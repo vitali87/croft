@@ -890,14 +890,17 @@ impl App {
     /// browser, another tmux window. With auto save "onWindowChange" (or
     /// `onFocusChange`) every dirty buffer is written now, the one being
     /// edited included, since the whole window is what lost focus; VS Code
-    /// does the same. Returns true when anything changed on screen.
+    /// does the same. A `Cmd+K` leader waiting for its second key stops
+    /// waiting, as VS Code's does when its window loses focus. Returns true
+    /// when anything changed on screen.
     pub fn on_window_focus_lost(&mut self) -> bool {
+        let left_chord = self.cmd_k_leader.take().is_some();
         if !self.auto_save_on_focus_change {
-            return false;
+            return left_chord;
         }
         // An auto save: the caret lines keep their trailing whitespace,
         // since the user may be mid-word when they alt-tab away (#1455).
-        self.sweep_dirty_buffers(false, false, true)
+        self.sweep_dirty_buffers(false, false, true) || left_chord
     }
 
     /// Sample the current focus (pane, active tab, active path) and report

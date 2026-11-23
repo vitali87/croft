@@ -1190,19 +1190,31 @@ fn pending_comments_stay_with_their_pull_request() {
 fn only_the_submissions_own_failure_ends_it() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.review_submitting = true;
+    let (answer_tx, answer_rx) = std::sync::mpsc::channel::<()>();
+    app.review_submit = Some(
+        crate::jobs::Job::spawn("review-submit", crate::jobs::Start::Now, move || {
+            let _ = answer_rx.recv();
+            crate::review_ops::Outcome::SubmitFailed(String::from("no"))
+        })
+        .unwrap(),
+    );
     app.review_tx
         .send(crate::review_ops::Outcome::Failed(String::from(
             "Reply failed",
         )))
         .unwrap();
     app.drain_review_ops();
-    assert!(app.review_submitting);
-    app.review_tx
-        .send(crate::review_ops::Outcome::SubmitFailed(String::from("no")))
-        .unwrap();
-    app.drain_review_ops();
-    assert!(!app.review_submitting);
+    assert!(app.review_submit.is_some());
+    answer_tx.send(()).unwrap();
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(1),
+        "the submission's own answer",
+        || {
+            app.drain_review_ops();
+            app.review_submit.is_none()
+        },
+    );
+    assert_eq!(app.status, "no");
 }
 
 /// #368: the navigator's notes and pending comments are previewed, then
@@ -1450,17 +1462,60 @@ fn a_submit_in_flight_keeps_new_comments_and_refuses_a_second_submit() {
     let rel = app.prompt.take().unwrap().target_dir;
     app.add_pending_review_comment("first", rel.clone());
     app.submit_review(String::from("Looks good"));
-    assert!(app.review_submitting);
+    assert!(app.review_submit.is_some());
     app.editor.cursor_row = 1;
     app.add_pending_review_comment("written meanwhile", rel);
     app.submit_review(String::from("again"));
     assert!(app.status.contains("already"), "{}", app.status);
     crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "the submit", || {
         app.drain_review_ops();
-        !app.review_submitting
+        app.review_submit.is_none()
     });
     let left: Vec<_> = app.review_pending.iter().map(|c| c.body.clone()).collect();
     assert_eq!(left, vec![String::from("written meanwhile")]);
+}
+
+/// #2578: a submission whose thread crashed no longer counts as in flight:
+/// its comments are still pending, and the next submit posts them instead
+/// of being refused as already running.
+#[test]
+fn a_review_submission_whose_thread_crashed_lets_the_next_one_run() {
+    let (_tmp, root, f, _log, _stdin, gh) = review_fixture();
+    let mut app = review_app(&root, &f, &gh);
+    app.editor.cursor_row = 0;
+    app.open_review_comment_prompt();
+    let rel = app.prompt.take().unwrap().target_dir;
+    app.add_pending_review_comment("first", rel);
+    app.review_submit = Some(
+        crate::jobs::Job::spawn(
+            "review-submit",
+            crate::jobs::Start::Now,
+            || -> crate::review_ops::Outcome {
+                panic!("the submission crashed (on purpose, in a test)")
+            },
+        )
+        .unwrap(),
+    );
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(1),
+        "the crashed submission to settle",
+        || {
+            app.drain_review_ops();
+            app.review_submit.is_none()
+        },
+    );
+    assert_eq!(
+        app.review_pending.len(),
+        1,
+        "its comments are still pending"
+    );
+    app.submit_review(String::from("Looks good"));
+    assert!(!app.status.contains("already"), "{}", app.status);
+    crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "the next submit", || {
+        app.drain_review_ops();
+        app.review_submit.is_none()
+    });
+    assert!(app.review_pending.is_empty(), "the next submit posted them");
 }
 
 #[test]
@@ -1657,6 +1712,39 @@ fn the_review_comment_pr_lookup_without_a_usable_gh_says_how_to_fix_it() {
         assert_eq!(app.review_pr_number(tmp.path()), None);
         assert_eq!(app.status, status);
     }
+}
+
+/// #2422: a `gh` just written, as a fresh install or update is, can't run
+/// for a moment ("Text file busy") while another process still holds it open
+/// for writing. The PR lookup behind Add Comment and Submit Review waits that
+/// moment out, as croft's other `gh` calls do, instead of reporting it.
+#[test]
+fn the_review_comment_pr_lookup_waits_out_a_briefly_busy_gh() {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let gh = tmp.path().join("gh");
+    let mut writer = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o755)
+        .open(&gh)
+        .unwrap();
+    writer.write_all(b"#!/bin/sh\necho 42\n").unwrap();
+    writer.flush().unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        drop(writer);
+    });
+    app.review_gh = gh.display().to_string();
+    assert_eq!(
+        app.review_pr_number(tmp.path()),
+        Some(String::from("42")),
+        "{}",
+        app.status
+    );
+    release.join().unwrap();
 }
 
 /// Load x/y#42 through `gh` and wait for its viewed-state read to settle.

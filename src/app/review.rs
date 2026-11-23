@@ -403,7 +403,7 @@ impl App {
         if !self.pending_is_for(&root, &number) {
             return;
         }
-        if self.review_submitting {
+        if self.review_submit.is_some() {
             self.status = String::from("A review is already being submitted");
             return;
         }
@@ -411,23 +411,33 @@ impl App {
             self.status = String::from("Nothing to submit: add a comment or a summary");
             return;
         }
-        crate::review_ops::spawn(
-            self.review_gh.clone(),
-            root,
-            crate::review_ops::Job::Submit {
-                number,
-                event,
-                summary,
+        let job = crate::review_ops::Job::Submit {
+            number,
+            event,
+            summary,
+            pending: self.review_pending.clone(),
+            settles: crate::review_ops::Settles {
                 pending: self.review_pending.clone(),
-                settles: crate::review_ops::Settles {
-                    pending: self.review_pending.clone(),
-                    ..Default::default()
-                },
+                ..Default::default()
             },
-            self.review_tx.clone(),
-        );
-        self.review_submitting = true;
-        self.status = String::from("Submitting review…");
+        };
+        self.start_review_submit(root, job, "Submitting review…");
+    }
+
+    /// Post a review as the `review-submit` job, saying `status` while it
+    /// runs. Its answer comes back through [`Self::drain_review_ops`].
+    fn start_review_submit(&mut self, root: PathBuf, job: crate::review_ops::Job, status: &str) {
+        let program = self.review_gh.clone();
+        let submit = crate::jobs::Job::spawn("review-submit", crate::jobs::Start::Now, move || {
+            crate::review_ops::run(&program, &root, job)
+        });
+        match submit {
+            Ok(submit) => {
+                self.review_submit = Some(submit);
+                self.status = String::from(status);
+            }
+            Err(e) => self.status = format!("Could not submit the review: {e}"),
+        }
     }
 
     /// Review: Resolve or Unresolve Thread: the focused box, else the next
@@ -499,7 +509,23 @@ impl App {
     pub fn drain_review_ops(&mut self) -> bool {
         use crate::review_ops::Outcome;
         let mut changed = false;
-        while let Ok(out) = self.review_rx.try_recv() {
+        let mut outcomes: Vec<Outcome> =
+            std::iter::from_fn(|| self.review_rx.try_recv().ok()).collect();
+        match self.review_submit.as_ref().map(crate::jobs::Job::poll) {
+            None | Some(crate::jobs::Poll::Pending) => {}
+            Some(crate::jobs::Poll::Done(out)) => {
+                self.review_submit = None;
+                outcomes.push(out);
+            }
+            // Its thread crashed, and the crash notice said so. The comments
+            // it was posting are still pending, and the next submit goes
+            // ahead instead of being refused as already running (#2578).
+            Some(crate::jobs::Poll::Died) => {
+                self.review_submit = None;
+                changed = true;
+            }
+        }
+        for out in outcomes {
             changed = true;
             match out {
                 Outcome::Replied { thread, text } => {
@@ -527,7 +553,6 @@ impl App {
                     folded,
                     settles,
                 } => {
-                    self.review_submitting = false;
                     self.review_pending.retain(|c| !settles.pending.contains(c));
                     if self.review_pending.is_empty() {
                         self.review_pending_pr = None;
@@ -579,10 +604,7 @@ impl App {
                 Outcome::NoPr => {
                     self.status = String::from("No PR for this branch — check it out first");
                 }
-                Outcome::SubmitFailed(e) => {
-                    self.review_submitting = false;
-                    self.status = e;
-                }
+                Outcome::SubmitFailed(e) => self.status = e,
                 // A failed reply or load leaves a submission in flight alone.
                 Outcome::Failed(e) => self.status = e,
             }
@@ -827,14 +849,20 @@ impl App {
                         crate::gh::signed_out(status).then(|| String::from(crate::gh::SIGNED_OUT))
                     }
                     // No output: gh did not start, or ran past the budget.
-                    None => std::process::Command::new(&self.review_gh)
-                        .arg("--version")
-                        .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status()
+                    None => {
+                        let mut probe = std::process::Command::new(&self.review_gh);
+                        probe
+                            .arg("--version")
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null());
+                        crate::review_ops::retry_while_busy(
+                            || probe.status(),
+                            |r| r.as_ref().is_err_and(crate::review_ops::text_file_busy),
+                        )
                         .err()
-                        .map(|e| crate::gh::spawn_error(&e, Some(root))),
+                        .map(|e| crate::gh::spawn_error(&e, Some(root)))
+                    }
                 };
                 self.status = match why {
                     Some(why) => format!("Could not find this branch's PR: {why}"),
@@ -966,7 +994,7 @@ impl App {
         if !self.pending_is_for(&root, &number) {
             return;
         }
-        if self.review_submitting {
+        if self.review_submit.is_some() {
             self.status = String::from("A review is already being submitted");
             return;
         }
@@ -976,24 +1004,18 @@ impl App {
             .filter(|c| comments.contains(c))
             .cloned()
             .collect();
-        crate::review_ops::spawn(
-            self.review_gh.clone(),
-            root,
-            crate::review_ops::Job::Submit {
-                number,
-                event: crate::review_threads::ReviewEvent::Comment,
-                summary: String::new(),
-                pending: comments,
-                settles: crate::review_ops::Settles {
-                    notes,
-                    sticky,
-                    pending,
-                },
+        let job = crate::review_ops::Job::Submit {
+            number,
+            event: crate::review_threads::ReviewEvent::Comment,
+            summary: String::new(),
+            pending: comments,
+            settles: crate::review_ops::Settles {
+                notes,
+                sticky,
+                pending,
             },
-            self.review_tx.clone(),
-        );
-        self.review_submitting = true;
-        self.status = String::from("Posting comments…");
+        };
+        self.start_review_submit(root, job, "Posting comments…");
     }
 
     /// Load this PR's review threads onto the open file as comment boxes
@@ -1792,19 +1814,27 @@ impl App {
 
 /// Run `cmd` for at most `budget`, collecting stdout; None when it could not
 /// start or ran out of time (it is then killed and reaped). For the few
-/// short commands that still run on the UI thread.
+/// short commands that still run on the UI thread. A program just written,
+/// such as a freshly installed `gh`, is waited out while it is "Text file
+/// busy" (#2422), as croft's other `gh` calls do, and that wait comes out of
+/// the same budget.
 pub(super) fn bounded_output(
     cmd: &mut std::process::Command,
     budget: std::time::Duration,
 ) -> Option<(std::process::ExitStatus, Vec<u8>)> {
     use std::io::Read;
     let deadline = std::time::Instant::now() + budget;
-    let mut child = cmd
-        .stdin(std::process::Stdio::null())
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(std::process::Stdio::null());
+    let mut child = crate::review_ops::retry_while_busy(
+        || cmd.spawn(),
+        |r| {
+            r.as_ref().is_err_and(crate::review_ops::text_file_busy)
+                && std::time::Instant::now() < deadline
+        },
+    )
+    .ok()?;
     let mut stdout = child.stdout.take()?;
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -1812,7 +1842,9 @@ pub(super) fn bounded_output(
         let _ = stdout.read_to_end(&mut buf);
         let _ = tx.send(buf);
     });
-    let bytes = rx.recv_timeout(budget).ok();
+    let bytes = rx
+        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        .ok();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return bytes.map(|b| (status, b)),

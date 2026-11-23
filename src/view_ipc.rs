@@ -270,17 +270,56 @@ fn retryable_refusal() -> ViewReply {
 }
 
 fn send_once(socket: &Path, req: &ViewRequest) -> std::io::Result<ViewReply> {
-    use std::os::unix::net::UnixStream;
-    let mut stream = UnixStream::connect(socket)?;
+    let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
+    exchange(&mut stream, req)
+}
+
+/// Write one request on a connected stream and read croft's answer.
+///
+/// A write that fails because croft already hung up still reads the answer
+/// (#2377). Croft gives a request one frame to arrive, then refuses it with
+/// [`FRAME_BUDGET_REFUSAL`] and closes. A client descheduled between
+/// `connect` and this write finds the socket closed (`EPIPE`) with that
+/// refusal already in its receive buffer. Returning the write error dropped
+/// the one reply [`send`] retries, so a busy shell printed "Broken pipe"
+/// where croft had asked for a second attempt. Only a broken pipe is read
+/// through: any other write error, and a broken pipe with no reply behind
+/// it, is reported as the write error it is. A reply that did arrive is
+/// croft's answer whatever it says, so one that does not parse is reported
+/// as malformed, as it is when the write went through, and not as a croft
+/// that is gone: that would send git's sequence editor to its fallback for
+/// a croft that answered.
+fn exchange(
+    stream: &mut std::os::unix::net::UnixStream,
+    req: &ViewRequest,
+) -> std::io::Result<ViewReply> {
     let mut line = serde_json::to_string(req)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     line.push('\n');
-    stream.write_all(line.as_bytes())?;
-    stream.flush()?;
+    if let Err(e) = stream
+        .write_all(line.as_bytes())
+        .and_then(|()| stream.flush())
+    {
+        if e.kind() != std::io::ErrorKind::BrokenPipe {
+            return Err(e);
+        }
+        // `InvalidData` is the one read error with bytes behind it (a reply
+        // that is not JSON, not UTF-8, or too long); every other one says
+        // nothing came back.
+        return match read_reply(stream) {
+            Err(read) if read.kind() != std::io::ErrorKind::InvalidData => Err(e),
+            answer => answer,
+        };
+    }
+    read_reply(stream)
+}
+
+/// Croft's one-line answer to a request, within the client's 5s.
+fn read_reply(stream: &std::os::unix::net::UnixStream) -> std::io::Result<ViewReply> {
     let reply = read_line_by_deadline(
-        &stream,
+        stream,
         std::time::Instant::now() + std::time::Duration::from_secs(5),
         "croft did not reply within 5s",
     )?;
@@ -1414,6 +1453,71 @@ mod tests {
             "and the success must come from a SECOND connection: delete the \
              retry and this is 1 with the refusal returned"
         );
+    }
+
+    /// A refusal croft sent before the request was written is still read
+    /// (#2377).
+    ///
+    /// Croft refuses a request that misses its frame and closes; a client
+    /// descheduled between `connect` and the write then finds the socket
+    /// closed. The pair below is that moment made exact: croft's end has
+    /// written the refusal and gone before the client writes a byte. Without
+    /// the read-through the client returns the `EPIPE` and `send` never sees
+    /// the one reply it retries, which is what printed "Broken pipe" at a busy
+    /// shell (and failed `a_view_request_from_a_pane_opens_the_file_in_the_editor`
+    /// on a loaded CI runner).
+    #[test]
+    fn a_refusal_sent_before_the_request_is_written_is_still_read() {
+        use std::os::unix::net::UnixStream;
+        let (mut gone, closed) = UnixStream::pair().unwrap();
+        drop(closed);
+        assert_eq!(
+            gone.write_all(b"{}\n").unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe,
+            "the write this test is about must fail the way a closed croft makes it fail"
+        );
+
+        let (mut client, mut croft) = UnixStream::pair().unwrap();
+        write_reply(&mut croft, &retryable_refusal()).unwrap();
+        drop(croft);
+
+        assert_eq!(
+            exchange(&mut client, &ViewRequest::new(Path::new("/tmp/x"))).unwrap(),
+            retryable_refusal(),
+            "the refusal is croft's answer and `send` retries it, so the broken \
+             write must not hide it"
+        );
+    }
+
+    /// A broken pipe with nothing behind it is still the write error (#2377).
+    ///
+    /// The read-through is for an answer croft gave; a croft that closed
+    /// without one must not turn into "closed without replying", which
+    /// describes a request croft read.
+    #[test]
+    fn a_broken_pipe_with_no_reply_is_reported_as_the_write_error() {
+        let (mut client, croft) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(croft);
+
+        let err = exchange(&mut client, &ViewRequest::new(Path::new("/tmp/x"))).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe, "{err}");
+    }
+
+    /// A malformed reply behind a broken pipe is reported as malformed.
+    ///
+    /// Something answered, so this is not a croft that is gone: reported as
+    /// the write error, it became `NoCroft` and sent git's sequence editor to
+    /// its fallback editor, while the same reply after a write that went
+    /// through is reported as the bad reply it is.
+    #[test]
+    fn a_malformed_reply_behind_a_broken_pipe_is_reported_as_malformed() {
+        use std::os::unix::net::UnixStream;
+        let (mut client, mut croft) = UnixStream::pair().unwrap();
+        croft.write_all(b"not a reply\n").unwrap();
+        drop(croft);
+
+        let err = exchange(&mut client, &ViewRequest::new(Path::new("/tmp/x"))).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
     }
 
     /// One retry, not a loop (#362).

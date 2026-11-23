@@ -678,6 +678,13 @@ impl FsWatch {
         self.rx = Some(rx);
     }
 
+    /// The watcher's thread has not answered yet: until it does, the pass
+    /// that installs it (`try_install_watcher`) is still to come.
+    #[cfg(test)]
+    pub fn installing(&self) -> bool {
+        self.init_rx.is_some()
+    }
+
     #[cfg(test)]
     pub fn force_poll_due(&mut self) {
         self.poll_last_check = Instant::now()

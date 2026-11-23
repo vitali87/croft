@@ -1,0 +1,167 @@
+# Stage B of the refactor program (#2062): where each item of src/app/debugger.rs goes.
+# One row per item, in file order. pr 0 means the item stays in debugger.rs; the others
+# move to src/app/debugger/<file>.rs in that PR. kind, impl and name are as
+# `scripts/check_pure_move.py list` prints them. Run
+# `scripts/move_items.py --target debugger --check` after adding an item to debugger.rs.
+# debugger.rs keeps the types and constants the App's fields and every part share.
+pr	file	kind	impl	name
+1	adapters	fn	-	lldb_dap_rank
+1	adapters	fn	-	lldb_dap_path
+1	adapters	fn	-	lldb_dap_missing_message
+2	python	fn	-	project_python
+2	python	fn	-	project_python_on
+1	adapters	fn	-	is_executable_file
+7	view	fn	-	push_variable_rows
+0		const	-	REAPER_TEARDOWN_GRACE_MS
+0		enum	-	PendingLaunchStep
+0		enum	-	MemberOutcome
+0		enum	-	LaunchSlot
+6	events	fn	-	index_after_removals
+9	console	fn	-	mirror_open_console_lines
+14	breakpoint_list	fn	-	breakpoint_section_rows
+16	attach	fn	-	list_user_processes
+0		enum	-	InputThen
+0		enum	-	PreLaunchWait
+0		fn	impl PreLaunchWait	of
+11	compounds	fn	-	finished_settles_pending
+0		const	-	PRELAUNCH_MARK_GRACE
+10	launch	fn	-	resolve_lldb_program
+11	compounds	fn	-	pending_abort_reason
+6	events	fn	-	debug_end_message
+7	view	fn	impl App	handle_run_debug_key
+1	adapters	fn	impl App	install_delve
+3	debug_test	fn	impl App	debug_test_at_cursor
+3	debug_test	fn	impl App	test_runner_for_focused_file
+3	debug_test	fn	impl App	debug_named_test
+3	debug_test	fn	impl App	debug_named_test_now
+3	debug_test	fn	impl App	start_test_binary_build
+4	builds	fn	impl App	start_cargo_program_build
+4	builds	fn	impl App	drain_pending_cargo_launch
+3	debug_test	fn	impl App	drain_pending_test_debug
+3	debug_test	fn	impl App	launch_lldb_test_debug
+7	view	fn	impl App	refresh_run_debug
+5	active_file	fn	impl App	run_spec_for
+6	events	fn	impl App	poll_dap
+7	view	fn	impl App	refresh_debug_panel
+7	view	fn	impl App	build_debug_view
+8	watches	fn	impl App	refresh_watches
+8	watches	fn	impl App	add_watch_expression
+8	watches	fn	impl App	remove_watch_expression
+9	console	fn	impl App	debug_console_push
+9	console	fn	impl App	debug_console_push_output
+9	console	fn	impl App	debug_console_push_line
+9	console	fn	impl App	debug_console_append
+9	console	fn	impl App	debug_repl_submit
+9	console	fn	impl App	debug_hover_value
+7	view	fn	impl App	debug_panel_click
+7	view	fn	impl App	debug_row_menu
+7	view	fn	impl App	copy_debug_value
+7	view	fn	impl App	copy_call_stack
+8	watches	fn	impl App	open_add_watch_prompt
+7	view	fn	impl App	run_debug_button_action
+7	view	fn	impl App	reveal_debug_view
+7	view	fn	impl App	debug_error
+10	launch	fn	impl App	launch_with_unsaved_saved
+10	launch	fn	impl App	run_with_unsaved_saved
+10	launch	fn	impl App	unsaved_editor_names
+10	launch	fn	impl App	debug_start_or_continue
+10	launch	fn	impl App	start_selected_debug
+10	launch	fn	impl App	start_selected_debug_now
+11	compounds	fn	impl App	launch_compound
+12	configs	fn	impl App	open_add_debug_config
+12	configs	fn	impl App	prompt_debug_config_field
+12	configs	fn	impl App	submit_debug_config_field
+12	configs	fn	impl App	finish_debug_config_draft
+12	configs	fn	impl App	open_debug_config_picker
+11	compounds	fn	impl App	launch_member_into_set
+11	compounds	fn	impl App	launch_after_compound_task_all
+11	compounds	fn	impl App	park_launch_behind
+11	compounds	fn	impl App	launch_compound_members
+11	compounds	fn	impl App	resume_pending_launch
+11	compounds	fn	impl App	launch_after_compound_task
+10	launch	fn	impl App	launch_debug_config
+3	debug_test	fn	impl App	failure_site_of
+3	debug_test	fn	impl App	arm_failure_breakpoint
+3	debug_test	fn	impl App	with_failure_note
+3	debug_test	fn	impl App	disarm_failure_breakpoint
+13	breakpoints	fn	impl App	collect_editor_breakpoints
+10	launch	fn	impl App	launch_resolved_config
+10	launch	fn	impl App	launch_resolved_into_set
+10	launch	fn	impl App	launch_resolved_in
+5	active_file	fn	impl App	start_debug_session
+5	active_file	fn	impl App	start_delve_debug_session
+3	debug_test	fn	impl App	start_delve_test_session
+5	active_file	fn	impl App	start_js_debug_session
+5	active_file	fn	impl App	start_lldb_debug_session
+4	builds	fn	impl App	begin_debug_build
+4	builds	fn	impl App	take_debug_build
+4	builds	fn	impl App	poll_debug_build
+4	builds	fn	impl App	launch_lldb
+4	builds	fn	impl App	build_debuggable_binary
+13	breakpoints	fn	impl App	debug_toggle_breakpoint
+13	breakpoints	fn	impl App	debug_toggle_breakpoint_line
+13	breakpoints	fn	impl App	debug_edit_condition
+13	breakpoints	fn	impl App	debug_edit_condition_line
+13	breakpoints	fn	impl App	commit_breakpoint_condition
+13	breakpoints	fn	impl App	open_debug_prompt
+13	breakpoints	fn	impl App	debug_edit_hit_condition
+13	breakpoints	fn	impl App	commit_hit_condition
+13	breakpoints	fn	impl App	debug_add_function_breakpoint
+13	breakpoints	fn	impl App	commit_function_breakpoint
+13	breakpoints	fn	impl App	debug_clear_function_breakpoints
+13	breakpoints	fn	impl App	push_function_breakpoints
+10	launch	fn	impl App	adopt_debug_session
+15	controls	fn	impl App	debug_run_to_cursor
+13	breakpoints	fn	impl App	debug_break_on_value_change
+13	breakpoints	fn	impl App	commit_data_breakpoint
+13	breakpoints	fn	impl App	debug_clear_data_breakpoints
+13	breakpoints	fn	impl App	debug_edit_logpoint
+13	breakpoints	fn	impl App	debug_edit_logpoint_line
+13	breakpoints	fn	impl App	commit_logpoint
+15	controls	fn	impl App	run_debug_control
+15	controls	fn	impl App	debug_continue
+15	controls	fn	impl App	debug_step_into_target
+15	controls	fn	impl App	offer_step_in_targets
+15	controls	fn	impl App	debug_step_into
+15	controls	fn	impl App	debug_step
+13	breakpoints	fn	impl App	debug_toggle_raised_exceptions
+15	controls	fn	impl App	debug_pause
+15	controls	fn	impl App	debug_restart
+8	watches	fn	impl App	reset_watch_runtime
+11	compounds	fn	impl App	report_member_ended
+11	compounds	fn	impl App	refocus_debug_session
+11	compounds	fn	impl App	switch_debug_session
+14	breakpoint_list	fn	impl App	breakpoint_items
+14	breakpoint_list	fn	impl App	sync_breakpoint_list
+14	breakpoint_list	fn	impl App	breakpoint_list_click
+14	breakpoint_list	fn	impl App	remove_breakpoint_at
+16	attach	fn	impl App	open_attach_process_picker
+16	attach	fn	impl App	take_pending_attach
+11	compounds	fn	impl App	record_post_debug_task
+11	compounds	fn	impl App	run_post_debug_tasks
+15	controls	fn	impl App	debug_stop_by_user
+15	controls	fn	impl App	debug_stop
+5	active_file	fn	impl App	run_active_file
+5	active_file	fn	impl App	run_active_file_now
+16	attach	fn	impl App	consume_process_picker_image_clear
+16	attach	fn	impl App	open_attach_python_picker
+16	attach	fn	impl App	close_process_picker
+16	attach	fn	impl App	handle_process_picker_key
+16	attach	fn	impl App	attach_process_picker_selection
+16	attach	fn	impl App	handle_process_picker_mouse
+16	attach	fn	impl App	render_process_picker
+16	attach	fn	impl App	attach_to_python_target
+17	inline_values	fn	impl App	refresh_inline_values
+17	inline_values	fn	impl App	clear_inline_values
+17	inline_values	fn	impl App	toggle_inline_values
+13	breakpoints	fn	impl App	resend_breakpoints
+2	python	fn	-	find_python_venv
+2	python	fn	-	project_python_for
+2	python	fn	-	debuggee_python
+2	python	fn	-	debuggee_python_note
+10	launch	fn	-	no_display_for_a_browser
+10	launch	fn	-	no_display
+2	python	fn	-	with_python_note
+2	python	fn	-	launch_request_python
+2	python	fn	-	debug_test_python
+2	python	fn	-	config_project_python

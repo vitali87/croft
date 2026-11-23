@@ -430,9 +430,13 @@ pub(super) fn numstat_map(
     args: &[&str],
 ) -> std::collections::HashMap<String, (usize, usize)> {
     let output = match Command::new("git")
-        // Poll without taking index.lock; see run_git.
+        // Poll without taking index.lock; see run_git. `git diff` does not
+        // honour GIT_OPTIONAL_LOCKS: a file whose timestamp changed but
+        // whose bytes did not has it write the refreshed index back, so its
+        // refresh is turned off too (#2593). The counts are the same: a
+        // file with the same bytes has none either way.
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .args(["-C", workdir])
+        .args(["-c", "diff.autoRefreshIndex=false", "-C", workdir])
         .args(args)
         .output()
     {

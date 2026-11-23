@@ -1087,7 +1087,7 @@ fn the_failure_site_survives_a_whole_cargo_test_run() {
 fn a_test_built_app_reads_no_user_settings_layer() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    let user_dir = crate::paths::config_dir();
+    let user_dir = crate::paths::real_config_dir();
     // At startup and again on a live settings reload.
     for when in ["startup", "reload"] {
         if when == "reload" {
@@ -1829,6 +1829,31 @@ fn cancel_test_run_stops_a_run_and_says_so_when_idle() {
         .on_busy_started(crate::testing::model::Activity::Running);
     app.handle_testing_key(key(KeyCode::Char('s'), KeyModifiers::NONE));
     assert_eq!(app.status, "Cancelling test run");
+}
+
+/// #2592: a test run whose runner crashed ends and the status line says
+/// why; a runner that crashed again soon after says how to start it.
+#[test]
+fn a_test_run_whose_runner_crashed_says_so() {
+    use crate::testing::worker::TestWorker;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for (crashes, said) in [(1, TEST_RUNNER_CRASHED), (2, TEST_RUNNER_STOPPED)] {
+        app.test_worker = TestWorker::crashing(tmp.path().to_path_buf(), crashes);
+        app.testing
+            .on_busy_started(crate::testing::model::Activity::Running);
+        app.test_worker.run_all();
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_secs(5),
+            "the crash to be reported",
+            || {
+                app.test_worker.drain(&mut app.testing);
+                app.say_why_test_runs_ended();
+                app.status == said
+            },
+        );
+        assert!(!app.testing.is_busy(), "the run ended");
+    }
 }
 
 /// #2067: the Testing view wears the chosen theme and shows that it has

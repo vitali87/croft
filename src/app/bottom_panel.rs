@@ -252,10 +252,22 @@ impl App {
     /// the user their code is fine when the checker never checked it.
     /// Otherwise the count is this producer's own, not the panel's.
     pub(super) fn drain_project_check(&mut self) -> bool {
-        let Ok((cwd, done)) = self.project_check_rx.try_recv() else {
+        let Some(job) = self.project_check.as_ref() else {
             return false;
         };
-        self.project_check_running = false;
+        let (cwd, done) = match job.poll() {
+            crate::jobs::Poll::Pending => return false,
+            // The check's thread crashed. The crash notice has said so; the
+            // check is no longer running, so the next one can start (#2562).
+            crate::jobs::Poll::Died => {
+                self.project_check = None;
+                return true;
+            }
+            crate::jobs::Poll::Done(result) => {
+                self.project_check = None;
+                result
+            }
+        };
         match done {
             Err(e) => {
                 // true, not false: the status changed, so the frame must be
@@ -293,7 +305,7 @@ impl App {
         }
     }
 
-    /// Queue a finished check on the REAL channel WITHOUT draining (#256).
+    /// Queue a finished check as the REAL job WITHOUT draining (#256).
     ///
     /// Test-only. The sibling helper drains immediately, which is right for
     /// testing the reporting logic but wrong for the same-tick race: the
@@ -313,8 +325,7 @@ impl App {
             stdout: stdout.as_bytes().to_vec(),
             stderr: stderr.as_bytes().to_vec(),
         };
-        self.project_check_running = true;
-        let _ = self.project_check_tx.send((cwd.to_path_buf(), Ok(out)));
+        self.project_check = Some(crate::jobs::Job::finished((cwd.to_path_buf(), Ok(out))));
     }
 
     /// Whether the session's one-shot size hint has been spent (#256).
@@ -333,11 +344,11 @@ impl App {
         let _ = self.project_hint_tx.send(());
     }
 
-    /// Push a finished check through the REAL channel and drain it (#256).
+    /// Hand a finished check to the REAL job slot and drain it (#256).
     ///
-    /// Test-only, and deliberately not a shortcut: it sends down
-    /// `project_check_tx` and calls `drain_project_check`, so the reporting
-    /// logic under test is the shipped one. A helper that set the status
+    /// Test-only, and deliberately not a shortcut: it fills `project_check`
+    /// and calls `drain_project_check`, so the reporting logic under test is
+    /// the shipped one. A helper that set the status
     /// itself would pass while the drain was broken.
     /// Unix-only: `ExitStatusExt::from_raw` has a different meaning on
     /// Windows, and an ungated spawning helper breaks that target's test
@@ -356,8 +367,7 @@ impl App {
             stdout: stdout.as_bytes().to_vec(),
             stderr: stderr.as_bytes().to_vec(),
         };
-        self.project_check_running = true;
-        let _ = self.project_check_tx.send((cwd.to_path_buf(), Ok(out)));
+        self.project_check = Some(crate::jobs::Job::finished((cwd.to_path_buf(), Ok(out))));
         self.drain_project_check();
     }
 
@@ -1527,10 +1537,22 @@ impl App {
                 changed = true;
             }
         }
-        // Latest background-poll snapshot (a complete listener set): add new
-        // ports, then reconcile so ports that stopped listening go not-live and
-        // eventually drop. Only the newest queued snapshot matters.
-        if let Some(poll) = self.port_poll_rx.try_iter().last() {
+        // The background poll's snapshot (a complete listener set): add new
+        // ports, then reconcile so ports that stopped listening go not-live
+        // and eventually drop. A poll whose thread crashed brings nothing,
+        // and is no longer in flight, so the next starts on cadence (#2568).
+        let polled = match self.port_poll.as_ref().map(crate::jobs::Job::poll) {
+            None | Some(crate::jobs::Poll::Pending) => None,
+            Some(crate::jobs::Poll::Done(poll)) => {
+                self.port_poll = None;
+                Some(poll)
+            }
+            Some(crate::jobs::Poll::Died) => {
+                self.port_poll = None;
+                None
+            }
+        };
+        if let Some(poll) = polled {
             for hit in poll.hits {
                 if self
                     .ports
@@ -1556,11 +1578,7 @@ impl App {
         }
         // On cadence, kick off a fresh poll off-thread — `lsof`/`ps` block for
         // tens of ms and must never run on the event loop. One in flight max.
-        if self.last_port_poll.elapsed() >= PORT_POLL_INTERVAL
-            && !self
-                .port_poll_inflight
-                .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if self.last_port_poll.elapsed() >= PORT_POLL_INTERVAL && self.port_poll.is_none() {
             self.last_port_poll = std::time::Instant::now();
             let pids: Vec<i32> = self
                 .terminals
@@ -1568,26 +1586,26 @@ impl App {
                 .filter_map(|t| t.pid().map(|p| p as i32))
                 .collect();
             if !pids.is_empty() {
-                let tx = self.port_poll_tx.clone();
-                let inflight = self.port_poll_inflight.clone();
-                inflight.store(true, std::sync::atomic::Ordering::Relaxed);
-                std::thread::spawn(move || {
-                    // Two questions, two scans. The subtree scan says what to
-                    // SURFACE (a system daemon is not the user's dev server);
-                    // the unscoped one says what is still UP, which the subtree
-                    // cannot answer for a port nobody in it owns.
-                    let mut hits: Vec<crate::port_detect::PortHit> = Vec::new();
-                    for pid in pids {
-                        for hit in crate::port_detect::poll_listeners(pid) {
-                            if !hits.iter().any(|h| h.port == hit.port) {
-                                hits.push(hit);
+                // A poll that cannot start is tried again on the next
+                // cadence tick.
+                let job =
+                    crate::jobs::Job::spawn("port-poll", crate::jobs::Start::Now, move || {
+                        // Two questions, two scans. The subtree scan says what to
+                        // SURFACE (a system daemon is not the user's dev server);
+                        // the unscoped one says what is still UP, which the subtree
+                        // cannot answer for a port nobody in it owns.
+                        let mut hits: Vec<crate::port_detect::PortHit> = Vec::new();
+                        for pid in pids {
+                            for hit in crate::port_detect::poll_listeners(pid) {
+                                if !hits.iter().any(|h| h.port == hit.port) {
+                                    hits.push(hit);
+                                }
                             }
                         }
-                    }
-                    let listening = crate::port_detect::poll_all_listening();
-                    let _ = tx.send(PortPoll { hits, listening });
-                    inflight.store(false, std::sync::atomic::Ordering::Relaxed);
-                });
+                        let listening = crate::port_detect::poll_all_listening();
+                        PortPoll { hits, listening }
+                    });
+                self.port_poll = job.ok();
             }
         }
         changed

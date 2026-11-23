@@ -2048,7 +2048,7 @@ impl App {
                         self.status =
                             String::from("Whole-project check: tsconfig.json includes no files");
                     }
-                    Some(_) if self.project_check_running => {
+                    Some(_) if self.project_check.is_some() => {
                         self.status = String::from("A whole-project check is already running");
                     }
                     Some(ProjectCheck::Run(runs)) => {
@@ -2058,7 +2058,6 @@ impl App {
                         // below never even painted. Same shape as
                         // `record_history_snapshot_of`: spawn, send, drain on
                         // the tick.
-                        let tx = self.project_check_tx.clone();
                         let root_for_thread = root.clone();
                         let mode = self.problems_project_scope.clone();
                         let hint_tx = self.project_hint_tx.clone();
@@ -2069,58 +2068,71 @@ impl App {
                         // set where the hint is RECEIVED, which is the only
                         // point that knows one was warranted.
                         let hinted = self.project_check_hinted;
-                        std::thread::spawn(move || {
-                            // The cap's one-time hint (#256 criterion 5).
-                            // Computed HERE, on the thread already spawned
-                            // for the compile, because it is a whole-
-                            // workspace walk - never on the UI thread. The
-                            // explicit run still proceeds either way; the
-                            // cap governs UNASKED runs, and this tells the
-                            // user once that automatic ones will not start.
-                            if !hinted
-                                && !Self::project_check_auto_enabled(
-                                    &root_for_thread,
-                                    &mode,
-                                    Self::PROJECT_CHECK_AUTO_MAX_FILES,
-                                )
-                                && Self::project_scope_mode(&mode) == "auto"
-                            {
-                                let _ = hint_tx.send(());
-                            }
-                            // .output(), never .status(): the checker must not
-                            // inherit croft's TTY, or its diagnostics spray
-                            // over the UI. One run per referenced project,
-                            // merged: both streams concatenated, and the
-                            // last failing status kept, so one failing
-                            // project fails the sweep.
-                            let mut done: Option<std::io::Result<std::process::Output>> = None;
-                            for (program, args) in runs {
-                                let out = std::process::Command::new(&program)
-                                    .args(&args)
-                                    .current_dir(&root_for_thread)
-                                    .output();
-                                done = Some(match (done, out) {
-                                    (Some(Ok(mut acc)), Ok(o)) => {
-                                        acc.stdout.extend(o.stdout);
-                                        acc.stderr.extend(o.stderr);
-                                        if !o.status.success() {
-                                            acc.status = o.status;
-                                        }
-                                        Ok(acc)
-                                    }
-                                    (Some(Err(e)), _) | (_, Err(e)) => Err(e),
-                                    (None, Ok(o)) => Ok(o),
-                                });
-                                if matches!(done, Some(Err(_))) {
-                                    break;
+                        let job = crate::jobs::Job::spawn(
+                            "check-project",
+                            crate::jobs::Start::Now,
+                            move || {
+                                // The cap's one-time hint (#256 criterion 5).
+                                // Computed HERE, on the thread already spawned
+                                // for the compile, because it is a whole-
+                                // workspace walk - never on the UI thread. The
+                                // explicit run still proceeds either way; the
+                                // cap governs UNASKED runs, and this tells the
+                                // user once that automatic ones will not start.
+                                if !hinted
+                                    && !Self::project_check_auto_enabled(
+                                        &root_for_thread,
+                                        &mode,
+                                        Self::PROJECT_CHECK_AUTO_MAX_FILES,
+                                    )
+                                    && Self::project_scope_mode(&mode) == "auto"
+                                {
+                                    let _ = hint_tx.send(());
                                 }
+                                // .output(), never .status(): the checker must not
+                                // inherit croft's TTY, or its diagnostics spray
+                                // over the UI. One run per referenced project,
+                                // merged: both streams concatenated, and the
+                                // last failing status kept, so one failing
+                                // project fails the sweep.
+                                let mut done: Option<std::io::Result<std::process::Output>> = None;
+                                for (program, args) in runs {
+                                    let out = std::process::Command::new(&program)
+                                        .args(&args)
+                                        .current_dir(&root_for_thread)
+                                        .output();
+                                    done = Some(match (done, out) {
+                                        (Some(Ok(mut acc)), Ok(o)) => {
+                                            acc.stdout.extend(o.stdout);
+                                            acc.stderr.extend(o.stderr);
+                                            if !o.status.success() {
+                                                acc.status = o.status;
+                                            }
+                                            Ok(acc)
+                                        }
+                                        (Some(Err(e)), _) | (_, Err(e)) => Err(e),
+                                        (None, Ok(o)) => Ok(o),
+                                    });
+                                    if matches!(done, Some(Err(_))) {
+                                        break;
+                                    }
+                                }
+                                // `runs` is never empty, so `done` is always set.
+                                let done = done.unwrap_or_else(|| {
+                                    Err(std::io::Error::other("no checker to run"))
+                                });
+                                (root_for_thread, done)
+                            },
+                        );
+                        match job {
+                            Ok(job) => {
+                                self.project_check = Some(job);
+                                self.status = String::from("Checking the whole project...");
                             }
-                            if let Some(done) = done {
-                                let _ = tx.send((root_for_thread, done));
+                            Err(e) => {
+                                self.status = format!("Could not start the project check: {e}");
                             }
-                        });
-                        self.project_check_running = true;
-                        self.status = String::from("Checking the whole project...");
+                        }
                     }
                 }
             }

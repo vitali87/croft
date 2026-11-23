@@ -796,7 +796,7 @@ mod tests {
     fn a_test_build_reads_the_user_layers_outside_the_config_dir() {
         let dir = user_layers_dir();
         assert!(
-            !dir.starts_with(crate::paths::config_dir()),
+            !dir.starts_with(crate::paths::real_config_dir()),
             "user layers read from the real config dir: {}",
             dir.display()
         );

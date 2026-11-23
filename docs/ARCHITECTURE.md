@@ -17,7 +17,25 @@ Resizes call `master.resize(...)` and `term.resize(...)` so programs like `htop`
 ```
 src/
 ├── main.rs              entry point + module declarations
-├── cli.rs               clap CLI: open path, setup-terminal / setup-iterm2 / setup-cross / remote / view / keys subcommands
+├── cli.rs               clap CLI: open path, setup-terminal / setup-iterm2 / setup-cross / remote / view / keys subcommands: what every part shares (the clap root, `Cli`); the command line's own code is in the files in `cli/` below, while a subcommand that drives a feature (remote, attach, record, view, ...) calls into that feature's module
+├── cli/                 the command line's feature files, beside cli.rs; each file's `//!` doc says what it holds
+│   ├── commands.rs       every subcommand and its flags, as clap parses them
+│   ├── cross.rs          `croft setup-cross`: the cross-build's targets, and installing zig, cargo-zigbuild and the targets
+│   ├── git_editor.rs     `croft edit` as git's editor: the user's own sequence editor, and git's own editor when no croft is there
+│   ├── hook.rs           `croft hook`: Claude Code's edit hook itself, and installing or removing it
+│   ├── keys.rs           `croft keys`: printing each key and mouse event as croft receives it
+│   ├── launcher_install.rs `croft install-launcher`: the macOS Croft.app that opens croft in a new Ghostty window
+│   ├── links.rs          `croft open-link` and `croft install-link-handler`: following a link into a session, and handling the links
+│   ├── pair_provider.rs  `croft pair`'s provider flags: `--base-url` alone means ollama, which defaults to its local port
+│   ├── plot.rs           `croft plot`: a chart of stdin, as an inline image or as text, in the theme's colours
+│   ├── run.rs            running what was parsed: each subcommand handed to its code, or the workspace opened
+│   ├── terminal_setup.rs `croft setup-terminal`, `setup-iterm2` and `setup-ghostty`: setting up macOS terminals for croft
+│   ├── tests.rs          the command line's own tests
+│   ├── theme_import.rs   `croft theme-import`: converting a VS Code theme from a file or the marketplace, and installing it
+│   ├── typos.rs          a misspelled subcommand clap took as a folder, turned into an error that names the one meant
+│   ├── version.rs        the plain version `--version` prints, and the provenance line `--build-info` prints
+│   ├── vscode_import.rs  `croft import-vscode`: converting a VS Code profile, and the report of what came across
+│   ├── workspace.rs      the `PATH` and `--open-file` arguments: the workspace root, the file to open and its `file:line[:col]` location
 ├── clipboard.rs         native macOS clipboard read/write (NSPasteboard) with pbpaste fallback, wl-paste / xclip / xsel on Linux, and croft's own last copy, which a paste inside croft falls back to where the host clipboard can't be read (an SSH host with no clipboard tool)
 ├── command_history.rs    durable cross-session shell command history as JSONL under `~/.config/croft/command_history.jsonl` (cwd / exit / duration), read off OSC 133 marks with no shell hooks; Ctrl+Shift+H opens the search popup
 ├── fleet.rs              running one command across N ssh hosts and diffing the results, behind "Terminal: Fleet Run"; the fleet must be named (`hosts: command`, `*` for explicit broadcast)
@@ -42,6 +60,7 @@ src/
 │   ├── remotes.rs        pull, push, publish, fetch and clone; add and remove remotes; a file's web link
 │   ├── staging.rs        stage, unstage, remove and discard paths, one or all
 │   ├── stash.rs          stash, list, show, apply, pop and drop stashes
+│   ├── state_watch.rs    noticing git used outside croft: stamps on the few files in git's own folder a commit, checkout, staging, fetch or push writes
 │   ├── status.rs         the status snapshot: branch, ahead/behind, changes, ignored paths, the prepared commit message, repositories one folder down
 │   ├── tags.rs           list, create, delete and push tags, here and on a remote
 │   ├── tests.rs          git.rs's own tests
@@ -66,10 +85,11 @@ src/
 ├── hot_exit.rs           hot exit (#862): the workspace's unsaved buffers backed up while unsaved under `~/.local/state/croft/hot-exit/<workspace digest>/<pid>.json`, one file per running croft; a launch restores only the files of crofts that are gone, as unsaved tabs, and a clean quit removes its own
 ├── history.rs            local history: per-save snapshots under `~/.config/croft/history` (raw bytes, deduped, capped, 10s merge window), merged into the Explorer timeline, backing snapshot diff/restore plus a per-line `.seats` authorship sidecar
 ├── icons.rs             Codicon and file-type Nerd Font glyphs and per-language colors
-├── install_session.rs   streams install-progress events while a remote host builds / installs the croft binary
+├── install_session.rs   streams install-progress events while a remote host builds / installs the croft binary, failing the connect when its thread crashes
 ├── inline_complete.rs    inline suggestions (#607): ghost text from a model after a pause in typing, or from the file's language server when it offers LSP 3.18 inline completions; a server's replace-range answer that only types ahead becomes plain ghost text, any other is applied whole by Tab
 ├── iterm2.rs             iTerm2 plist mutation helpers for fonts and Croft key mappings; forwarders are tracked in a `Croft User Keymap Forwarders` ledger and swept before inserts, only while still the exact croft forwarder
 ├── iterm2_inline.rs      inline-image baking pipeline and protocol dispatch (iTerm2 OSC 1337 / Kitty graphics / DEC sixel): wordmark, image and PDF previews, activity-bar icons, minimap
+├── jobs.rs               background work that hands the UI one result, streams that send several updates and then end, and long-lived workers that answer many: started now or after the first frame, on a thread named after the job, a job or stream read as dead and a worker started again once when its thread ends
 ├── jsonc.rs              JSONC (VS Code's JSON with comments and trailing commas) to strict JSON: the one stripper every settings, tasks, launch, keybindings and theme reader shares; a leaf, so readers need not depend on `tasks`
 ├── keymap.rs             user key bindings from `~/.config/croft/keybindings.json`: parses chord strings into normalized Chords mapped to palette Command ids, consulted ahead of the built-in chords; tolerant JSONC, reloads on save
 ├── launcher.rs           macOS `croft install-launcher`: builds a clickable Croft.app via `osacompile` (an AppleScript applet, so double-clicked documents arrive as `odoc` events), brands the plist with PlistBuddy, then ad-hoc `codesign` and `lsregister`
@@ -93,7 +113,7 @@ src/
 │   ├── clipboard.rs      the relay's clipboard requests: pasting from and copying to this machine's clipboard
 │   ├── config_push.rs    pushing the user's config to the remote; `croft sync-config` and its diff
 │   ├── config_repush.rs  re-pushing changed config during a session over the bulk lane
-│   ├── control.rs        the SSH control master: starting or adopting it, commands over its socket
+│   ├── control.rs        the SSH control master: starting or adopting it, commands over its socket, and closing one an install could not use (#2610)
 │   ├── cross_build.rs    building a static croft for the remote here: toolchain probes, the build, shipping it
 │   ├── forward.rs        the relay's open and forward requests: links in the local browser, forwarded ports
 │   ├── hosts.rs          the hosts in ~/.ssh/config, and the host a running ssh's argv names
@@ -189,11 +209,46 @@ src/
 │   ├── bottom_panel.rs  the bottom panel and its tab strip, the OUTPUT picker, PROBLEMS and the diagnostics store, the whole-project check, build matchers, and the PORTS panel
 │   ├── click.rs         double / triple click detection
 │   ├── code_scanning.rs SARIF results viewer (list, open, preview, baselines, export, fixes and step marks), GitHub code scanning (pick, download, follow branch, dismiss) and SARIF logs shown as problems
-│   ├── codeql.rs        the CodeQL side bar: databases, query history and logs, running queries, suites and packs, result viewers, AST and CFG, the model editor, the run queue, variant analysis, and downloading and updating the CLI
+│   ├── codeql.rs        the CodeQL side bar: databases, query history and logs, running queries, suites and packs, result viewers, AST and CFG, the model editor, the run queue, variant analysis, and downloading and updating the CLI: what every part shares (the run mode, the results its worker threads send back, the database sources and the variant analysis poll intervals); each feature is in a file in `codeql/` below
+│   ├── codeql/          the CodeQL side bar's feature files, beside codeql.rs; each file's `//!` doc says what it holds
+│   │   ├── cli_install.rs      the CodeQL CLI: which `codeql` runs, its version, downloading it and checking for updates
+│   │   ├── contextual.rs       contextual queries: View AST and View CFG
+│   │   ├── database_sources.rs adding a database from a folder, an archive, a URL or GitHub, and its source to the workspace
+│   │   ├── databases.rs        the database list: removing, renaming, sorting, upgrading, deleting unused copies, and where databases are kept
+│   │   ├── history.rs          the query history: its entries, their queries, logs and results folders
+│   │   ├── logs.rs             a run's evaluator and query logs, the log viewer, and Compare Performance
+│   │   ├── model_editor.rs     the model editor: endpoints, their models, and the model pack
+│   │   ├── packs.rs            suites and packs: installing, downloading and running them
+│   │   ├── queries.rs          the workspace's queries: finding and creating them, Quick Query, query help
+│   │   ├── queue.rs            the run queue: many queries in turn, or one query on several databases
+│   │   ├── results.rs          a run's results: result sets, the alert and raw views, Compare Results, Export Results
+│   │   ├── run.rs              running a query, quick evaluation and Debug Query, cancelling and recording a run
+│   │   ├── side_bar.rs         the side bar itself: availability, its keys and what each row does
+│   │   ├── test_runs.rs        CodeQL: Run Tests through the Testing view, and Accept Test Output
+│   │   ├── variant_repos.rs    variant analysis targets: the controller, lists, repositories, owners and Code Search
+│   │   ├── variant_runs.rs     variant analysis runs: submitting, following, fetching and exporting results
 │   ├── commands.rs      `run_command`, the Command Palette, the Extensions view, extension commands (MCP tools, viewers) and Show Memory Usage
 │   ├── completion.rs    the completion popup, auto-imports, snippets, signature help, ghost-text suggestions and Emmet
 │   ├── cursor_blink.rs  caret blink timing
-│   ├── debugger.rs      Run and Debug: launch configs and Add Configuration, compounds and preLaunchTask waits, adapters, debug builds, attach pickers, the paused view, watches, the console, stepping, every kind of breakpoint, Debug Test and inline values
+│   ├── debugger.rs      Run and Debug: launch configs and Add Configuration, compounds and preLaunchTask waits, adapters, debug builds, attach pickers, the paused view, watches, the console, stepping, every kind of breakpoint, Debug Test and inline values: what every part shares (a launch parked behind its `preLaunchTask` and how it waits, what became of a compound member, whether a launch replaces the running set or joins it, what runs once a launch's `${input:...}` questions are answered, and the js-debug teardown grace); each feature is in a file in `debugger/` below
+│   ├── debugger/        the Run and Debug feature files, beside debugger.rs; each file's `//!` doc says what it holds
+│   │   ├── active_file.rs      running and debugging the active file, the adapter picked by its kind
+│   │   ├── adapters.rs         finding lldb-dap, telling a runnable binary, and installing delve
+│   │   ├── attach.rs           the attach process pickers and attaching to the chosen process
+│   │   ├── breakpoint_list.rs  the BREAKPOINTS list: its rows, clicks and removal
+│   │   ├── breakpoints.rs      line, conditional, hit-count, function and data breakpoints, logpoints, exceptions
+│   │   ├── builds.rs           debug builds: `cargo`, C/C++ and single Rust files, then lldb-dap on the binary
+│   │   ├── compounds.rs        compounds, preLaunchTask waits, postDebugTask and switching sessions
+│   │   ├── configs.rs          Add Configuration and the Select and Start Debugging picker
+│   │   ├── console.rs          the debug console, its REPL and OUTPUT mirror, and hover-to-evaluate
+│   │   ├── controls.rs         continue, pause, stepping, Step Into Target, Run to Cursor, restart and stop
+│   │   ├── debug_test.rs       Debug Test: the test at the caret or by name, its build, launch and failure breakpoint
+│   │   ├── events.rs           the sessions' events, drained each frame: stops, output and endings
+│   │   ├── inline_values.rs    inline values beside the paused lines
+│   │   ├── launch.rs           F5 and launching a configuration: saving first, resolving, spawning, installing
+│   │   ├── python.rs           which Python a debugged program runs under, and the note on an old one
+│   │   ├── view.rs             the view: its keys, button, paused-state tree, clicks, row menu and errors
+│   │   ├── watches.rs          watch expressions: adding, removing and evaluating them
 │   ├── diff_merge.rs    diff editor upkeep and navigation, merge conflicts and the three-way merge editor, the history scrubber, local history and the who-wrote-this lens
 │   ├── editor_input.rs  editor keys, vim mode, macros, multi-cursor and line commands, typing toggles, copy, cut and paste routing and the clipboard, and reading dropped file paths out of a paste
 │   ├── editor_layout.rs the tree of editor groups: splitting, moving focus between and collapsing them, and each group's rectangle; the focused group's tabs live in `App::editor`
@@ -206,7 +261,30 @@ src/
 │   ├── hover.rs         LSP hover dwell timing
 │   ├── inline_images.rs pictures in the terminal: support detection, the background chrome bake, sending and clearing each picture every frame (the activity-bar icons included), the editor, terminal and Markdown overlays, and the minimap
 │   ├── key_input.rs     `handle_key` and `handle_key_inner`, Cmd+K chords, every `is_*_key` predicate, the key and mouse contexts for user keymaps, voice input and the on-screen keyboard
-│   ├── language_servers.rs language servers: sync, messages and progress, decorations, go-to and peek, hierarchies, rename, code actions, formatting, linked editing, smart select, highlights, symbol pickers, code lens, outline, breadcrumbs, sticky scroll, restart
+│   ├── language_servers.rs language servers: sync, messages and progress, decorations, go-to and peek, hierarchies, rename, code actions, formatting, linked editing, smart select, highlights, symbol pickers, code lens, outline, breadcrumbs, sticky scroll, restart: the types and constants its parts share (what an on-type formatting reply means, what a crumb stands for, the outline's key and its parse channel, a place Peek References shows, the shell server and its missing-tool notices, CodeLens's settle time, sticky scroll's row cap, the inline-outline size cap, the restart notice during an update build, and the hover's divider and empty-caret message); each feature is in a file in `language_servers/` below
+│   ├── language_servers/ the language server feature files, beside language_servers.rs; each file's `//!` doc says what it holds
+│   │   ├── breadcrumbs.rs       breadcrumbs, their pickers, and the sticky-scroll headers
+│   │   ├── capabilities.rs      the active file's language and which features its server supports
+│   │   ├── code_actions.rs      Quick Fix: requesting, picking, resolving and applying code actions
+│   │   ├── code_lens.rs         CodeLens: requesting, landing, running and toggling lenses
+│   │   ├── decorations.rs       document links, folding ranges, colors and Change Color Presentation
+│   │   ├── format.rs            Format Document and Selection, Prettier, and format-on-save
+│   │   ├── go_to_symbol.rs      Go to Symbol in Editor: the picker, its keys, mouse and drawing
+│   │   ├── hierarchy.rs         call and type hierarchies: the requests and the picker of answers
+│   │   ├── hover_text.rs        the hover's text: diagnostics first, then the server's answer
+│   │   ├── inlay_hints.rs       inlay hints: their replies, refresh, requests and the toggle
+│   │   ├── messages.rs          server progress, messages, questions and show-document requests
+│   │   ├── navigation.rs        Go to Definition and its kin: requests, jumps and the multi-location picker
+│   │   ├── outline.rs           the OUTLINE: syntax and server symbols, and the secondary side bar
+│   │   ├── peek.rs              Peek Definition and Peek References: the popup, its excerpt and stepping
+│   │   ├── rename.rs            Rename Symbol: the prompt, prepare-rename and landing the reply
+│   │   ├── rust_analyzer.rs     rust-analyzer's `Rust:` commands: sending them and acting on the answers
+│   │   ├── selection.rs         Expand and Shrink Selection, and occurrence highlights
+│   │   ├── semantic.rs          semantic tokens, their refresh, and the background syntax pass landing
+│   │   ├── sync.rs              keeping servers in step with the open files, their diagnostics, and restarts
+│   │   ├── typing.rs            on-type formatting, linked editing, parameter-hint triggers and snippet items
+│   │   ├── workspace_edits.rs   applying workspace edits to buffers and files, and refusing stale ones
+│   │   ├── workspace_symbols.rs Go to Symbol in Workspace: the debounced query, replies and the picker
 │   ├── memory_report.rs Developer: Show Memory Usage: the per-subsystem figures laid out as Markdown, opened as a rendered preview so typing can't edit it
 │   ├── menus.rs         right-click and dropdown menus: shortcut hints, ContextMenu methods, geometry, keys, drawing, `dispatch_menu_action`, and the status-bar click menus
 │   ├── mouse_input.rs   all mouse handling (`handle_mouse_inner`), hover popups and tooltips, and closing stale popups on a click
@@ -225,6 +303,7 @@ src/
 │   ├── sidebar_dwell.rs side bar auto-hide's grace delay: how long focus must stay away before the side bar collapses
 │   ├── terminal_panes.rs terminal panes: split, layout, collapse, maximize and rail, reorder, profiles, rename, notes, close and undo, saving and restoring the panel, redraw tracking, recordings, bells and exits, labels and pane buttons
 │   ├── terminal_tools.rs typing into terminals (key encoding, broadcast, paste confirm, redaction, timestamps), find, quick select, copy mode, command history and decorations, CAPTURES, links and inline suggestions
+│   ├── tick.rs          the main loop's background pass: every poll and drain, in a fixed order, before anything is drawn, and whether the screen needs drawing; a test calls it to run one real pass
 │   ├── viewers.rs       read-only viewers: the spreadsheet, CSV and SQLite grid, PDF, archives, hex, rendered logs, and the Markdown preview with its scroll sync
 │   ├── welcome.rs       welcome-screen state: the "IN THIS RELEASE" highlights, read synchronously from `release_notes::release_notes()` (no thread, no network)
 │   ├── welcome_screen.rs the welcome page (logo picture and its bake, wordmark, Start list, release-note card, Loch layout) and the guided tour
@@ -233,7 +312,36 @@ src/
 ├── dap/                 debugger stack: Debug Adapter Protocol client. debugpy (Python: the adapter on a private 3.14+ venv, the program on the project's own interpreter, #864) is the verified mechanism; Rust/C/C++ route to lldb-dap; JS/TS route to vscode-js-debug; Go routes to delve (`dlv dap` over TCP, single-session, #264). Which file types each handles is a data-driven extension axis (see registry.rs)
 │   ├── mod.rs
 │   ├── transport.rs     DAP wire framing (Content-Length + seq envelope, not JSON-RPC, so async-lsp can't be reused); spawns the adapter detached via setsid (so the debuggee can't tcsetpgrp-background and SIGTTIN-suspend croft, and so teardown can killpg the whole group), blocking reader thread frames stdout into an mpsc channel; Drop signals the process group and reaps the child, except after a `disconnect` (#1536): then a detached teardown thread gives the adapter up to 2 s to answer and end the debuggee, kills the group, and SIGKILLs the debuggee pid from the `process` event if a launched program is still running (debugpy's launcher puts it in its own group, out of `killpg`'s reach); quit stops every session and joins these teardowns
-│   ├── session.rs            one debug launch session: the initialize → setBreakpoints → configurationDone → stopped state machine, event classifier, the stackTrace → scopes → variables chain, evaluate, breakpoints and logpoints, over one adapter-agnostic launch_with
+│   ├── session.rs            one debug launch session: the initialize → setBreakpoints → configurationDone → stopped state machine, event classifier, the stackTrace → scopes → variables chain, evaluate, breakpoints and logpoints, over one adapter-agnostic launch_with: what its parts share (`DapSession` and the types its fields hold: its phase, a source breakpoint, a stack frame, a scope, a variable and delve's build folder; and the `DapEvent`s `poll` returns); each part is in a file in `session/` below
+│   ├── session/         the debug session's feature files, beside session.rs; each file's `//!` doc says what it holds
+│   │   ├── breakpoints.rs       line, function and data breakpoints, what the adapter reports back, and Run to Cursor
+│   │   ├── child_sessions.rs    vscode-js-debug's `startDebugging` reverse request, the answer every reverse request needs, and opening the child
+│   │   ├── events.rs            a raw DAP message classified into a `DapEvent`, the output worth showing, and why an adapter refused to start
+│   │   ├── exceptions.rs        the exception filters an adapter offers, breaking on raised exceptions, and what was thrown
+│   │   ├── inspection.rs        threads, the call stack, scopes and variables, evaluate, and the locals inline values draw from
+│   │   ├── launch.rs            spawning or reaching each adapter, delve's build folder, the fresh session, and disconnecting
+│   │   ├── messages.rs          the per-frame poll: the handshake, each message's effect on the session, and the adapter's capabilities
+│   │   ├── running_set.rs       the sessions in flight: their names, console streams and backlogs, and which one is focused
+│   │   ├── session_set_tests.rs the tests of the set of debug sessions in flight
+│   │   ├── start_requests.rs    `initialize`, each adapter family's `launch`, `configurationDone` and `disconnect`
+│   │   ├── stepping.rs          pause, continue, step over, into and out, and Step Into Target
+│   │   ├── tests.rs             the debug session's own tests
+│   ├── configs.rs            launch.json, `.croft` over `.vscode`: its configurations and compounds, `inputs`, `presentation`, `${...}` variables and `envFile`, each entry resolved into its adapter's DAP request, and the entry Debug: Add Configuration… writes: what its parts share (`DebugConfig`, its `RequestKind` and its `preLaunchTask`); each part is in a file in `configs/` below
+│   ├── configs/         launch.json's feature files, beside configs.rs; each file's `//!` doc says what it holds
+│   │   ├── add_configuration.rs Debug: Add Configuration…: its fields, the entry it makes, and writing `.croft/launch.json`
+│   │   ├── compounds.rs         compounds: reading them and resolving their members
+│   │   ├── debug_test.rs        the configuration for debugging tests, laid over croft's pytest launch
+│   │   ├── discovery.rs         finding every launch.json and what it declares, and the folders a name points at
+│   │   ├── env_files.rs         reading a dotenv `envFile`: quotes, escapes, comments and `${NAME}` references
+│   │   ├── go.rs                delve's requests, `auto` mode, and Connect to server
+│   │   ├── inputs.rs            the `inputs` array, the `${input:id}` ids a configuration uses, and which are still to ask
+│   │   ├── js.rs                vscode-js-debug's requests: browsers, `node-terminal`, and what a Node launch must name
+│   │   ├── lldb.rs              lldb-dap's requests, the processes to attach to, and building a `cargo` block
+│   │   ├── presentation.rs      `presentation` blocks: hidden entries, groups and order, and the picker's sort
+│   │   ├── python.rs            debugpy's `launch` and `attach` requests
+│   │   ├── resolve.rs           resolving a configuration: substitution, `envFile`, the mapped fields and the adapter a `type` maps to
+│   │   ├── substitution.rs      `${...}` variables: expanding them, with an unknown one an error
+│   │   ├── tests.rs             the launch configurations' own tests
 │   ├── registry.rs           data-driven debug-adapter registry: maps a file extension to an AdapterKind from the `[[debug_adapters]]` blocks in bundled + user manifests, skipping adapters whose extension is disabled in the Extensions panel
 │   ├── log.rs           optional DAP wire log at ~/.croft/dap.log (gated by CROFT_DAP_LOG), mirroring lsp/log_file.rs
 │   ├── install.rs       provisions a private debugpy venv at ~/.croft/debug-venv via uv (PEP 668 forbids pip-ing into the uv-managed CPython; mirrors ~/.croft/servers), and the vscode-js-debug server at ~/.croft/js-debug from a release pinned by version and SHA-256
@@ -249,7 +357,22 @@ src/
 │   ├── model.rs         TestStatus (NotRun/Running/Passed/Failed/Skipped) + TestCase; suite_and_leaf splits a `module::name` path for the tree
 │   ├── registry.rs           data-driven test-runner registry: maps a workspace root to a Runner from the `[[test_runners]]` blocks in bundled + user manifests, skipping runners whose extension is disabled in the Extensions panel
 │   ├── parse.rs              per-tool output parsers — libtest, pytest (plain `-v` lines and pytest-xdist's outcome-first `[gwN]` lines), vitest, jest — with all node IDs normalised to `::` separators so one panel tree serves every runner
-│   └── worker.rs             the test-runner command layer: RunAll / RunOne / RunFilter / RunSuite / Discover per runner, building each tool's argv and streaming cases over an mpsc channel
+│   ├── worker.rs             the test-runner command layer: RunAll / RunOne / RunFilter / RunSuite / Discover per runner, building each tool's argv and streaming cases over an mpsc channel: what its parts share (`Runner`, `TestRequest` and the numbered `Sent` that carries it, `TestResponse` with the `CoverageError` it carries, `TestWorker`, the handle the app holds, and the `RunControl` and `EpochTx` structs whose fields several parts read); each part is in a file in `worker/` below
+│   └── worker/          the test runner's feature files, beside worker.rs; each file's `//!` doc says what it holds
+│       ├── commands.rs          cargo's command line, and its build-status lines as progress
+│       ├── control.rs           cancelling a run by killing its runner's process group, as for a thread that crashed
+│       ├── coverage.rs          coverage runs: LCOV, scopes, and each runner's coverage tool
+│       ├── discovery.rs         listing each runner's tests without running them
+│       ├── go_and_codeql.rs     `go test -json` and `codeql test run`: their command lines and results
+│       ├── handle.rs            queueing runs and discoveries, cancelling, re-rooting, draining results, and a thread that crashed
+│       ├── js_args.rs           vitest's and jest's command lines, and the arguments that pick a test, a suite or a file
+│       ├── main_loop.rs         the worker thread's loop
+│       ├── pytest.rs            pytest's command line: which Python or script runs it, and its verbosity
+│       ├── runners.rs           which runner runs a folder's, a file's or a test's tests
+│       ├── runs.rs              running every test, one, several, or a filter's
+│       ├── streaming.rs         streaming a runner's output, tagged with its request, and its exit code
+│       ├── test_binaries.rs     the cargo test harnesses built, and the one that holds a test
+│       ├── tests.rs             the test runner's own tests
 ├── mcp/                 MCP sidecar host (Tier-1 extensions): croft is a DETERMINISTIC MCP host — a human invokes a contributed palette command and croft calls one pre-known tool on one vetted local server (no LLM picks tools), which removes MCP's whole prompt-injection/tool-poisoning attack family
 │   ├── mod.rs           module overview + McpOutcome (the off-thread worker's result)
 │   ├── transport.rs     JSON-RPC 2.0 over newline-delimited JSON on the server's stdio (the MCP stdio framing; simpler than DAP's Content-Length); setsid-detached child, reader thread -> mpsc, stderr drained into an 8 KiB tail whose last line names why a server exited before answering, least-privilege env_clear()+envs()
@@ -330,7 +453,21 @@ src/
     ├── editor_find.rs        VS Code-style inline Find bar (`Cmd+F`) with match highlight, Enter/Shift+Enter walk, case/whole-word/regex toggles and a Replace row (`Cmd+Opt+F`); Replace All runs through the same `split_for_highlight` as count and paint
     ├── extensions.rs         Extensions sidebar widget: projects bundled and user manifests into a theme-aware list grouped under BUILT-IN/INSTALLED/AVAILABLE, with pill toggles, +Add, trash, a local filter box and clear/refresh; reports clicks back to App, which owns the state
     ├── file_finder.rs   VS Code-style Quick Open (Cmd+P) fuzzy file picker with tiered match ranking (exact filename > prefix > substring > path > subsequence)
-    ├── file_tree.rs          `ignore::WalkBuilder` backed file tree: lazy children, fs-watcher refresh, multi-select, drag-drop, bulk trash, reveal-path, multi-root section rows, sticky scroll and compact folders
+    ├── file_tree.rs          `ignore::WalkBuilder` backed file tree: lazy children, fs-watcher refresh, multi-select, drag-drop, bulk trash, reveal-path, multi-root section rows, sticky scroll and compact folders: what its parts share (`FileTree`, its constructor, and `Node`, the row its fields hold); each part is in a file in `file_tree/` below
+    ├── file_tree/        the Explorer's file tree's feature files, beside file_tree.rs; each file's `//!` doc says what it holds
+    │   ├── android_trash.rs   the freedesktop home trash on Android, where the `trash` crate has none
+    │   ├── decorations.rs     a row's git decoration, name and icon colours, the active indent guide, and ignored or agent-changed paths
+    │   ├── deletion.rs        which rows may be deleted, and moving paths to the system's trash
+    │   ├── drawing.rs         drawing the rows, icons, guides, sticky band and scrollbar
+    │   ├── filter.rs          the tree filter's fuzzy match, and the matched letters bold in a row's name
+    │   ├── listing.rs         reading a folder, Explorer order, compact folders, and refreshing children on file system events
+    │   ├── move_and_copy.rs   pasting and dropping: a free destination name, no folder into itself, moving and copying
+    │   ├── navigation.rs      the arrow, page, Home and End keys, scrolling, expanding and collapsing, revealing a path, and type-to-find
+    │   ├── new_and_rename.rs  New File, New Folder and Rename: where an entry goes, checking its name, and renaming
+    │   ├── roots.rs           the workspace roots: replacing the primary, adding and removing the others, and which owns a path
+    │   ├── selection.rs       the cursor, the multi-selection and its anchor, and the paths an action takes
+    │   ├── sticky.rs          the folders pinned at the top while their contents scroll
+    │   ├── tests.rs           the file tree's own tests
     ├── header_pill.rs   shared section-header pill button (chip-backed codicon affordance + theme colours) used by both the Remote Explorer (+ / refresh) and Source Control (refresh) headers
     ├── captures.rs           the panel group's CAPTURES tab (iTerm2's Capture Output): lines collected by `capture` triggers, with Enter jumping to the originating pane row; pure widget capped at 500 entries, and it also shapes the "Ask Navigator about this line" turn
     ├── history_popup.rs      `Ctrl+Shift+H` command-history popup over command_history.rs: query line, newest-first deduped results with exit/duration/cwd meta, `Ctrl+R` scope filter
@@ -359,7 +496,7 @@ src/
     │   ├── results.rs       the results list: hits in order, counts, selection, scrolling, the mode toggles
     │   ├── tests.rs         the search panel's own tests
     │   ├── walk.rs          walking the workspace and streaming each file's hits; searching an unsaved buffer
-    │   ├── worker.rs        the background search worker, its requests and events, and the typing pause
+    │   ├── worker.rs        the background search worker, its requests and events, and the typing pause; each search run is numbered and its events carry the number, so the panel keeps only the run it shows, and a run stopped part-way ends `Cancelled`, never `Done` (#2608); each scan is a `search-scan` job the worker watches while it waits, so a run whose scan crashed ends `Crashed` (#2611)
     ├── shortcuts.rs     F1 shortcuts modal: every binding grouped by pane, scrollable
     ├── branch_picker.rs Checkout / Create Branch quick-pick overlay: type to filter the repo's branches, Enter to switch or create-and-switch (also drives the Branch submenu's merge / rebase / delete / create-from via `branch_purpose`); pure widget fed by `git::list_branches`
     ├── input_prompt.rs  single-line text modal for SCM ops that need a typed value (clone URL, branch rename, remote name/URL, tag name), tagged by `InputPurpose`; `InputPrompt::confirm` is the same box with no field, a Y/N question (trash, uninstall, remove, consent) that nothing typed can answer
@@ -544,9 +681,11 @@ Branch, dirty and ahead-behind status, plus the full set of working-tree operati
 
 **Multi-root.** There is one `GitWorker` per workspace root (`App::git` primary plus `git_extra`), each discovering its own toplevel. The SCM surfaces — status-line branch, panel, COMMITS graph, and `scm_root` for panel ops — follow the ACTIVE repo, meaning the root owning the focused file, with the primary as fallback. Non-active workers drain status-only and have their change lists re-requested on switch. HEAD-oid invalidation for gutter baselines is per repo, gutter/blame/timeline pair each file with its owning root, and the Explorer's ignored set is unioned across every root's cwd-scoped query. Code: the app's `GitWorker` handle in `app/git_worker.rs`; the loop it talks to is in `git/worker.rs`.
 
+**Git used outside croft (#2577).** A commit, checkout, staging, fetch or push run in another terminal changes only files in git's own folder, which the file watcher skips (its write storms are what #898 fixed). So each `GitWorker` keeps a `GitStateWatch`: on the watcher's poll it stamps (modification time and length) `HEAD`, its reflog, the `index`, `FETCH_HEAD` and `packed-refs` in the git dir, plus the `refs/heads` and `refs/tags` folders (a ref made, deleted or moved is renamed into its folder), the branch's ref and its upstream's (`GitStatus.upstream`) in the common dir. A stamp that moved re-reads the status and, for the active repo, refetches COMMITS, whose ref labels a same-commit checkout, a fetch or a new tag changes without moving HEAD. The git and common dirs are worked out from the filesystem the way git does (`.git` or the `gitdir:` file it names, then `commondir`), so a linked worktree or submodule is watched too and the poll never starts a process. croft's own reads run with `GIT_OPTIONAL_LOCKS=0` and write none of these files, so a refresh never sets off the next. Code: `git/state_watch.rs`; `refresh_if_git_moved` in `app/git_worker.rs`, called from `poll_filesystem_changes` through `refresh_git_status_if_git_moved` in `app/scm.rs`.
+
 **Toplevel versus workspace root.** The status poll discovers the repository toplevel (`repo_toplevel`, `rev-parse --show-toplevel` — the same probe that answers repo membership) and carries it on `GitStatus.repo_root`. Porcelain and numstat paths and `HEAD:<rel>` pathspecs resolve against the TOPLEVEL however `-C` is set, so every porcelain-derived join, Source Control mutation and HEAD read goes through `App::scm_root` (the toplevel, or the workspace root outside a repo). That way a workspace rooted in a repo subdirectory stages, discards and diffs correctly. Paths croft itself computed relative to the workspace — merge-complete staging, blame, file history — keep their workspace pairing, and the Explorer's ignored-set query deliberately stays at the workspace root, because `ls-files` is cwd-scoped and that is exactly the subtree the Explorer needs. Code: `repo_toplevel` in `git.rs`, `GitStatus` and the ignored-set query in `git/status.rs`, porcelain and numstat parsing in `git/changes.rs`, HEAD reads in `git/contents.rs`.
 
-**Operations.** stage(/all), unstage(/all), commit (the index when anything is staged, else every tracked change, as VS Code's smart commit / staged / all / amend), push (/force/to-remote/publish), pull (/rebase), fetch, sync, clone, branch list / checkout / create (/from) / rename / delete / merge / rebase, remote list / add / remove, stash push (/untracked/staged, optionally named) / list / show / apply / pop / drop, tag list / create / delete, discard (/all), and diffs. Hunk-level staging feeds self-generated single-hunk unified patches to `git apply --cached[/-R]` on stdin. Every read-only poll runs with `GIT_OPTIONAL_LOCKS=0`, so background status never takes `index.lock` out from under a user mutation. `blame` and `parse_blame` (`git blame --line-porcelain`) back the editor's GitLens-style inline annotation, and `commit_card` its hover card, read when the pointer rests on it because porcelain gives only a commit's first line (#1556). Code: one file per area — `git/staging.rs` (stage, unstage, discard), `git/commits.rs`, `git/remotes.rs` (push, pull, fetch, clone, remotes), `git/branches.rs`, `git/stash.rs`, `git/tags.rs` and `git/diffs.rs`; hunk staging in `git/patches.rs`; the lock-free poll in `run_git` in `git.rs`; `blame` and `parse_blame` in `git/blame.rs`; `commit_card` in `git/history.rs`.
+**Operations.** stage(/all), unstage(/all), commit (the index when anything is staged, else every tracked change, as VS Code's smart commit / staged / all / amend), push (/force/to-remote/publish), pull (/rebase), fetch, sync, clone, branch list / checkout / create (/from) / rename / delete / merge / rebase, remote list / add / remove, stash push (/untracked/staged, optionally named) / list / show / apply / pop / drop, tag list / create / delete, discard (/all), and diffs. Hunk-level staging feeds self-generated single-hunk unified patches to `git apply --cached[/-R]` on stdin. Every read-only poll runs with `GIT_OPTIONAL_LOCKS=0`, so background status never takes `index.lock` out from under a user mutation; the change list's line counts also turn off `diff.autoRefreshIndex`, because `git diff` does not honour that variable and would write the refreshed index back for a file whose timestamp changed but not its bytes (#2593). `blame` and `parse_blame` (`git blame --line-porcelain`) back the editor's GitLens-style inline annotation, and `commit_card` its hover card, read when the pointer rests on it because porcelain gives only a commit's first line (#1556). Code: one file per area — `git/staging.rs` (stage, unstage, discard), `git/commits.rs`, `git/remotes.rs` (push, pull, fetch, clone, remotes), `git/branches.rs`, `git/stash.rs`, `git/tags.rs` and `git/diffs.rs`; hunk staging in `git/patches.rs`; the lock-free poll in `run_git` in `git.rs`; `blame` and `parse_blame` in `git/blame.rs`; `commit_card` in `git/history.rs`.
 
 **The Explorer's greyed-out set.** This is two steps. `ls-files --others --ignored --directory` gives a cheap candidate list, where a fully-ignored dir collapses to one entry instead of enumerating `target/`. Then `check-ignore -z --stdin` confirms each, because the listing also collapses any entirely-untracked directory whose contents merely happen to be ignored — `logs/` would otherwise grey with no rule matching it. Both calls read RAW bytes (`git_raw`): git sorts a leading-space filename first, so a blanket `trim()` would eat that space, and a filename need not be UTF-8. Code: `query_ignored` in `git/status.rs`, over `git_raw` in `git.rs`.
 
@@ -806,7 +945,7 @@ On-screen keyboard for Termux, needed because mouse tracking blocks the native s
 
 Developer: Toggle Screencast Mode, VS Code's keystroke overlay, on `Shift+F8`. A terminal recording shows what happened but not what was pressed: the palette closes before anyone reads it, and there is no mouse pointer in it. While the mode is on, `handle_key` hands each press to `Screencast::press` before dispatching it, and the keys show as key caps in a box at the bottom of the workspace for `LINGER` after the last one.
 
-**Chips.** A run of typed characters is one chip, a held key is one chip with a count (`↓ ×12`), and a `Cmd+K` chord's second key joins the leader's chip (`Ctrl+K Z`). A key that answers an armed `cmd_k_leader` is recorded after dispatch instead, as a chord step only when `handle_cmd_k_chord` consumed it (`note_chord_step`): one that matched nothing goes on to the prompt or shell, and is shown, or left out, like any key sent there. `run_command` names its command on the chip of the key being dispatched, so a palette Enter or a `keybindings.json` chord reads `Enter  View: Toggle Zen Mode`. The hard-wired chords call their methods directly, and the overlay does not guess a title for them from the keybinding hints: `Ctrl+C` is Copy in the editor and SIGINT in the terminal, and a guessed name would be wrong there.
+**Chips.** A run of typed characters is one chip, a held key is one chip with a count (`↓ ×12`), and a `Cmd+K` chord's second key joins the leader's chip (`Ctrl+K Z`). A key that answers an armed `cmd_k_leader` is recorded after dispatch instead, as a chord step (`note_chord_step`), whether `handle_cmd_k_chord` ran a chord for it or it completed none, which, as in VS Code, only ends the wait. A character that completed none where typing is left out (a masked prompt, the shell) stays out all the same: it reached neither, but it may be the first character of a secret typed after a stray `Cmd+K`. `run_command` names its command on the chip of the key being dispatched, so a palette Enter or a `keybindings.json` chord reads `Enter  View: Toggle Zen Mode`. The hard-wired chords call their methods directly, and the overlay does not guess a title for them from the keybinding hints: `Ctrl+C` is Copy in the editor and SIGINT in the terminal, and a guessed name would be wrong there.
 
 **Secrets stay off the screen.** The key is recorded before dispatch, while the prompt or pane it goes to is still the one open, so `screencast_hides_typing` knows where it lands. A key that would type a character there (a character with neither `Ctrl` nor `Cmd` held, `Alt` included, the test a masked prompt applies before it takes one) is left out in a masked input prompt, the connect dialog's password or passphrase phase, and the shell: a hosted pane's PTY lives in its pane host, so croft cannot read the termios that would say echo is off for a sudo password, and what the shell does echo is on screen anyway. Chords and named keys still show. A paste from the host terminal reaches croft as text, not as its `Cmd+V`, so `handle_paste` adds a `Paste` chip: never the text, which is as likely as anything to be a secret.
 
@@ -863,11 +1002,13 @@ Fetches a theme from a marketplace. It resolves a `publisher.name` id, a marketp
 
 ### testing/
 
-Test Runner. A background worker runs the project's test tool off the render loop and streams parsed cases into the Testing panel, mirroring the drain-per-tick pattern of app/git_worker and dap.
+Test Runner. A background worker runs the project's test tool off the render loop and streams parsed cases into the Testing panel, mirroring the drain-per-tick pattern of app/git_worker and dap. It is a `jobs::Worker` on a thread named `test-runner`. `worker.rs` keeps what the app and the worker's parts share: `Runner`, `TestRequest` and the numbered `Sent` that carries it, `TestResponse` with the `CoverageError` it carries, `TestWorker`, and the `RunControl` and `EpochTx` structs whose fields several parts read. Each part of the worker lives in a file of its own in `worker/`.
 
 **Runner selection.** `cargo test` for Rust, `pytest` for Python, `vitest` or `jest` for JS/TS, `go test` for Go, picked per workspace by `registry::runner_for` from `[[test_runners]]` manifest data. When no enabled runner claims the root, the four run entry points refuse with a status, and the worker refuses a queued request with a dedicated `Refused` response *before* any `Started`. The panel rolls the Running marks back and keeps its tree. Neither layer ever falls through to cargo, so a disabled runner extension really does stop runs. Opening the Testing view never looks for the runner on the UI thread (#1841): finding it reads every runner manifest and can walk the tree for CodeQL test packs, so the view queues a *quiet* discover and the worker decides. The worker answers a quiet discover with a `QuietDiscovery` marker before anything else, and only that marker clears the view's queued flag, so another request's answers cannot let a reopen queue a second discover. A root no runner claims ends at the marker, which says nothing; `r` in the view asks loudly and gets the refusal.
 
-**Re-rooting.** An Explorer re-root rebinds the worker, resets the panel, and re-discovers. So does focusing a file in a different workspace folder under multi-root (`active_test_root`, the same focus-follow as the SCM surfaces; tasks, run-active-file, and the DAP launch cwd/venv ceiling resolve per owning folder too). Responses are epoch-tagged, so a run still streaming for the old root is dropped by the drain — the commit graph's root-tag idea.
+**Re-rooting.** An Explorer re-root rebinds the worker, resets the panel, and re-discovers. So does focusing a file in a different workspace folder under multi-root (`active_test_root`, the same focus-follow as the SCM surfaces; tasks, run-active-file, and the DAP launch cwd/venv ceiling resolve per owning folder too). Every request carries the epoch it was sent under, and its answers come back tagged with it, so a run still streaming for the old root is dropped by the drain — the commit graph's root-tag idea.
+
+**After a crash (#2592).** The app numbers its requests and tags them with their epoch; the thread counts nothing itself, so a fresh thread agrees with the app about which requests a cancel covers and which root an answer is for. When the thread ends, the drain kills the runner it was reading from, ends a run or discovery in flight as stopped (its Running marks go back, as on a cancel) and says so on the status line, and gives the fresh thread the root, `codeql` program and extensions folder again. The run is not sent again: a run can have side effects. A second crash within a minute stops the worker and the status line says so; the next run or discovery starts it again.
 
 **Debug-a-test.** `Cmd+K Shift+Enter`, or Alt+click on the gutter `▷`, hands a test to the DAP stack. pytest goes as a debugpy `module` launch under the project's interpreter (`pytest_debug_launch_request`; the adapter injects debugpy into the debuggee). cargo goes via `worker::build_test_binary` (`cargo test --no-run --message-format=json`, with the bin/lib artifact outranking integration targets), launched under lldb-dap with the test name as its libtest filter argv (`lldb_test_launch_request`).
 
@@ -1048,7 +1189,7 @@ VS Code colour theme import: converts a theme `.json` (JSONC, plus `include` cha
 
 ### file_tree.rs
 
-An `ignore::WalkBuilder`-backed tree with lazy children, fs-watcher refresh, multi-select, drag-drop, bulk trash, and reveal-path on `Cmd+P` open.
+An `ignore::WalkBuilder`-backed tree with lazy children, fs-watcher refresh, multi-select, drag-drop, bulk trash, and reveal-path on `Cmd+P` open. `file_tree.rs` keeps the tree itself: `FileTree`, whose private fields every part reads, its constructor, and `Node`, the row it lists. Each feature lives in a file of its own in `file_tree/`.
 
 **Multi-root ready.** `add_root` appends further workspace roots as depth-0 section rows (`root_paths` enumerates them; `self.root` stays the primary). Every root-special behavior keys on the row's *depth*, not index 0: Collapse All spares all root rows, the delete guard refuses them, and `reveal_path` plus the ignored-set ancestor walk resolve through the owning root (longest prefix, so nested roots pick the deeper one). Sticky ancestors were depth-based already.
 
@@ -1399,7 +1540,7 @@ A release-availability check plus a staged upgrade. Once a day, tracked by the c
 
 **Update stages, it does not replace.** A croft that is itself a release (from crates.io or a release archive) on Linux or macOS copies in the release's own archive binary, checked against its signed `SHA256SUMS`; otherwise, or when that fails, Update runs `cargo install croft-software --version X --root ~/.cache/croft/staged`. Either way it runs in the background, so the binary on PATH is untouched and a fresh launch stays on the current version. While it runs the popup is down: the status bar's spinner, naming the version, is the one progress indicator, as it is for every other update (#1852). The popup then comes back to offer Relaunch, which copies the staged binary over the installed one and re-execs — the same path the updater chord (`Ctrl+Shift+F9`) takes.
 
-**Failures say why (#1844).** A release download that cannot reach the server at all, or loses it mid-download, is logged as the network being out of reach, and the `cargo install` fallback still runs: GitHub out of reach is not crates.io out of reach, and cargo honours a proxy that croft's own HTTP client does not. When the staging fails, the card comes back saying why, with Retry, Skip and Later and a link that opens the staging's log in a tab: "no internet connection" when cargo could not reach crates.io or there was no cargo to fall back to, else that cargo is missing or that the build failed. The updater chord and "Help: Update croft" stage a version the popup offers; with none on offer they ask GitHub now, whatever the daily throttle and an earlier Skip, and say what they found: up to date, a newer version, or why they could not ask. They never ask where the startup check stays off: on a remote-launched croft, which the croft that launched it updates, or with `CROFT_NO_UPDATE_CHECK` set.
+**Failures say why (#1844).** A release download that cannot reach the server at all, or loses it mid-download, is logged as the network being out of reach, and the `cargo install` fallback still runs: GitHub out of reach is not crates.io out of reach, and cargo honours a proxy that croft's own HTTP client does not. When the staging fails, the card comes back saying why, with Retry, Skip and Later and a link that opens the staging's log in a tab: "no internet connection" when cargo could not reach crates.io or there was no cargo to fall back to, else that cargo is missing or that the build failed. A staging whose thread crashed fails the same way, saying so (#2604). The updater chord and "Help: Update croft" stage a version the popup offers; with none on offer they ask GitHub now, whatever the daily throttle and an earlier Skip, and say what they found: up to date, a newer version, or why they could not ask. They never ask where the startup check stays off: on a remote-launched croft, which the croft that launched it updates, or with `CROFT_NO_UPDATE_CHECK` set.
 
 **Never automatic.** Skip remembers the version so it is not offered again, and `CROFT_NO_UPDATE_CHECK` disables the check entirely.
 
@@ -1407,7 +1548,7 @@ A release-availability check plus a staged upgrade. Once a day, tracked by the c
 
 ### voice.rs
 
-Voice input for the Termux OSK mic key. It delegates to `termux-dialog speech` (Android's SpeechRecognizer, the same engine Gboard's mic uses), auto-installs the `termux-api` package via `InstallState`, and sends the transcript over a channel the app injects through `handle_key`.
+Voice input for the Termux OSK mic key. It delegates to `termux-dialog speech` (Android's SpeechRecognizer, the same engine Gboard's mic uses), auto-installs the `termux-api` package via `InstallState`, and reads each session's result on a background job whose transcript the app injects through `handle_key`. A reader that crashes reads as dead, so the session ends, the listening flag is cleared and the next tap starts a new one, instead of every tap cancelling a session nothing will ever answer (#2602).
 
 **`termux-dialog speech`, not `termux-speech-to-text`.** The service closes its output on `onEndOfSpeech` and so discards the final `onResults` transcript.
 
@@ -1444,7 +1585,7 @@ A per-agent ledger of the files an agent changed while you were looking elsewher
 
 ### dap/configs.rs
 
-Reads `launch.json` (`.croft` over `.vscode`), both its `configurations` and its `compounds`, and resolves a chosen entry into a DAP request.
+Reads `launch.json` (`.croft` over `.vscode`), both its `configurations` and its `compounds`, and resolves a chosen entry into a DAP request. `configs.rs` keeps `DebugConfig`, the configuration every part reads, with its `RequestKind` and its `preLaunchTask`. Each feature lives in a file of its own in `configs/`.
 
 **`presentation` is honoured for configurations AND compounds, in one sorted list.** VS Code puts both kinds through the same comparator, so a config and a compound naming the same `presentation.group` belong together; sorting the two kinds separately would split that group no matter what the file asked for. `visible_and_sorted` is transcribed from VS Code's `getVisibleAndSorted` rather than invented, because each of its rules is one croft would otherwise get subtly wrong: an entry that HAS a `presentation` sorts ahead of one that has none, a grouped entry ahead of an ungrouped one, groups by name rather than first-seen, and a numeric `order` ahead of a missing one. The sort is stable, which is what leaves a workspace declaring no `presentation` in exactly its file order. One divergence, deliberate: VS Code compares group names with locale-aware `localeCompare` where croft compares bytewise, which agrees on ASCII and would otherwise cost a collation dependency for a picker's ordering.
 
@@ -1507,6 +1648,20 @@ Local history: per-save snapshots under `~/.config/croft/history`, FNV-keyed wit
 iTerm2 plist mutation helpers for fonts and Croft key mappings.
 
 **User-keybinding forwarders are tracked in a ledger.** They are recorded in a root-plist ledger (`Croft User Keymap Forwarders`, key to hex) and swept on the next setup run before any inserts, but only while their value is still the exact croft forwarder. That way a chord deleted from `keybindings.json` releases its Cmd chord without destroying an entry the user has since rewired in iTerm2 prefs.
+
+### jobs.rs
+
+Background work that runs off the UI thread and hands back one result, which the UI collects on a later tick with `Job::poll`.
+
+**A start choice, made on purpose.** `Job::spawn` takes a `Start` with no default: `Now` for work someone is waiting on, `AfterFirstFrame` for work the first frame does not need, which then waits on `startup_gate`.
+
+**A thread named after the job.** The crash notice (`poll_background_panic`) names the thread that crashed, so a crashed job says which one it was. A job's, stream's or worker's thread is marked as one croft recovers from (`on_supervised_thread`), so its notice says croft carried on, where any other thread's still says to save and restart; and the notice is shown before the polls that settle the task, and a task that says what its crash cost claims its notice (`claim_background_panic`), so that message is the one left on the status line. Crashes between two notices are all named, and one croft did not recover from keeps the advice to restart (#2609).
+
+**A dead job is not a running one.** `poll` reports `Died` when the job's thread ended without a result, which a channel whose sender the `App` also kept could never see: Check Project stayed "already running" after its thread crashed (#2562). Go to File's index is built by the `file-index` job: a rebuild queued while one runs starts when that one ends, whether it landed or crashed, where it used to wait for the next file change after a crash (#2618). A thread that cannot be started at all is an error from `spawn`, reported where it happens. The places that collect a background thread's result by hand move onto this module one at a time (#2062).
+
+**Long-lived workers.** `Worker<Req, Resp>` is a thread croft sends requests to and reads answers from for as long as croft runs, the git status worker first (#2062). It is spawned with a `Start` and on a thread named after it, like a job. `poll` gives one answer at a time, `Idle`, or what happened to a thread that ended: `Restarted`, when a fresh thread has been started and the caller sends again what it needs (what was sent to the old one is lost), or `Stopped`, when it ended again within `RESTART_WINDOW` (a minute) of the last restart, so a crash that repeats on the same input cannot loop. `Stopped` is said once, so a caller that puts it on the status line says it once, and the worker reads as `Idle` after that; `restart` starts it again when the user asks. The git worker resends its folder and a full status request on a restart, and on a stop says so on the status line, with Source Control: Refresh starting it again (#2589). The test runner ends the run it was on as stopped and resends its root and settings, never the run, and the next run starts a stopped one (#2592). Live Run's runner forgets what it had sent, so an armed file runs again once it is the active tab and typing pauses, as Live Run only ever runs the active file; turning Live Run on for a file starts a stopped runner, or one whose thread ended where no tick saw it (#2597). Inline suggestions never send a request again on their own, since each is a model call: the next pause in typing asks afresh, nothing is sent to a stopped worker, and turning suggestions on starts it again (#2598).
+
+**Streams.** `Stream<T>` is work that sends several updates through a `Sink` and then ends, a staged update's build first (#2062). It is spawned with a `Start` and on a thread named after it, like a job. `poll` gives one update at a time, `Pending` while it is still at work, `Ended` once its work returned, or `Died` when its thread ended before that; after either end the caller drops it. A stream watches its own thread, as a worker does, because a helper thread of the work's own can hold a clone of its sink and keep the channel open after the work crashed; a helper's update sent after the work returned may never be read, so work waits for its helpers first. A staged build whose thread crashed ends as a failed one, for "the update's thread crashed", so the spinner stops and the popup offers Retry, and a drift rebuild's does the same with the updater chord ready to rebuild again; the status line is left to the crash notice, as for a job; both used to spin for good, with every try answered "croft is already updating in the background" (#2604). The remote install session is the `remote-install` stream: an install whose thread crashed fails the connect, its dialog saying "the install's thread crashed", where it used to show the install under way for good, and the install waits for its log and launch forwarders before its outcome, so its last lines and its launch signal come first (#2605).
 
 ### keymap.rs
 
@@ -1616,7 +1771,7 @@ Holds a launch's background work until its first frame is up. Started all at onc
 
 Where a launch's time goes. `main` starts the clock, a handful of `mark`s through `Cli::run`, `app::run` and `App::new` note when each startup step finished and how much of it this thread spent computing, and `finish`, called the moment the first frame is flushed, writes the list to `~/.cache/croft/startup-trace.txt` (`CROFT_STARTUP_TRACE=<file>` moves it).
 
-**The first frame is split too (#1973).** Getting from "screen set up" to the frame on screen is the main loop's first pass over every poll and drain, then the draw, and a launch that spent seconds there said only that. `main_loop` marks the pass in groups (file changes, background results, collaborators, panes and saves, language servers, the Explorer's views, AI tools, and so on) and `render` marks each part of the screen it draws, so a slow first frame names the group or the part that held it. The loop and the render keep running after the frame, where `mark` finds the trace finished and costs one load.
+**The first frame is split too (#1973).** Getting from "screen set up" to the frame on screen is the main loop's first pass over every poll and drain, then the draw, and a launch that spent seconds there said only that. The pass (`tick_background`, in `app/tick.rs`) marks itself in groups (file changes, background results, collaborators, panes and saves, language servers, the Explorer's views, AI tools, and so on) and `render` marks each part of the screen it draws, so a slow first frame names the group or the part that held it. The loop and the render keep running after the frame, where `mark` finds the trace finished and costs one load.
 
 **Always on.** A launch from Croft.app or a Dock icon carries no environment of ours, so a switch would never reach the launch that most needs measuring. A mark is a clock read and a push, a few dozen per launch, and the file goes out after the frame.
 

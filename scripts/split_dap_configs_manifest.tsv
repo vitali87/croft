@@ -1,0 +1,95 @@
+# Stage B of the refactor program (#2062): where each item of src/dap/configs.rs goes.
+# One row per item, in file order. pr 0 means the item stays in configs.rs; the others
+# move to src/dap/configs/<file>.rs in that PR. kind, impl and name are as
+# `scripts/check_pure_move.py list` prints them. Run
+# `scripts/move_items.py --target dap_configs --check` after adding an item to configs.rs.
+# configs.rs keeps DebugConfig, its RequestKind and its preLaunchTask.
+pr	file	kind	impl	name
+0		enum	-	RequestKind
+0		struct	-	DebugConfig
+0		fn	impl DebugConfig	pre_launch_task
+1	inputs	fn	impl DebugConfig	input_refs
+1	inputs	struct	-	LaunchInput
+1	inputs	enum	-	InputKind
+1	inputs	fn	-	parse_inputs
+1	inputs	fn	-	inputs_to_ask
+1	inputs	fn	-	text_input_refs
+1	inputs	fn	-	value_input_refs
+2	discovery	fn	-	discover_compounds
+2	discovery	fn	-	discover_configs_all
+2	discovery	fn	-	discover_configs
+2	discovery	fn	-	parse_launch_json
+3	presentation	struct	-	Presentation
+3	presentation	fn	-	parse_presentation
+3	presentation	fn	-	malformed_presentation_keys
+3	presentation	fn	-	visible_and_sorted
+3	presentation	fn	-	compare_orders
+4	compounds	struct	-	Compound
+3	presentation	fn	impl Compound	hidden
+3	presentation	fn	impl DebugConfig	hidden
+4	compounds	fn	-	parse_compounds
+4	compounds	fn	-	resolve_compound
+2	discovery	fn	-	folder_root
+2	discovery	fn	-	workspace_folders
+7	resolve	fn	-	adapter_for_type
+12	js	fn	-	browser_type
+12	js	const	-	BROWSER_DEBUG_PORT
+12	js	fn	-	js_config_error
+12	js	fn	-	with_headless_browser
+5	substitution	struct	-	SubstCtx
+5	substitution	fn	-	substitute
+5	substitution	fn	-	expand_variable
+5	substitution	fn	-	substitute_value
+7	resolve	struct	-	ResolvedConfig
+7	resolve	const	-	MAPPED_KEYS
+8	debug_test	fn	-	is_debug_test_config
+8	debug_test	fn	-	debug_test_config
+8	debug_test	const	-	DEBUG_TEST_META_KEYS
+8	debug_test	fn	-	with_debug_test_config
+7	resolve	const	-	CPPDBG_MAPPED_KEYS
+7	resolve	const	-	CPPDBG_IGNORED_KEYS
+7	resolve	fn	-	ignored_cppdbg_keys
+7	resolve	fn	-	resolve
+12	js	fn	-	node_terminal_command
+11	go	fn	-	resolve_go_auto_mode
+12	js	fn	-	is_assignment
+12	js	fn	-	names_runtime_executable
+12	js	fn	-	js_launch_has_target
+10	lldb	fn	-	parse_ps_processes
+7	resolve	fn	-	absolute_in
+6	env_files	fn	-	parse_env_file
+6	env_files	fn	-	parse_env_file_in
+6	env_files	fn	-	closing_quote
+6	env_files	fn	-	next_line
+6	env_files	fn	-	unescape_double_quoted
+6	env_files	fn	-	expand_env_refs
+7	resolve	fn	-	base_arguments
+7	resolve	fn	-	request_value
+9	python	fn	-	debugpy_request
+9	python	fn	-	debugpy_connect_address
+10	lldb	fn	-	lldb_request
+10	lldb	fn	-	lldb_attach_has_target
+10	lldb	struct	-	CargoSpec
+10	lldb	fn	-	cargo_spec
+10	lldb	fn	-	cargo_build_args
+10	lldb	fn	-	cargo_artifact
+10	lldb	fn	-	build_cargo_program
+11	go	fn	-	delve_remote_address
+11	go	fn	-	delve_request
+12	js	fn	-	with_workspace_folder
+12	js	fn	-	js_request
+13	add_configuration	enum	-	DraftField
+13	add_configuration	const	-	DRAFT_TYPES
+13	add_configuration	struct	-	ConfigDraft
+13	add_configuration	fn	impl ConfigDraft	new
+13	add_configuration	fn	impl ConfigDraft	attaches_by_port
+13	add_configuration	fn	impl ConfigDraft	next_field
+13	add_configuration	fn	impl ConfigDraft	optional
+13	add_configuration	fn	impl ConfigDraft	prompt
+13	add_configuration	fn	impl ConfigDraft	set
+13	add_configuration	fn	impl ConfigDraft	to_json
+13	add_configuration	fn	-	split_args
+13	add_configuration	fn	-	parse_env_pairs
+13	add_configuration	fn	-	add_to_croft_launch_json
+13	add_configuration	fn	-	temp_candidate
+13	add_configuration	fn	-	create_fresh_temp
