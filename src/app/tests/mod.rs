@@ -44,6 +44,7 @@ mod tasks;
 mod terminal;
 mod terminal_panes;
 mod testing;
+mod tick;
 mod updates;
 mod viewers;
 mod vim;
