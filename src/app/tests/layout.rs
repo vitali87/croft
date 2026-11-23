@@ -72,7 +72,7 @@ fn resting_on_an_activity_icon_arms_its_button_hint() {
     let backend = ratatui::backend::TestBackend::new(140, 50);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
-    let icon = app.sidebar_areas.search_icon;
+    let icon = app.sidebar_areas.activity_icons[ActivityIcon::Search];
     let (cx, cy) = (icon.x + icon.width / 2, icon.y);
     app.on_mouse_moved(cx, cy, false);
     assert_eq!(
@@ -546,13 +546,14 @@ fn activity_bar_icons_moving_within_the_flush_arms_a_one_shot_terminal_clear() {
         layout_customize_hover: String::new(),
     });
     let place = |app: &mut App, base: u16| {
-        app.sidebar_areas.explorer_icon = Rect::new(0, base, 2, 1);
-        app.sidebar_areas.search_icon = Rect::new(0, base + 2, 2, 1);
-        app.sidebar_areas.source_control_icon = Rect::new(0, base + 4, 2, 1);
-        app.sidebar_areas.remote_icon = Rect::new(0, base + 6, 2, 1);
-        app.sidebar_areas.run_debug_icon = Rect::new(0, base + 8, 2, 1);
-        app.sidebar_areas.extensions_icon = Rect::new(0, base + 10, 2, 1);
-        app.sidebar_areas.testing_icon = Rect::new(0, base + 12, 2, 1);
+        app.sidebar_areas.activity_icons[ActivityIcon::Explorer] = Rect::new(0, base, 2, 1);
+        app.sidebar_areas.activity_icons[ActivityIcon::Search] = Rect::new(0, base + 2, 2, 1);
+        app.sidebar_areas.activity_icons[ActivityIcon::SourceControl] =
+            Rect::new(0, base + 4, 2, 1);
+        app.sidebar_areas.activity_icons[ActivityIcon::Remote] = Rect::new(0, base + 6, 2, 1);
+        app.sidebar_areas.activity_icons[ActivityIcon::RunDebug] = Rect::new(0, base + 8, 2, 1);
+        app.sidebar_areas.activity_icons[ActivityIcon::Extensions] = Rect::new(0, base + 10, 2, 1);
+        app.sidebar_areas.activity_icons[ActivityIcon::Testing] = Rect::new(0, base + 12, 2, 1);
     };
     // First emit at one layout: records the positions, arms no clear.
     place(&mut app, 2);
@@ -697,7 +698,7 @@ fn croft_loch_activity_icons_rest_muted_hover_to_text_and_tint_their_badge() {
     let backend = ratatui::backend::TestBackend::new(120, 40);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|frame| app.render(frame)).unwrap();
-    let search = app.sidebar_areas.search_icon;
+    let search = app.sidebar_areas.activity_icons[ActivityIcon::Search];
     app.handle_mouse(crossterm::event::MouseEvent {
         kind: crossterm::event::MouseEventKind::Moved,
         column: search.x + 1,
@@ -799,7 +800,7 @@ fn croft_loch_leaves_the_sponsor_hearts_rows_to_its_baked_image() {
         .surfaces()
         .unwrap()
         .chrome();
-    let heart = app.sidebar_areas.sponsor_icon;
+    let heart = app.sidebar_areas.activity_icons[ActivityIcon::Sponsor];
     assert!(!heart.is_empty(), "a 40-row bar has room for the heart");
     for y in heart.top()..heart.bottom() {
         assert_ne!(
@@ -809,8 +810,10 @@ fn croft_loch_leaves_the_sponsor_hearts_rows_to_its_baked_image() {
         );
     }
     let above = heart.top() - 1;
-    let last_view = app.sidebar_areas.testing_icon.bottom();
-    assert!(above >= last_view.max(app.sidebar_areas.codeql_icon.bottom()));
+    let last_view = app.sidebar_areas.activity_icons[ActivityIcon::Testing].bottom();
+    assert!(
+        above >= last_view.max(app.sidebar_areas.activity_icons[ActivityIcon::CodeQL].bottom())
+    );
     assert_eq!(
         buf[(heart.x, above)].bg,
         chrome,
@@ -1026,9 +1029,9 @@ fn activity_bar_render_lays_out_run_debug_between_source_control_and_remote() {
     let backend = ratatui::backend::TestBackend::new(40, 30);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render_activity_bar(f, bar)).unwrap();
-    let scm = app.sidebar_areas.source_control_icon;
-    let run = app.sidebar_areas.run_debug_icon;
-    let rem = app.sidebar_areas.remote_icon;
+    let scm = app.sidebar_areas.activity_icons[ActivityIcon::SourceControl];
+    let run = app.sidebar_areas.activity_icons[ActivityIcon::RunDebug];
+    let rem = app.sidebar_areas.activity_icons[ActivityIcon::Remote];
     assert!(run.height > 0, "run-debug icon must claim a non-zero block");
     assert!(
         run.y > scm.y,
@@ -1633,13 +1636,13 @@ fn hovering_a_non_selected_activity_icon_emits_its_hovered_variant() {
         layout_customize_hover: "LCh".into(),
     });
     // Every view icon needs a non-empty block or the emit early-returns.
-    app.sidebar_areas.explorer_icon = Rect::new(0, 0, 2, 1);
-    app.sidebar_areas.search_icon = Rect::new(0, 2, 2, 1);
-    app.sidebar_areas.source_control_icon = Rect::new(0, 4, 2, 1);
-    app.sidebar_areas.remote_icon = Rect::new(0, 6, 2, 1);
-    app.sidebar_areas.run_debug_icon = Rect::new(0, 8, 2, 1);
-    app.sidebar_areas.extensions_icon = Rect::new(0, 10, 2, 1);
-    app.sidebar_areas.testing_icon = Rect::new(0, 12, 2, 1);
+    app.sidebar_areas.activity_icons[ActivityIcon::Explorer] = Rect::new(0, 0, 2, 1);
+    app.sidebar_areas.activity_icons[ActivityIcon::Search] = Rect::new(0, 2, 2, 1);
+    app.sidebar_areas.activity_icons[ActivityIcon::SourceControl] = Rect::new(0, 4, 2, 1);
+    app.sidebar_areas.activity_icons[ActivityIcon::Remote] = Rect::new(0, 6, 2, 1);
+    app.sidebar_areas.activity_icons[ActivityIcon::RunDebug] = Rect::new(0, 8, 2, 1);
+    app.sidebar_areas.activity_icons[ActivityIcon::Extensions] = Rect::new(0, 10, 2, 1);
+    app.sidebar_areas.activity_icons[ActivityIcon::Testing] = Rect::new(0, 12, 2, 1);
     app.sidebar_view = SidebarView::Explorer;
     // Hover Search, a non-selected icon.
     app.hovered_activity_icon = Some(ActivityIcon::Search);
@@ -1681,7 +1684,7 @@ fn hovering_the_sponsor_heart_emits_its_hovered_variant() {
     };
     draw(&mut app, 120, 40);
     assert!(emitted(&app).contains(&"HI".to_string()));
-    let heart = app.sidebar_areas.sponsor_icon;
+    let heart = app.sidebar_areas.activity_icons[ActivityIcon::Sponsor];
     app.handle_mouse(crossterm::event::MouseEvent {
         kind: crossterm::event::MouseEventKind::Moved,
         column: heart.x,
@@ -1738,7 +1741,7 @@ fn moving_over_an_activity_icon_marks_it_hovered_and_redirties_the_overlay() {
     use ratatui::layout::Rect;
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.sidebar_areas.search_icon = Rect::new(0, 4, 2, 2);
+    app.sidebar_areas.activity_icons[ActivityIcon::Search] = Rect::new(0, 4, 2, 2);
     // Baseline: no hover, icons already emitted (clean).
     app.hovered_activity_icon = None;
     app.overlays.activity.mark_emitted();
@@ -2581,7 +2584,7 @@ fn clicking_the_open_views_activity_icon_collapses_then_reopens_the_side_bar() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     draw(&mut app, 120, 40);
-    let explorer = app.sidebar_areas.explorer_icon;
+    let explorer = app.sidebar_areas.activity_icons[ActivityIcon::Explorer];
     assert!(app.show_tree && app.sidebar_view == SidebarView::Explorer);
     app.focus_pane(Pane::Tree);
     left_click(&mut app, explorer.x, explorer.y);
@@ -2605,8 +2608,8 @@ fn clicking_another_views_activity_icon_switches_and_expands_a_collapsed_side_ba
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     draw(&mut app, 120, 40);
-    let explorer = app.sidebar_areas.explorer_icon;
-    let search = app.sidebar_areas.search_icon;
+    let explorer = app.sidebar_areas.activity_icons[ActivityIcon::Explorer];
+    let search = app.sidebar_areas.activity_icons[ActivityIcon::Search];
     left_click(&mut app, search.x, search.y);
     assert!(
         app.show_tree,
@@ -2630,7 +2633,7 @@ fn collapsing_the_side_bar_from_its_icon_keeps_a_maximized_terminal() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     draw(&mut app, 120, 40);
-    let explorer = app.sidebar_areas.explorer_icon;
+    let explorer = app.sidebar_areas.activity_icons[ActivityIcon::Explorer];
     app.show_terminal = true;
     app.terminal_maximized = true;
     app.focus_pane(Pane::Tree);
@@ -4482,4 +4485,73 @@ fn the_secondary_side_bar_leaves_the_explorer_outline_s_focus_alone() {
     app.focus_pane(Pane::Editor);
     draw(&mut app, 140, 40);
     assert!(!app.outline.focused, "and then it does not");
+}
+
+/// #2062: the activity-bar table keeps every view icon where it was: the
+/// stack starts one row below the bar's top, one icon height apart, with
+/// Run and Debug above Remote and CodeQL last. The table's draw order is
+/// also the order its blocks are stored in, so looking up an icon's block
+/// finds that icon's.
+#[test]
+fn the_activity_bar_table_keeps_each_icon_in_its_place() {
+    use ratatui::layout::Rect;
+    let bar = Rect::new(0, 3, ACTIVITY_BAR_WIDTH, 40);
+    let tops: Vec<(ActivityIcon, u16)> = ActivityIcon::ALL
+        .into_iter()
+        .filter_map(|icon| {
+            icon.slot()
+                .map(|slot| (icon, activity_view_block(bar, slot).y))
+        })
+        .collect();
+    assert_eq!(
+        tops,
+        vec![
+            (ActivityIcon::Explorer, 4),
+            (ActivityIcon::Search, 6),
+            (ActivityIcon::SourceControl, 8),
+            (ActivityIcon::Remote, 12),
+            (ActivityIcon::RunDebug, 10),
+            (ActivityIcon::Extensions, 14),
+            (ActivityIcon::Testing, 16),
+            (ActivityIcon::CodeQL, 18),
+        ]
+    );
+    for (index, icon) in ActivityIcon::ALL.into_iter().enumerate() {
+        assert_eq!(icon as usize, index, "{icon:?} is stored where it is drawn");
+    }
+}
+
+/// #2062: hovering each icon's block finds that icon, and its tooltip names
+/// it as before.
+#[test]
+fn every_activity_icon_is_found_under_the_pointer_and_named() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let names: Vec<(ActivityIcon, &str)> = ActivityIcon::ALL
+        .into_iter()
+        .filter(|&icon| app.sidebar_areas.activity_icons[icon].width > 0)
+        .map(|icon| {
+            let block = app.sidebar_areas.activity_icons[icon];
+            assert_eq!(app.activity_icon_at(block.x, block.y), Some(icon));
+            (icon, icon.label())
+        })
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            (ActivityIcon::Explorer, "Explorer"),
+            (ActivityIcon::Search, "Search"),
+            (ActivityIcon::SourceControl, "Source Control"),
+            (ActivityIcon::Remote, "Remote"),
+            (ActivityIcon::RunDebug, "Run and Debug"),
+            (ActivityIcon::Extensions, "Extensions"),
+            (ActivityIcon::Testing, "Testing"),
+            (ActivityIcon::Sponsor, "Sponsor croft"),
+            (ActivityIcon::Settings, "Manage"),
+        ],
+        "CodeQL is not added by default, so it has no block"
+    );
 }

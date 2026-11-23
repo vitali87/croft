@@ -297,8 +297,8 @@ fn settings_gear_is_bottom_anchored_below_the_view_icons() {
     let backend = ratatui::backend::TestBackend::new(120, 40);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
-    let gear = app.sidebar_areas.settings_icon;
-    let run_debug = app.sidebar_areas.run_debug_icon;
+    let gear = app.sidebar_areas.activity_icons[ActivityIcon::Settings];
+    let run_debug = app.sidebar_areas.activity_icons[ActivityIcon::RunDebug];
     assert!(gear.width > 0, "gear must lay out on a tall bar");
     assert!(
         gear.y > run_debug.y,
@@ -314,7 +314,7 @@ fn settings_gear_is_bottom_anchored_below_the_view_icons() {
 #[test]
 fn settings_gear_bottom_inset_matches_the_view_icon_top_inset() {
     // The view icons start one cell below the bar's top edge
-    // (`activity_explorer_y` = `bar.y + 1`). The gear must leave the same
+    // (`activity_view_y` = `bar.y + 1` for the first). The gear must leave the same
     // one-cell gap above the status bar instead of hugging the bottom row,
     // so the bar reads as vertically balanced rather than bottom-heavy.
     let tmp = tempfile::tempdir().unwrap();
@@ -323,8 +323,8 @@ fn settings_gear_bottom_inset_matches_the_view_icon_top_inset() {
     let backend = ratatui::backend::TestBackend::new(120, 40);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
-    let explorer = app.sidebar_areas.explorer_icon;
-    let gear = app.sidebar_areas.settings_icon;
+    let explorer = app.sidebar_areas.activity_icons[ActivityIcon::Explorer];
+    let gear = app.sidebar_areas.activity_icons[ActivityIcon::Settings];
     assert!(gear.width > 0, "gear must lay out on a tall bar");
     // The activity bar spans every row except the single status-bar row.
     let bar_bottom = app.last_frame_area.height - 1 - 1;
@@ -349,7 +349,8 @@ fn the_gear_clears_the_last_view_icon_shown() {
     };
     assert_eq!(
         shortest(true) - shortest(false),
-        activity_codeql_y(bar(80)) - activity_testing_y(bar(80)),
+        activity_view_y(bar(80), ActivityIcon::CodeQL.slot().unwrap())
+            - activity_view_y(bar(80), ActivityIcon::Testing.slot().unwrap()),
         "one icon slot less without CodeQL"
     );
 }
@@ -362,7 +363,7 @@ fn clicking_the_gear_opens_the_color_theme_menu_then_the_picker() {
     let backend = ratatui::backend::TestBackend::new(120, 40);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
-    let gear = app.sidebar_areas.settings_icon;
+    let gear = app.sidebar_areas.activity_icons[ActivityIcon::Settings];
     app.handle_mouse(crossterm::event::MouseEvent {
         kind: crossterm::event::MouseEventKind::Down(MouseButton::Left),
         column: gear.x,
@@ -408,8 +409,8 @@ fn the_sponsor_heart_sits_directly_above_the_gear() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.overlays.activity.set_images(dummy_activity_images());
     draw(&mut app, 120, 40);
-    let heart = app.sidebar_areas.sponsor_icon;
-    let gear = app.sidebar_areas.settings_icon;
+    let heart = app.sidebar_areas.activity_icons[ActivityIcon::Sponsor];
+    let gear = app.sidebar_areas.activity_icons[ActivityIcon::Settings];
     assert!(heart.width > 0, "the heart lays out on a tall bar");
     assert_eq!((heart.x, heart.width), (gear.x, gear.width));
     assert_eq!(heart.y + heart.height, gear.y, "no gap above the gear");
@@ -442,7 +443,7 @@ fn clicking_the_sponsor_heart_opens_the_github_sponsors_page() {
     app.overlays.activity.set_images(dummy_activity_images());
     draw(&mut app, 120, 40);
     let view = app.sidebar_view;
-    let heart = app.sidebar_areas.sponsor_icon;
+    let heart = app.sidebar_areas.activity_icons[ActivityIcon::Sponsor];
     left_click(&mut app, heart.x, heart.y);
     assert_eq!(app.status, "Open https://github.com/sponsors/vitali87");
     assert!(app.context_menu.is_none(), "the heart opens no menu");

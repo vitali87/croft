@@ -248,33 +248,10 @@ fn fallback_popup_rect(full: Rect, max_w_cap: u16) -> Rect {
 
 #[derive(Default, Clone, Copy)]
 struct SidebarAreas {
-    /// Block occupied by the Explorer activity-bar icon, in absolute coords.
-    /// Multi-row when image rendering is active; the hit-test still uses the
-    /// whole block.
-    explorer_icon: Rect,
-    /// Block occupied by the Search activity-bar icon, in absolute coords.
-    search_icon: Rect,
-    /// Block occupied by the Source Control activity-bar icon, in absolute coords.
-    source_control_icon: Rect,
-    /// Block occupied by the Remote Explorer activity-bar icon, in absolute coords.
-    remote_icon: Rect,
-    /// Block occupied by the Run and Debug activity-bar icon, in absolute coords.
-    run_debug_icon: Rect,
-    /// Block occupied by the Extensions activity-bar icon, in absolute coords.
-    extensions_icon: Rect,
-    /// Block occupied by the Testing (beaker) activity-bar icon, in absolute coords.
-    testing_icon: Rect,
-    /// Block occupied by the CodeQL (QL) activity-bar icon; empty while the
-    /// built-in CodeQL extension is disabled.
-    codeql_icon: Rect,
-    /// Block occupied by the sponsor heart directly above the settings gear;
-    /// empty when the bar is too short for it. Clicking it opens croft's
-    /// GitHub Sponsors page.
-    sponsor_icon: Rect,
-    /// Block occupied by the settings gear, bottom-anchored on the activity
-    /// bar (VS Code's "Manage" button). Asymmetric to the view icons up top;
-    /// clicking it opens the settings menu (Color Theme picker).
-    settings_icon: Rect,
+    /// Where each activity-bar icon sits. Clicking the sponsor heart opens
+    /// croft's GitHub Sponsors page; the settings gear, bottom-anchored like
+    /// VS Code's "Manage" button, opens the settings menu.
+    activity_icons: ActivityBlocks,
 }
 
 /// Pre-encoded iTerm2 OSC-1337 inline-image escape sequences for each icon

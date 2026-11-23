@@ -1135,16 +1135,16 @@ impl App {
         let Some(images) = self.overlays.activity.images() else {
             return Vec::new();
         };
-        let exp_block = self.sidebar_areas.explorer_icon;
-        let sea_block = self.sidebar_areas.search_icon;
-        let scm_block = self.sidebar_areas.source_control_icon;
-        let rem_block = self.sidebar_areas.remote_icon;
-        let rdb_block = self.sidebar_areas.run_debug_icon;
-        let ext_block = self.sidebar_areas.extensions_icon;
-        let tst_block = self.sidebar_areas.testing_icon;
+        let exp_block = self.sidebar_areas.activity_icons[ActivityIcon::Explorer];
+        let sea_block = self.sidebar_areas.activity_icons[ActivityIcon::Search];
+        let scm_block = self.sidebar_areas.activity_icons[ActivityIcon::SourceControl];
+        let rem_block = self.sidebar_areas.activity_icons[ActivityIcon::Remote];
+        let rdb_block = self.sidebar_areas.activity_icons[ActivityIcon::RunDebug];
+        let ext_block = self.sidebar_areas.activity_icons[ActivityIcon::Extensions];
+        let tst_block = self.sidebar_areas.activity_icons[ActivityIcon::Testing];
         // Optional: absent while CodeQL is disabled, so not part of the
         // all-or-nothing readiness below.
-        let cql_block = self.sidebar_areas.codeql_icon;
+        let cql_block = self.sidebar_areas.activity_icons[ActivityIcon::CodeQL];
         // The activity bar is all-or-nothing: emit its icons only when every
         // block is laid out (a partial bar would look broken). When it's hidden
         // (Customize Layout / Zen) the blocks are zero-width and skipped, but
@@ -1219,13 +1219,13 @@ impl App {
         // The heart and the gear are bottom-anchored and may be absent on a
         // short bar (empty block). The heart is never selected; the gear
         // reads "active" while its menu/picker is open.
-        let spo_block = self.sidebar_areas.sponsor_icon;
+        let spo_block = self.sidebar_areas.activity_icons[ActivityIcon::Sponsor];
         let spo_state = if hov == Some(ActivityIcon::Sponsor) {
             &images.sponsor_hovered
         } else {
             &images.sponsor_inactive
         };
-        let set_block = self.sidebar_areas.settings_icon;
+        let set_block = self.sidebar_areas.activity_icons[ActivityIcon::Settings];
         let set_state = if self.settings_menu_active() {
             &images.settings_active
         } else if hov == Some(ActivityIcon::Settings) {
