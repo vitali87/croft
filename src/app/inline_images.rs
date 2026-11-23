@@ -722,7 +722,6 @@ impl App {
     }
 
     pub fn flush_run_debug_icon_overlay(&mut self) {
-        use std::io::Write;
         if self.modal_overlay_open() {
             return;
         }
@@ -771,16 +770,13 @@ impl App {
         if !self.chrome_image_due("run_debug", &osc, at) {
             return;
         }
-        let mut out = stdout();
-        let cursor_on = self.cursor_should_be_visible();
-        let _ = write!(out, "\x1b[?25l\x1b[s");
-        let _ = write!(out, "\x1b[{};{}H", cy + 1, cx + 1);
-        let _ = out.write_all(osc.as_bytes());
-        let _ = write!(out, "\x1b[u");
-        if cursor_on {
-            let _ = write!(out, "\x1b[?25h");
-        }
-        let _ = out.flush();
+        write_inline_image(
+            &mut stdout(),
+            cx,
+            cy,
+            osc.as_bytes(),
+            self.cursor_should_be_visible(),
+        );
         self.overlays.run_debug.mark_emitted_at((cx, cy));
     }
 
@@ -801,7 +797,6 @@ impl App {
     /// Clears when the panel strip is hidden, the count is zero, or a modal owns
     /// the screen; arms a one-shot clear when the anchor moves so no ghost stacks.
     pub fn flush_problems_badge_overlay(&mut self) {
-        use std::io::Write;
         if self.modal_overlay_open() {
             return;
         }
@@ -832,16 +827,13 @@ impl App {
         if !self.chrome_image_due("problems_badge", &osc, at) {
             return;
         }
-        let mut out = stdout();
-        let cursor_on = self.cursor_should_be_visible();
-        let _ = write!(out, "\x1b[?25l\x1b[s");
-        let _ = write!(out, "\x1b[{};{}H", cy + 1, cx + 1);
-        let _ = out.write_all(osc.as_bytes());
-        let _ = write!(out, "\x1b[u");
-        if cursor_on {
-            let _ = write!(out, "\x1b[?25h");
-        }
-        let _ = out.flush();
+        write_inline_image(
+            &mut stdout(),
+            cx,
+            cy,
+            osc.as_bytes(),
+            self.cursor_should_be_visible(),
+        );
         self.overlays.problems_badge.mark_emitted_at((cx, cy));
     }
 
@@ -852,7 +844,6 @@ impl App {
     /// flush each frame so iTerm2 keeps the image painted even after
     /// surrounding cells redraw.
     pub fn flush_no_repo_hero_overlay(&mut self) {
-        use std::io::Write;
         if self.modal_overlay_open() {
             return;
         }
@@ -916,16 +907,13 @@ impl App {
         if !self.chrome_image_due("hero", &osc, hero) {
             return;
         }
-        let mut out = stdout();
-        let cursor_on = self.cursor_should_be_visible();
-        let _ = write!(out, "\x1b[?25l\x1b[s");
-        let _ = write!(out, "\x1b[{};{}H", hero.y + 1, hero.x + 1);
-        let _ = out.write_all(osc.as_bytes());
-        let _ = write!(out, "\x1b[u");
-        if cursor_on {
-            let _ = write!(out, "\x1b[?25h");
-        }
-        let _ = out.flush();
+        write_inline_image(
+            &mut stdout(),
+            hero.x,
+            hero.y,
+            osc.as_bytes(),
+            self.cursor_should_be_visible(),
+        );
         self.overlays.hero.mark_emitted();
     }
 
@@ -937,7 +925,6 @@ impl App {
     /// cached image cells — otherwise the illustration ghosts onto
     /// whatever view (Explorer / Search / …) replaces it.
     pub fn flush_ssh_empty_state_overlay(&mut self) {
-        use std::io::Write;
         let should_show = self.shortcuts_modal.is_none()
             && self.file_finder.is_none()
             && self.zoxide_jump.is_none()
@@ -967,16 +954,13 @@ impl App {
         if self.update_card_covers(at) || !self.chrome_image_due("ssh", &osc, at) {
             return;
         }
-        let mut out = stdout();
-        let cursor_on = self.cursor_should_be_visible();
-        let _ = write!(out, "\x1b[?25l\x1b[s");
-        let _ = write!(out, "\x1b[{};{}H", cy + 1, cx + 1);
-        let _ = out.write_all(osc.as_bytes());
-        let _ = write!(out, "\x1b[u");
-        if cursor_on {
-            let _ = write!(out, "\x1b[?25h");
-        }
-        let _ = out.flush();
+        write_inline_image(
+            &mut stdout(),
+            cx,
+            cy,
+            osc.as_bytes(),
+            self.cursor_should_be_visible(),
+        );
         self.overlays.ssh.mark_displayed();
     }
 
@@ -2451,6 +2435,30 @@ impl App {
             target_dir: self.tree.root.clone(),
         });
     }
+}
+
+/// Send one inline picture straight to the terminal, after ratatui's diff
+/// (ratatui cannot draw one): the caret is hidden and its place saved, the
+/// picture is written from cell (`cell_x`, `cell_y`), and the caret goes back
+/// where it was, shown again only when `cursor_on` says it should be. Every
+/// single picture croft sends goes out through here, so this guard around it
+/// is written once (#2062). `payload` is the picture's escape sequence,
+/// borrowed: a picture can be megabytes.
+pub(super) fn write_inline_image(
+    out: &mut impl std::io::Write,
+    cell_x: u16,
+    cell_y: u16,
+    payload: &[u8],
+    cursor_on: bool,
+) {
+    let _ = write!(out, "\x1b[?25l\x1b[s");
+    let _ = write!(out, "\x1b[{};{}H", cell_y + 1, cell_x + 1);
+    let _ = out.write_all(payload);
+    let _ = write!(out, "\x1b[u");
+    if cursor_on {
+        let _ = write!(out, "\x1b[?25h");
+    }
+    let _ = out.flush();
 }
 
 /// The SGR prefix (reset + truecolor fg/bg) for one ratatui cell, used when

@@ -6709,17 +6709,13 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                     if !app.overlays.editor[side].needs_emit(underlays.editor[side]) {
                         continue;
                     }
-                    use std::io::Write;
-                    let mut out = stdout();
-                    let cursor_on = app.cursor_should_be_visible();
-                    let _ = write!(out, "\x1b[?25l\x1b[s");
-                    let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
-                    let _ = out.write_all(osc.as_bytes());
-                    let _ = write!(out, "\x1b[u");
-                    if cursor_on {
-                        let _ = write!(out, "\x1b[?25h");
-                    }
-                    let _ = out.flush();
+                    write_inline_image(
+                        &mut stdout(),
+                        layout.cell_x,
+                        layout.cell_y,
+                        osc.as_bytes(),
+                        app.cursor_should_be_visible(),
+                    );
                     app.mark_editor_image_displayed(side);
                     app.overlays.editor[side].mark_sent_over(underlays.editor[side]);
                 } else {
@@ -6737,17 +6733,13 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 )
             {
                 if app.overlays.terminal_image.needs_emit(underlays.terminal) {
-                    use std::io::Write;
-                    let mut out = stdout();
-                    let cursor_on = app.cursor_should_be_visible();
-                    let _ = write!(out, "\x1b[?25l\x1b[s");
-                    let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
-                    let _ = out.write_all(osc.as_bytes());
-                    let _ = write!(out, "\x1b[u");
-                    if cursor_on {
-                        let _ = write!(out, "\x1b[?25h");
-                    }
-                    let _ = out.flush();
+                    write_inline_image(
+                        &mut stdout(),
+                        layout.cell_x,
+                        layout.cell_y,
+                        osc.as_bytes(),
+                        app.cursor_should_be_visible(),
+                    );
                     app.mark_terminal_image_displayed();
                     app.overlays
                         .terminal_image
@@ -6767,17 +6759,13 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 )
             {
                 if app.overlays.markdown_image.needs_emit(underlays.markdown) {
-                    use std::io::Write;
-                    let mut out = stdout();
-                    let cursor_on = app.cursor_should_be_visible();
-                    let _ = write!(out, "\x1b[?25l\x1b[s");
-                    let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
-                    let _ = out.write_all(osc.as_bytes());
-                    let _ = write!(out, "\x1b[u");
-                    if cursor_on {
-                        let _ = write!(out, "\x1b[?25h");
-                    }
-                    let _ = out.flush();
+                    write_inline_image(
+                        &mut stdout(),
+                        layout.cell_x,
+                        layout.cell_y,
+                        osc.as_bytes(),
+                        app.cursor_should_be_visible(),
+                    );
                     app.mark_markdown_image_displayed();
                     app.overlays
                         .markdown_image
@@ -6797,17 +6785,13 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 )
             {
                 if app.overlays.minimap.needs_emit(underlays.minimap) {
-                    use std::io::Write;
-                    let mut out = stdout();
-                    let cursor_on = app.cursor_should_be_visible();
-                    let _ = write!(out, "\x1b[?25l\x1b[s");
-                    let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
-                    let _ = out.write_all(osc.as_bytes());
-                    let _ = write!(out, "\x1b[u");
-                    if cursor_on {
-                        let _ = write!(out, "\x1b[?25h");
-                    }
-                    let _ = out.flush();
+                    write_inline_image(
+                        &mut stdout(),
+                        layout.cell_x,
+                        layout.cell_y,
+                        osc.as_bytes(),
+                        app.cursor_should_be_visible(),
+                    );
                     app.mark_minimap_image_displayed();
                     app.overlays.minimap.mark_sent_over(underlays.minimap);
                 }
@@ -6836,17 +6820,13 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                     layout.cell_h,
                 )
             {
-                use std::io::Write;
-                let mut out = stdout();
-                let cursor_on = app.cursor_should_be_visible();
-                let _ = write!(out, "\x1b[?25l\x1b[s");
-                let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
-                let _ = out.write_all(img.as_bytes());
-                let _ = write!(out, "\x1b[u");
-                if cursor_on {
-                    let _ = write!(out, "\x1b[?25h");
-                }
-                let _ = out.flush();
+                write_inline_image(
+                    &mut stdout(),
+                    layout.cell_x,
+                    layout.cell_y,
+                    img.as_bytes(),
+                    app.cursor_should_be_visible(),
+                );
                 app.mark_welcome_image_emitted();
             }
             // Last of all: re-paint the chrome tooltip on top of any sidebar

@@ -4080,3 +4080,24 @@ tool = "now"
         app.status
     );
 }
+
+/// #2062: every single inline picture goes out through one writer, which
+/// sends exactly the bytes each of the nine copies it replaced sent: the
+/// caret hidden and its place saved, a move to the picture's cell (row then
+/// column, each counted from 1), the picture, the caret put back where it
+/// was, and the caret shown again only when it should be visible.
+#[test]
+fn an_inline_picture_goes_out_inside_the_caret_guard() {
+    let mut shown = Vec::new();
+    write_inline_image(&mut shown, 4, 2, b"PICTURE", true);
+    assert_eq!(
+        shown,
+        b"\x1b[?25l\x1b[s\x1b[3;5HPICTURE\x1b[u\x1b[?25h".to_vec()
+    );
+    let mut hidden = Vec::new();
+    write_inline_image(&mut hidden, 0, 0, b"PICTURE", false);
+    assert_eq!(hidden, b"\x1b[?25l\x1b[s\x1b[1;1HPICTURE\x1b[u".to_vec());
+    let mut far = Vec::new();
+    write_inline_image(&mut far, 239, 66, b"", true);
+    assert_eq!(far, b"\x1b[?25l\x1b[s\x1b[67;240H\x1b[u\x1b[?25h".to_vec());
+}
