@@ -23,7 +23,7 @@ fn picture_app(root: &Path) -> App {
 /// catch-all, so a pop-up cannot join the list without a way to open it
 /// here. An agent's proposal is a real one, sent through the edit hook;
 /// the returned stream is the hook's end, kept open while the test runs.
-fn open(app: &mut App, p: Popup) -> Option<std::os::unix::net::UnixStream> {
+pub(super) fn open(app: &mut App, p: Popup) -> Option<std::os::unix::net::UnixStream> {
     match p {
         Popup::Prompt => {
             app.prompt = Some(Prompt {
@@ -180,6 +180,43 @@ fn open(app: &mut App, p: Popup) -> Option<std::os::unix::net::UnixStream> {
         Popup::TerminalWarning => app.pending_terminal_warning = true,
     }
     None
+}
+
+/// Close `p` again, the state [`open`] set taken away.
+pub(super) fn close(app: &mut App, p: Popup) {
+    match p {
+        Popup::Prompt => app.prompt = None,
+        Popup::LocalOpenConfirm => app.pending_local_open = None,
+        Popup::DiscardConfirm => app.pending_discard = None,
+        Popup::RevertHunkConfirm => app.pending_revert_hunk = None,
+        Popup::DiscardAllConfirm => app.pending_discard_all = false,
+        Popup::StashDropConfirm => app.pending_stash_drop = None,
+        Popup::UnsavedScmConfirm => app.pending_unsaved_scm = None,
+        Popup::ReplaceAllConfirm => app.pending_replace_all = None,
+        Popup::BroadcastConfirm => app.pending_broadcast_enable = false,
+        Popup::TerminalPasteConfirm => app.pending_terminal_paste = None,
+        Popup::RunBlockConfirm => app.pending_run_block = None,
+        Popup::UnsavedConfirm => app.pending_unsaved = None,
+        Popup::LossySaveConfirm => app.pending_lossy_save = None,
+        Popup::FileFinder => app.file_finder = None,
+        Popup::CommandPalette => app.command_palette = None,
+        Popup::GoToSymbol => app.go_to_symbol = None,
+        Popup::WorkspaceSymbols => app.workspace_symbols = None,
+        Popup::ProcessPicker => app.process_picker = None,
+        Popup::ZoxideJump => app.zoxide_jump = None,
+        Popup::CommandHistory => app.command_history_popup = None,
+        Popup::BranchPicker => app.branch_picker = None,
+        Popup::SettingsEditor => app.settings_editor = None,
+        Popup::InputPrompt => app.input_prompt = None,
+        Popup::ListPicker => app.list_picker = None,
+        Popup::ShortcutsModal => app.shortcuts_modal = None,
+        Popup::ConnectDialog => app.connect_dialog = None,
+        Popup::Approval => {
+            app.approval_ui = None;
+            app.approvals.clear();
+        }
+        Popup::TerminalWarning => app.pending_terminal_warning = false,
+    }
 }
 
 /// The bug (#2659): iTerm2 and Sixel have no layer for pictures, so croft
