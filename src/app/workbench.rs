@@ -535,11 +535,7 @@ impl App {
             kitty_id,
             1,
         )?;
-        Some(crate::iterm2_inline::maybe_tmux_wrap(
-            self.inline_protocol,
-            crate::iterm2_inline::detect_tmux(),
-            raw,
-        ))
+        Some(self.wrap_for_terminal(raw))
     }
 
     /// Rebuild the cached Explorer unsaved-file badge when the count, theme, or
