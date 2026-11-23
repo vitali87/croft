@@ -225,10 +225,12 @@ impl App {
             prompt.edit(|t, at| crate::widgets::line_edit::insert_at(t, at, &text));
             return true;
         }
-        // The confirms answered after it.
+        // The confirms answered after it, then a right-click menu, which
+        // takes every key while it is open and has no field (Codex).
         self.pending_local_open.is_some()
             || self.pending_discard.is_some()
             || self.pending_revert_hunk.is_some()
+            || self.context_menu.is_some()
     }
 
     /// Flip native modal (vim) editing on or off. Driven by the global Cmd+E

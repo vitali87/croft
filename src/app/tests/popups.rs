@@ -783,3 +783,31 @@ fn a_paste_goes_into_the_reason_for_refusing_an_edit() {
         "nothing reaches the file"
     );
 }
+
+/// A right-click menu is not one of the pop-ups drawn over the middle of
+/// the screen, but it takes every key while it is open, so a paste goes
+/// nowhere either: not into the file or the shell beside it (Codex, #2665).
+#[test]
+fn a_paste_with_a_right_click_menu_open_goes_nowhere() {
+    for behind in [Pane::Editor, Pane::Terminal] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = paste_app(tmp.path(), behind);
+        let items = vec![(
+            String::from("New File"),
+            MenuAction::Create(CreateKind::File),
+        )];
+        app.context_menu = Some(ContextMenu::flat((2, 2), items, tmp.path().to_path_buf()));
+        app.handle_paste("zx");
+        assert_eq!(
+            app.editor.lines.join("\n"),
+            "keep",
+            "nothing reaches the file"
+        );
+        assert_eq!(
+            app.terminals[0].written_bytes_for_test(),
+            b"",
+            "nothing reaches the shell"
+        );
+        assert!(app.context_menu.is_some(), "the menu stays open");
+    }
+}
