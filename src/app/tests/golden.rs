@@ -622,60 +622,9 @@ fn golden_scenes_are_skipped_only_in_a_published_crate_without_goldens() {
 /// How many frames a scene may take to settle.
 const MAX_FRAMES: usize = 4;
 
-/// `TestBackend`, plus whether the caret is shown, which it keeps private.
-pub(super) struct GoldenBackend {
-    pub(super) inner: TestBackend,
-    pub(super) caret_shown: bool,
-}
-
-impl Backend for GoldenBackend {
-    type Error = std::convert::Infallible;
-
-    fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
-    where
-        I: Iterator<Item = (u16, u16, &'a Cell)>,
-    {
-        self.inner.draw(content)
-    }
-
-    fn hide_cursor(&mut self) -> Result<(), Self::Error> {
-        self.caret_shown = false;
-        self.inner.hide_cursor()
-    }
-
-    fn show_cursor(&mut self) -> Result<(), Self::Error> {
-        self.caret_shown = true;
-        self.inner.show_cursor()
-    }
-
-    fn get_cursor_position(&mut self) -> Result<Position, Self::Error> {
-        self.inner.get_cursor_position()
-    }
-
-    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> Result<(), Self::Error> {
-        self.inner.set_cursor_position(position)
-    }
-
-    fn clear(&mut self) -> Result<(), Self::Error> {
-        self.inner.clear()
-    }
-
-    fn clear_region(&mut self, clear_type: ClearType) -> Result<(), Self::Error> {
-        self.inner.clear_region(clear_type)
-    }
-
-    fn size(&self) -> Result<Size, Self::Error> {
-        self.inner.size()
-    }
-
-    fn window_size(&mut self) -> Result<WindowSize, Self::Error> {
-        self.inner.window_size()
-    }
-
-    fn flush(&mut self) -> Result<(), Self::Error> {
-        self.inner.flush()
-    }
-}
+/// The snapshots record whether the caret is shown, which `TestBackend`
+/// keeps private.
+use super::CaretBackend as GoldenBackend;
 
 /// Pin every App field that startup reads from the terminal's environment,
 /// as the module doc lists. Run as soon as the App is built and again just

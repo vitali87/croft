@@ -116,6 +116,62 @@ fn crash_slot_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// `TestBackend`, plus whether the caret is shown, which it keeps private:
+/// the screen snapshots and the caret tests read both.
+pub(super) struct CaretBackend {
+    pub(super) inner: ratatui::backend::TestBackend,
+    pub(super) caret_shown: bool,
+}
+
+impl ratatui::backend::Backend for CaretBackend {
+    type Error = std::convert::Infallible;
+
+    fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
+    where
+        I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+    {
+        ratatui::backend::Backend::draw(&mut self.inner, content)
+    }
+
+    fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+        self.caret_shown = false;
+        ratatui::backend::Backend::hide_cursor((&mut self.inner)
+    }
+
+    fn show_cursor(&mut self) -> Result<(), Self::Error> {
+        self.caret_shown = true;
+        ratatui::backend::Backend::show_cursor((&mut self.inner)
+    }
+
+    fn get_cursor_position(&mut self) -> Result<ratatui::layout::Position, Self::Error> {
+        ratatui::backend::Backend::get_cursor_position((&mut self.inner)
+    }
+
+    fn set_cursor_position<P: Into<ratatui::layout::Position>>(&mut self, position: P) -> Result<(), Self::Error> {
+        ratatui::backend::Backend::set_cursor_position(&mut self.inner, position)
+    }
+
+    fn clear(&mut self) -> Result<(), Self::Error> {
+        ratatui::backend::Backend::clear(&mut self.inner)
+    }
+
+    fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> Result<(), Self::Error> {
+        ratatui::backend::Backend::clear_region(&mut self.inner, clear_type)
+    }
+
+    fn size(&self) -> Result<ratatui::layout::Size, Self::Error> {
+        ratatui::backend::Backend::size((&self.inner)
+    }
+
+    fn window_size(&mut self) -> Result<ratatui::backend::WindowSize, Self::Error> {
+        ratatui::backend::Backend::window_size((&mut self.inner)
+    }
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        ratatui::backend::Backend::flush((&mut self.inner)
+    }
+}
+
 fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
     KeyEvent::new(code, mods)
 }

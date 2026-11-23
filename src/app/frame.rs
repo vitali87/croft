@@ -236,6 +236,16 @@ impl App {
     /// it can re-Show the caret after the OSC-1337 image emit only when the
     /// editor would have shown it this frame.
     pub(super) fn cursor_should_be_visible(&self) -> bool {
+        // The connect dialog places its own caret in its field whenever it
+        // has one, as `render_connect_dialog` does: put that one back, not
+        // a pane's (#2669 review).
+        if self
+            .connect_dialog
+            .as_ref()
+            .is_some_and(|d| d.cursor_screen_pos().is_some())
+        {
+            return self.cursor_visible_phase();
+        }
         if self.context_menu.is_some() || self.prompt.is_some() || !self.cursor_visible_phase() {
             return false;
         }
