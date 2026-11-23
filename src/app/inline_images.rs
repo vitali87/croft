@@ -691,7 +691,7 @@ impl App {
     }
 
     pub fn flush_run_debug_icon_overlay(&mut self, drawn: &ratatui::buffer::Buffer) {
-        if self.modal_overlay_open() {
+        if self.pictures_held_back() {
             return;
         }
         let panel_visible = self.show_tree
@@ -763,10 +763,11 @@ impl App {
     /// Emit the PROBLEMS-tab orange circle as an OSC-1337/Kitty inline image at
     /// the cell `paint_panel_tabs` recorded this frame, re-emitted every frame
     /// (like the activity-bar badges) so heavy SGR traffic can't evict it.
-    /// Clears when the panel strip is hidden, the count is zero, or a modal owns
-    /// the screen; arms a one-shot clear when the anchor moves so no ghost stacks.
+    /// Clears when the panel strip is hidden or the count is zero, and waits
+    /// while a pop-up is open; arms a one-shot clear when the anchor moves so
+    /// no ghost stacks.
     pub fn flush_problems_badge_overlay(&mut self, drawn: &ratatui::buffer::Buffer) {
-        if self.modal_overlay_open() {
+        if self.pictures_held_back() {
             return;
         }
         let Some((cx, cy)) = self.problems_badge_cell.filter(|_| self.show_terminal) else {
@@ -813,7 +814,7 @@ impl App {
     /// flush each frame so iTerm2 keeps the image painted even after
     /// surrounding cells redraw.
     pub fn flush_no_repo_hero_overlay(&mut self, drawn: &ratatui::buffer::Buffer) {
-        if self.modal_overlay_open() {
+        if self.pictures_held_back() {
             return;
         }
         let panel_visible = self.show_tree
@@ -884,19 +885,13 @@ impl App {
 
     /// Emit the OSC-1337 SSH-empty-state illustration at the cell the
     /// remote panel reserved on its most recent render. When the panel
-    /// is no longer the active view (or has hosts, or the shortcuts
-    /// modal is open), this arms a one-shot terminal.clear() via
+    /// is no longer the active view (or has hosts, or a pop-up is
+    /// open), this arms a one-shot terminal.clear() via
     /// `consume_ssh_empty_state_image_clear()` so iTerm2 evicts the
     /// cached image cells — otherwise the illustration ghosts onto
     /// whatever view (Explorer / Search / …) replaces it.
     pub fn flush_ssh_empty_state_overlay(&mut self, drawn: &ratatui::buffer::Buffer) {
-        let should_show = self.shortcuts_modal.is_none()
-            && self.file_finder.is_none()
-            && self.zoxide_jump.is_none()
-            && self.command_history_popup.is_none()
-            && self.branch_picker.is_none()
-            && self.input_prompt.is_none()
-            && self.list_picker.is_none()
+        let should_show = !self.pictures_held_back()
             && self.show_tree
             && self.sidebar_view == SidebarView::Remote
             && self.remote.targets.is_empty();
@@ -1426,18 +1421,7 @@ impl App {
     }
 
     pub fn editor_image_payload(&self, side: usize) -> Option<(&str, &EditorImageLayout)> {
-        if self.shortcuts_modal.is_some()
-            || self.file_finder.is_some()
-            || self.command_palette.is_some()
-            || self.go_to_symbol.is_some()
-            || self.workspace_symbols.is_some()
-            || self.process_picker.is_some()
-            || self.zoxide_jump.is_some()
-            || self.command_history_popup.is_some()
-            || self.branch_picker.is_some()
-            || self.input_prompt.is_some()
-            || self.list_picker.is_some()
-        {
+        if self.pictures_held_back() {
             return None;
         }
         self.overlays.editor[side].payload()
@@ -1594,21 +1578,10 @@ impl App {
         self.overlays.markdown_image.mark_displayed();
     }
 
-    /// The markdown-preview image escape to flush this frame; same modal
-    /// gate as the terminal pane picture.
+    /// The markdown-preview image escape to flush this frame; held back
+    /// under a pop-up, as the terminal pane picture is.
     pub fn markdown_image_payload(&self) -> Option<(&str, &MarkdownImageLayout)> {
-        if self.shortcuts_modal.is_some()
-            || self.file_finder.is_some()
-            || self.command_palette.is_some()
-            || self.go_to_symbol.is_some()
-            || self.workspace_symbols.is_some()
-            || self.process_picker.is_some()
-            || self.zoxide_jump.is_some()
-            || self.command_history_popup.is_some()
-            || self.branch_picker.is_some()
-            || self.input_prompt.is_some()
-            || self.list_picker.is_some()
-        {
+        if self.pictures_held_back() {
             return None;
         }
         self.overlays.markdown_image.payload()
@@ -1734,21 +1707,11 @@ impl App {
         self.overlays.terminal_image.consume_clear()
     }
 
-    /// The pane image escape to flush this frame, gated off while any modal
-    /// popup is up so the picture never paints over it.
+    /// The pane image escape to flush this frame, held back while a pop-up
+    /// is open ([`Self::pictures_held_back`]) so the picture never paints
+    /// over it.
     pub fn terminal_image_payload(&self) -> Option<(&str, &TerminalImageLayout)> {
-        if self.shortcuts_modal.is_some()
-            || self.file_finder.is_some()
-            || self.command_palette.is_some()
-            || self.go_to_symbol.is_some()
-            || self.workspace_symbols.is_some()
-            || self.process_picker.is_some()
-            || self.zoxide_jump.is_some()
-            || self.command_history_popup.is_some()
-            || self.branch_picker.is_some()
-            || self.input_prompt.is_some()
-            || self.list_picker.is_some()
-        {
+        if self.pictures_held_back() {
             return None;
         }
         self.overlays.terminal_image.payload()
@@ -2160,19 +2123,7 @@ impl App {
     }
 
     pub fn minimap_image_payload(&self) -> Option<(&str, &MinimapLayout)> {
-        if self.shortcuts_modal.is_some()
-            || self.file_finder.is_some()
-            || self.command_palette.is_some()
-            || self.go_to_symbol.is_some()
-            || self.workspace_symbols.is_some()
-            || self.process_picker.is_some()
-            || self.zoxide_jump.is_some()
-            || self.command_history_popup.is_some()
-            || self.branch_picker.is_some()
-            || self.input_prompt.is_some()
-            || self.list_picker.is_some()
-            || self.menu_covers(self.minimap_img_rect)
-        {
+        if self.pictures_held_back() || self.menu_covers(self.minimap_img_rect) {
             return None;
         }
         self.overlays.minimap.payload()
