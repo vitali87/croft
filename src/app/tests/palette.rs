@@ -2890,10 +2890,13 @@ fn quick_open_line_hint_counts_the_buffer_a_pick_opens_as_it_is_now() {
 /// #2062 (card 8): every palette command as the palette knows it, saved in
 /// `golden/commands.txt`. Each row is one command in palette order: its
 /// place there, its variant, id, title and extra search words, its hint as
-/// macOS and Linux show it, and the groups it is in. The
-/// Customize Layout rows follow in the popup's order. The command-table
-/// refactor must leave the file byte-identical; rewrite it with
-/// `CROFT_BLESS=1` only after a change meant to move a command.
+/// macOS and Linux show it, and the groups it is in. The Customize Layout
+/// rows follow in the popup's order. The command-table refactor must leave
+/// the file byte-identical; rewrite it with `CROFT_BLESS=1` only after a
+/// change meant to move a command. Like the screen goldens and the key
+/// ledger, it runs on Linux, where the goldens module is built; it spells
+/// both platforms' hints itself, so the macOS spelling is checked there too.
+#[cfg(target_os = "linux")]
 #[test]
 fn every_command_matches_the_saved_registry() {
     use crate::widgets::command_palette::{ALL_COMMANDS, LAYOUT_COMMANDS, hint_for_platform};
