@@ -50,6 +50,7 @@ mod mouse_input;
 mod nav;
 mod overlay;
 mod perf_hud;
+mod popups;
 mod prompts;
 mod remote_sessions;
 mod review;
@@ -5331,9 +5332,11 @@ impl App {
         &mut self.terminals[self.active_terminal]
     }
 
-    /// Whether a modal overlay owns the screen right now. The same eleven-way
-    /// check was repeated verbatim at three overlay-flush sites; auto-hide
-    /// (#260) needs it too, so it lives here once.
+    /// Whether one of twelve pop-ups is open: the pickers, the input prompt,
+    /// F1 and an agent's edit proposal. Mouse handling, auto-hide (#260) and
+    /// the editor's accent marks ask this. Pictures ask
+    /// [`Self::pictures_held_back`] instead, which counts every pop-up
+    /// (#2659).
     fn modal_overlay_open(&self) -> bool {
         self.approval_ui.is_some()
             || self.shortcuts_modal.is_some()
