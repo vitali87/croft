@@ -2203,14 +2203,14 @@ fn every_listed_chord_runs_its_command() {
         .iter()
         .filter(|c| !matches!(c.name, "palette" | "confirm"))
         .collect();
-    // One thread per context: each builds its own apps.
-    let runs: Vec<(&str, Vec<(Command, String)>)> = std::thread::scope(|s| {
-        let handles: Vec<_> = contexts
-            .iter()
-            .map(|ctx| s.spawn(move || (ctx.name, command_runs(ctx))))
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
+    // One context after another, as the ledger's own tests build one app at
+    // a time: apps built side by side here are load the suite's wait budgets
+    // do not count, and under CI's load Source Control's git status outran
+    // its budget.
+    let runs: Vec<(&str, Vec<(Command, String)>)> = contexts
+        .iter()
+        .map(|ctx| (ctx.name, command_runs(ctx)))
+        .collect();
     let places = proved_in_places();
     let mut unproven: Vec<String> = Vec::new();
     let mut proven: Vec<&str> = Vec::new();
