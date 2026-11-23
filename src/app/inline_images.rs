@@ -210,6 +210,18 @@ pub(super) fn rgba_to_png(rgba: Vec<u8>, w: u32, h: u32) -> Option<Vec<u8>> {
 }
 
 impl App {
+    /// A picture's escape sequence as the terminal must receive it, in the
+    /// picture protocol croft detected: wrapped for tmux to pass through when
+    /// croft runs inside tmux. The pictures built on the UI thread all go
+    /// through here (#2062).
+    pub(super) fn wrap_for_terminal(&self, raw: String) -> String {
+        crate::iterm2_inline::maybe_tmux_wrap(
+            self.inline_protocol,
+            crate::iterm2_inline::detect_tmux(),
+            raw,
+        )
+    }
+
     /// Detect inline-image support via env vars only — no stdin queries, no
     /// raw-mode contention. Queries the terminal cell pixel size via
     /// crossterm's `window_size` (TIOCGWINSZ ioctl, no stdin involvement).
@@ -902,11 +914,7 @@ impl App {
                 crate::iterm2_inline::KITTY_ID_HERO,
                 crate::iterm2_inline::KITTY_Z_BELOW_TEXT_AND_BG,
             ) {
-                let osc = crate::iterm2_inline::maybe_tmux_wrap(
-                    protocol,
-                    crate::iterm2_inline::detect_tmux(),
-                    raw,
-                );
+                let osc = self.wrap_for_terminal(raw);
                 self.overlays.hero.set(osc, desired);
             }
         }
@@ -1595,11 +1603,7 @@ impl App {
                 crate::iterm2_inline::KITTY_Z_BELOW_TEXT_AND_BG,
             )
         {
-            let osc = crate::iterm2_inline::maybe_tmux_wrap(
-                self.inline_protocol,
-                crate::iterm2_inline::detect_tmux(),
-                raw,
-            );
+            let osc = self.wrap_for_terminal(raw);
             self.overlays.editor[side].set(osc, desired);
         }
     }
@@ -1766,11 +1770,7 @@ impl App {
                 crate::iterm2_inline::KITTY_Z_BELOW_TEXT_AND_BG,
             )
         {
-            let osc = crate::iterm2_inline::maybe_tmux_wrap(
-                self.inline_protocol,
-                crate::iterm2_inline::detect_tmux(),
-                raw,
-            );
+            let osc = self.wrap_for_terminal(raw);
             self.overlays.terminal_image.set(osc, desired);
         }
     }
@@ -1922,11 +1922,7 @@ impl App {
                 crate::iterm2_inline::KITTY_Z_BELOW_TEXT_AND_BG,
             )
         {
-            let osc = crate::iterm2_inline::maybe_tmux_wrap(
-                self.inline_protocol,
-                crate::iterm2_inline::detect_tmux(),
-                raw,
-            );
+            let osc = self.wrap_for_terminal(raw);
             self.overlays.markdown_image.set(osc, desired);
         }
     }
@@ -2146,11 +2142,7 @@ impl App {
             false,
             crate::iterm2_inline::KITTY_ID_MINIMAP,
         ) {
-            let osc = crate::iterm2_inline::maybe_tmux_wrap(
-                self.inline_protocol,
-                crate::iterm2_inline::detect_tmux(),
-                raw,
-            );
+            let osc = self.wrap_for_terminal(raw);
             self.overlays.minimap.set(osc, desired);
         }
     }
