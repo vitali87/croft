@@ -2886,3 +2886,46 @@ fn quick_open_line_hint_counts_the_buffer_a_pick_opens_as_it_is_now() {
         "a pick opens the active group's short copy"
     );
 }
+
+/// #2062 (card 8): every palette command as the palette knows it, saved in
+/// `golden/commands.txt`. Each row is one command in palette order: its
+/// place there, its variant, id, title and extra search words, its hint as
+/// macOS and Linux show it, and the groups it is in. The
+/// Customize Layout rows follow in the popup's order. The command-table
+/// refactor must leave the file byte-identical; rewrite it with
+/// `CROFT_BLESS=1` only after a change meant to move a command.
+#[test]
+fn every_command_matches_the_saved_registry() {
+    use crate::widgets::command_palette::{ALL_COMMANDS, LAYOUT_COMMANDS, hint_for_platform};
+    use std::fmt::Write as _;
+    let mut text = String::from(
+        "# Every palette command: src/app/tests/palette.rs. Rewrite with CROFT_BLESS=1 after a change meant to move one.\n\
+         # palette place | variant | id | title | keyword | macOS hint | Linux hint | groups\n",
+    );
+    for (place, cmd) in ALL_COMMANDS.iter().enumerate() {
+        let hint = cmd.keybinding_hint();
+        let groups: Vec<&str> = [
+            (LAYOUT_COMMANDS.contains(cmd), "layout"),
+            (cmd.skips_the_shell(), "skips-the-shell"),
+            (cmd.is_codeql(), "codeql"),
+        ]
+        .into_iter()
+        .filter_map(|(member, group)| member.then_some(group))
+        .collect();
+        let row = format!(
+            "{place} | {cmd:?} | {} | {} | {} | {} | {} | {}",
+            cmd.id(),
+            cmd.title(),
+            cmd.keyword(),
+            hint_for_platform(hint, true),
+            hint_for_platform(hint, false),
+            groups.join(" "),
+        );
+        writeln!(text, "{}", row.trim_end()).unwrap();
+    }
+    text.push_str("# Customize Layout, in the popup's order\n");
+    for cmd in LAYOUT_COMMANDS {
+        writeln!(text, "layout | {cmd:?}").unwrap();
+    }
+    super::golden::check_text("commands", &text);
+}

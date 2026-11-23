@@ -415,6 +415,15 @@ fn compare(dirs: &Dirs, name: &str, actual: &str, bless: bool) -> Result<(), Str
     ))
 }
 
+/// Compare `text` with the golden `name` that a test outside the scenes
+/// saves here, or rewrite it under `CROFT_BLESS=1`, failing the test with
+/// the first differences on a mismatch.
+pub(super) fn check_text(name: &str, text: &str) {
+    if let Err(err) = compare(&Dirs::repo(), name, text, blessing()) {
+        panic!("{err}");
+    }
+}
+
 /// A hand-built shot of `width` x 1 cells for the harness's own tests.
 fn shot_of(width: u16, paint: impl FnOnce(&mut Buffer)) -> Shot {
     let mut buffer = Buffer::empty(Rect::new(0, 0, width, 1));
@@ -1032,8 +1041,9 @@ fn every_golden_belongs_to_a_scene() {
         );
         return;
     };
-    // Goldens another test module saves here: the key ledger's.
-    const SAVED_ELSEWHERE: [&str; 1] = ["key-ledger"];
+    // Goldens other test modules save here: the key ledger's and the
+    // command registry's.
+    const SAVED_ELSEWHERE: [&str; 2] = ["key-ledger", "commands"];
     let owned: Vec<String> = owned_goldens()
         .into_iter()
         .chain(SAVED_ELSEWHERE.map(String::from))
