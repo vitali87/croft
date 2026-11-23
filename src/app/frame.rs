@@ -2341,6 +2341,9 @@ impl App {
         // hidden panel, alt screen, off-screen anchor — is inside).
         self.update_terminal_image_overlay();
         self.update_markdown_image_overlay();
+        // The shell's grey history suggestion is part of its typed line, so
+        // it is drawn with the panes, under every pop-up (#2667).
+        self.paint_terminal_suggestion(frame);
         // Every picture's place is known now and nothing is drawn over the
         // panes yet: what lies under each picture is noted, to compare with
         // the finished frame (#2663).
@@ -2447,7 +2450,6 @@ impl App {
         // composite over the tooltip; re-emitting the box last wins the cell.
         self.ui_tooltip_area = tooltip_area;
 
-        self.paint_terminal_suggestion(frame);
         self.render_screencast(frame, main_area);
         // The last of the frame's drawing: a picture whose cells changed
         // since the note above has a pop-up over it, and waits (#2663).

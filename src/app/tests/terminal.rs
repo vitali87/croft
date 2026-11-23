@@ -8398,3 +8398,105 @@ fn a_bracketed_paste_into_the_terminal_find_bar_lands_at_the_caret() {
     assert_eq!(find.query, "abc");
     assert_eq!(find.caret(), 2, "the caret stays after what was pasted");
 }
+
+/// The bug (#2667): the shell's grey history suggestion was drawn after
+/// every pop-up, so with the terminal focused it was written over Settings,
+/// a confirm or any pop-up covering the shell's line. It is part of that
+/// line, and is drawn with it, under the pop-ups.
+#[test]
+fn the_shell_suggestion_never_draws_over_a_popup() {
+    use crate::app::popups::Popup;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.command_history =
+        crate::command_history::CommandHistory::load(&tmp.path().join("hist.jsonl"));
+    // A long typed line puts the suggestion in the middle of the screen,
+    // under the pop-ups drawn there; the newlines put it mid-terminal.
+    let typed = format!("echo {}", "a".repeat(60));
+    app.command_history
+        .entries
+        .push(crate::command_history::HistoryEntry {
+            cmd: format!("{typed} && echo done"),
+            cwd: String::new(),
+            host: String::new(),
+            exit: Some(0),
+            dur_ms: 0,
+            ts: 0,
+        });
+    let script = format!(
+        "printf '\\n\\n\\n\\n\\n\\n\\n\\n\\n\\n\\033]133;A\\007$ \\033]133;B\\007{typed}'; sleep 30"
+    );
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), script],
+        tmp.path(),
+    )
+    .unwrap();
+    app.active_terminal = 0;
+    app.show_terminal = true;
+    app.terminal_maximized = true;
+    app.focus_pane(Pane::Terminal);
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 45)).unwrap();
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the shell's suggestion to show",
+        || {
+            term.draw(|f| app.render(f)).unwrap();
+            app.term_suggestion.is_some()
+        },
+    );
+    let mut draw = |app: &mut App, suggest: bool| {
+        app.term_suggest_enabled = suggest;
+        term.draw(|f| app.render(f)).unwrap().buffer.clone()
+    };
+    let base = draw(&mut app, false);
+    let shown = draw(&mut app, true);
+    let suggestion: Vec<(u16, u16)> = base
+        .content
+        .iter()
+        .enumerate()
+        .filter(|(i, c)| shown.content[*i] != **c)
+        .map(|(i, _)| base.pos_of(i))
+        .collect();
+    assert!(
+        !suggestion.is_empty(),
+        "the suggestion must show with no pop-up open"
+    );
+
+    let mut over = Vec::new();
+    let mut covering = Vec::new();
+    for p in Popup::ALL {
+        let _hook = super::popups::open(&mut app, p);
+        let without = draw(&mut app, false);
+        let with = draw(&mut app, true);
+        // Cells the pop-up drew, and cells the suggestion drew over it.
+        // A backdrop that only dims the text behind a picker is not the
+        // pop-up itself: the suggestion is dimmed with the rest of the line.
+        let popup = |xy: (u16, u16)| {
+            without[xy].symbol() != base[xy].symbol() || without[xy].bg != base[xy].bg
+        };
+        if suggestion.iter().any(|&xy| popup(xy)) {
+            covering.push(p);
+        }
+        // Only the suggestion's own cells: a spinner elsewhere in a pop-up
+        // may move between the two frames.
+        let drawn_over = suggestion
+            .iter()
+            .filter(|&&xy| with[xy] != without[xy] && popup(xy))
+            .count();
+        if drawn_over > 0 {
+            over.push(format!("{p:?} ({drawn_over} cells)"));
+        }
+        super::popups::close(&mut app, p);
+        assert!(!p.is_open(&app), "{p:?} must close again");
+    }
+    assert!(
+        covering.contains(&Popup::SettingsEditor),
+        "Settings must cover the suggestion, or this test proves nothing: {covering:?}"
+    );
+    assert!(
+        over.is_empty(),
+        "the shell's suggestion was drawn over these pop-ups: {}",
+        over.join(", ")
+    );
+}
