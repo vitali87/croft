@@ -2094,17 +2094,15 @@ fn effects_in(ctx: &Context, enders: &mut Enders, run: impl FnOnce(&mut App)) ->
     fx
 }
 
-/// For each command a [`PROOF_PLACES`] entry names, every line on which its
-/// chord and its palette run did not do the same work there; none for a
-/// command they did.
-fn proved_in_places() -> Vec<(Command, Vec<String>)> {
+/// What each [`PROOF_PLACES`] entry showed for each chord of each command
+/// it names: the command, the chord, and `None` where pressing the chord did
+/// what running the command did there, else the line saying what each did.
+fn proved_in_places() -> Vec<(Command, String, Option<String>)> {
     let mut enders = Enders::default();
-    let mut out: Vec<(Command, Vec<String>)> = Vec::new();
+    let mut out = Vec::new();
     for place in PROOF_PLACES {
         for cmd in place.commands {
             let ran = effects_in(&place.context, &mut enders, |app| app.run_command(*cmd));
-            let mut misses = Vec::new();
-            let mut proven = false;
             for keys in linux_keys(cmd.keybinding_hint()) {
                 let Ok(keys) = keys else { continue };
                 let pressed = effects_in(&place.context, &mut enders, |app| {
@@ -2112,20 +2110,15 @@ fn proved_in_places() -> Vec<(Command, Vec<String>)> {
                         let _ = app.handle_key(*key);
                     }
                 });
-                if same_work(&pressed, &ran) {
-                    proven = true;
-                } else {
-                    misses.push(format!(
-                        "{} | {} | ran: {ran} | pressed: {pressed}",
-                        place.context.name,
-                        spell(&keys)
-                    ));
-                }
+                let chord = spell(&keys);
+                let miss = (!same_work(&pressed, &ran)).then(|| {
+                    format!(
+                        "{} | {chord} | ran: {ran} | pressed: {pressed}",
+                        place.context.name
+                    )
+                });
+                out.push((*cmd, chord, miss));
             }
-            if proven {
-                misses.clear();
-            }
-            out.push((*cmd, misses));
         }
     }
     out
@@ -2226,28 +2219,33 @@ fn every_listed_chord_runs_its_command() {
         if hint.is_empty() {
             continue;
         }
+        // Every chord the hint lists must run the command somewhere.
         let mut lines = Vec::new();
-        let mut done = false;
+        let mut done = true;
+        let mut pressed_any = false;
         for keys in linux_keys(hint) {
             let Ok(keys) = keys else { continue };
+            pressed_any = true;
             let chord = spell(&keys);
+            let mut this_one = false;
             for (context, list) in &runs {
                 let ran = &list.iter().find(|(c, _)| c == cmd).unwrap().1;
                 let pressed = saved.get(&(context.to_string(), chord.clone()));
                 let pressed = pressed.map_or("(not pressed there)", String::as_str);
-                if same_work(pressed, ran) {
-                    done = true;
-                }
+                this_one |= same_work(pressed, ran);
                 lines.push(format!(
                     "  {context} | {chord} | ran: {ran} | pressed: {pressed}"
                 ));
             }
+            for (_, _, miss) in places.iter().filter(|(c, k, _)| c == cmd && *k == chord) {
+                match miss {
+                    None => this_one = true,
+                    Some(line) => lines.push(format!("  {line}")),
+                }
+            }
+            done &= this_one;
         }
-        if let Some((_, misses)) = places.iter().find(|(c, _)| c == cmd) {
-            done |= misses.is_empty();
-            lines.extend(misses.iter().map(|m| format!("  {m}")));
-        }
-        if done {
+        if done && pressed_any {
             proven.push(cmd.id());
         } else if !UNPROVEN.iter().any(|(id, _)| *id == cmd.id()) {
             unproven.push(format!("{} [{hint}]\n{}", cmd.id(), lines.join("\n")));
