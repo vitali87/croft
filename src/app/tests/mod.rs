@@ -340,7 +340,8 @@ fn menu_action_of<'a>(items: &'a [MenuEntry], label: &str) -> Option<&'a MenuAct
 /// Explorer menus over `file` (with a copied file to paste and another to
 /// compare with), and of the rows with a shortcut in the menus built where
 /// they open: the editor's, its gutter's, the Outline's, a folder's in the
-/// Explorer, the terminal's, a finished command's and a CAPTURES row's. These
+/// Explorer, the terminal's, the status bar's indentation menu's, a finished
+/// command's and a CAPTURES row's. These
 /// are the rows whose shortcuts the menus advertise (#885).
 fn menu_row_actions(app: &App, file: &Path) -> Vec<MenuAction> {
     fn actions(entries: Vec<MenuEntry>) -> Vec<MenuAction> {
@@ -439,6 +440,8 @@ fn menu_row_actions(app: &App, file: &Path) -> Vec<MenuAction> {
         MenuAction::ToggleMaximizeTerminal(0),
         MenuAction::KillTerminal(0),
         MenuAction::ClearTerminal(0),
+        MenuAction::ConvertIndentation(true),
+        MenuAction::ConvertIndentation(false),
     ]);
     let finished = crate::widgets::terminal::CommandDecoration {
         id: 0,

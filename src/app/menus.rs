@@ -106,6 +106,10 @@ pub(super) fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::CopyCommandOutput(..) => Some("⌘K ⇧C"),
         MenuAction::SelectCommandOutput(..) => Some("⌘K ⇧S"),
         MenuAction::RerunCommand(..) => Some("⌘K ⇧R"),
+        // The status bar's indentation menu (#2643): the chords the palette's
+        // Convert Indentation to Spaces / Tabs carry.
+        MenuAction::ConvertIndentation(true) => Some("⌥⇧⌘S"),
+        MenuAction::ConvertIndentation(false) => Some("⌥⇧⌘T"),
         _ => None,
     }
 }
