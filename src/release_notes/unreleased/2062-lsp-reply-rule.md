@@ -1,1 +1,0 @@
-refactor: Groundwork for the refactor program (#2062): Go to Declaration, Go to Type Definition, Rename, Format Document and Quick Fix read their language-server replies through one shared rule (keep the last answer to the request still waited on) instead of five copies of the same loop. Nothing changes in use.

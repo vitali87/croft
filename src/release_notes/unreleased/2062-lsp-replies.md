@@ -1,1 +1,0 @@
-refactor: Groundwork for the refactor program (#2062): the language-server manager's 31 reply channels are made and held in one place, a pair of bundles named alike, instead of the same list written out five times. Nothing changes in use.

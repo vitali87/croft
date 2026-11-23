@@ -1,1 +1,0 @@
-refactor: Groundwork for the refactor program (#2062): the list of every built-in command (titles, shortcut hints, ids and search words) lives in its own file, out of the command palette's drawing code, so the palette, menus and keybindings read it from one place. Nothing changes in use.

@@ -1,1 +1,0 @@
-refactor: Groundwork for the refactor program (#2062): a command's group (the terminal's commands, CodeQL's) is declared on its row of the command table instead of read from how its title starts, so renaming a title can no longer change how its keys are routed, and a `keybindings.json` id finds its command in one step instead of a scan of every command. Nothing changes in use.
