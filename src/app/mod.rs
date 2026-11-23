@@ -2147,11 +2147,10 @@ pub struct App {
     /// Whether the editor was wide enough for the strip on the last frame,
     /// so turning the minimap on can say why it does not show.
     minimap_room: bool,
-    /// The buffer ratatui drew last, and what each small chrome image (the
-    /// PROBLEMS badge, Run and Debug icon, sidebar illustrations) was sent
-    /// over, keyed by overlay, for [`App::chrome_image_due`]. Keys not
-    /// checked in a frame (the image was hidden) are dropped.
-    drawn_buffer: Option<ratatui::buffer::Buffer>,
+    /// What each small chrome image (the PROBLEMS badge, Run and Debug
+    /// icon, sidebar illustrations) was last sent over, keyed by overlay,
+    /// for [`App::chrome_image_due`]. Keys not checked in a frame (the image
+    /// was hidden) are dropped.
     chrome_sent: std::collections::HashMap<&'static str, u64>,
     chrome_seen: std::collections::HashSet<&'static str>,
     /// A left-drag is panning the view via the minimap strip.
@@ -4572,7 +4571,6 @@ impl App {
             minimap_text: false,
             minimap_text_cache: None,
             minimap_room: true,
-            drawn_buffer: None,
             chrome_sent: std::collections::HashMap::new(),
             chrome_seen: std::collections::HashSet::new(),
             minimap_drag: false,
@@ -5188,7 +5186,6 @@ impl App {
     /// this frame; the next frame clears, full-redraws, and re-emits a single
     /// clean set at the new cells.
     pub fn flush_activity_image_overlays(&mut self, around: &[u64]) {
-        use std::io::Write;
         // The keepalive re-emit fights iTerm2's image-cache eviction. Neither
         // the sixel cell buffer nor Kitty's image layer evicts, so there the
         // icons re-emit only when dirty: on Kitty the keepalive cost about
@@ -5246,34 +5243,27 @@ impl App {
             self.overlays.activity.set_sent(sent);
             return;
         }
-        let mut out = stdout();
         let cursor_on = self.cursor_should_be_visible();
-        let _ = write!(out, "\x1b[?25l\x1b[s");
-        for ((x, y), seq) in &overlays {
-            // Same screen bound as the image writers (#513): a raw
-            // absolute-CUP write that ratatui cannot repair, so the origin
-            // is checked before it is used.
-            //
-            // 1x1 is NARROWER than some payloads here, and knowingly so.
-            // `pending_activity_image_overlays` discards each block's
-            // `Rect` and returns only its origin, and a count badge is 2-3
-            // cells wide (`count_badge_cells_w`), so a badge whose left
-            // edge is on screen and right edge is not would pass this.
-            // Not reachable today -- the badges anchor to the left-hand
-            // activity bar -- and making it exact means returning the
-            // `Rect` from that function, which is a wider change than this
-            // guard. Recorded rather than left to be rediscovered.
-            if !self.overlay_fits_on_screen(*x, *y, 1, 1) {
-                continue;
-            }
-            let _ = write!(out, "\x1b[{};{}H", y + 1, x + 1); // 1-based
-            let _ = out.write_all(seq.as_bytes());
-        }
-        let _ = write!(out, "\x1b[u");
-        if cursor_on {
-            let _ = write!(out, "\x1b[?25h");
-        }
-        let _ = out.flush();
+        let on_screen = overlays
+            .iter()
+            .filter(|((x, y), _)| {
+                // Same screen bound as the image writers (#513): a raw
+                // absolute-CUP write that ratatui cannot repair, so the origin
+                // is checked before it is used.
+                //
+                // 1x1 is NARROWER than some payloads here, and knowingly so.
+                // `pending_activity_image_overlays` discards each block's
+                // `Rect` and returns only its origin, and a count badge is 2-3
+                // cells wide (`count_badge_cells_w`), so a badge whose left
+                // edge is on screen and right edge is not would pass this.
+                // Not reachable today -- the badges anchor to the left-hand
+                // activity bar -- and making it exact means returning the
+                // `Rect` from that function, which is a wider change than this
+                // guard. Recorded rather than left to be rediscovered.
+                self.overlay_fits_on_screen(*x, *y, 1, 1)
+            })
+            .map(|((x, y), seq)| (*x, *y, seq.as_bytes()));
+        write_inline_images(&mut stdout(), on_screen, cursor_on);
         self.overlays.activity.mark_emitted();
         self.overlays.activity.store_positions(positions);
         self.overlays.activity.set_neighbourhood(around.to_vec());
@@ -6657,11 +6647,12 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             }
             crate::startup_trace::mark("loop work done");
             let draw_start = std::time::Instant::now();
-            let drawn = terminal.draw(|f| app.render_for_terminal(f))?;
+            // The frame ratatui just drew, read in place by the picture
+            // flushes below rather than copied (#2062).
+            let mut drawn = terminal.draw(|f| app.render_for_terminal(f))?.buffer;
             crate::startup_trace::mark("frame drawn");
             app.sync_caret_style();
-            let mut underlays = app.image_underlays(drawn.buffer);
-            app.keep_drawn_buffer(drawn.buffer);
+            let mut underlays = app.image_underlays(drawn);
             // Record render+flush time and the bytes ratatui shipped this
             // frame so the F8 HUD can show where remote latency goes.
             app.perf.record_draw(draw_start.elapsed().as_micros());
@@ -6675,9 +6666,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 app.overlays.welcome.mark_dirty();
                 app.overlays.hero.mark_dirty();
                 app.forget_sent_images();
-                let drawn = terminal.draw(|f| app.render_for_terminal(f))?;
-                underlays = app.image_underlays(drawn.buffer);
-                app.keep_drawn_buffer(drawn.buffer);
+                drawn = terminal.draw(|f| app.render_for_terminal(f))?.buffer;
+                underlays = app.image_underlays(drawn);
             }
             // After ratatui flushes its diff, paint the activity-bar icons
             // directly via OSC-1337 on every redraw. We previously gated
@@ -6709,17 +6699,13 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                     if !app.overlays.editor[side].needs_emit(underlays.editor[side]) {
                         continue;
                     }
-                    use std::io::Write;
-                    let mut out = stdout();
-                    let cursor_on = app.cursor_should_be_visible();
-                    let _ = write!(out, "\x1b[?25l\x1b[s");
-                    let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
-                    let _ = out.write_all(osc.as_bytes());
-                    let _ = write!(out, "\x1b[u");
-                    if cursor_on {
-                        let _ = write!(out, "\x1b[?25h");
-                    }
-                    let _ = out.flush();
+                    write_inline_image(
+                        &mut stdout(),
+                        layout.cell_x,
+                        layout.cell_y,
+                        osc.as_bytes(),
+                        app.cursor_should_be_visible(),
+                    );
                     app.mark_editor_image_displayed(side);
                     app.overlays.editor[side].mark_sent_over(underlays.editor[side]);
                 } else {
@@ -6737,17 +6723,13 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 )
             {
                 if app.overlays.terminal_image.needs_emit(underlays.terminal) {
-                    use std::io::Write;
-                    let mut out = stdout();
-                    let cursor_on = app.cursor_should_be_visible();
-                    let _ = write!(out, "\x1b[?25l\x1b[s");
-                    let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
-                    let _ = out.write_all(osc.as_bytes());
-                    let _ = write!(out, "\x1b[u");
-                    if cursor_on {
-                        let _ = write!(out, "\x1b[?25h");
-                    }
-                    let _ = out.flush();
+                    write_inline_image(
+                        &mut stdout(),
+                        layout.cell_x,
+                        layout.cell_y,
+                        osc.as_bytes(),
+                        app.cursor_should_be_visible(),
+                    );
                     app.mark_terminal_image_displayed();
                     app.overlays
                         .terminal_image
@@ -6767,17 +6749,13 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 )
             {
                 if app.overlays.markdown_image.needs_emit(underlays.markdown) {
-                    use std::io::Write;
-                    let mut out = stdout();
-                    let cursor_on = app.cursor_should_be_visible();
-                    let _ = write!(out, "\x1b[?25l\x1b[s");
-                    let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
-                    let _ = out.write_all(osc.as_bytes());
-                    let _ = write!(out, "\x1b[u");
-                    if cursor_on {
-                        let _ = write!(out, "\x1b[?25h");
-                    }
-                    let _ = out.flush();
+                    write_inline_image(
+                        &mut stdout(),
+                        layout.cell_x,
+                        layout.cell_y,
+                        osc.as_bytes(),
+                        app.cursor_should_be_visible(),
+                    );
                     app.mark_markdown_image_displayed();
                     app.overlays
                         .markdown_image
@@ -6797,34 +6775,28 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 )
             {
                 if app.overlays.minimap.needs_emit(underlays.minimap) {
-                    use std::io::Write;
-                    let mut out = stdout();
-                    let cursor_on = app.cursor_should_be_visible();
-                    let _ = write!(out, "\x1b[?25l\x1b[s");
-                    let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
-                    let _ = out.write_all(osc.as_bytes());
-                    let _ = write!(out, "\x1b[u");
-                    if cursor_on {
-                        let _ = write!(out, "\x1b[?25h");
-                    }
-                    let _ = out.flush();
+                    write_inline_image(
+                        &mut stdout(),
+                        layout.cell_x,
+                        layout.cell_y,
+                        osc.as_bytes(),
+                        app.cursor_should_be_visible(),
+                    );
                     app.mark_minimap_image_displayed();
                     app.overlays.minimap.mark_sent_over(underlays.minimap);
                 }
             } else {
                 app.overlays.minimap.forget_sent();
             }
-            // Run-and-Debug headline icon: same re-emit-every-frame trick.
-            // Only fires while the sidebar is on the Run-Debug view and the
-            // panel reserved a cell for the icon on its last render. On
-            // view change the `consume_run_debug_image_clear` gate above
-            // already armed `terminal.clear()`, evicting the cached
-            // image cells before the next sidebar paints.
-            app.flush_run_debug_icon_overlay();
-            app.flush_problems_badge_overlay();
-            app.flush_no_repo_hero_overlay();
-            app.flush_ssh_empty_state_overlay();
-            app.end_chrome_flush();
+            // The small chrome pictures: the Run-and-Debug headline icon,
+            // the PROBLEMS badge and the source-control and SSH
+            // illustrations. The icon only fires while the sidebar is on
+            // the Run-Debug view and the panel reserved a cell for it on
+            // its last render. On view change the
+            // `consume_run_debug_image_clear` gate above already armed
+            // `terminal.clear()`, evicting the cached image cells before
+            // the next sidebar paints.
+            app.flush_chrome_images(drawn);
             // Welcome-screen logo: same OSC-1337 trick, gated by its own
             // dirty flag and only emitted while the editor pane is in its
             // blank initial state.
@@ -6836,17 +6808,13 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                     layout.cell_h,
                 )
             {
-                use std::io::Write;
-                let mut out = stdout();
-                let cursor_on = app.cursor_should_be_visible();
-                let _ = write!(out, "\x1b[?25l\x1b[s");
-                let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
-                let _ = out.write_all(img.as_bytes());
-                let _ = write!(out, "\x1b[u");
-                if cursor_on {
-                    let _ = write!(out, "\x1b[?25h");
-                }
-                let _ = out.flush();
+                write_inline_image(
+                    &mut stdout(),
+                    layout.cell_x,
+                    layout.cell_y,
+                    img.as_bytes(),
+                    app.cursor_should_be_visible(),
+                );
                 app.mark_welcome_image_emitted();
             }
             // Last of all: re-paint the chrome tooltip on top of any sidebar
