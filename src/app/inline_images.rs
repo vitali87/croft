@@ -2438,12 +2438,9 @@ impl App {
 }
 
 /// Send one inline picture straight to the terminal, after ratatui's diff
-/// (ratatui cannot draw one): the caret is hidden and its place saved, the
-/// picture is written from cell (`cell_x`, `cell_y`), and the caret goes back
-/// where it was, shown again only when `cursor_on` says it should be. Every
-/// single picture croft sends goes out through here, so this guard around it
-/// is written once (#2062). `payload` is the picture's escape sequence,
-/// borrowed: a picture can be megabytes.
+/// (ratatui cannot draw one): a batch of one for [`write_inline_images`].
+/// `payload` is the picture's escape sequence, borrowed: a picture can be
+/// megabytes.
 pub(super) fn write_inline_image(
     out: &mut impl std::io::Write,
     cell_x: u16,
@@ -2451,9 +2448,27 @@ pub(super) fn write_inline_image(
     payload: &[u8],
     cursor_on: bool,
 ) {
+    write_inline_images(out, [(cell_x, cell_y, payload)], cursor_on);
+}
+
+/// Send inline pictures straight to the terminal, after ratatui's diff
+/// (ratatui cannot draw one), inside one caret guard: the caret is hidden
+/// and its place saved, each picture is written from its cell (`x`, `y`),
+/// and the caret goes back where it was, shown again only when `cursor_on`
+/// says it should be. Every picture croft sends goes out through here --
+/// one at a time through [`write_inline_image`], or the activity bar's
+/// icons and badges together -- so this guard is written once (#2062). An
+/// empty batch still sends the guard, as the activity bar always did.
+pub(super) fn write_inline_images<'a>(
+    out: &mut impl std::io::Write,
+    pictures: impl IntoIterator<Item = (u16, u16, &'a [u8])>,
+    cursor_on: bool,
+) {
     let _ = write!(out, "\x1b[?25l\x1b[s");
-    let _ = write!(out, "\x1b[{};{}H", cell_y + 1, cell_x + 1);
-    let _ = out.write_all(payload);
+    for (cell_x, cell_y, payload) in pictures {
+        let _ = write!(out, "\x1b[{};{}H", cell_y + 1, cell_x + 1);
+        let _ = out.write_all(payload);
+    }
     let _ = write!(out, "\x1b[u");
     if cursor_on {
         let _ = write!(out, "\x1b[?25h");

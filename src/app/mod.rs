@@ -5188,7 +5188,6 @@ impl App {
     /// this frame; the next frame clears, full-redraws, and re-emits a single
     /// clean set at the new cells.
     pub fn flush_activity_image_overlays(&mut self, around: &[u64]) {
-        use std::io::Write;
         // The keepalive re-emit fights iTerm2's image-cache eviction. Neither
         // the sixel cell buffer nor Kitty's image layer evicts, so there the
         // icons re-emit only when dirty: on Kitty the keepalive cost about
@@ -5246,34 +5245,27 @@ impl App {
             self.overlays.activity.set_sent(sent);
             return;
         }
-        let mut out = stdout();
         let cursor_on = self.cursor_should_be_visible();
-        let _ = write!(out, "\x1b[?25l\x1b[s");
-        for ((x, y), seq) in &overlays {
-            // Same screen bound as the image writers (#513): a raw
-            // absolute-CUP write that ratatui cannot repair, so the origin
-            // is checked before it is used.
-            //
-            // 1x1 is NARROWER than some payloads here, and knowingly so.
-            // `pending_activity_image_overlays` discards each block's
-            // `Rect` and returns only its origin, and a count badge is 2-3
-            // cells wide (`count_badge_cells_w`), so a badge whose left
-            // edge is on screen and right edge is not would pass this.
-            // Not reachable today -- the badges anchor to the left-hand
-            // activity bar -- and making it exact means returning the
-            // `Rect` from that function, which is a wider change than this
-            // guard. Recorded rather than left to be rediscovered.
-            if !self.overlay_fits_on_screen(*x, *y, 1, 1) {
-                continue;
-            }
-            let _ = write!(out, "\x1b[{};{}H", y + 1, x + 1); // 1-based
-            let _ = out.write_all(seq.as_bytes());
-        }
-        let _ = write!(out, "\x1b[u");
-        if cursor_on {
-            let _ = write!(out, "\x1b[?25h");
-        }
-        let _ = out.flush();
+        let on_screen = overlays
+            .iter()
+            .filter(|((x, y), _)| {
+                // Same screen bound as the image writers (#513): a raw
+                // absolute-CUP write that ratatui cannot repair, so the origin
+                // is checked before it is used.
+                //
+                // 1x1 is NARROWER than some payloads here, and knowingly so.
+                // `pending_activity_image_overlays` discards each block's
+                // `Rect` and returns only its origin, and a count badge is 2-3
+                // cells wide (`count_badge_cells_w`), so a badge whose left
+                // edge is on screen and right edge is not would pass this.
+                // Not reachable today -- the badges anchor to the left-hand
+                // activity bar -- and making it exact means returning the
+                // `Rect` from that function, which is a wider change than this
+                // guard. Recorded rather than left to be rediscovered.
+                self.overlay_fits_on_screen(*x, *y, 1, 1)
+            })
+            .map(|((x, y), seq)| (*x, *y, seq.as_bytes()));
+        write_inline_images(&mut stdout(), on_screen, cursor_on);
         self.overlays.activity.mark_emitted();
         self.overlays.activity.store_positions(positions);
         self.overlays.activity.set_neighbourhood(around.to_vec());
