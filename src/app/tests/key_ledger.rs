@@ -20,6 +20,15 @@
 //! source leaves the ledger out, as it does the screen goldens, and there
 //! the comparison is skipped with a note.
 //!
+//! The ledger also proves that each palette command's chord runs that
+//! command. `every_listed_chord_runs_its_command` runs every command with a
+//! chord from the palette in the same contexts and compares what it did with
+//! what its chord did there, read from the saved ledger. A chord that works
+//! only in a given state (a Markdown file, a pinned tab, two terminals) is
+//! pressed in a place set up for it, in `PROOF_PLACES`. `UNPROVEN` names the
+//! commands no place reaches, with why (a language server, a debug session,
+//! this machine), and can only shrink.
+//!
 //! One chord reaches outside the test: re-rooting the Explorer
 //! (`ctrl+shift+/`) writes the window title straight to the terminal, so the
 //! test's output shows an `ESC]0;` sequence.
@@ -28,6 +37,7 @@
 //! be another file.
 
 use super::*;
+use crate::command_registry::Command;
 use crate::keymap::Chord;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -1738,4 +1748,531 @@ fn every_advertised_chord_does_what_the_ledger_says_in_the_command_palette() {
 #[test]
 fn every_advertised_chord_does_what_the_ledger_says_in_a_confirm_dialog() {
     check_context("confirm");
+}
+
+/// What each key sequence did in each context, read from the saved ledger,
+/// which the tests above keep true: `(context, chord)` to its effects. None
+/// where a published crate's source has no saved ledger.
+fn saved_presses() -> Option<BTreeMap<(String, String), String>> {
+    let saved = match std::fs::read_to_string(LEDGER) {
+        Ok(saved) => saved,
+        Err(_) if super::golden::packaged_source() => return None,
+        Err(err) => panic!("no saved ledger at {LEDGER} ({err}): write it with CROFT_BLESS=1"),
+    };
+    let presses = saved
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .map(|line| {
+            let mut parts = line.splitn(3, " | ");
+            let mut next = || parts.next().unwrap().to_string();
+            let (context, chord, effects) = (next(), next(), next());
+            ((context, chord), effects)
+        })
+        .collect();
+    Some(presses)
+}
+
+/// `effects` without its status line, which a command run from the palette
+/// may set where its chord does not (Toggle Word Wrap says "Word wrap: on").
+fn without_status(effects: &str) -> String {
+    let Some(at) = effects.find("status=\"") else {
+        return effects.to_string();
+    };
+    // The value is written with `{:?}`, so a quote inside it is escaped.
+    let value = &effects[at + "status=\"".len()..];
+    let mut end = None;
+    let mut escaped = false;
+    for (i, c) in value.char_indices() {
+        match c {
+            '\\' if !escaped => escaped = true,
+            '"' if !escaped => {
+                end = Some(i);
+                break;
+            }
+            _ => escaped = false,
+        }
+    }
+    let end = at + "status=\"".len() + end.expect("a closed status value") + 1;
+    let rest = format!("{}{}", &effects[..at], &effects[end..]);
+    rest.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Whether pressing a command's chord did what running the command did: the
+/// same effects, something happened, and at most the status line differs.
+fn same_work(pressed: &str, ran: &str) -> bool {
+    if ran == "-" {
+        return false;
+    }
+    if pressed == ran {
+        return true;
+    }
+    let (pressed, ran) = (without_status(pressed), without_status(ran));
+    !ran.is_empty() && pressed == ran
+}
+
+/// What running each palette command with a chord did in `ctx`, on an app
+/// set up as the ledger sets it up there. An app is kept for the next
+/// command while the last one changed nothing it shows, as the ledger keeps
+/// its apps, and `CROFT_LEDGER_FRESH=1` builds a new one for every command.
+fn command_runs(ctx: &Context) -> Vec<(Command, String)> {
+    let fresh = std::env::var("CROFT_LEDGER_FRESH").is_ok_and(|v| v == "1");
+    let mut enders = Enders::default();
+    let mut kept: Option<Built> = None;
+    let mut runs = Vec::new();
+    for cmd in crate::command_registry::ALL_COMMANDS {
+        if cmd.keybinding_hint().is_empty() {
+            continue;
+        }
+        let b = kept.get_or_insert_with(|| build(ctx));
+        b.app.run_command(*cmd);
+        if b.app.git_net_job.is_some() {
+            wait_for_git_net(&mut b.app);
+        }
+        if ctx.repo {
+            settle_source_control(&mut b.app, &b.root);
+        }
+        let fx = effects(&b.seen, &fingerprint(&b.app, &b.root));
+        if fresh || fx != "-" {
+            kept.take().unwrap().retire(&mut enders);
+        }
+        runs.push((*cmd, fx));
+    }
+    if let Some(done) = kept {
+        done.retire(&mut enders);
+    }
+    runs
+}
+
+/// Writes `text` to `name` in the app's workspace and opens it, the caret at
+/// `caret`.
+fn open_new(app: &mut App, name: &str, text: &str, caret: (usize, usize)) {
+    let path = app.workspace_root().join(name);
+    std::fs::write(&path, text).unwrap();
+    app.editor.open_pinned(&path).unwrap();
+    (app.editor.cursor_row, app.editor.cursor_col) = caret;
+    app.focus_pane(Pane::Editor);
+}
+
+/// A file eight blocks deep, so every fold level up to seven has a block.
+const DEEP_RS: &str = concat!(
+    "fn deep() {\n",
+    "    if a {\n",
+    "        if b {\n",
+    "            if c {\n",
+    "                if d {\n",
+    "                    if e {\n",
+    "                        if f {\n",
+    "                            if g {\n",
+    "                                done();\n",
+    "                            }\n",
+    "                        }\n",
+    "                    }\n",
+    "                }\n",
+    "            }\n",
+    "        }\n",
+    "    }\n",
+    "}\n",
+);
+
+/// A file with two merge conflicts.
+const CONFLICTED: &str = concat!(
+    "a\n",
+    "<<<<<<< HEAD\n",
+    "ours\n",
+    "=======\n",
+    "theirs\n",
+    ">>>>>>> topic\n",
+    "b\n",
+    "<<<<<<< HEAD\n",
+    "ours too\n",
+    "=======\n",
+    "theirs too\n",
+    ">>>>>>> topic\n",
+    "c\n",
+);
+
+/// A place the ledger's contexts do not set up, where some commands' chords
+/// do their work, and the commands it proves.
+struct ProofPlace {
+    context: Context,
+    commands: &'static [Command],
+}
+
+/// The places beyond the ledger's own contexts.
+const PROOF_PLACES: &[ProofPlace] = &[
+    ProofPlace {
+        context: Context {
+            name: "trailing whitespace and blank lines",
+            repo: false,
+            setup: |app| open_new(app, "trim.rs", "fn a() {   \n}  \n\n\n\n", (0, 0)),
+        },
+        commands: &[Command::TrimTrailingWhitespace, Command::TrimFinalNewlines],
+    },
+    ProofPlace {
+        context: Context {
+            name: "a selection grown twice",
+            repo: false,
+            setup: |app| {
+                app.focus_pane(Pane::Editor);
+                app.run_command(Command::ExpandSelection);
+                app.run_command(Command::ExpandSelection);
+            },
+        },
+        commands: &[Command::ShrinkSelection],
+    },
+    ProofPlace {
+        context: Context {
+            name: "Find open over a selection",
+            repo: false,
+            setup: |app| {
+                app.focus_pane(Pane::Editor);
+                select(app, ON_TOTAL, TOTAL_END);
+                app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL))
+                    .unwrap();
+            },
+        },
+        commands: &[Command::ToggleFindInSelection],
+    },
+    ProofPlace {
+        context: Context {
+            name: "a file eight blocks deep",
+            repo: false,
+            setup: |app| open_new(app, "deep.rs", DEEP_RS, (0, 0)),
+        },
+        commands: &[
+            Command::FoldLevel3,
+            Command::FoldLevel4,
+            Command::FoldLevel5,
+            Command::FoldLevel6,
+            Command::FoldLevel7,
+        ],
+    },
+    ProofPlace {
+        context: Context {
+            name: "everything folded",
+            repo: false,
+            setup: |app| {
+                app.focus_pane(Pane::Editor);
+                app.run_command(Command::FoldAll);
+            },
+        },
+        commands: &[Command::UnfoldAll],
+    },
+    ProofPlace {
+        context: Context {
+            name: "every region folded",
+            repo: false,
+            setup: |app| {
+                app.focus_pane(Pane::Editor);
+                app.run_command(Command::FoldAllRegions);
+            },
+        },
+        commands: &[Command::UnfoldAllRegions],
+    },
+    ProofPlace {
+        context: Context {
+            name: "a Markdown file, the caret in a shell fence",
+            repo: false,
+            setup: |app| open_new(app, "run.md", "# Run\n\n```sh\necho hi\n```\n", (3, 0)),
+        },
+        commands: &[
+            Command::OpenMarkdownPreviewToSide,
+            Command::RunCodeBlockAtCursor,
+        ],
+    },
+    ProofPlace {
+        context: Context {
+            name: "a pinned tab",
+            repo: false,
+            setup: |app| {
+                app.focus_pane(Pane::Editor);
+                app.run_command(Command::PinEditor);
+            },
+        },
+        commands: &[Command::UnpinEditor],
+    },
+    ProofPlace {
+        context: Context {
+            name: "two editor groups, the right one focused",
+            repo: false,
+            setup: |app| {
+                app.focus_pane(Pane::Editor);
+                app.split_editor();
+            },
+        },
+        commands: &[Command::FocusLeftEditorGroup],
+    },
+    ProofPlace {
+        context: Context {
+            name: "two editor groups, the left one focused",
+            repo: false,
+            setup: |app| {
+                app.focus_pane(Pane::Editor);
+                app.split_editor();
+                app.focus_editor_group(true);
+            },
+        },
+        commands: &[Command::FocusRightEditorGroup],
+    },
+    ProofPlace {
+        context: Context {
+            name: "two terminals, the panel focused",
+            repo: false,
+            setup: |app| {
+                app.show_terminal = true;
+                app.bottom_panel_tab = BottomPanelTab::Terminal;
+                app.focus_pane(Pane::Terminal);
+                app.split_terminal().unwrap();
+            },
+        },
+        commands: &[Command::FocusNextTerminal, Command::FocusPreviousTerminal],
+    },
+    ProofPlace {
+        context: Context {
+            name: "a terminal that reports Shift with Ctrl (kitty keyboard protocol)",
+            repo: false,
+            setup: |app| {
+                app.focus_pane(Pane::Editor);
+                app.kitty_keys = true;
+            },
+        },
+        commands: &[Command::ShowSourceControl],
+    },
+    ProofPlace {
+        context: Context {
+            name: "a C file beside its header",
+            repo: false,
+            setup: |app| {
+                let header = app.workspace_root().join("pair.h");
+                std::fs::write(header, "int pair(void);\n").unwrap();
+                open_new(app, "pair.c", "int pair(void) { return 2; }\n", (0, 0));
+            },
+        },
+        commands: &[Command::SwitchHeaderSource],
+    },
+    ProofPlace {
+        context: Context {
+            name: "a file with two merge conflicts",
+            repo: false,
+            setup: |app| open_new(app, "conflicted.txt", CONFLICTED, (0, 0)),
+        },
+        commands: &[Command::MergeNextConflict, Command::MergePrevConflict],
+    },
+    ProofPlace {
+        context: Context {
+            name: "Search with its query selected",
+            repo: false,
+            setup: |app| {
+                app.set_sidebar_view(SidebarView::Search);
+                app.search.query = String::from("total");
+                app.search.run_query();
+                app.set_sidebar_view(SidebarView::Search);
+            },
+        },
+        commands: &[
+            Command::SearchToggleMatchCase,
+            Command::SearchToggleWholeWord,
+            Command::SearchToggleRegex,
+            Command::SearchTogglePreserveCase,
+            Command::SearchToggleDetails,
+        ],
+    },
+];
+
+/// What `run` did on an app freshly set up as `ctx`.
+fn effects_in(ctx: &Context, enders: &mut Enders, run: impl FnOnce(&mut App)) -> String {
+    let mut b = build(ctx);
+    run(&mut b.app);
+    if b.app.git_net_job.is_some() {
+        wait_for_git_net(&mut b.app);
+    }
+    if ctx.repo {
+        settle_source_control(&mut b.app, &b.root);
+    }
+    let fx = effects(&b.seen, &fingerprint(&b.app, &b.root));
+    b.retire(enders);
+    fx
+}
+
+/// For each command a [`PROOF_PLACES`] entry names, every line on which its
+/// chord and its palette run did not do the same work there; none for a
+/// command they did.
+fn proved_in_places() -> Vec<(Command, Vec<String>)> {
+    let mut enders = Enders::default();
+    let mut out: Vec<(Command, Vec<String>)> = Vec::new();
+    for place in PROOF_PLACES {
+        for cmd in place.commands {
+            let ran = effects_in(&place.context, &mut enders, |app| app.run_command(*cmd));
+            let mut misses = Vec::new();
+            let mut proven = false;
+            for keys in linux_keys(cmd.keybinding_hint()) {
+                let Ok(keys) = keys else { continue };
+                let pressed = effects_in(&place.context, &mut enders, |app| {
+                    for key in &keys {
+                        let _ = app.handle_key(*key);
+                    }
+                });
+                if same_work(&pressed, &ran) {
+                    proven = true;
+                } else {
+                    misses.push(format!(
+                        "{} | {} | ran: {ran} | pressed: {pressed}",
+                        place.context.name,
+                        spell(&keys)
+                    ));
+                }
+            }
+            if proven {
+                misses.clear();
+            }
+            out.push((*cmd, misses));
+        }
+    }
+    out
+}
+
+/// Why a command's chord needs a language server to do anything.
+const NEEDS_A_LANGUAGE_SERVER: &str = "works through a language server; the tests start none";
+/// Why a command's chord needs a debug session.
+const NEEDS_A_DEBUG_SESSION: &str = "steers a debug session; the tests start no debugger";
+/// Why a merge-conflict command's chord is not the command itself.
+const OPENS_THE_MERGE_PICKER: &str = "Cmd+. in a merge conflict opens the Accept Current / \
+     Incoming / Both picker, whose rows run these; the chord is the way there";
+/// Why a Source Control diff command's chord is not proven.
+const A_KEY_IN_THE_DIFF_VIEW: &str =
+    "a single key in Source Control's diff view, which no proof place opens";
+
+/// Palette commands whose chord [`every_listed_chord_runs_its_command`]
+/// cannot press where it does its work, by id, with why. One that becomes
+/// proven fails the test until it is taken off, so the list only shrinks.
+const UNPROVEN: &[(&str, &str)] = &[
+    ("merge_accept_current", OPENS_THE_MERGE_PICKER),
+    ("merge_accept_incoming", OPENS_THE_MERGE_PICKER),
+    ("merge_accept_both", OPENS_THE_MERGE_PICKER),
+    ("peek_references", NEEDS_A_LANGUAGE_SERVER),
+    ("go_to_definition", NEEDS_A_LANGUAGE_SERVER),
+    ("go_to_references", NEEDS_A_LANGUAGE_SERVER),
+    ("go_to_declaration", NEEDS_A_LANGUAGE_SERVER),
+    ("go_to_type_definition", NEEDS_A_LANGUAGE_SERVER),
+    ("go_to_implementations", NEEDS_A_LANGUAGE_SERVER),
+    ("stage_hunk", A_KEY_IN_THE_DIFF_VIEW),
+    ("unstage_hunk", A_KEY_IN_THE_DIFF_VIEW),
+    ("revert_hunk", A_KEY_IN_THE_DIFF_VIEW),
+    ("pause_debugging", NEEDS_A_DEBUG_SESSION),
+    ("continue", NEEDS_A_DEBUG_SESSION),
+    ("step_over", NEEDS_A_DEBUG_SESSION),
+    ("step_into", NEEDS_A_DEBUG_SESSION),
+    ("step_out", NEEDS_A_DEBUG_SESSION),
+    ("switch_debug_session", NEEDS_A_DEBUG_SESSION),
+    (
+        "toggle_inline_suggestions",
+        "asks a model when ANTHROPIC_API_KEY is set (machine-bound, see MACHINE_BOUND)",
+    ),
+    (
+        "attach_python_process",
+        "lists this machine's running Python processes (machine-bound)",
+    ),
+    (
+        "update_croft",
+        "checks for a croft update over the network (machine-bound)",
+    ),
+    (
+        "zoxide_jump",
+        "jumps with zoxide, installed or not (machine-bound)",
+    ),
+    ("http_send_request", "sends a real HTTP request"),
+    (
+        "hex_find_next",
+        "F3 in the hex view with its find open, which no proof place opens",
+    ),
+];
+
+/// Every chord croft lists for a palette command runs that command: pressed
+/// where the command does its work, it does what the palette's run of the
+/// command does there (the status line may differ), and something happens.
+/// The places are the key ledger's contexts, whose saved presses this reads,
+/// and [`PROOF_PLACES`]. The palette and confirm contexts are left out: there
+/// a chord goes to the open palette or dialog. [`UNPROVEN`] names the
+/// commands no place reaches, with why.
+#[test]
+fn every_listed_chord_runs_its_command() {
+    use crate::command_registry::ALL_COMMANDS;
+    // Blessing rewrites the saved ledger while this reads it: check after.
+    if std::env::var("CROFT_BLESS").is_ok_and(|v| v == "1") {
+        eprintln!("skipped while CROFT_BLESS=1 rewrites the ledger: run again without it");
+        return;
+    }
+    let Some(saved) = saved_presses() else {
+        eprintln!("skipped, a published crate's source has no saved ledger");
+        return;
+    };
+    let contexts: Vec<&Context> = CONTEXTS
+        .iter()
+        .filter(|c| !matches!(c.name, "palette" | "confirm"))
+        .collect();
+    // One thread per context: each builds its own apps.
+    let runs: Vec<(&str, Vec<(Command, String)>)> = std::thread::scope(|s| {
+        let handles: Vec<_> = contexts
+            .iter()
+            .map(|ctx| s.spawn(move || (ctx.name, command_runs(ctx))))
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let places = proved_in_places();
+    let mut unproven: Vec<String> = Vec::new();
+    let mut proven: Vec<&str> = Vec::new();
+    for cmd in ALL_COMMANDS {
+        let hint = cmd.keybinding_hint();
+        if hint.is_empty() {
+            continue;
+        }
+        let mut lines = Vec::new();
+        let mut done = false;
+        for keys in linux_keys(hint) {
+            let Ok(keys) = keys else { continue };
+            let chord = spell(&keys);
+            for (context, list) in &runs {
+                let ran = &list.iter().find(|(c, _)| c == cmd).unwrap().1;
+                let pressed = saved.get(&(context.to_string(), chord.clone()));
+                let pressed = pressed.map_or("(not pressed there)", String::as_str);
+                if same_work(pressed, ran) {
+                    done = true;
+                }
+                lines.push(format!(
+                    "  {context} | {chord} | ran: {ran} | pressed: {pressed}"
+                ));
+            }
+        }
+        if let Some((_, misses)) = places.iter().find(|(c, _)| c == cmd) {
+            done |= misses.is_empty();
+            lines.extend(misses.iter().map(|m| format!("  {m}")));
+        }
+        if done {
+            proven.push(cmd.id());
+        } else if !UNPROVEN.iter().any(|(id, _)| *id == cmd.id()) {
+            unproven.push(format!("{} [{hint}]\n{}", cmd.id(), lines.join("\n")));
+        }
+    }
+    let stale: Vec<&str> = UNPROVEN
+        .iter()
+        .map(|(id, _)| *id)
+        .filter(|id| {
+            proven.contains(id)
+                || !ALL_COMMANDS
+                    .iter()
+                    .any(|c| c.id() == *id && !c.keybinding_hint().is_empty())
+        })
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "UNPROVEN lists commands that are proven now or list no chord; take them off: {stale:?}"
+    );
+    assert!(
+        unproven.is_empty(),
+        "{} palette command(s) list a chord that does not run them where they work. \
+         Fix the chord or the hint, add a PROOF_PLACES entry that sets up where it \
+         works, or list it in UNPROVEN with why:\n{}",
+        unproven.len(),
+        unproven.join("\n")
+    );
 }
