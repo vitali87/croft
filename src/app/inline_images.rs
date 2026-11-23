@@ -2,6 +2,7 @@
 //! and clearing each picture every frame (the activity-bar icons included), the
 //! editor, terminal and Markdown overlays, and the minimap.
 
+use super::popups::PictureSpot;
 use super::*;
 
 pub(super) const FALLBACK_CELL_PIXEL: (u32, u32) = (10, 20);
@@ -691,7 +692,7 @@ impl App {
     }
 
     pub fn flush_run_debug_icon_overlay(&mut self, drawn: &ratatui::buffer::Buffer) {
-        if self.pictures_held_back() {
+        if self.picture_waits(PictureSpot::RunDebugIcon) {
             return;
         }
         let panel_visible = self.show_tree
@@ -767,7 +768,7 @@ impl App {
     /// while a pop-up is open; arms a one-shot clear when the anchor moves so
     /// no ghost stacks.
     pub fn flush_problems_badge_overlay(&mut self, drawn: &ratatui::buffer::Buffer) {
-        if self.pictures_held_back() {
+        if self.picture_waits(PictureSpot::ProblemsBadge) {
             return;
         }
         let Some((cx, cy)) = self.problems_badge_cell.filter(|_| self.show_terminal) else {
@@ -814,7 +815,7 @@ impl App {
     /// flush each frame so iTerm2 keeps the image painted even after
     /// surrounding cells redraw.
     pub fn flush_no_repo_hero_overlay(&mut self, drawn: &ratatui::buffer::Buffer) {
-        if self.pictures_held_back() {
+        if self.picture_waits(PictureSpot::SourceControlHero) {
             return;
         }
         let panel_visible = self.show_tree
@@ -891,7 +892,7 @@ impl App {
     /// cached image cells — otherwise the illustration ghosts onto
     /// whatever view (Explorer / Search / …) replaces it.
     pub fn flush_ssh_empty_state_overlay(&mut self, drawn: &ratatui::buffer::Buffer) {
-        let should_show = !self.pictures_held_back()
+        let should_show = !self.picture_waits(PictureSpot::SshIllustration)
             && self.show_tree
             && self.sidebar_view == SidebarView::Remote
             && self.remote.targets.is_empty();
@@ -1421,7 +1422,7 @@ impl App {
     }
 
     pub fn editor_image_payload(&self, side: usize) -> Option<(&str, &EditorImageLayout)> {
-        if self.pictures_held_back() {
+        if self.picture_waits(PictureSpot::Editor(side)) {
             return None;
         }
         self.overlays.editor[side].payload()
@@ -1581,7 +1582,7 @@ impl App {
     /// The markdown-preview image escape to flush this frame; held back
     /// under a pop-up, as the terminal pane picture is.
     pub fn markdown_image_payload(&self) -> Option<(&str, &MarkdownImageLayout)> {
-        if self.pictures_held_back() {
+        if self.picture_waits(PictureSpot::Markdown) {
             return None;
         }
         self.overlays.markdown_image.payload()
@@ -1711,7 +1712,7 @@ impl App {
     /// is open ([`Self::pictures_held_back`]) so the picture never paints
     /// over it.
     pub fn terminal_image_payload(&self) -> Option<(&str, &TerminalImageLayout)> {
-        if self.pictures_held_back() {
+        if self.picture_waits(PictureSpot::Terminal) {
             return None;
         }
         self.overlays.terminal_image.payload()
@@ -2123,7 +2124,7 @@ impl App {
     }
 
     pub fn minimap_image_payload(&self) -> Option<(&str, &MinimapLayout)> {
-        if self.pictures_held_back() || self.menu_covers(self.minimap_img_rect) {
+        if self.picture_waits(PictureSpot::Minimap) || self.menu_covers(self.minimap_img_rect) {
             return None;
         }
         self.overlays.minimap.payload()

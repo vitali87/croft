@@ -422,6 +422,7 @@ impl App {
     pub(super) fn render(&mut self, frame: &mut ratatui::Frame) {
         // Set again by the welcome panel when it paints the button.
         self.welcome_tour_button = Rect::default();
+        self.picture_cover.start_frame();
         let size = frame.area();
         self.last_frame_area = size;
         if let Some(menu) = self.context_menu.as_mut() {
@@ -2324,6 +2325,16 @@ impl App {
             );
         }
 
+        // Terminal-pane inline image: sync after the panes have painted so
+        // last_inner and the scroll offset are this frame's (all gating —
+        // hidden panel, alt screen, off-screen anchor — is inside).
+        self.update_terminal_image_overlay();
+        self.update_markdown_image_overlay();
+        // Every picture's place is known now and nothing is drawn over the
+        // panes yet: what lies under each picture is noted, to compare with
+        // the finished frame (#2663).
+        self.note_pictures_before_popups(frame.buffer_mut());
+
         // Overlays render last so they sit on top of everything else. The port
         // toast goes first so modals/menus paint above it.
         //
@@ -2365,11 +2376,6 @@ impl App {
         self.render_run_block_confirm(frame);
         self.render_unsaved_confirm(frame);
         self.render_lossy_save_confirm(frame);
-        // Terminal-pane inline image: sync after the panes have painted so
-        // last_inner and the scroll offset are this frame's (all gating —
-        // hidden panel, alt screen, off-screen anchor — is inside).
-        self.update_terminal_image_overlay();
-        self.update_markdown_image_overlay();
         self.render_editor_find(frame);
         self.render_terminal_find(frame);
         self.render_file_finder(frame);
@@ -2429,6 +2435,9 @@ impl App {
 
         self.paint_terminal_suggestion(frame);
         self.render_screencast(frame, main_area);
+        // The last of the frame's drawing: a picture whose cells changed
+        // since the note above has a pop-up over it, and waits (#2663).
+        self.note_pictures_after_popups(frame.buffer_mut());
 
         // A quick input owns the caret while it is open on a `surfaces`
         // theme: its query's, and no pane's caret blinking through the card.

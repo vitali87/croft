@@ -292,7 +292,7 @@ src/
 │   ├── nav.rs           editor back / forward navigation history
 │   ├── overlay.rs       inline-image overlay state + clear-on-hide latches (iTerm2 cell eviction; the Kitty path adds a delete-all on the same clear frames)
 │   ├── perf_hud.rs      F8 performance HUD
-│   ├── popups.rs        every pop-up drawn over the middle of the screen, in one list, and whether pictures are held back while one is open
+│   ├── popups.rs        every pop-up drawn over the middle of the screen, in one list, and whether pictures are held back while one is open; and, from what each frame drew, which pictures any other pop-up landed on
 │   ├── prompts.rs       the input popup and the list picker (opening, keys, clicks, drawing), `submit_input_prompt` and `confirm_list_picker`, and the small inline prompt
 │   ├── remote_sessions.rs SSH connect and install, the ssh-pane offer, handing off to a remote croft, Remote Explorer keys, config sync, drop relay and scp uploads, port forwarding, and opening URLs on the local machine
 │   ├── review.rs        pull-request review tabs (fetching with gh, viewed marks, checks, per-file diffs, worktree checkout) and the comment boxes in the editor: review threads, navigator notes and sticky notes
