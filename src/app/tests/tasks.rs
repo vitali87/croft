@@ -1316,7 +1316,7 @@ fn a_task_pane_whose_shell_left_the_directory_is_not_reused() {
     // (#2650; #2167 fixed the same race in the rerun test).
     let root = tmp.path().canonicalize().unwrap();
     crate::test_budget::await_spawned(
-        crate::test_budget::tests::TASK_PANE_PROMPT_BASE,
+        std::time::Duration::from_secs(10),
         "the build to run and the task pane's shell to return to its prompt",
         || {
             let t = &app.terminals[app.active_terminal];
