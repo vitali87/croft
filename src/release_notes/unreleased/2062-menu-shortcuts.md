@@ -1,0 +1,1 @@
+refactor: Groundwork for the refactor program (#2062): every menu action now states the shortcut its menu row shows, or why it shows none, so a new menu row cannot ship without that decision. Nothing changes in use.
