@@ -185,7 +185,9 @@ commands! {
     TransformTitle {
         id: "transform_title",
         title: "Transform to Title Case",
-        hint: "Cmd+Opt+Shift+C",
+        // VS Code binds it no key. Cmd+Opt+Shift+C is Copy Relative Path,
+        // there and here (#2648).
+        hint: "",
     }
     TransformSnake {
         id: "transform_snake",

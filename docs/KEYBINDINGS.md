@@ -585,7 +585,8 @@ Not supported yet: transforms such as `${TM_FILENAME/(.*)\\..+$/$1/}`, a picker 
 | `Cmd`+`Opt`+`Shift`+`T` | Convert Indentation to Tabs: replace each leading run of one tab width of spaces with a tab, leaving any remainder |
 | `Cmd`+`Opt`+`Shift`+`N` | Trim Final Newlines: drop trailing blank lines at the end of the file (always keeping at least one line) |
 | `Cmd`+`Opt`+`Shift`+`J` | Join Lines: collapse the selected lines (or the current line with the next) into one, single-spaced |
-| `Cmd`+`Opt`+`Shift`+`U` / `L` / `C` | Transform the selection (or the word under the cursor) to Uppercase / Lowercase / Title Case |
+| `Cmd`+`Opt`+`Shift`+`U` / `L` | Transform the selection (or the word under the cursor) to Uppercase / Lowercase |
+| Command Palette "Transform to Title Case" | Capitalise each word of the selection (or the word under the cursor). It has no chord, as in VS Code: `Cmd`+`Opt`+`Shift`+`C` is Copy Relative Path |
 | Command Palette "Transform to Snake Case" / "Camel Case" / "Pascal Case" / "Kebab Case" | Rewrite each identifier in the selection (or the word under each caret) as `user_name` / `userName` / `UserName` / `user-name` |
 | `Cmd`+`Opt`+`Shift`+`A` / `D` | Sort the selected lines (or the whole file) Ascending / Descending |
 | `Cmd`+`Opt`+`Shift`+`W` | Trim Trailing Whitespace: strip trailing spaces and tabs from every line |
@@ -604,6 +605,7 @@ Not supported yet: transforms such as `${TM_FILENAME/(.*)\\..+$/$1/}`, a picker 
 | Click a line number | Select that line; drag down or up the line numbers to select whole lines |
 | `Ctrl`+`C` / `Cmd`+`C` | Copy the selection to the system clipboard |
 | `Cmd`+`Opt`+`C` / `Ctrl`+`Opt`+`C` | Copy Path: copy the active file's absolute path to the system clipboard (also on the editor tab right-click menu) |
+| `Cmd`+`Opt`+`Shift`+`C` / `Ctrl`+`Opt`+`Shift`+`C` | Copy Relative Path: copy the active file's path relative to the workspace root |
 | `Ctrl`+`X` / `Cmd`+`X` | Cut the selection |
 | `Ctrl`+`V` / `Cmd`+`V` | Paste at the cursor (replaces any selection) |
 | `Ctrl`+`Z` / `Cmd`+`Z` | Undo (typing bursts coalesce; backspace, paste, cut, replace are each one step) |
@@ -1341,7 +1343,8 @@ When the line carries a `path:line` that resolves to an existing file, that file
 | `⌘⌥⇧S` / `⌘⌥⇧T` | Convert Indentation to Spaces / Tabs |
 | `⌘⌥⇧N` | Trim Final Newlines |
 | `⌘⌥⇧J` | Join Lines |
-| `⌘⌥⇧U` / `⌘⌥⇧L` / `⌘⌥⇧C` | Transform to Uppercase / Lowercase / Title Case |
+| `⌘⌥⇧U` / `⌘⌥⇧L` | Transform to Uppercase / Lowercase |
+| `⌘⌥⇧C` | Copy Relative Path |
 | `⌘⌥⇧A` / `⌘⌥⇧D` | Sort Lines Ascending / Descending |
 | `⌘⌥⇧W` | Trim Trailing Whitespace |
 | `⌘⌥⇧F` | Format Document |
