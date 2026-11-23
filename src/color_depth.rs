@@ -170,6 +170,109 @@ pub fn drop_underline_colors(buffer: &mut Buffer) {
     }
 }
 
+/// Removes underline colours (SGR 58) from a byte stream on its way to a
+/// terminal that cannot read them (#2661), for the bytes croft does not draw
+/// itself: a persistent session's output, shared by every attached client,
+/// is filtered per client. Only `ESC [ … m` sequences change; everything
+/// else, pictures and OSC strings included, passes through byte for byte.
+/// A sequence split across two writes is held until its end arrives.
+#[derive(Default)]
+pub struct UnderlineColorFilter {
+    pending: Vec<u8>,
+}
+
+impl UnderlineColorFilter {
+    /// A sequence longer than this without its final byte is not one croft
+    /// writes; it is passed on as it came.
+    const LONGEST: usize = 256;
+
+    /// Append `input` to `out` with every underline colour removed.
+    pub fn feed(&mut self, input: &[u8], out: &mut Vec<u8>) {
+        let joined;
+        let data: &[u8] = if self.pending.is_empty() {
+            input
+        } else {
+            self.pending.extend_from_slice(input);
+            joined = std::mem::take(&mut self.pending);
+            &joined
+        };
+        let mut at = 0;
+        while let Some(found) = memchr::memchr(0x1b, &data[at..]) {
+            let esc = at + found;
+            out.extend_from_slice(&data[at..esc]);
+            if esc + 1 == data.len() {
+                self.pending.extend_from_slice(&data[esc..]);
+                return;
+            }
+            if data[esc + 1] != b'[' {
+                out.push(0x1b);
+                at = esc + 1;
+                continue;
+            }
+            let body = esc + 2;
+            let Some(end) = data[body..].iter().position(|b| (0x40..=0x7e).contains(b)) else {
+                if data.len() - esc > Self::LONGEST {
+                    out.extend_from_slice(&data[esc..]);
+                } else {
+                    self.pending.extend_from_slice(&data[esc..]);
+                }
+                return;
+            };
+            let fin = body + end;
+            let params = &data[body..fin];
+            match (data[fin], without_underline_color(params)) {
+                (b'm', Some(kept)) if kept.is_empty() => {}
+                (b'm', Some(kept)) => {
+                    out.extend_from_slice(b"\x1b[");
+                    out.extend_from_slice(&kept);
+                    out.push(b'm');
+                }
+                _ => out.extend_from_slice(&data[esc..=fin]),
+            }
+            at = fin + 1;
+        }
+        out.extend_from_slice(&data[at..]);
+    }
+}
+
+/// `params` of an SGR sequence with its underline colours removed, or `None`
+/// when it holds none (or is not plain SGR parameters). `58;5;n` and
+/// `58;2;r;g;b` take their arguments with them; `38` and `48` keep theirs, so
+/// a `58` that is a colour index (`38;5;58`) stays.
+fn without_underline_color(params: &[u8]) -> Option<Vec<u8>> {
+    if !params
+        .iter()
+        .all(|b| b.is_ascii_digit() || *b == b';' || *b == b':')
+    {
+        return None;
+    }
+    let fields: Vec<&[u8]> = params.split(|b| *b == b';').collect();
+    let mut kept: Vec<&[u8]> = Vec::with_capacity(fields.len());
+    let mut changed = false;
+    let mut i = 0;
+    while i < fields.len() {
+        let field = fields[i];
+        let head = field.split(|b| *b == b':').next().unwrap_or_default();
+        let span = if field.contains(&b':') {
+            1
+        } else {
+            match (head, fields.get(i + 1).copied()) {
+                (b"38" | b"48" | b"58", Some(b"5")) => 3,
+                (b"38" | b"48" | b"58", Some(b"2")) => 5,
+                _ => 1,
+            }
+        };
+        let group = &fields[i..(i + span).min(fields.len())];
+        if head == b"58" {
+            changed = true;
+        } else {
+            kept.extend_from_slice(group);
+        }
+        i += span;
+    }
+    changed.then(|| kept.join(&b';'))
+}
+
 /// The xterm colour cube's six levels per channel.
 const CUBE: [u8; 6] = [0, 95, 135, 175, 215, 255];
 
@@ -446,6 +549,72 @@ mod tests {
         assert_eq!(buf.content[0].underline_color, Color::Reset);
         assert_eq!(buf.content[0].modifier, Modifier::UNDERLINED);
         assert_eq!(buf.content[0].fg, Color::Rgb(1, 2, 3));
+    }
+
+    fn filtered(chunks: &[&[u8]]) -> Vec<u8> {
+        let mut filter = super::UnderlineColorFilter::default();
+        let mut out = Vec::new();
+        for chunk in chunks {
+            filter.feed(chunk, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn the_filter_removes_underline_colours_and_nothing_else() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"a\x1b[58;5;8mb", b"ab"),
+            (b"a\x1b[58;2;1;2;3mb", b"ab"),
+            (b"a\x1b[58:2::1:2:3mb", b"ab"),
+            (b"\x1b[4;58;5;8mx", b"\x1b[4mx"),
+            (b"\x1b[1;58;2;9;9;9;3mx", b"\x1b[1;3mx"),
+            // A colour index of 58 is a colour, not code 58.
+            (b"\x1b[38;5;58mx", b"\x1b[38;5;58mx"),
+            (b"\x1b[48;2;58;58;58mx", b"\x1b[48;2;58;58;58mx"),
+            // Resetting the underline colour, a reset and other sequences.
+            (b"\x1b[59m\x1b[m\x1b[0m", b"\x1b[59m\x1b[m\x1b[0m"),
+            (b"\x1b[58;5H\x1b[?2026h", b"\x1b[58;5H\x1b[?2026h"),
+            // Pictures and OSC strings pass byte for byte.
+            (
+                b"\x1bP0;1;0q#58;2;1;2;3~\x1b\\",
+                b"\x1bP0;1;0q#58;2;1;2;3~\x1b\\",
+            ),
+            (
+                b"\x1b]1337;File=inline=1:AAAA\x07",
+                b"\x1b]1337;File=inline=1:AAAA\x07",
+            ),
+            (
+                "caf\u{e9} \u{2014}".as_bytes(),
+                "caf\u{e9} \u{2014}".as_bytes(),
+            ),
+        ];
+        for (input, want) in cases {
+            assert_eq!(
+                filtered(&[input]),
+                want.to_vec(),
+                "{}",
+                String::from_utf8_lossy(input)
+            );
+        }
+    }
+
+    /// A write may end anywhere, even inside a sequence: the result is the
+    /// same however the stream is cut.
+    #[test]
+    fn the_filter_gives_the_same_bytes_however_the_stream_is_cut() {
+        let stream: &[u8] =
+            b"tab \x1b[3m\x1b[4m\x1b[58;5;8mname\x1b[24m\x1b[59m rest\x1b[38;5;58m!\x1b[0m\x1b";
+        let whole = filtered(&[stream]);
+        assert!(
+            !String::from_utf8_lossy(&whole).contains("[58;"),
+            "{whole:?}"
+        );
+        for cut in 0..=stream.len() {
+            let (a, b) = stream.split_at(cut);
+            assert_eq!(filtered(&[a, b]), whole, "cut at {cut}");
+        }
+        let bytes: Vec<&[u8]> = stream.chunks(1).collect();
+        assert_eq!(filtered(&bytes), whole, "one byte at a time");
     }
 
     /// Negative: at truecolor the frame is left exactly as drawn.

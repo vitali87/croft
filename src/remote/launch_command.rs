@@ -146,7 +146,10 @@ pub(super) fn remote_croft_command_for_terminal(
     // Hosts with neither exec croft directly, no persistence.
     // `CROFT_SESSION_PERSISTENT=1` is exported only on the persistent
     // branches so the remote croft can tell whether its session survives a
-    // transport drop and surface that on its status line.
+    // transport drop and surface that on its status line. Under dtach a
+    // later attach may come from a terminal that cannot read underline
+    // colours and nothing can remove them on its way (the session host's
+    // clients do, #2661), so that branch never draws them.
     let socket = dtach_socket_path(path);
     let mux_socket = mux_socket_path(path);
     let workspace_flag = match path.filter(|p| !p.is_empty()) {
@@ -154,7 +157,7 @@ pub(super) fn remote_croft_command_for_terminal(
         None => String::new(),
     };
     format!(
-        "{prefix}if croft session-host --probe >/dev/null 2>&1; then mkdir -p \"$(dirname \"{mux_socket}\")\"; export CROFT_SESSION_PERSISTENT=1; exec croft session-host --socket \"{mux_socket}\"{workspace_flag} -- {croft_invocation}; elif command -v dtach >/dev/null 2>&1; then mkdir -p \"$(dirname \"{socket}\")\"; export CROFT_SESSION_PERSISTENT=1; exec dtach -A \"{socket}\" -E -z -r winch {croft_invocation}; else exec {croft_invocation}; fi"
+        "{prefix}if croft session-host --probe >/dev/null 2>&1; then mkdir -p \"$(dirname \"{mux_socket}\")\"; export CROFT_SESSION_PERSISTENT=1; exec croft session-host --socket \"{mux_socket}\"{workspace_flag} -- {croft_invocation}; elif command -v dtach >/dev/null 2>&1; then mkdir -p \"$(dirname \"{socket}\")\"; export CROFT_SESSION_PERSISTENT=1 CROFT_UNDERLINE_COLORS=0; exec dtach -A \"{socket}\" -E -z -r winch {croft_invocation}; else exec {croft_invocation}; fi"
     )
 }
 

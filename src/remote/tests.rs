@@ -2589,4 +2589,11 @@ fn remote_launch_carries_whether_underline_colours_are_read() {
     let mine = vec![(String::from("CROFT_UNDERLINE_COLORS"), String::from("1"))];
     let env = with_underline_colors(&mine, false);
     assert_eq!(env.last(), mine.last(), "the user's entry comes last");
+    // Under dtach nothing can remove them for a later attach from another
+    // terminal, so that branch never draws them.
+    let launch = remote_croft_command_for_terminal(None, None, None, None, false, &[], false);
+    assert!(
+        launch.contains("export CROFT_SESSION_PERSISTENT=1 CROFT_UNDERLINE_COLORS=0; exec dtach"),
+        "{launch}"
+    );
 }
