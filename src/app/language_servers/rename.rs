@@ -34,7 +34,15 @@ impl App {
         // Overwriting also disarms any previous in-flight prepare: its caret
         // is abandoned, and a late verdict for it must not reopen a prompt
         // carrying the old (row, col) into the rename request.
-        self.prepare_rename_request = Some((id, path, row, col, self.editor.edit_seq));
+        self.prepare_rename_request = Some(CaretRequest {
+            id,
+            at: CaretSpot {
+                path,
+                row,
+                col,
+                seq: self.editor.edit_seq,
+            },
+        });
         self.status = String::from("Preparing rename…");
     }
 
@@ -95,7 +103,17 @@ impl App {
         &mut self,
         result: crate::lsp::manager::PrepareRenameResult,
     ) -> bool {
-        let Some((id, path, row, col, seq)) = self.prepare_rename_request.clone() else {
+        let Some(CaretRequest {
+            id,
+            at:
+                CaretSpot {
+                    path,
+                    row,
+                    col,
+                    seq,
+                },
+        }) = self.prepare_rename_request.clone()
+        else {
             return false;
         };
         if result.request_id != id {

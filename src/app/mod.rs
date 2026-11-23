@@ -2841,15 +2841,16 @@ pub struct App {
     implementation_request_id: Option<u64>,
     references_request_id: Option<u64>,
     call_hierarchy_request_id: Option<u64>,
-    /// In-flight documentHighlight request, with the (path, row, col,
-    /// edit_seq) it was fired for so a reply for a caret or buffer state the
-    /// editor has since left is dropped.
-    occurrences_request: Option<(u64, PathBuf, usize, usize, u64)>,
-    /// In-flight linkedEditingRange request (#254): (id, path, edit_seq).
-    linked_request: Option<(u64, PathBuf, u64)>,
-    /// Last observed `(path, row, col, seq)` for the linked-editing
-    /// debounce, and when it settled — occurrences' idle pattern.
-    linked_observed: Option<(PathBuf, usize, usize, u64)>,
+    /// In-flight documentHighlight request, with the caret spot it was
+    /// fired for so a reply for a caret or buffer state the editor has
+    /// since left is dropped.
+    occurrences_request: Option<CaretRequest>,
+    /// In-flight linkedEditingRange request (#254), with the file and edit
+    /// seq it was asked for.
+    linked_request: Option<FileRequest>,
+    /// Last observed caret spot for the linked-editing debounce, and when
+    /// it settled — occurrences' idle pattern.
+    linked_observed: Option<CaretSpot>,
     linked_observed_at: std::time::Instant,
     /// A request already went out for `linked_observed` (#1299). Kept
     /// apart from `linked_request`, which the reply clears: a `null`
@@ -2866,7 +2867,7 @@ pub struct App {
     selection_range_request: Option<PendingSelectionRanges>,
     /// The caret state `tick_occurrences` last observed, and when it changed.
     /// A caret resting on one spot for `OCCURRENCES_IDLE` fires one request.
-    occ_observed: Option<(PathBuf, usize, usize, u64)>,
+    occ_observed: Option<CaretSpot>,
     occ_observed_at: std::time::Instant,
     rename_request_id: Option<u64>,
     /// The open buffers' `edit_seq`s when the in-flight rename went out
@@ -2875,9 +2876,9 @@ pub struct App {
     /// An Explorer rename or move waiting on the servers' `willRenameFiles`
     /// edit (#610); it runs when the answer lands or its deadline passes.
     pending_file_move: Option<PendingFileMove>,
-    /// In-flight prepareRename (#254): (id, path, row, col, edit_seq) —
-    /// the deferred rename prompt's context.
-    prepare_rename_request: Option<(u64, PathBuf, usize, usize, u64)>,
+    /// In-flight prepareRename (#254), with the caret spot that is the
+    /// deferred rename prompt's context.
+    prepare_rename_request: Option<CaretRequest>,
     format_request_id: Option<u64>,
     /// True when the in-flight format request is Format Selection (#254)
     /// — the drain words its statuses accordingly.
@@ -2888,11 +2889,11 @@ pub struct App {
     /// VS Code's `editor.formatOnType` (#254): typing a server trigger
     /// character runs onTypeFormatting at the spot. Off by default.
     format_on_type: bool,
-    /// In-flight on-type request: (id, the edit_seq it was computed
-    /// against, the tab's path). The reply applies only while that same
-    /// tab is active and its buffer has not moved since — `edit_seq` is
-    /// per-tab, so the seq alone cannot tell tabs apart.
-    on_type_request: Option<(u64, u64, PathBuf)>,
+    /// In-flight on-type request, with the tab's path and the edit_seq it
+    /// was computed against. The reply applies only while that same tab is
+    /// active and its buffer has not moved since — `edit_seq` is per-tab,
+    /// so the seq alone cannot tell tabs apart.
+    on_type_request: Option<FileRequest>,
     code_action_request_id: Option<u64>,
     /// True when the in-flight code-action request is a `codeAction/resolve`
     /// (the reply is one resolved action to apply directly) rather than the

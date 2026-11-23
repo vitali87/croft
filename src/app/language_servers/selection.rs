@@ -129,12 +129,12 @@ impl App {
             self.occurrences_request = None;
             return self.editor.clear_occurrences();
         };
-        let cur = (
+        let cur = CaretSpot {
             path,
-            self.editor.cursor_row,
-            self.editor.cursor_col,
-            self.editor.edit_seq,
-        );
+            row: self.editor.cursor_row,
+            col: self.editor.cursor_col,
+            seq: self.editor.edit_seq,
+        };
         if self.occ_observed.as_ref() != Some(&cur) {
             self.occ_observed = Some(cur);
             self.occ_observed_at = std::time::Instant::now();
@@ -147,16 +147,16 @@ impl App {
         let already_requested = self
             .occurrences_request
             .as_ref()
-            .is_some_and(|(_, p, r, c, s)| (p, r, c, s) == (&cur.0, &cur.1, &cur.2, &cur.3));
+            .is_some_and(|request| request.at == cur);
         if already_requested || self.occ_observed_at.elapsed() < OCCURRENCES_IDLE {
             return false;
         }
-        let (uline, uchar) = self.editor.pos_to_utf16(cur.1, cur.2);
+        let (uline, uchar) = self.editor.pos_to_utf16(cur.row, cur.col);
         let Some(lsp) = self.lsp.as_mut() else {
             return false;
         };
-        let id = lsp.request_document_highlights(cur.0.clone(), uline, uchar);
-        self.occurrences_request = Some((id, cur.0, cur.1, cur.2, cur.3));
+        let id = lsp.request_document_highlights(cur.path.clone(), uline, uchar);
+        self.occurrences_request = Some(CaretRequest { id, at: cur });
         false
     }
 
@@ -175,7 +175,11 @@ impl App {
         }
         let mut changed = false;
         for result in results {
-            let Some((id, path, _row, _col, seq)) = self.occurrences_request.as_ref() else {
+            let Some(CaretRequest {
+                id,
+                at: CaretSpot { path, seq, .. },
+            }) = self.occurrences_request.as_ref()
+            else {
                 continue;
             };
             if result.request_id != *id

@@ -2697,7 +2697,15 @@ fn a_prepare_rename_verdict_routes_to_the_prompt_status_or_fallback() {
         target,
     };
     let arm = |app: &mut App| {
-        app.prepare_rename_request = Some((4, path.clone(), 1, 9, app.editor.edit_seq));
+        app.prepare_rename_request = Some(CaretRequest {
+            id: 4,
+            at: CaretSpot {
+                path: path.clone(),
+                row: 1,
+                col: 9,
+                seq: app.editor.edit_seq,
+            },
+        });
         app.prompt = None;
         app.status = String::from("Preparing rename…");
     };
@@ -3096,7 +3104,11 @@ fn an_on_type_reply_applies_only_while_its_buffer_and_tab_are_unmoved() {
     );
 
     // Armed and everything matches.
-    app.on_type_request = Some((7, app.editor.edit_seq, a.clone()));
+    app.on_type_request = Some(FileRequest {
+        id: 7,
+        path: a.clone(),
+        seq: app.editor.edit_seq,
+    });
     assert_eq!(
         app.on_type_reply_disposition(&reply(7, &a)),
         OnTypeReply::Apply
@@ -3114,7 +3126,11 @@ fn an_on_type_reply_applies_only_while_its_buffer_and_tab_are_unmoved() {
     );
 
     // Buffer moved since the request.
-    app.on_type_request = Some((7, app.editor.edit_seq.wrapping_sub(1), a.clone()));
+    app.on_type_request = Some(FileRequest {
+        id: 7,
+        path: a.clone(),
+        seq: app.editor.edit_seq.wrapping_sub(1),
+    });
     assert_eq!(
         app.on_type_reply_disposition(&reply(7, &a)),
         OnTypeReply::Stale,
@@ -3122,7 +3138,11 @@ fn an_on_type_reply_applies_only_while_its_buffer_and_tab_are_unmoved() {
     );
 
     // Reply is for a different file than the one requested.
-    app.on_type_request = Some((7, app.editor.edit_seq, a.clone()));
+    app.on_type_request = Some(FileRequest {
+        id: 7,
+        path: a.clone(),
+        seq: app.editor.edit_seq,
+    });
     assert_eq!(
         app.on_type_reply_disposition(&reply(7, &b)),
         OnTypeReply::Stale,
@@ -3132,7 +3152,11 @@ fn an_on_type_reply_applies_only_while_its_buffer_and_tab_are_unmoved() {
     // The requested tab is no longer active: edit_seq is per-tab, so the
     // counter alone would compare two unrelated buffers.
     app.editor.open_pinned(&b).unwrap();
-    app.on_type_request = Some((7, app.editor.edit_seq, a.clone()));
+    app.on_type_request = Some(FileRequest {
+        id: 7,
+        path: a.clone(),
+        seq: app.editor.edit_seq,
+    });
     assert_eq!(
         app.on_type_reply_disposition(&reply(7, &a)),
         OnTypeReply::Stale,

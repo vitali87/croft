@@ -3632,15 +3632,16 @@ fn a_resting_caret_asks_for_its_highlights_once() {
     );
     app.occ_observed_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
     app.tick_occurrences();
-    let (id, ..) = app
+    let id = app
         .occurrences_request
-        .clone()
+        .as_ref()
+        .map(|r| r.id)
         .expect("one request once the caret has rested");
     for _ in 0..20 {
         app.tick_occurrences();
     }
     assert_eq!(
-        app.occurrences_request.as_ref().map(|r| r.0),
+        app.occurrences_request.as_ref().map(|r| r.id),
         Some(id),
         "no second request while the reply is out"
     );
@@ -3662,7 +3663,7 @@ fn a_resting_caret_asks_for_its_highlights_once() {
         app.tick_occurrences();
     }
     assert_eq!(
-        app.occurrences_request.as_ref().map(|r| r.0),
+        app.occurrences_request.as_ref().map(|r| r.id),
         Some(id),
         "and none after it, while the caret stays put"
     );
