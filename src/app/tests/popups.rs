@@ -520,11 +520,29 @@ fn the_source_control_illustration_waits_for_a_tooltip_drawn_over_it() {
         "staging: the illustration has its place"
     );
     assert!(!app.picture_waits(crate::app::popups::PictureSpot::SourceControlHero));
+    // A one-line tooltip just above the illustration touches none of it.
     app.ui_tooltip = Some(crate::widgets::hover_popup::HoverPopup::new_compact(
         String::from("Initialize Repository"),
         (hero.x + 1, hero.y + 1),
     ));
     term.draw(|f| app.render(f)).unwrap();
+    let above = app.ui_tooltip_area.expect("the tooltip is drawn");
+    assert!(
+        above.y + 1 < hero.y + 1
+            || !app.picture_waits(crate::app::popups::PictureSpot::SourceControlHero),
+        "a tooltip that misses the illustration must not hold it back"
+    );
+    // One whose line lands inside it does.
+    app.ui_tooltip = Some(crate::widgets::hover_popup::HoverPopup::new_compact(
+        String::from("Initialize Repository"),
+        (hero.x + 1, hero.y + hero.height - 1),
+    ));
+    term.draw(|f| app.render(f)).unwrap();
+    let over = app.ui_tooltip_area.expect("the tooltip is drawn");
+    assert!(
+        over.intersects(hero),
+        "staging: the tooltip {over:?} must land on the illustration {hero:?}"
+    );
     assert!(app.picture_waits(crate::app::popups::PictureSpot::SourceControlHero));
 }
 
