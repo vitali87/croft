@@ -1,1 +1,0 @@
-refactor: Groundwork for the refactor program (#2062): the details kept with a language-server request still waited on (its id, file, caret spot and edit seq) are named fields in one order, instead of unnamed tuples that two features ordered differently. Nothing changes in use.

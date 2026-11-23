@@ -1,1 +1,0 @@
-refactor: Groundwork for the refactor program (#2062): each activity-bar icon's pictures are baked from, kept with and chosen through the same icon table, instead of thirty separate fields and ten copies of the same choice. Nothing changes in use.
