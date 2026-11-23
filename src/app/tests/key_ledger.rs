@@ -2276,3 +2276,162 @@ fn every_listed_chord_runs_its_command() {
         unproven.join("\n")
     );
 }
+
+/// Every key sequence the F1 sheet lists, spelled as the ledger spells it.
+fn f1_chords() -> BTreeSet<String> {
+    let mut chords = BTreeSet::new();
+    for group in crate::widgets::shortcuts::SHORTCUT_GROUPS {
+        for entry in group.entries {
+            if unpressed_f1_row(group.title, entry.keys).is_none() {
+                for keys in linux_keys(entry.keys).into_iter().flatten() {
+                    chords.insert(spell(&keys));
+                }
+            }
+        }
+    }
+    chords
+}
+
+/// The chords written in backticks in `text`, one per run of backticked
+/// keys: `` `Cmd`+`Opt`+`S` ``, `` `Cmd+K` `L` `` and `` `Enter`/`F3` `` are
+/// one run each. `` `Cmd+K` `Cmd+1` … `Cmd+K` `Cmd+7` `` is the range
+/// `Cmd+K Cmd+1..7`.
+fn backticked_chords(text: &str) -> Vec<String> {
+    // Each run of backticked keys, with the text before it.
+    let mut runs: Vec<(&str, String)> = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('`') {
+        let Some(len) = rest[open + 1..].find('`') else {
+            break;
+        };
+        let between = &rest[..open];
+        let span = &rest[open + 1..open + 1 + len];
+        match runs.last_mut() {
+            // `Cmd`+`Opt`+`Shift`+`U` / `L`: the bare key takes the modifiers.
+            Some((_, run)) if matches!(between, "+" | "/" | " " | " / ") => {
+                run.push_str(between);
+                run.push_str(span);
+            }
+            // `Ctrl+p` / `Cmd+p`, then `#`: each chord, then the key.
+            Some((_, run)) if matches!(between, ", then " | " then ") => {
+                *run = run
+                    .split(" / ")
+                    .map(|chord| format!("{chord} then {span}"))
+                    .collect::<Vec<_>>()
+                    .join(" / ");
+            }
+            _ => runs.push((between, span.to_string())),
+        }
+        rest = &rest[open + len + 2..];
+    }
+    let mut out: Vec<String> = Vec::new();
+    for (between, run) in runs {
+        // `X1 … X7`, the same keys but the last digit, is the range X1..7.
+        if between == " … "
+            && let Some(prev) = out.last_mut()
+            && let (Some(a), Some(b)) = (prev.chars().last(), run.chars().last())
+            && a.is_ascii_digit()
+            && b.is_ascii_digit()
+            && prev[..prev.len() - 1] == run[..run.len() - 1]
+        {
+            prev.push_str(&format!("..{b}"));
+        } else {
+            out.push(run);
+        }
+    }
+    out
+}
+
+/// Every key sequence docs/KEYBINDINGS.md writes in backticks, spelled as the
+/// ledger spells it. Spans that name no keys (a setting, a file) are skipped.
+fn documented_chords() -> BTreeSet<String> {
+    let doc =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/KEYBINDINGS.md"))
+            .unwrap();
+    let mut chords = BTreeSet::new();
+    for line in doc.lines() {
+        for run in backticked_chords(line) {
+            for alt in alternatives(&run) {
+                // The docs write some letters small (`Cmd+Shift+s`); hints
+                // and the Linux spelling rules write them capital.
+                let alt: String = alt
+                    .split(' ')
+                    .map(|step| match step.rsplit_once('+') {
+                        Some((mods, key)) if key.len() == 1 => {
+                            format!("{mods}+{}", key.to_ascii_uppercase())
+                        }
+                        _ => step.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let linux = crate::command_registry::hint_for_platform(&alt, false);
+                if let Ok(keys) = keys_of(&linux) {
+                    chords.insert(spell(&keys));
+                }
+            }
+        }
+    }
+    chords
+}
+
+/// A chord in a palette hint is where people look for it: the F1 sheet lists
+/// it, and so does docs/KEYBINDINGS.md.
+#[test]
+fn every_palette_chord_is_on_the_f1_sheet_and_in_the_docs() {
+    let f1 = f1_chords();
+    let docs = documented_chords();
+    let mut missing = Vec::new();
+    for cmd in crate::command_registry::ALL_COMMANDS {
+        let hint = cmd.keybinding_hint();
+        for keys in linux_keys(hint).into_iter().flatten() {
+            let chord = spell(&keys);
+            let gone: Vec<&str> = [("the F1 sheet", &f1), ("docs/KEYBINDINGS.md", &docs)]
+                .into_iter()
+                .filter(|(_, listed)| !listed.contains(&chord))
+                .map(|(place, _)| place)
+                .collect();
+            if !gone.is_empty() {
+                missing.push(format!(
+                    "{} [{hint}] {chord}: not in {}",
+                    cmd.id(),
+                    gone.join(" or ")
+                ));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "{} palette chord(s) missing where people look for them:\n{}",
+        missing.len(),
+        missing.join("\n")
+    );
+}
+
+#[test]
+fn backticked_keys_read_as_the_chords_they_spell() {
+    assert_eq!(
+        backticked_chords("| `Cmd`+`Opt`+`Shift`+`S` | x |"),
+        ["Cmd+Opt+Shift+S"]
+    );
+    assert_eq!(
+        backticked_chords("`Cmd+K` `L` / `Ctrl+K` `L`"),
+        ["Cmd+K L / Ctrl+K L"]
+    );
+    assert_eq!(backticked_chords("`Enter`/`F3` forward"), ["Enter/F3"]);
+    assert_eq!(
+        backticked_chords("| `Cmd`+`Opt`+`Shift`+`U` / `L` |"),
+        ["Cmd+Opt+Shift+U / L"]
+    );
+    assert_eq!(
+        backticked_chords("`Ctrl+p` / `Cmd+p`, then `#`"),
+        ["Ctrl+p then # / Cmd+p then #"]
+    );
+    assert_eq!(
+        backticked_chords("| `Cmd+K` `Cmd+1` … `Cmd+K` `Cmd+7` | Fold |"),
+        ["Cmd+K Cmd+1..7"]
+    );
+    assert_eq!(
+        backticked_chords("set `tab_size`, and `Esc`"),
+        ["tab_size", "Esc"]
+    );
+}
