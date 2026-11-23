@@ -163,25 +163,17 @@ impl App {
     }
 
     pub fn drain_lsp_rename(&mut self) -> bool {
-        let mut arrived = false;
-        let mut edits: Option<Vec<(PathBuf, Vec<crate::widgets::editor::TextSpanEdit>)>> = None;
-        {
-            let Some(lsp) = self.lsp.as_ref() else {
-                return false;
-            };
-            while let Some(result) = lsp.drain_rename() {
-                if Some(result.request_id) != self.rename_request_id {
-                    continue;
-                }
-                arrived = true;
-                edits = result.edits;
-            }
-        }
-        if !arrived {
+        let Some(lsp) = self.lsp.as_ref() else {
             return false;
-        }
-        self.rename_request_id = None;
-        self.land_rename(edits);
+        };
+        let Some(reply) = take_reply(
+            &mut self.rename_request_id,
+            || lsp.drain_rename(),
+            |r| r.request_id,
+        ) else {
+            return false;
+        };
+        self.land_rename(reply.edits);
         true
     }
 

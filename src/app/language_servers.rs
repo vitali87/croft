@@ -44,6 +44,29 @@ use sync::*;
 pub(super) use typing::is_signature_help_trigger;
 pub(super) use typing::snippet_completion_item;
 
+/// The answer to the request still waited on, from every reply waiting on
+/// one channel (#2062). `next` yields the replies oldest first; one whose
+/// `id` is not `pending` answers an older request and is dropped, and the
+/// last that matches wins. Taking an answer ends the wait, so `pending` is
+/// cleared; with none, it is left as it was. Declaration, type definition,
+/// rename, formatting and code actions read their replies this way.
+pub(super) fn take_reply<T>(
+    pending: &mut Option<u64>,
+    mut next: impl FnMut() -> Option<T>,
+    id: impl Fn(&T) -> u64,
+) -> Option<T> {
+    let mut reply = None;
+    while let Some(candidate) = next() {
+        if Some(id(&candidate)) == *pending {
+            reply = Some(candidate);
+        }
+    }
+    if reply.is_some() {
+        *pending = None;
+    }
+    reply
+}
+
 /// What to do with one on-type formatting reply (#254). `NotOurs` leaves the
 /// armed request alone — a superseded reply must not disarm the newer one
 /// still in flight — while `Stale` and `Apply` both consume it.
