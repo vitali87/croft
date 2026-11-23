@@ -2942,9 +2942,6 @@ fn every_command_matches_the_saved_registry() {
 #[test]
 fn no_pane_caret_blinks_through_a_popup() {
     use crate::app::popups::Popup;
-    let tmp = tempfile::tempdir().unwrap();
-    let file = tmp.path().join("a.txt");
-    std::fs::write(&file, "one\ntwo\n").unwrap();
     let draw = |app: &mut App| {
         let backend = super::golden::GoldenBackend {
             inner: ratatui::backend::TestBackend::new(120, 40),
@@ -2963,6 +2960,9 @@ fn no_pane_caret_blinks_through_a_popup() {
         crate::theme::Theme::from_id("loch"),
     ] {
         for p in Popup::ALL {
+            let tmp = tempfile::tempdir().unwrap();
+            let file = tmp.path().join("a.txt");
+            std::fs::write(&file, "one\ntwo\n").unwrap();
             let mut app = App::new(tmp.path().to_path_buf()).unwrap();
             app.apply_theme(theme);
             app.editor.open_in_new_tab(&file).unwrap();
