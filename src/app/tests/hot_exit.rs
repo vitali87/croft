@@ -2859,5 +2859,8 @@ fn the_connect_dialog_reads_its_question_but_not_the_password() {
         item.ends_with("Type the answer. Enter, send. Escape, cancel"),
         "{item}"
     );
-    assert!(!item.contains("hunter2"), "the password is never read: {item}");
+    assert!(
+        !item.contains("hunter2"),
+        "the password is never read: {item}"
+    );
 }

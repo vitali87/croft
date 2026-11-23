@@ -2986,7 +2986,10 @@ impl App {
         if let Some(drop) = &self.pending_stash_drop {
             return Some(said(
                 "Drop stash?",
-                &[drop.label.clone(), tr("This permanently deletes the stash.")],
+                &[
+                    drop.label.clone(),
+                    tr("This permanently deletes the stash."),
+                ],
                 &[yes_no("Y, yes, drop it")],
             ));
         }
