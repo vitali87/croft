@@ -3567,3 +3567,103 @@ fn a_new_breadcrumb_picker_starts_unfiltered() {
     app.open_breadcrumb_picker(0);
     assert_eq!(crumb_picker_labels(&app).len(), 2, "the old text is gone");
 }
+
+/// #2062, a guard before the LSP reply mailbox (card 7): F12 and Alt+F12
+/// share one definition reply channel. A reply to the peek request opens the
+/// peek popup and leaves the caret where it was; a reply to the F12 request
+/// jumps.
+#[test]
+fn a_peek_definition_reply_opens_the_peek_popup_instead_of_jumping() {
+    use crate::lsp::manager::DefinitionResult;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = jump_app(tmp.path());
+    let path = app.editor.path.clone().unwrap();
+    let caret = (app.editor.cursor_row, app.editor.cursor_col);
+    app.handle_key(key(KeyCode::F(12), KeyModifiers::ALT))
+        .unwrap();
+    let peek = app
+        .peek_definition_request_id
+        .expect("Alt+F12 sent a peek request");
+    assert_eq!(app.definition_request_id, None, "and no jump request");
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .push_definition_for_test(DefinitionResult {
+            request_id: peek,
+            target: Some((path.clone(), 0, 0)),
+        });
+    assert!(app.drain_lsp_definition());
+    assert!(app.peek_popup.is_some(), "the peek reply opens the popup");
+    assert_eq!(
+        (app.editor.cursor_row, app.editor.cursor_col),
+        caret,
+        "and does not move the caret"
+    );
+    assert_eq!(app.peek_definition_request_id, None);
+
+    app.peek_popup = None;
+    app.peek_target = None;
+    app.request_definition_at_cursor();
+    let jump = app.definition_request_id.expect("F12 sent a request");
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .push_definition_for_test(DefinitionResult {
+            request_id: jump,
+            target: Some((path, 0, 0)),
+        });
+    assert!(app.drain_lsp_definition());
+    assert!(app.peek_popup.is_none(), "an F12 reply opens no popup");
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 0));
+}
+
+/// #2062, a guard before the LSP reply mailbox (card 7): a caret resting on
+/// one spot asks for its highlights once, after the idle wait, and not again
+/// on every tick, whether or not the reply has come back.
+#[test]
+fn a_resting_caret_asks_for_its_highlights_once() {
+    use crate::lsp::manager::{DocumentHighlightsResult, OccurrenceItem};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = jump_app(tmp.path());
+    app.tick_occurrences();
+    assert!(
+        app.occurrences_request.is_none(),
+        "nothing is asked before the caret has rested"
+    );
+    app.occ_observed_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    app.tick_occurrences();
+    let (id, ..) = app
+        .occurrences_request
+        .clone()
+        .expect("one request once the caret has rested");
+    for _ in 0..20 {
+        app.tick_occurrences();
+    }
+    assert_eq!(
+        app.occurrences_request.as_ref().map(|r| r.0),
+        Some(id),
+        "no second request while the reply is out"
+    );
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .push_document_highlights_for_test(DocumentHighlightsResult {
+            request_id: id,
+            items: vec![OccurrenceItem {
+                start_line: 1,
+                start_char: 14,
+                end_line: 1,
+                end_char: 28,
+                write: false,
+            }],
+        });
+    assert!(app.drain_lsp_document_highlights(), "the reply paints");
+    for _ in 0..20 {
+        app.tick_occurrences();
+    }
+    assert_eq!(
+        app.occurrences_request.as_ref().map(|r| r.0),
+        Some(id),
+        "and none after it, while the caret stays put"
+    );
+}

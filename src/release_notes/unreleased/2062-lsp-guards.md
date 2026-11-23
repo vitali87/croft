@@ -1,0 +1,1 @@
+refactor: Groundwork for the refactor program (#2062): two new tests pin how a peek-definition reply opens the peek popup and how a resting caret asks the language server for its highlights once, so the coming language-server cleanup cannot change either. Nothing changes in use.

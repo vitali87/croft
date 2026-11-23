@@ -65,6 +65,15 @@ impl LspManager {
         })
     }
 
+    /// Test hook: deliver a documentHighlight reply as if a server had
+    /// answered.
+    #[cfg(test)]
+    pub fn push_document_highlights_for_test(&self, result: DocumentHighlightsResult) {
+        self.doc_highlights_test_tx
+            .send(result)
+            .expect("highlights channel open");
+    }
+
     pub fn drain_document_highlights(&self) -> Option<DocumentHighlightsResult> {
         self.doc_highlights_rx.try_recv().ok()
     }
