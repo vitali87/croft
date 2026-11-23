@@ -44,6 +44,7 @@ mod tasks;
 mod terminal;
 mod terminal_panes;
 mod testing;
+mod tick;
 mod updates;
 mod viewers;
 mod vim;
@@ -104,6 +105,14 @@ fn app_source() -> String {
         all.push_str(&text);
     }
     all
+}
+
+/// The crash notice's slot is one for the whole process: tests that fill it,
+/// read it, or run a background pass (which takes what is in it) take turns.
+fn crash_slot_lock() -> std::sync::MutexGuard<'static, ()> {
+    static SLOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SLOT.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {

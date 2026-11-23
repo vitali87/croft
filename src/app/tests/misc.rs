@@ -871,14 +871,6 @@ fn show_memory_usage_renders_in_the_active_theme() {
     );
 }
 
-/// The crash notice's slot is one for the whole process: tests that fill and
-/// read it take turns.
-fn crash_slot_lock() -> std::sync::MutexGuard<'static, ()> {
-    static SLOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    SLOT.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
 /// #2609: the crash notice of a task croft recovers from (a job, stream or
 /// worker) says croft carried on, instead of asking for a restart the task
 /// does not need; the record's place is still named.
