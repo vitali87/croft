@@ -8,6 +8,8 @@ use super::*;
 /// `handle_tree_key` / `handle_explorer_shortcut` so the menu is a
 /// discovery surface for the same accelerators the keyboard accepts.
 /// [`platform_shortcut_for`] spells it for the platform croft runs on.
+/// Every action has an arm, with no catch-all, so a new menu row does not
+/// compile until it says which shortcut it shows, or why it shows none.
 pub(super) fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
     match action {
         MenuAction::Create(CreateKind::File) => Some("⌘F"),
@@ -110,7 +112,47 @@ pub(super) fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         // Convert Indentation to Spaces / Tabs carry.
         MenuAction::ConvertIndentation(true) => Some("⌥⇧⌘S"),
         MenuAction::ConvertIndentation(false) => Some("⌥⇧⌘T"),
-        _ => None,
+        // Each row below runs on the value it was picked with (a viewer, a
+        // breadcrumb entry, a resolved location, a theme, a code lens, a
+        // shell profile, a commit, an Explorer view, a minimap edge, or a
+        // status-bar picker's language, line ending, encoding or indent
+        // style), so no chord can stand for it.
+        MenuAction::OpenInViewer(..)
+        | MenuAction::OpenCrumbFile(_)
+        | MenuAction::BrowseCrumbFolder { .. }
+        | MenuAction::GoToLocation { .. }
+        | MenuAction::SetTheme(_)
+        | MenuAction::RunCodeLens(_)
+        | MenuAction::NewTerminalWithProfile(_)
+        | MenuAction::CommitAction { .. }
+        | MenuAction::ToggleExplorerView(_)
+        | MenuAction::SetMinimapSide(_)
+        | MenuAction::SetLanguage(_)
+        | MenuAction::SetLineEnding(_)
+        | MenuAction::SetEncoding(_)
+        | MenuAction::SetIndentStyle(_) => None,
+        // The editor-group moves and splits in the tab menu: croft binds
+        // none of them, and the palette's group moves carry no chord either.
+        MenuAction::SplitEditorLeft
+        | MenuAction::SplitEditorDown
+        | MenuAction::MoveEditorUp
+        | MenuAction::MoveEditorDown
+        | MenuAction::MoveEditorLeft
+        | MenuAction::MoveEditorRight => None,
+        // Copy Permalink and Open on Remote (#1610): their palette commands
+        // carry no chord either.
+        MenuAction::CopyPermalink | MenuAction::OpenOnRemote => None,
+        // The Customize Layout popup's rows whose palette commands carry no
+        // chord. (Its side bar, panel, minimap and Zen rows have their arms
+        // above.)
+        MenuAction::OpenCustomizeLayout
+        | MenuAction::ToggleActivityBar
+        | MenuAction::ToggleAutoHideSideBar
+        | MenuAction::ToggleStatusBar
+        | MenuAction::SetSideBarPosition(_)
+        | MenuAction::SetPanelAlignment(_)
+        | MenuAction::SetQuickInputPosition(_)
+        | MenuAction::ToggleCenteredLayout => None,
     }
 }
 
