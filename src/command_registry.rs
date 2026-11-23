@@ -4,1093 +4,2575 @@
 //! platform. The palette widget, the menus, the keyboard shortcuts screen and
 //! `keybindings.json` all read it here.
 
-/// One invokable command. The order of variants is the order commands appear
-/// in the palette before the user types anything (grouped by category, most
-/// useful first), so keep related commands adjacent.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Command {
+/// Declares every built-in command once, as one row: the variant (under its
+/// docs), its `keybindings.json` id, its title and its default shortcut hint,
+/// with the reason beside any hint that is empty or unusual. From the rows
+/// come [`Command`], [`ALL_COMMANDS`] in the rows' order, and
+/// [`Command::id`], [`Command::title`] and [`Command::keybinding_hint`]. A row
+/// without all three fields does not compile, so no command can ship without
+/// an id, a title or a decision about its shortcut (croft tenet: everything
+/// has a shortcut, or says why not).
+macro_rules! commands {
+    ($(
+        $(#[$attr:meta])*
+        $variant:ident {
+            id: $id:literal,
+            title: $title:literal,
+            hint: $hint:expr $(,)?
+        }
+    )*) => {
+        /// One invokable command. The order of variants is the order commands
+        /// appear in the palette before the user types anything (grouped by
+        /// category, most useful first), so keep related commands adjacent.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum Command {
+            $($(#[$attr])* $variant,)*
+        }
+
+        /// Every command, in palette display order. Single source of truth for
+        /// both the empty-query list and the test that guards the count.
+        pub const ALL_COMMANDS: &[Command] = &[$(Command::$variant,)*];
+
+        impl Command {
+            /// The human-readable label shown in the palette and matched against the
+            /// query. Mirrors VS Code's command titles.
+            pub fn title(self) -> &'static str {
+                match self {
+                    $(Command::$variant => $title,)*
+                }
+            }
+
+            /// The default key-binding hint shown right-aligned on the row, or an
+            /// empty string for palette-only commands. The label uses the macOS chord
+            /// names; on Linux/Android the command modifier is `Ctrl`, and
+            /// [`platform_hint`] spells it that way where it is shown.
+            pub fn keybinding_hint(self) -> &'static str {
+                match self {
+                    $(Command::$variant => $hint,)*
+                }
+            }
+
+            /// The stable snake_case identifier used in `keybindings.json`. This is the
+            /// contract a user's config binds against, so the strings must never drift
+            /// once shipped (unlike `title`, which is display-only).
+            pub fn id(self) -> &'static str {
+                match self {
+                    $(Command::$variant => $id,)*
+                }
+            }
+        }
+    };
+}
+
+commands! {
     // --- Editor: line / selection ops (the new VS Code parity features) ---
-    MoveLineUp,
-    MoveLineDown,
+    MoveLineUp {
+        id: "move_line_up",
+        title: "Move Line Up",
+        hint: "Alt+↑",
+    }
+    MoveLineDown {
+        id: "move_line_down",
+        title: "Move Line Down",
+        hint: "Alt+↓",
+    }
     /// Copy Line Up/Down (#916): VS Code's `copyLinesUpAction` /
     /// `copyLinesDownAction`, by default Shift+Alt+Up/Down.
-    CopyLineUp,
-    CopyLineDown,
-    ToggleLineComment,
-    ToggleBlockComment,
-    JoinLines,
-    InsertLineBelow,
-    InsertLineAbove,
-    DeleteLine,
-    KillToEndOfLine,
-    TransformUpper,
-    TransformLower,
-    TransformTitle,
-    TransformSnake,
-    TransformCamel,
-    TransformPascal,
-    TransformKebab,
-    SortLinesAscending,
-    SortLinesDescending,
-    IncrementNumber,
-    DecrementNumber,
-    TrimTrailingWhitespace,
-    EmmetExpandAbbreviation,
-    EmmetWrapWithAbbreviation,
-    EmmetRemoveTag,
-    EmmetUpdateTag,
-    EmmetBalanceOutward,
-    EmmetBalanceInward,
-    EmmetMatchTag,
-    ToggleWordWrap,
-    ExpandSelection,
-    ShrinkSelection,
-    ReplaceInFile,
-    ToggleFindInSelection,
-    MergeAcceptCurrent,
-    MergeAcceptIncoming,
-    MergeAcceptBoth,
-    MergeAcceptAllCurrent,
-    MergeAcceptAllIncoming,
-    MergeNextConflict,
-    MergePrevConflict,
-    GoToNextChange,
-    GoToPrevChange,
+    CopyLineUp {
+        id: "copy_line_up",
+        title: "Copy Line Up",
+        hint: "Shift+Alt+↑",
+    }
+    CopyLineDown {
+        id: "copy_line_down",
+        title: "Copy Line Down",
+        hint: "Shift+Alt+↓",
+    }
+    ToggleLineComment {
+        id: "toggle_line_comment",
+        title: "Toggle Line Comment",
+        hint: "Cmd+/",
+    }
+    ToggleBlockComment {
+        id: "toggle_block_comment",
+        title: "Toggle Block Comment",
+        hint: "Shift+Alt+A",
+    }
+    JoinLines {
+        id: "join_lines",
+        title: "Join Lines",
+        hint: "Cmd+Opt+Shift+J",
+    }
+    InsertLineBelow {
+        id: "insert_line_below",
+        title: "Insert Line Below",
+        hint: "Cmd+Enter",
+    }
+    InsertLineAbove {
+        id: "insert_line_above",
+        title: "Insert Line Above",
+        hint: "Cmd+Shift+Enter",
+    }
+    DeleteLine {
+        id: "delete_line",
+        title: "Delete Line",
+        hint: "Cmd+Shift+K",
+    }
+    KillToEndOfLine {
+        id: "kill_to_end_of_line",
+        title: "Kill to End of Line",
+        // macOS keeps `Ctrl+K`; off it `Ctrl+K` is the `Cmd+K` leader
+        // except in vim mode (#843), so the palette is the way there.
+        hint: if cfg!(target_os = "macos") {
+            "Ctrl+K"
+        } else {
+            ""
+        },
+    }
+    TransformUpper {
+        id: "transform_upper",
+        title: "Transform to Uppercase",
+        hint: "Cmd+Opt+Shift+U",
+    }
+    TransformLower {
+        id: "transform_lower",
+        title: "Transform to Lowercase",
+        hint: "Cmd+Opt+Shift+L",
+    }
+    TransformTitle {
+        id: "transform_title",
+        title: "Transform to Title Case",
+        hint: "Cmd+Opt+Shift+C",
+    }
+    TransformSnake {
+        id: "transform_snake",
+        title: "Transform to Snake Case",
+        hint: "",
+    }
+    TransformCamel {
+        id: "transform_camel",
+        title: "Transform to Camel Case",
+        hint: "",
+    }
+    TransformPascal {
+        id: "transform_pascal",
+        title: "Transform to Pascal Case",
+        hint: "",
+    }
+    TransformKebab {
+        id: "transform_kebab",
+        title: "Transform to Kebab Case",
+        hint: "",
+    }
+    SortLinesAscending {
+        id: "sort_lines_ascending",
+        title: "Sort Lines Ascending",
+        hint: "Cmd+Opt+Shift+A",
+    }
+    SortLinesDescending {
+        id: "sort_lines_descending",
+        title: "Sort Lines Descending",
+        hint: "Cmd+Opt+Shift+D",
+    }
+    IncrementNumber {
+        id: "increment_number",
+        title: "Increment Number Under Cursor",
+        hint: "Cmd+Opt+=",
+    }
+    DecrementNumber {
+        id: "decrement_number",
+        title: "Decrement Number Under Cursor",
+        hint: "Cmd+Opt+-",
+    }
+    TrimTrailingWhitespace {
+        id: "trim_trailing_whitespace",
+        title: "Trim Trailing Whitespace",
+        hint: "Cmd+Opt+Shift+W",
+    }
+    EmmetExpandAbbreviation {
+        id: "emmet_expand_abbreviation",
+        title: "Emmet: Expand Abbreviation",
+        hint: "Cmd+Opt+Shift+E",
+    }
+    EmmetWrapWithAbbreviation {
+        id: "emmet_wrap_with_abbreviation",
+        title: "Emmet: Wrap with Abbreviation",
+        hint: "",
+    }
+    EmmetRemoveTag {
+        id: "emmet_remove_tag",
+        title: "Emmet: Remove Tag",
+        hint: "",
+    }
+    EmmetUpdateTag {
+        id: "emmet_update_tag",
+        title: "Emmet: Update Tag",
+        hint: "",
+    }
+    EmmetBalanceOutward {
+        id: "emmet_balance_outward",
+        title: "Emmet: Balance (outward)",
+        hint: "",
+    }
+    EmmetBalanceInward {
+        id: "emmet_balance_inward",
+        title: "Emmet: Balance (inward)",
+        hint: "",
+    }
+    EmmetMatchTag {
+        id: "emmet_match_tag",
+        title: "Emmet: Go to Matching Pair",
+        hint: "",
+    }
+    ToggleWordWrap {
+        id: "toggle_word_wrap",
+        title: "View: Toggle Word Wrap",
+        hint: "Alt+Z",
+    }
+    ExpandSelection {
+        id: "expand_selection",
+        title: "Expand Selection",
+        hint: "Shift+Alt+\u{2192}",
+    }
+    ShrinkSelection {
+        id: "shrink_selection",
+        title: "Shrink Selection",
+        hint: "Shift+Alt+\u{2190}",
+    }
+    ReplaceInFile {
+        id: "replace_in_file",
+        title: "Replace in File",
+        hint: "Cmd+Opt+F",
+    }
+    ToggleFindInSelection {
+        id: "toggle_find_in_selection",
+        title: "Find: Toggle Find in Selection",
+        hint: "Alt+L",
+    }
+    MergeAcceptCurrent {
+        id: "merge_accept_current",
+        title: "Merge Conflict: Accept Current",
+        hint: "Cmd+.",
+    }
+    MergeAcceptIncoming {
+        id: "merge_accept_incoming",
+        title: "Merge Conflict: Accept Incoming",
+        hint: "Cmd+.",
+    }
+    MergeAcceptBoth {
+        id: "merge_accept_both",
+        title: "Merge Conflict: Accept Both",
+        hint: "Cmd+.",
+    }
+    MergeAcceptAllCurrent {
+        id: "merge_accept_all_current",
+        title: "Merge Conflict: Accept All Current",
+        hint: "",
+    }
+    MergeAcceptAllIncoming {
+        id: "merge_accept_all_incoming",
+        title: "Merge Conflict: Accept All Incoming",
+        hint: "",
+    }
+    MergeNextConflict {
+        id: "merge_next_conflict",
+        title: "Merge Conflict: Next Conflict",
+        hint: "F7",
+    }
+    MergePrevConflict {
+        id: "merge_prev_conflict",
+        title: "Merge Conflict: Previous Conflict",
+        hint: "Shift+F7",
+    }
+    GoToNextChange {
+        id: "next_change",
+        title: "Go to Next Change",
+        hint: "F7",
+    }
+    GoToPrevChange {
+        id: "previous_change",
+        title: "Go to Previous Change",
+        hint: "Shift+F7",
+    }
     /// Walk the PROBLEMS list (build messages and diagnostics) from the
     /// caret, across files, wrapping at the ends.
-    GoToNextProblem,
-    GoToPrevProblem,
-    MergeComplete,
-    MergeOpenEditor,
-    MergeToggleBase,
-    MergeAcceptBothReverse,
-    MergeIgnore,
-    DebugAddWatch,
-    DebugClearWatch,
-    PeekDefinition,
-    PeekReferences,
-    GoToDefinition,
-    GoToReferences,
-    GoToDeclaration,
-    GoToTypeDefinition,
+    GoToNextProblem {
+        id: "next_problem",
+        title: "Go to Next Problem",
+        // No default chord: F8 is the perf toggle here. Bind one in
+        // keybindings.json, or import VS Code's F8 / Shift+F8.
+        hint: "",
+    }
+    GoToPrevProblem {
+        id: "previous_problem",
+        title: "Go to Previous Problem",
+        hint: "",
+    }
+    MergeComplete {
+        id: "merge_complete",
+        title: "Merge: Complete Merge (stage file)",
+        hint: "",
+    }
+    MergeOpenEditor {
+        id: "merge_open_editor",
+        title: "Merge: Open Merge Editor",
+        hint: "",
+    }
+    MergeToggleBase {
+        id: "merge_toggle_base",
+        title: "Merge: Show Base",
+        hint: "",
+    }
+    MergeAcceptBothReverse {
+        id: "merge_accept_both_reverse",
+        title: "Merge: Accept Combination (Incoming First)",
+        hint: "",
+    }
+    MergeIgnore {
+        id: "merge_ignore",
+        title: "Merge: Ignore (Keep Base)",
+        hint: "",
+    }
+    DebugAddWatch {
+        id: "debug_add_watch",
+        title: "Debug: Add Watch Expression",
+        hint: "",
+    }
+    DebugClearWatch {
+        id: "debug_clear_watch",
+        title: "Debug: Remove All Watch Expressions",
+        hint: "",
+    }
+    PeekDefinition {
+        id: "peek_definition",
+        title: "Peek Definition",
+        hint: "Alt+F12",
+    }
+    PeekReferences {
+        id: "peek_references",
+        title: "Peek References",
+        hint: "Alt+Shift+F12",
+    }
+    GoToDefinition {
+        id: "go_to_definition",
+        title: "Go to Definition",
+        hint: "F12",
+    }
+    GoToReferences {
+        id: "go_to_references",
+        title: "Go to References",
+        hint: "Shift+F12",
+    }
+    GoToDeclaration {
+        id: "go_to_declaration",
+        title: "Go to Declaration",
+        hint: "Ctrl+Shift+F12",
+    }
+    GoToTypeDefinition {
+        id: "go_to_type_definition",
+        title: "Go to Type Definition",
+        hint: "Ctrl+F12",
+    }
     /// Go to Implementations (#843): Cmd+F12, which has no `Ctrl` form
     /// (`Ctrl+F12` is Go to Type Definition).
-    GoToImplementations,
-    SwitchHeaderSource,
-    RenameSymbol,
+    GoToImplementations {
+        id: "go_to_implementations",
+        title: "Go to Implementations",
+        hint: "Cmd+F12",
+    }
+    SwitchHeaderSource {
+        id: "switch_header_source",
+        title: "C/C++: Switch Header/Source",
+        hint: "Alt+O",
+    }
+    RenameSymbol {
+        id: "rename_symbol",
+        title: "Rename Symbol",
+        hint: "F2",
+    }
     /// Trigger Suggest / Trigger Parameter Hints (#916): the completion
     /// popup Ctrl+Space opens, and the parameter hints typing `(` asks for.
-    TriggerSuggest,
-    TriggerParameterHints,
+    TriggerSuggest {
+        id: "trigger_suggest",
+        title: "Trigger Suggest",
+        hint: "Ctrl+Space",
+    }
+    TriggerParameterHints {
+        id: "trigger_parameter_hints",
+        title: "Trigger Parameter Hints",
+        // No chord of its own: VS Code's Ctrl+Shift+Space is the
+        // terminal's Quick Select here. Typing `(` or `,` asks too.
+        hint: "",
+    }
     /// Show or Focus Hover (#1518): the hover popup for the caret, the one
     /// the pointer's rest opens, from the keyboard.
-    ShowHover,
-    MouseAddCursorAtClick,
-    MouseGoToDefinitionAtClick,
-    MouseOpenLinkAtClick,
-    ClearBuildDiagnostics,
-    StageHunk,
-    UnstageHunk,
-    RevertHunk,
+    ShowHover {
+        id: "show_hover",
+        title: "Show or Focus Hover",
+        hint: "Cmd+K Cmd+I",
+    }
+    MouseAddCursorAtClick {
+        id: "mouse_add_cursor_at_click",
+        title: "Mouse: Add Cursor at Click",
+        hint: "",
+    }
+    MouseGoToDefinitionAtClick {
+        id: "mouse_go_to_definition_at_click",
+        title: "Mouse: Go to Definition at Click",
+        hint: "",
+    }
+    MouseOpenLinkAtClick {
+        id: "mouse_open_link_at_click",
+        title: "Mouse: Open Link at Click",
+        hint: "",
+    }
+    ClearBuildDiagnostics {
+        id: "clear_build_diagnostics",
+        title: "Problems: Clear Build Diagnostics",
+        hint: "",
+    }
+    StageHunk {
+        id: "stage_hunk",
+        title: "Git: Stage Hunk",
+        hint: "S in diff",
+    }
+    UnstageHunk {
+        id: "unstage_hunk",
+        title: "Git: Unstage Hunk",
+        hint: "U in diff",
+    }
+    RevertHunk {
+        id: "revert_hunk",
+        title: "Git: Revert Hunk",
+        hint: "R in diff",
+    }
     /// Git: Undo Last Commit (#1350): `reset --soft HEAD~1`, its message
     /// back in the Source Control box.
-    GitUndoLastCommit,
+    GitUndoLastCommit {
+        id: "git_undo_last_commit",
+        title: "Git: Undo Last Commit",
+        hint: "",
+    }
     /// rust-analyzer's own commands (#1626), listed only while it serves
     /// the active file.
-    RustExpandMacro,
-    RustParentModule,
-    RustOpenCargoToml,
-    RustRebuildProcMacros,
-    RustReloadWorkspace,
+    RustExpandMacro {
+        id: "rust_expand_macro",
+        title: "Rust: Expand Macro Recursively at Caret",
+        hint: "",
+    }
+    RustParentModule {
+        id: "rust_parent_module",
+        title: "Rust: Locate Parent Module",
+        hint: "",
+    }
+    RustOpenCargoToml {
+        id: "rust_open_cargo_toml",
+        title: "Rust: Open Cargo.toml",
+        hint: "",
+    }
+    RustRebuildProcMacros {
+        id: "rust_rebuild_proc_macros",
+        title: "Rust: Rebuild Proc Macros and Build Scripts",
+        hint: "",
+    }
+    RustReloadWorkspace {
+        id: "rust_reload_workspace",
+        title: "Rust: Reload Workspace",
+        hint: "",
+    }
     /// Git: Copy Permalink / Copy Head Link / Open on Remote (#1610): the
     /// selected lines on the remote's web page, at HEAD's commit or branch.
-    GitCopyPermalink,
-    GitCopyHeadLink,
-    GitOpenOnRemote,
-
+    GitCopyPermalink {
+        id: "git_copy_permalink",
+        title: "Git: Copy Permalink",
+        hint: "",
+    }
+    GitCopyHeadLink {
+        id: "git_copy_head_link",
+        title: "Git: Copy Head Link",
+        hint: "",
+    }
+    GitOpenOnRemote {
+        id: "git_open_on_remote",
+        title: "Git: Open on Remote",
+        hint: "",
+    }
     /// Pick a stash and open its changes (#1581).
-    GitViewStash,
+    GitViewStash {
+        id: "git_view_stash",
+        title: "Git: View Stash\u{2026}",
+        hint: "",
+    }
     /// The caret line's commit, as the inline blame names it (#1556): open
     /// the changes it made to the file, or copy its hash.
-    GitOpenLineCommit,
-    GitCopyLineCommitHash,
-    AddCursorAbove,
-    AddCursorBelow,
-    ColumnSelectUp,
-    ColumnSelectDown,
-    ColumnSelectLeft,
-    ColumnSelectRight,
-    ColumnSelectPageUp,
-    ColumnSelectPageDown,
-    ToggleColumnSelection,
-    AddSelectionToNextMatch,
-    SelectAllOccurrences,
-    AddCursorsToLineEnds,
-    ExpandLineSelection,
+    GitOpenLineCommit {
+        id: "git_open_line_commit",
+        title: "Git: Open Commit for Line",
+        hint: "",
+    }
+    GitCopyLineCommitHash {
+        id: "git_copy_line_commit_hash",
+        title: "Git: Copy Commit Hash for Line",
+        hint: "",
+    }
+    AddCursorAbove {
+        id: "add_cursor_above",
+        title: "Add Cursor Above",
+        hint: "Cmd+Opt+↑",
+    }
+    AddCursorBelow {
+        id: "add_cursor_below",
+        title: "Add Cursor Below",
+        hint: "Cmd+Opt+↓",
+    }
+    ColumnSelectUp {
+        id: "column_select_up",
+        title: "Column Select Up",
+        hint: "Cmd+Shift+Opt+↑",
+    }
+    ColumnSelectDown {
+        id: "column_select_down",
+        title: "Column Select Down",
+        hint: "Cmd+Shift+Opt+↓",
+    }
+    ColumnSelectLeft {
+        id: "column_select_left",
+        title: "Column Select Left",
+        hint: "Cmd+Shift+Opt+←",
+    }
+    ColumnSelectRight {
+        id: "column_select_right",
+        title: "Column Select Right",
+        hint: "Cmd+Shift+Opt+→",
+    }
+    ColumnSelectPageUp {
+        id: "column_select_page_up",
+        title: "Column Select Page Up",
+        hint: "Cmd+Shift+Opt+PageUp",
+    }
+    ColumnSelectPageDown {
+        id: "column_select_page_down",
+        title: "Column Select Page Down",
+        hint: "Cmd+Shift+Opt+PageDown",
+    }
+    ToggleColumnSelection {
+        id: "toggle_column_selection",
+        title: "View: Toggle Column Selection Mode",
+        hint: "",
+    }
+    AddSelectionToNextMatch {
+        id: "add_selection_to_next_match",
+        title: "Add Selection to Next Find Match",
+        hint: "Cmd+D",
+    }
+    SelectAllOccurrences {
+        id: "select_all_occurrences",
+        title: "Select All Occurrences of Find Match",
+        hint: "Cmd+Shift+L",
+    }
+    AddCursorsToLineEnds {
+        id: "add_cursors_to_line_ends",
+        title: "Add Cursors to Line Ends",
+        hint: "Shift+Alt+I",
+    }
+    ExpandLineSelection {
+        id: "expand_line_selection",
+        title: "Expand Line Selection",
+        hint: "Cmd+L",
+    }
     // --- Editor: bracket / character / indentation ops ---
-    JumpToBracket,
-    SelectToBracket,
-    TransposeCharacters,
-    IndentationToSpaces,
-    IndentationToTabs,
-    TrimFinalNewlines,
-    ToggleOverviewRuler,
-    ToggleBookmark,
-    NextBookmark,
-    PreviousBookmark,
-    ClearBookmarks,
-    ViewBookmarks,
-    FormatDocument,
-    FormatSelection,
-    ChangeColorPresentation,
-    ToggleFormatOnType,
-    ToggleFormatOnSave,
-    QuickFix,
+    JumpToBracket {
+        id: "jump_to_bracket",
+        title: "Go to Bracket",
+        hint: "Cmd+Shift+\\",
+    }
+    SelectToBracket {
+        id: "select_to_bracket",
+        title: "Select to Bracket",
+        hint: "Cmd+Opt+\\",
+    }
+    TransposeCharacters {
+        id: "transpose_characters",
+        title: "Transpose Characters around the Cursor",
+        hint: "Ctrl+T",
+    }
+    IndentationToSpaces {
+        id: "indentation_to_spaces",
+        title: "Convert Indentation to Spaces",
+        hint: "Cmd+Opt+Shift+S",
+    }
+    IndentationToTabs {
+        id: "indentation_to_tabs",
+        title: "Convert Indentation to Tabs",
+        hint: "Cmd+Opt+Shift+T",
+    }
+    TrimFinalNewlines {
+        id: "trim_final_newlines",
+        title: "Trim Final Newlines",
+        hint: "Cmd+Opt+Shift+N",
+    }
+    ToggleOverviewRuler {
+        id: "toggle_overview_ruler",
+        title: "View: Toggle Overview Ruler",
+        hint: "",
+    }
+    ToggleBookmark {
+        id: "toggle_bookmark",
+        title: "Bookmarks: Toggle Bookmark",
+        hint: "Cmd+Opt+Shift+K",
+    }
+    NextBookmark {
+        id: "next_bookmark",
+        title: "Bookmarks: Next Bookmark",
+        hint: "Cmd+Opt+.",
+    }
+    PreviousBookmark {
+        id: "previous_bookmark",
+        title: "Bookmarks: Previous Bookmark",
+        hint: "Cmd+Opt+,",
+    }
+    ClearBookmarks {
+        id: "clear_bookmarks",
+        title: "Bookmarks: Clear All in File",
+        hint: "Cmd+Opt+Shift+B",
+    }
+    ViewBookmarks {
+        id: "view_bookmarks",
+        title: "Bookmarks: View Bookmarks",
+        hint: "Cmd+K Cmd+M",
+    }
+    FormatDocument {
+        id: "format_document",
+        title: "Format Document",
+        hint: "Cmd+Opt+Shift+F",
+    }
+    FormatSelection {
+        id: "format_selection",
+        title: "Format Selection",
+        hint: "Cmd+K Cmd+F",
+    }
+    ChangeColorPresentation {
+        id: "change_color_presentation",
+        title: "Change Color Presentation",
+        hint: "",
+    }
+    ToggleFormatOnType {
+        id: "toggle_format_on_type",
+        title: "Preferences: Toggle Format on Type",
+        hint: "",
+    }
+    ToggleFormatOnSave {
+        id: "toggle_format_on_save",
+        title: "Preferences: Toggle Format on Save",
+        hint: "Cmd+K F",
+    }
+    QuickFix {
+        id: "quick_fix",
+        title: "Quick Fix",
+        hint: "Cmd+.",
+    }
     // --- Editor: folding ---
-    ToggleFold,
-    FoldAll,
-    UnfoldAll,
-    FoldAllComments,
-    FoldAllRegions,
-    UnfoldAllRegions,
+    ToggleFold {
+        id: "toggle_fold",
+        title: "Toggle Fold",
+        hint: "Cmd+K Cmd+L",
+    }
+    FoldAll {
+        id: "fold_all",
+        title: "Fold All",
+        hint: "Cmd+K Cmd+0",
+    }
+    UnfoldAll {
+        id: "unfold_all",
+        title: "Unfold All",
+        hint: "Cmd+K Cmd+J",
+    }
+    FoldAllComments {
+        id: "fold_all_comments",
+        title: "Fold All Block Comments",
+        hint: "Cmd+K Cmd+/",
+    }
+    FoldAllRegions {
+        id: "fold_all_regions",
+        title: "Fold All Regions",
+        hint: "Cmd+K Cmd+8",
+    }
+    UnfoldAllRegions {
+        id: "unfold_all_regions",
+        title: "Unfold All Regions",
+        hint: "Cmd+K Cmd+9",
+    }
     /// Fold Level 1-7 (#1653): collapse every fold that deep or deeper.
-    FoldLevel1,
-    FoldLevel2,
-    FoldLevel3,
-    FoldLevel4,
-    FoldLevel5,
-    FoldLevel6,
-    FoldLevel7,
+    FoldLevel1 {
+        id: "fold_level_1",
+        title: "Fold Level 1",
+        hint: "Cmd+K Cmd+1",
+    }
+    FoldLevel2 {
+        id: "fold_level_2",
+        title: "Fold Level 2",
+        hint: "Cmd+K Cmd+2",
+    }
+    FoldLevel3 {
+        id: "fold_level_3",
+        title: "Fold Level 3",
+        hint: "Cmd+K Cmd+3",
+    }
+    FoldLevel4 {
+        id: "fold_level_4",
+        title: "Fold Level 4",
+        hint: "Cmd+K Cmd+4",
+    }
+    FoldLevel5 {
+        id: "fold_level_5",
+        title: "Fold Level 5",
+        hint: "Cmd+K Cmd+5",
+    }
+    FoldLevel6 {
+        id: "fold_level_6",
+        title: "Fold Level 6",
+        hint: "Cmd+K Cmd+6",
+    }
+    FoldLevel7 {
+        id: "fold_level_7",
+        title: "Fold Level 7",
+        hint: "Cmd+K Cmd+7",
+    }
     /// The fold at the caret and every fold inside it (#1653).
-    FoldRecursively,
-    UnfoldRecursively,
+    FoldRecursively {
+        id: "fold_recursively",
+        title: "Fold Recursively",
+        // VS Code's Cmd+K Cmd+[ / ] collapse and restore terminal panes
+        // here, so these two are palette commands, bindable by id.
+        hint: "",
+    }
+    UnfoldRecursively {
+        id: "unfold_recursively",
+        title: "Unfold Recursively",
+        hint: "",
+    }
     // --- File / editor management ---
-    SaveFile,
-    SaveAs,
+    SaveFile {
+        id: "save_file",
+        title: "File: Save",
+        hint: "Cmd+S",
+    }
+    SaveAs {
+        id: "save_as",
+        title: "File: Save As…",
+        hint: "",
+    }
     /// File: Save with Sudo (#1379): write a file this user may not write
     /// through `sudo tee` in a terminal pane, where sudo asks for the
     /// password itself.
-    SaveWithSudo,
+    SaveWithSudo {
+        id: "save_with_sudo",
+        title: "File: Save with Sudo",
+        hint: "",
+    }
     /// File: Revert File (#1285): drop the tab's unsaved edits for the
     /// text on disk, as one undo step.
-    RevertFile,
+    RevertFile {
+        id: "revert_file",
+        title: "File: Revert File",
+        hint: "",
+    }
     /// File: Save All (#852): every dirty tab, in every split.
-    SaveAll,
+    SaveAll {
+        id: "save_all",
+        title: "File: Save All",
+        // VS Code's macOS chord; its Linux `Ctrl+K S` is Select for
+        // Compare here, so Linux takes `Ctrl+Alt+S` instead.
+        hint: "Cmd+Opt+S",
+    }
     /// File: New File… / New Folder… (#852): the Explorer's create prompt
     /// from any pane, beside the active file or in the Explorer selection.
-    NewFile,
-    NewUntitledFile,
-    NewFolder,
-    Undo,
-    Redo,
-    SelectAll,
-    ToggleAutoSave,
-    ToggleAutoSaveOnFocusChange,
-    ToggleInlineBlame,
-    ToggleLiveRun,
-    ToggleProvenance,
-    DiffToggleGroupBySeat,
-    ToggleIndentGuides,
-    ToggleBracketColors,
-    ToggleRenderWhitespace,
+    NewFile {
+        id: "new_file",
+        title: "File: New File…",
+        // Palette-only: the Explorer's `Cmd+F` / `Cmd+Shift+N` are Find
+        // and unbound outside it, so neither is the command's chord.
+        hint: "",
+    }
+    NewUntitledFile {
+        id: "new_untitled_file",
+        title: "File: New Untitled Text File",
+        hint: "Cmd+N",
+    }
+    NewFolder {
+        id: "new_folder",
+        title: "File: New Folder…",
+        hint: "",
+    }
+    Undo {
+        id: "undo",
+        title: "Undo",
+        hint: "Cmd+Z",
+    }
+    Redo {
+        id: "redo",
+        title: "Redo",
+        hint: "Shift+Cmd+Z",
+    }
+    SelectAll {
+        id: "select_all",
+        title: "Select All",
+        hint: "Cmd+A",
+    }
+    ToggleAutoSave {
+        id: "toggle_auto_save",
+        title: "File: Toggle Auto Save",
+        hint: "",
+    }
+    ToggleAutoSaveOnFocusChange {
+        id: "toggle_auto_save_on_focus_change",
+        title: "File: Toggle Auto Save on Focus Change",
+        hint: "",
+    }
+    ToggleInlineBlame {
+        id: "toggle_inline_blame",
+        title: "Git: Toggle Inline Blame",
+        hint: "",
+    }
+    ToggleLiveRun {
+        id: "toggle_live_run",
+        title: "Python: Toggle Live Run",
+        hint: "Cmd+K V",
+    }
+    ToggleProvenance {
+        id: "toggle_provenance",
+        title: "Editor: Toggle Provenance",
+        hint: "",
+    }
+    DiffToggleGroupBySeat {
+        id: "diff_toggle_group_by_seat",
+        title: "Diff: Toggle Group by Seat",
+        hint: "",
+    }
+    ToggleIndentGuides {
+        id: "toggle_indent_guides",
+        title: "View: Toggle Indent Guides",
+        hint: "",
+    }
+    ToggleBracketColors {
+        id: "toggle_bracket_colors",
+        title: "Editor: Toggle Bracket Pair Colorization",
+        hint: "",
+    }
+    ToggleRenderWhitespace {
+        id: "toggle_render_whitespace",
+        title: "View: Toggle Render Whitespace",
+        hint: "",
+    }
     /// View: Change Line Numbers (#1576): on, relative, interval, off.
-    CycleLineNumbers,
-    ToggleInlineValues,
-    ToggleInlayHints,
-    ToggleMarkdownPreview,
+    CycleLineNumbers {
+        id: "cycle_line_numbers",
+        title: "View: Change Line Numbers (On, Relative, Interval, Off)",
+        hint: "",
+    }
+    ToggleInlineValues {
+        id: "toggle_inline_values",
+        title: "Debug: Toggle Inline Values",
+        hint: "",
+    }
+    ToggleInlayHints {
+        id: "toggle_inlay_hints",
+        title: "Editor: Toggle Inlay Hints",
+        hint: "",
+    }
+    ToggleMarkdownPreview {
+        id: "toggle_markdown_preview",
+        title: "Markdown: Toggle Preview",
+        hint: "Cmd+Shift+V",
+    }
     /// Markdown: Open Preview to the Side (#1605), VS Code's
     /// `markdown.showPreviewToSide`: the rendered view in the next group,
     /// following the source as it is typed.
-    OpenMarkdownPreviewToSide,
+    OpenMarkdownPreviewToSide {
+        id: "open_markdown_preview_to_side",
+        title: "Markdown: Open Preview to the Side",
+        hint: "Cmd+K V",
+    }
     /// Markdown: Run Code Block at Cursor (#843): Cmd+Enter's run of the
     /// fence under the caret, from any terminal.
-    RunCodeBlockAtCursor,
-    RestoreSnapshot,
-    CloseEditor,
-    ReopenClosedEditor,
+    RunCodeBlockAtCursor {
+        id: "run_code_block_at_cursor",
+        title: "Markdown: Run Code Block at Cursor",
+        hint: "Cmd+Enter",
+    }
+    RestoreSnapshot {
+        id: "restore_snapshot",
+        title: "Local History: Restore Snapshot",
+        hint: "",
+    }
+    CloseEditor {
+        id: "close_editor",
+        title: "View: Close Editor",
+        hint: "Cmd+W",
+    }
+    ReopenClosedEditor {
+        id: "reopen_closed_editor",
+        title: "View: Reopen Closed Editor",
+        hint: "Cmd+K Shift+W",
+    }
     /// Explorer: Jump to Directory (zoxide) (#843): the Explorer's Cmd+Z,
     /// which has no `Ctrl` form.
-    ZoxideJump,
+    ZoxideJump {
+        id: "zoxide_jump",
+        title: "Explorer: Jump to Directory (zoxide)",
+        hint: "Cmd+Z in Explorer",
+    }
     /// The editor tab menu's close / pin / keep rows as commands (#852),
     /// VS Code's names, each on the active tab of the focused group.
-    CloseOtherEditors,
-    CloseEditorsToTheRight,
-    CloseSavedEditors,
-    CloseAllEditors,
+    CloseOtherEditors {
+        id: "close_other_editors",
+        title: "View: Close Other Editors in Group",
+        // Not VS Code's ⌥⌘T, which iTerm2 keeps for New Tab and a Linux
+        // desktop for a new terminal (#2072).
+        hint: "Cmd+K Shift+X",
+    }
+    CloseEditorsToTheRight {
+        id: "close_editors_to_the_right",
+        title: "View: Close Editors to the Right in Group",
+        hint: "Cmd+K →",
+    }
+    CloseSavedEditors {
+        id: "close_saved_editors",
+        title: "View: Close Saved Editors in Group",
+        hint: "Cmd+K U",
+    }
+    CloseAllEditors {
+        id: "close_all_editors",
+        title: "View: Close All Editors",
+        hint: "Cmd+K W",
+    }
     /// View: Pin Editor / Unpin Editor. The palette offers only the one
     /// that applies to the active tab, as VS Code does
     /// (`CommandPalette::set_hidden`); both stay bindable.
-    PinEditor,
-    UnpinEditor,
-    KeepEditor,
+    PinEditor {
+        id: "pin_editor",
+        title: "View: Pin Editor",
+        // One chord toggles, as VS Code's `Ctrl+K Shift+Enter` serves
+        // both through their `when` clauses.
+        hint: "Cmd+K P",
+    }
+    UnpinEditor {
+        id: "unpin_editor",
+        title: "View: Unpin Editor",
+        hint: "Cmd+K P",
+    }
+    KeepEditor {
+        id: "keep_editor",
+        title: "View: Keep Editor",
+        hint: "Cmd+K Shift+P",
+    }
     /// View: Move Editor Left / Right (#1565): the active tab one place
     /// along its group's tab bar.
-    MoveEditorLeftInGroup,
-    MoveEditorRightInGroup,
+    MoveEditorLeftInGroup {
+        id: "move_editor_left_in_group",
+        title: "View: Move Editor Left",
+        // VS Code's Linux and Windows chords; its macOS Cmd+K
+        // Cmd+Shift+Left / Right are rebindable by id.
+        hint: "Ctrl+Shift+PageUp",
+    }
+    MoveEditorRightInGroup {
+        id: "move_editor_right_in_group",
+        title: "View: Move Editor Right",
+        hint: "Ctrl+Shift+PageDown",
+    }
     /// View: Move Editor into Next / Previous Group (#1565): the active tab
     /// to the next or previous group, creating one beside it when there is
     /// none that way.
-    MoveEditorToNextGroup,
-    MoveEditorToPreviousGroup,
-    SplitEditor,
+    MoveEditorToNextGroup {
+        id: "move_editor_to_next_group",
+        title: "View: Move Editor into Next Group",
+        // VS Code's Ctrl+Alt+Left / Right already move croft's caret a
+        // word (they carry Alt), so these two are palette commands,
+        // bindable by id.
+        hint: "",
+    }
+    MoveEditorToPreviousGroup {
+        id: "move_editor_to_previous_group",
+        title: "View: Move Editor into Previous Group",
+        hint: "",
+    }
+    SplitEditor {
+        id: "split_editor",
+        title: "View: Split Editor",
+        hint: "Cmd+\\",
+    }
     /// View: Focus Left / Right Editor Group (#843): Cmd+Opt+Left / Right,
     /// which have no `Ctrl` form off macOS.
-    FocusLeftEditorGroup,
-    FocusRightEditorGroup,
-    QuickOpen,
-    TakeTheTour,
+    FocusLeftEditorGroup {
+        id: "focus_left_editor_group",
+        title: "View: Focus Left Editor Group",
+        hint: "Cmd+Opt+←",
+    }
+    FocusRightEditorGroup {
+        id: "focus_right_editor_group",
+        title: "View: Focus Right Editor Group",
+        hint: "Cmd+Opt+→",
+    }
+    QuickOpen {
+        id: "quick_open",
+        title: "Go to File",
+        hint: "Cmd+P",
+    }
+    TakeTheTour {
+        id: "help_take_the_tour",
+        title: "Help: Take the Tour",
+        hint: "",
+    }
     /// Help: Sponsor croft (#1940): the activity bar's heart from the
     /// keyboard, opening croft's GitHub Sponsors page.
-    SponsorCroft,
-    SarifNextResult,
-    SarifPreviousResult,
-    SarifOpenCodeScanning,
+    SponsorCroft {
+        id: "help_sponsor_croft",
+        title: "Help: Sponsor croft",
+        hint: "",
+    }
+    SarifNextResult {
+        id: "sarif_next_result",
+        title: "SARIF: Next Result",
+        hint: "",
+    }
+    SarifPreviousResult {
+        id: "sarif_previous_result",
+        title: "SARIF: Previous Result",
+        hint: "",
+    }
+    SarifOpenCodeScanning {
+        id: "sarif_open_code_scanning",
+        title: "SARIF: Open GitHub Code Scanning Analysis",
+        hint: "",
+    }
     /// SARIF: Load Code Scanning Results (#577): the current branch's
     /// newest analyses per tool, at the nearest scanned commit.
-    SarifLoadCodeScanning,
-    GoToSymbol,
-    GoToWorkspaceSymbol,
+    SarifLoadCodeScanning {
+        id: "sarif_load_code_scanning",
+        title: "SARIF: Load Code Scanning Results for This Branch",
+        hint: "",
+    }
+    GoToSymbol {
+        id: "go_to_symbol",
+        title: "Go to Symbol in Editor",
+        hint: "Cmd+Shift+O",
+    }
+    GoToWorkspaceSymbol {
+        id: "go_to_workspace_symbol",
+        title: "Go to Symbol in Workspace",
+        hint: "Cmd+P #",
+    }
     /// VS Code "Go Back" (Ctrl+-): return to the location before the last
     /// navigation jump (Go to Definition, a reference pick, a symbol jump).
-    NavigateBack,
-    NavigateForward,
-    GoToLastEditLocation,
-    ToggleVimMode,
-    MacroStartStopRecording,
-    MacroReplayLast,
-    MacroReplayTimes,
+    NavigateBack {
+        id: "navigate_back",
+        title: "Go Back",
+        hint: "Ctrl+-",
+    }
+    NavigateForward {
+        id: "navigate_forward",
+        title: "Go Forward",
+        hint: "Ctrl+Shift+-",
+    }
+    GoToLastEditLocation {
+        id: "go_to_last_edit_location",
+        title: "Go to Last Edit Location",
+        hint: "Cmd+K Cmd+Q",
+    }
+    ToggleVimMode {
+        id: "toggle_vim_mode",
+        title: "Toggle Vim Mode",
+        hint: "Cmd+E",
+    }
+    MacroStartStopRecording {
+        id: "macro_record",
+        title: "Macro: Start/Stop Recording",
+        hint: "",
+    }
+    MacroReplayLast {
+        id: "macro_replay_last",
+        title: "Macro: Replay Last",
+        hint: "",
+    }
+    MacroReplayTimes {
+        id: "macro_replay_times",
+        title: "Macro: Replay N Times…",
+        hint: "",
+    }
     // --- View / navigation ---
-    ShowExplorer,
+    ShowExplorer {
+        id: "show_explorer",
+        title: "View: Show Explorer",
+        hint: "Cmd+Shift+E",
+    }
     /// View: Focus and Select Breadcrumbs (#1608): the last crumb's picker.
-    FocusBreadcrumbs,
-    ShowSearch,
+    FocusBreadcrumbs {
+        id: "breadcrumbs_focus_and_select",
+        title: "View: Focus and Select Breadcrumbs",
+        hint: "Cmd+Shift+.",
+    }
+    ShowSearch {
+        id: "show_search",
+        title: "View: Show Search",
+        hint: "Cmd+Shift+F",
+    }
     /// Search: Replace in Files (#860): the Search side bar with its Replace
     /// row expanded and focused.
-    ReplaceInFiles,
+    ReplaceInFiles {
+        id: "replace_in_files",
+        title: "Search: Replace in Files",
+        hint: "Cmd+Shift+H",
+    }
     /// The Search side bar's `Aa` / `ab` / `.*` toggles and its `...`
     /// include / exclude row, from the keyboard (#860).
-    SearchToggleMatchCase,
-    SearchToggleWholeWord,
-    SearchToggleRegex,
-    SearchTogglePreserveCase,
-    SearchToggleDetails,
-    ShowSourceControl,
-    AddWorkspaceFolder,
-    RemoveWorkspaceFolder,
-    SaveWorkspaceAs,
-    OpenWorkspaceFromFile,
-    ReopenAsHex,
-    ReopenAsPreview,
-    ReopenAsText,
-    NotebookRunAll,
-    NotebookInterrupt,
-    NotebookRestart,
-    NotebookSelectKernel,
-    RestartLanguageServers,
-    RestartLanguageServersForFile,
-    TestingRunWithCoverage,
-    CoverageClear,
-    TestingInstallCoverageTool,
-    TestingShowCoverageReport,
-    DeveloperShowMemoryUsage,
+    SearchToggleMatchCase {
+        id: "search_toggle_match_case",
+        title: "Search: Toggle Match Case",
+        // VS Code's search-input keys, live while a Search input has
+        // focus; run from the palette they reveal the side bar first.
+        hint: "Alt+C",
+    }
+    SearchToggleWholeWord {
+        id: "search_toggle_whole_word",
+        title: "Search: Toggle Match Whole Word",
+        hint: "Alt+W",
+    }
+    SearchToggleRegex {
+        id: "search_toggle_regex",
+        title: "Search: Toggle Use Regular Expression",
+        hint: "Alt+R",
+    }
+    SearchTogglePreserveCase {
+        id: "search_toggle_preserve_case",
+        title: "Search: Toggle Preserve Case",
+        hint: "Alt+P",
+    }
+    SearchToggleDetails {
+        id: "search_toggle_details",
+        title: "Search: Toggle Search Details",
+        // VS Code binds none that is free here (its Ctrl+Shift+J is
+        // croft's maximize-terminal); D for details.
+        hint: "Alt+D",
+    }
+    ShowSourceControl {
+        id: "show_source_control",
+        title: "View: Show Source Control",
+        hint: "Cmd+Shift+S",
+    }
+    AddWorkspaceFolder {
+        id: "add_workspace_folder",
+        title: "Workspaces: Add Folder to Workspace",
+        hint: "",
+    }
+    RemoveWorkspaceFolder {
+        id: "remove_workspace_folder",
+        title: "Workspaces: Remove Folder from Workspace",
+        hint: "",
+    }
+    SaveWorkspaceAs {
+        id: "save_workspace_as",
+        title: "Workspaces: Save Workspace As",
+        hint: "",
+    }
+    OpenWorkspaceFromFile {
+        id: "open_workspace_from_file",
+        title: "Workspaces: Open Workspace from File",
+        hint: "",
+    }
+    ReopenAsHex {
+        id: "reopen_as_hex",
+        title: "File: Reopen as Hex",
+        hint: "",
+    }
+    ReopenAsPreview {
+        id: "reopen_as_preview",
+        title: "File: Reopen as Preview",
+        hint: "",
+    }
+    ReopenAsText {
+        id: "reopen_as_text",
+        title: "File: Reopen as Text",
+        hint: "",
+    }
+    NotebookRunAll {
+        id: "notebook_run_all",
+        title: "Notebook: Run All Cells",
+        hint: "",
+    }
+    NotebookInterrupt {
+        id: "notebook_interrupt",
+        title: "Notebook: Interrupt Kernel",
+        hint: "",
+    }
+    NotebookRestart {
+        id: "notebook_restart",
+        title: "Notebook: Restart Kernel",
+        hint: "",
+    }
+    NotebookSelectKernel {
+        id: "notebook_select_kernel",
+        title: "Notebook: Select Kernel",
+        hint: "",
+    }
+    RestartLanguageServers {
+        id: "restart_language_servers",
+        title: "Language Servers: Restart All",
+        hint: "",
+    }
+    RestartLanguageServersForFile {
+        id: "restart_language_servers_for_file",
+        title: "Language Servers: Restart for This File",
+        hint: "",
+    }
+    TestingRunWithCoverage {
+        id: "testing_run_with_coverage",
+        title: "Testing: Run All Tests with Coverage",
+        hint: "",
+    }
+    CoverageClear {
+        id: "coverage_clear",
+        title: "Coverage: Clear",
+        hint: "",
+    }
+    TestingInstallCoverageTool {
+        id: "testing_install_coverage_tool",
+        title: "Testing: Install Coverage Tool",
+        hint: "",
+    }
+    TestingShowCoverageReport {
+        id: "testing_show_coverage_report",
+        title: "Testing: Show Coverage Report",
+        hint: "",
+    }
+    DeveloperShowMemoryUsage {
+        id: "developer_show_memory_usage",
+        title: "Developer: Show Memory Usage",
+        hint: "",
+    }
     /// Developer: Toggle Screencast Mode: show the keys pressed, the command
     /// each ran and where a click landed, for a recording.
-    ToggleScreencastMode,
-    RunTestAtCursorWithCoverage,
-    TestingToggleWatchAll,
-    TestingGoToFirstFailure,
-    TestingCancelRun,
-    HexFindNext,
-    SheetInsertRowBelow,
-    SheetDeleteRow,
-    SheetInsertColRight,
-    SheetDeleteCol,
-    MediaOpenExternal,
-    ShowRunDebug,
-    ShowRemote,
-    ShowExtensions,
-    CompareExtensionsWithVscode,
-    ShowTesting,
-    ShowCodeQL,
-    CodeqlRunQuery,
-    CodeqlRunQuerySuite,
-    CodeqlRemoveDatabase,
-    CodeqlRenameDatabase,
-    CodeqlSortDatabases,
-    CodeqlRevealDatabase,
-    CodeqlUpgradeDatabase,
-    CodeqlClearCache,
-    CodeqlTrimCache,
-    CodeqlTrimCacheToOverlay,
-    CodeqlAddDatabaseSource,
-    CodeqlDeleteUnusedDatabases,
-    CodeqlRemoveHistory,
-    CodeqlRenameHistory,
-    CodeqlSortHistory,
-    CodeqlViewQuery,
-    CodeqlCreateQuery,
-    CodeqlRunPack,
-    CodeqlRunQueryOnDatabases,
-    CodeqlCancelQueue,
-    CodeqlCopyVersion,
-    CodeqlDownloadCli,
-    CodeqlCheckCliUpdates,
-    CodeqlInstallPackDependencies,
-    CodeqlDownloadPacks,
-    CodeqlRunPublishedPack,
-    CodeqlQuickQuery,
-    CodeqlCompareResults,
-    CodeqlShowEvaluatorLog,
-    CodeqlShowEvaluatorLogSummary,
-    CodeqlShowEvaluatorLogViewer,
-    CodeqlShowQueryLog,
-    CodeqlComparePerformance,
-    CodeqlPreviewQueryHelp,
-    CodeqlExportResults,
-    CodeqlSetUpController,
-    CodeqlAddVariantRepo,
-    CodeqlAddVariantList,
-    CodeqlAddVariantOwner,
-    CodeqlVariantCodeSearch,
-    CodeqlOpenVariantConfig,
-    CodeqlOpenVariantOnGithub,
-    CodeqlRunVariantAnalysis,
-    CodeqlOpenVariantResults,
-    CodeqlExportVariantResults,
-    CodeqlCopyVariantRepoList,
-    CodeqlViewVariantLogs,
-    CodeqlRunTests,
-    CodeqlDebugQuery,
-    CodeqlDebugSelection,
-    CodeqlResultsUp,
-    CodeqlResultsDown,
-    CodeqlResultsLeft,
-    CodeqlResultsRight,
-    SheetSortByColumn,
-    CodeqlQuickEval,
-    CodeqlQuickEvalCount,
-    CodeqlViewAst,
-    CodeqlOpenModelEditor,
-    CodeqlModelEndpoint,
-    CodeqlOpenReferencedFile,
-    CodeqlViewAlertsCsv,
-    CodeqlViewAlertsSarif,
-    CodeqlViewResultsCsv,
-    CodeqlShowResultSet,
-    CodeqlViewCfg,
-    CodeqlRunAllQueries,
-    CodeqlRunSelectedQueries,
-    CodeqlCancelRunningQuery,
-    CodeqlAcceptTestOutput,
-    CodeqlFocusSideBar,
-    CodeqlOpenResultsDirectory,
-    RunTestAtCursor,
-    DebugTestAtCursor,
+    ToggleScreencastMode {
+        id: "toggle_screencast_mode",
+        title: "Developer: Toggle Screencast Mode",
+        hint: "Shift+F8",
+    }
+    RunTestAtCursorWithCoverage {
+        id: "run_test_at_cursor_with_coverage",
+        title: "Testing: Run Test at Cursor with Coverage",
+        hint: "",
+    }
+    TestingToggleWatchAll {
+        id: "testing_toggle_watch_all",
+        title: "Testing: Toggle Watch All Tests",
+        hint: "",
+    }
+    TestingGoToFirstFailure {
+        id: "testing_go_to_first_failure",
+        title: "Testing: Go to First Failure",
+        hint: "",
+    }
+    TestingCancelRun {
+        id: "testing_cancel_run",
+        title: "Testing: Cancel Test Run",
+        hint: "",
+    }
+    HexFindNext {
+        id: "hex_find_next",
+        title: "Hex: Find Next",
+        hint: "F3",
+    }
+    SheetInsertRowBelow {
+        id: "sheet_insert_row_below",
+        title: "Sheet: Insert Row Below",
+        hint: "",
+    }
+    SheetDeleteRow {
+        id: "sheet_delete_row",
+        title: "Sheet: Delete Row",
+        hint: "",
+    }
+    SheetInsertColRight {
+        id: "sheet_insert_col_right",
+        title: "Sheet: Insert Column Right",
+        hint: "",
+    }
+    SheetDeleteCol {
+        id: "sheet_delete_col",
+        title: "Sheet: Delete Column",
+        hint: "",
+    }
+    MediaOpenExternal {
+        id: "media_open_external",
+        title: "Media: Open in System Player",
+        hint: "",
+    }
+    ShowRunDebug {
+        id: "show_run_debug",
+        title: "View: Show Run and Debug",
+        hint: "Cmd+Shift+D",
+    }
+    ShowRemote {
+        id: "show_remote",
+        title: "View: Show Remote",
+        hint: "Cmd+Shift+R",
+    }
+    ShowExtensions {
+        id: "show_extensions",
+        title: "View: Show Extensions",
+        hint: "Cmd+Shift+X",
+    }
+    CompareExtensionsWithVscode {
+        id: "compare_extensions_with_vscode",
+        title: "Extensions: Compare with VS Code",
+        hint: "",
+    }
+    ShowTesting {
+        id: "show_testing",
+        title: "View: Show Testing",
+        hint: "Cmd+K B",
+    }
+    ShowCodeQL {
+        id: "show_codeql",
+        title: "View: Show CodeQL",
+        hint: "",
+    }
+    CodeqlRunQuery {
+        id: "codeql_run_query",
+        title: "CodeQL: Run Query on Selected Database",
+        hint: "",
+    }
+    CodeqlRunQuerySuite {
+        id: "codeql_run_query_suite",
+        title: "CodeQL: Run Query Suite",
+        hint: "",
+    }
+    CodeqlRemoveDatabase {
+        id: "codeql_remove_database",
+        title: "CodeQL: Remove Database",
+        hint: "",
+    }
+    CodeqlRenameDatabase {
+        id: "codeql_rename_database",
+        title: "CodeQL: Rename Database",
+        hint: "",
+    }
+    CodeqlSortDatabases {
+        id: "codeql_sort_databases",
+        title: "CodeQL: Sort Databases",
+        hint: "",
+    }
+    CodeqlRevealDatabase {
+        id: "codeql_reveal_database",
+        title: "CodeQL: Reveal Database in Explorer",
+        hint: "",
+    }
+    CodeqlUpgradeDatabase {
+        id: "codeql_upgrade_database",
+        title: "CodeQL: Upgrade Database",
+        hint: "",
+    }
+    CodeqlClearCache {
+        id: "codeql_clear_cache",
+        title: "CodeQL: Clear Cache",
+        hint: "",
+    }
+    CodeqlTrimCache {
+        id: "codeql_trim_cache",
+        title: "CodeQL: Trim Cache",
+        hint: "",
+    }
+    CodeqlTrimCacheToOverlay {
+        id: "codeql_trim_cache_to_overlay_base",
+        title: "CodeQL: Trim Cache to Overlay Base",
+        hint: "",
+    }
+    CodeqlAddDatabaseSource {
+        id: "codeql_add_database_source",
+        title: "CodeQL: Add Database Source to Workspace",
+        hint: "",
+    }
+    CodeqlDeleteUnusedDatabases {
+        id: "codeql_delete_unused_databases",
+        title: "CodeQL: Delete Unused Databases",
+        hint: "",
+    }
+    CodeqlRemoveHistory {
+        id: "codeql_remove_history",
+        title: "CodeQL: Remove Query History Entry",
+        hint: "",
+    }
+    CodeqlRenameHistory {
+        id: "codeql_rename_history",
+        title: "CodeQL: Rename Query History Entry",
+        hint: "",
+    }
+    CodeqlSortHistory {
+        id: "codeql_sort_history",
+        title: "CodeQL: Sort Query History",
+        hint: "",
+    }
+    CodeqlViewQuery {
+        id: "codeql_view_query",
+        title: "CodeQL: View Query",
+        hint: "",
+    }
+    CodeqlCreateQuery {
+        id: "codeql_create_query",
+        title: "CodeQL: Create Query",
+        hint: "",
+    }
+    CodeqlRunPack {
+        id: "codeql_run_pack",
+        title: "CodeQL: Run Queries in Pack",
+        hint: "",
+    }
+    CodeqlRunQueryOnDatabases {
+        id: "codeql_run_query_on_databases",
+        title: "CodeQL: Run Query on Multiple Databases",
+        hint: "",
+    }
+    CodeqlCancelQueue {
+        id: "codeql_cancel_queue",
+        title: "CodeQL: Cancel Queued Queries",
+        hint: "",
+    }
+    CodeqlCopyVersion {
+        id: "codeql_copy_version_information",
+        title: "CodeQL: Copy Version Information",
+        hint: "",
+    }
+    CodeqlDownloadCli {
+        id: "codeql_download_cli",
+        title: "CodeQL: Download CLI",
+        hint: "",
+    }
+    CodeqlCheckCliUpdates {
+        id: "codeql_check_for_cli_updates",
+        title: "CodeQL: Check for CLI Updates",
+        hint: "",
+    }
+    CodeqlInstallPackDependencies {
+        id: "codeql_install_pack_dependencies",
+        title: "CodeQL: Install Pack Dependencies",
+        hint: "",
+    }
+    CodeqlDownloadPacks {
+        id: "codeql_download_packs",
+        title: "CodeQL: Download Packs",
+        hint: "",
+    }
+    CodeqlRunPublishedPack {
+        id: "codeql_run_published_pack",
+        title: "CodeQL: Run Queries in Published Pack",
+        hint: "",
+    }
+    CodeqlQuickQuery {
+        id: "codeql_quick_query",
+        title: "CodeQL: Quick Query",
+        hint: "",
+    }
+    CodeqlCompareResults {
+        id: "codeql_compare_query_results",
+        title: "CodeQL: Compare Query Results",
+        hint: "",
+    }
+    CodeqlShowEvaluatorLog {
+        id: "codeql_show_evaluator_log",
+        title: "CodeQL: Show Evaluator Log (Raw JSON)",
+        hint: "",
+    }
+    CodeqlShowEvaluatorLogSummary {
+        id: "codeql_show_evaluator_log_summary",
+        title: "CodeQL: Show Evaluator Log (Summary Text)",
+        hint: "",
+    }
+    CodeqlShowEvaluatorLogViewer {
+        id: "codeql_show_evaluator_log_viewer",
+        title: "CodeQL: Show Evaluator Log (Viewer)",
+        hint: "",
+    }
+    CodeqlShowQueryLog {
+        id: "codeql_show_query_log",
+        title: "CodeQL: Show Query Log",
+        hint: "",
+    }
+    CodeqlComparePerformance {
+        id: "codeql_compare_performance",
+        title: "CodeQL: Compare Performance",
+        hint: "",
+    }
+    CodeqlPreviewQueryHelp {
+        id: "codeql_preview_query_help",
+        title: "CodeQL: Preview Query Help",
+        hint: "",
+    }
+    CodeqlExportResults {
+        id: "codeql_export_results",
+        title: "CodeQL: Export Results",
+        hint: "",
+    }
+    CodeqlSetUpController {
+        id: "codeql_set_up_controller_repository",
+        title: "CodeQL: Set Up Controller Repository",
+        hint: "",
+    }
+    CodeqlAddVariantRepo {
+        id: "codeql_add_variant_analysis_repository",
+        title: "CodeQL: Add Variant Analysis Repository",
+        hint: "",
+    }
+    CodeqlAddVariantList {
+        id: "codeql_add_variant_analysis_list",
+        title: "CodeQL: Add Variant Analysis Repository List",
+        hint: "",
+    }
+    CodeqlAddVariantOwner {
+        id: "codeql_add_variant_analysis_owner",
+        title: "CodeQL: Add Variant Analysis Owner",
+        hint: "",
+    }
+    CodeqlVariantCodeSearch {
+        id: "codeql_add_repositories_with_code_search",
+        title: "CodeQL: Add Repositories with GitHub Code Search",
+        hint: "",
+    }
+    CodeqlOpenVariantConfig {
+        id: "codeql_open_variant_analysis_config",
+        title: "CodeQL: Open Variant Analysis Config File",
+        hint: "",
+    }
+    CodeqlOpenVariantOnGithub {
+        id: "codeql_open_variant_analysis_on_github",
+        title: "CodeQL: Open Variant Analysis Repository on GitHub",
+        hint: "",
+    }
+    CodeqlRunVariantAnalysis {
+        id: "codeql_run_variant_analysis",
+        title: "CodeQL: Run Variant Analysis",
+        hint: "",
+    }
+    CodeqlOpenVariantResults {
+        id: "codeql_open_variant_analysis_results",
+        title: "CodeQL: Open Variant Analysis Results",
+        hint: "",
+    }
+    CodeqlExportVariantResults {
+        id: "codeql_export_variant_analysis_results",
+        title: "CodeQL: Export Variant Analysis Results",
+        hint: "",
+    }
+    CodeqlCopyVariantRepoList {
+        id: "codeql_copy_variant_repo_list",
+        title: "CodeQL: Copy Variant Analysis Repository List",
+        hint: "",
+    }
+    CodeqlViewVariantLogs {
+        id: "codeql_view_variant_logs",
+        title: "CodeQL: View Variant Analysis Logs",
+        hint: "",
+    }
+    CodeqlRunTests {
+        id: "codeql_run_tests",
+        title: "CodeQL: Run Tests",
+        hint: "",
+    }
+    CodeqlDebugQuery {
+        id: "codeql_debug_query",
+        title: "CodeQL: Debug Query",
+        hint: "",
+    }
+    CodeqlDebugSelection {
+        id: "codeql_debug_selection",
+        title: "CodeQL: Debug Selection",
+        hint: "",
+    }
+    CodeqlResultsUp {
+        id: "codeql_results_up",
+        title: "CodeQL: Previous Result",
+        hint: "",
+    }
+    CodeqlResultsDown {
+        id: "codeql_results_down",
+        title: "CodeQL: Next Result",
+        hint: "",
+    }
+    CodeqlResultsLeft {
+        id: "codeql_results_left",
+        title: "CodeQL: Previous Result Column",
+        hint: "",
+    }
+    CodeqlResultsRight {
+        id: "codeql_results_right",
+        title: "CodeQL: Next Result Column",
+        hint: "",
+    }
+    SheetSortByColumn {
+        id: "sheet_sort_by_column",
+        title: "Sheet: Sort by Column",
+        hint: "",
+    }
+    CodeqlQuickEval {
+        id: "codeql_quick_eval",
+        title: "CodeQL: Quick Evaluation",
+        hint: "",
+    }
+    CodeqlQuickEvalCount {
+        id: "codeql_quick_eval_count",
+        title: "CodeQL: Quick Evaluation Count",
+        hint: "",
+    }
+    CodeqlViewAst {
+        id: "codeql_view_ast",
+        title: "CodeQL: View AST",
+        hint: "",
+    }
+    CodeqlOpenModelEditor {
+        id: "codeql_open_model_editor",
+        title: "CodeQL: Open Model Editor",
+        hint: "",
+    }
+    CodeqlModelEndpoint {
+        id: "codeql_model_endpoint",
+        title: "CodeQL: Model Endpoint",
+        hint: "",
+    }
+    CodeqlOpenReferencedFile {
+        id: "codeql_open_referenced_file",
+        title: "CodeQL: Open Referenced File",
+        hint: "",
+    }
+    CodeqlViewAlertsCsv {
+        id: "codeql_view_alerts_csv",
+        title: "CodeQL: View Alerts (CSV)",
+        hint: "",
+    }
+    CodeqlViewAlertsSarif {
+        id: "codeql_view_alerts_sarif",
+        title: "CodeQL: View Alerts (SARIF)",
+        hint: "",
+    }
+    CodeqlViewResultsCsv {
+        id: "codeql_view_results_csv",
+        title: "CodeQL: View Results (CSV)",
+        hint: "",
+    }
+    CodeqlShowResultSet {
+        id: "codeql_show_result_set",
+        title: "CodeQL: Show Result Set",
+        hint: "",
+    }
+    CodeqlViewCfg {
+        id: "codeql_view_cfg",
+        title: "CodeQL: View CFG",
+        hint: "",
+    }
+    CodeqlRunAllQueries {
+        id: "codeql_run_all_queries",
+        title: "CodeQL: Run All Queries in Workspace",
+        hint: "",
+    }
+    CodeqlRunSelectedQueries {
+        id: "codeql_run_selected_queries",
+        title: "CodeQL: Run Queries in Selected Files",
+        hint: "",
+    }
+    CodeqlCancelRunningQuery {
+        id: "codeql_cancel_running_query",
+        title: "CodeQL: Cancel Running Query",
+        hint: "",
+    }
+    CodeqlAcceptTestOutput {
+        id: "codeql_accept_test_output",
+        title: "CodeQL: Accept Test Output",
+        hint: "",
+    }
+    CodeqlFocusSideBar {
+        id: "codeql_focus_side_bar",
+        title: "CodeQL: Focus Side Bar",
+        hint: "",
+    }
+    CodeqlOpenResultsDirectory {
+        id: "codeql_open_results_directory",
+        title: "CodeQL: Open Query Results Directory",
+        hint: "",
+    }
+    RunTestAtCursor {
+        id: "run_test_at_cursor",
+        title: "Testing: Run Test at Cursor",
+        hint: "Cmd+K Enter",
+    }
     /// Testing: Run All Tests / Run Tests in Current File / Rerun Failed
     /// Tests / Rerun Last Run (#1535), VS Code's everyday test commands.
-    TestingRunAll,
-    TestingRunFile,
-    TestingRerunFailed,
-    TestingRerunLast,
-    ToggleSideBar,
-    ToggleAutoHideSideBar,
-    ToggleSecondarySideBar,
-    ToggleZenMode,
+    TestingRunAll {
+        id: "testing_run_all",
+        title: "Testing: Run All Tests",
+        hint: "",
+    }
+    TestingRunFile {
+        id: "testing_run_file",
+        title: "Testing: Run Tests in Current File",
+        hint: "",
+    }
+    TestingRerunFailed {
+        id: "testing_rerun_failed",
+        title: "Testing: Rerun Failed Tests",
+        hint: "",
+    }
+    TestingRerunLast {
+        id: "testing_rerun_last",
+        title: "Testing: Rerun Last Run",
+        hint: "",
+    }
+    DebugTestAtCursor {
+        id: "debug_test_at_cursor",
+        title: "Testing: Debug Test at Cursor",
+        hint: "Cmd+K Shift+Enter",
+    }
+    ToggleSideBar {
+        id: "toggle_side_bar",
+        title: "View: Toggle Primary Side Bar",
+        hint: "Cmd+B",
+    }
+    ToggleAutoHideSideBar {
+        id: "toggle_auto_hide_side_bar",
+        title: "View: Toggle Auto-Hide Side Bar",
+        hint: "",
+    }
+    ToggleSecondarySideBar {
+        id: "toggle_secondary_side_bar",
+        title: "View: Toggle Secondary Side Bar",
+        hint: "Cmd+Opt+B",
+    }
+    ToggleZenMode {
+        id: "toggle_zen_mode",
+        title: "View: Toggle Zen Mode",
+        hint: "Cmd+K Z",
+    }
     /// Centre the editor in its column (#1585), VS Code's View: Toggle
     /// Centered Layout.
-    ToggleCenteredLayout,
-    ToggleTerminal,
+    ToggleCenteredLayout {
+        id: "toggle_centered_layout",
+        title: "View: Toggle Centered Layout",
+        hint: "",
+    }
+    ToggleTerminal {
+        id: "toggle_terminal",
+        title: "View: Toggle Terminal",
+        hint: "Ctrl+J",
+    }
     /// The Customize Layout popup's rows as commands (#852), VS Code's
     /// names: the bars' visibility, the side bar's side, and pickers for
     /// the panel alignment and the quick input position. `LAYOUT_COMMANDS`
     /// lists them with the popup's other rows so "layout" finds them all.
-    ToggleActivityBar,
-    ToggleStatusBar,
-    ToggleSideBarPosition,
-    SetPanelAlignment,
-    SetQuickInputPosition,
+    ToggleActivityBar {
+        id: "toggle_activity_bar",
+        title: "View: Toggle Activity Bar Visibility",
+        hint: "",
+    }
+    ToggleStatusBar {
+        id: "toggle_status_bar",
+        title: "View: Toggle Status Bar Visibility",
+        hint: "",
+    }
+    ToggleSideBarPosition {
+        id: "toggle_side_bar_position",
+        title: "View: Toggle Primary Side Bar Position",
+        hint: "",
+    }
+    SetPanelAlignment {
+        id: "set_panel_alignment",
+        title: "View: Set Panel Alignment…",
+        hint: "",
+    }
+    SetQuickInputPosition {
+        id: "set_quick_input_position",
+        title: "View: Set Quick Input Position…",
+        hint: "",
+    }
     /// View: Customize Layout… (#852): the popup itself.
-    CustomizeLayout,
+    CustomizeLayout {
+        id: "customize_layout",
+        title: "View: Customize Layout…",
+        hint: "",
+    }
     /// Terminal: Focus Terminal (#852): the TERMINAL tab, shown and focused.
     /// With the `Show*` commands below, one command per bottom-panel tab
     /// (`BottomPanelTab::show_command` pairs them).
-    FocusTerminal,
-    ShowProblems,
-    ShowOutput,
+    FocusTerminal {
+        id: "focus_terminal",
+        title: "Terminal: Focus Terminal",
+        hint: "Cmd+Shift+T",
+    }
+    ShowProblems {
+        id: "show_problems",
+        title: "View: Show Problems",
+        hint: "Cmd+Shift+M",
+    }
+    ShowOutput {
+        id: "show_output",
+        title: "View: Show Output",
+        hint: "Cmd+Shift+U",
+    }
     /// Output: Select Channel… (#852): the OUTPUT dropdown as a picker.
-    OutputSelectChannel,
-    ShowPorts,
-    ShowCaptures,
-    ToggleMinimap,
+    OutputSelectChannel {
+        id: "output_select_channel",
+        title: "Output: Select Channel…",
+        hint: "",
+    }
+    ShowPorts {
+        id: "show_ports",
+        title: "View: Show Ports",
+        hint: "",
+    }
+    ShowCaptures {
+        id: "show_captures",
+        title: "View: Show Captures",
+        hint: "",
+    }
+    ToggleMinimap {
+        id: "toggle_minimap",
+        title: "View: Toggle Minimap",
+        hint: "Cmd+Opt+M",
+    }
     /// Run the whole-project checker and put its findings in PROBLEMS (#256).
-    ProblemsCheckProject,
+    ProblemsCheckProject {
+        id: "problems_check_project",
+        title: "Problems: Check Whole Project",
+        hint: "",
+    }
     /// Cycle whether that check may run WITHOUT being asked (#256).
-    ProblemsToggleProjectAuto,
-    ProblemsToggleScope,
-    DiffToggleIgnoreWhitespace,
-    NewTerminal,
+    ProblemsToggleProjectAuto {
+        id: "problems_toggle_project_auto",
+        title: "Problems: Whole-Project Check Auto-Run (Auto / On / Off)",
+        hint: "",
+    }
+    ProblemsToggleScope {
+        id: "problems_toggle_scope",
+        title: "Problems: Toggle Scope (Open Files / Whole Project)",
+        hint: "",
+    }
+    DiffToggleIgnoreWhitespace {
+        id: "diff_toggle_ignore_whitespace",
+        title: "Diff: Toggle Ignore Whitespace",
+        hint: "",
+    }
+    NewTerminal {
+        id: "new_terminal",
+        title: "Terminal: Create New Terminal",
+        hint: "Cmd+T",
+    }
     /// Terminal: Run Selected Text in Active Terminal (#1292): the
     /// editor's selection, or the caret's line, run in the active pane.
-    RunSelectedText,
+    RunSelectedText {
+        id: "run_selected_text",
+        title: "Terminal: Run Selected Text in Active Terminal",
+        hint: "",
+    }
     /// Terminal: Focus Next / Previous Terminal (#843): Cmd+] / Cmd+[, which
     /// have no `Ctrl` form (`Ctrl+[` is `Esc`).
-    FocusNextTerminal,
-    FocusPreviousTerminal,
+    FocusNextTerminal {
+        id: "focus_next_terminal",
+        title: "Terminal: Focus Next Terminal",
+        hint: "Cmd+]",
+    }
+    FocusPreviousTerminal {
+        id: "focus_previous_terminal",
+        title: "Terminal: Focus Previous Terminal",
+        hint: "Cmd+[",
+    }
     /// The terminal's own actions as commands (#1562): before, each was a
     /// fixed chord or a right-click row only, so the palette could not find
     /// it, `keybindings.json` could not bind it, and `croft import-vscode`
     /// dropped a VS Code user's chord for it. Each acts on the active pane.
-    TerminalClear,
-    TerminalRename,
-    TerminalKill,
-    TerminalSplit,
-    TerminalNewWithProfile,
-    TerminalQuickSelect,
-    TerminalCopyMode,
-    TerminalCommandHistory,
-    TerminalOpenScrollback,
+    TerminalClear {
+        id: "terminal_clear",
+        title: "Terminal: Clear",
+        hint: "Cmd+K K",
+    }
+    TerminalRename {
+        id: "terminal_rename",
+        title: "Terminal: Rename",
+        hint: "Cmd+K R",
+    }
+    TerminalKill {
+        id: "terminal_kill",
+        title: "Terminal: Kill the Active Terminal Instance",
+        hint: "",
+    }
+    TerminalSplit {
+        id: "terminal_split",
+        title: "Terminal: Split Terminal",
+        hint: "",
+    }
+    TerminalNewWithProfile {
+        id: "terminal_new_with_profile",
+        title: "Terminal: Create New Terminal (With Profile)",
+        hint: "",
+    }
+    TerminalQuickSelect {
+        id: "terminal_quick_select",
+        title: "Terminal: Quick Select",
+        hint: "Ctrl+Shift+Space",
+    }
+    TerminalCopyMode {
+        id: "terminal_copy_mode",
+        title: "Terminal: Enter Copy Mode",
+        hint: "Ctrl+Shift+Y",
+    }
+    TerminalCommandHistory {
+        id: "terminal_command_history",
+        title: "Terminal: Show Command History",
+        hint: "Ctrl+Shift+H",
+    }
+    TerminalOpenScrollback {
+        id: "terminal_open_scrollback",
+        title: "Terminal: Open Scrollback in Editor",
+        hint: "Cmd+K D",
+    }
     // --- Run / debug ---
-    StartDebugging,
-    SelectDebugConfig,
-    AddDebugConfig,
-    StopDebugging,
-    PauseDebugging,
-    SwitchDebugSession,
-    RestartDebugging,
-    ToggleBreakpoint,
-    EditBreakpointCondition,
-    EditLogpoint,
-    ShowIncomingCalls,
-    ShowOutgoingCalls,
-    ShowSupertypes,
-    ShowSubtypes,
-    ToggleCodeLens,
-    RunCodeLens,
-    DebugAddHitCountBreakpoint,
-    DebugAddFunctionBreakpoint,
-    DebugRemoveFunctionBreakpoints,
-    DebugRunToCursor,
-    DebugBreakOnValueChange,
-    DebugRemoveDataBreakpoints,
-    OpenSearchEditor,
-    RerunSearchEditor,
-    RebaseAbort,
-    GitContinueOperation,
-    GitSkipOperation,
-    GitAbortOperation,
+    StartDebugging {
+        id: "start_debugging",
+        title: "Debug: Start Debugging",
+        hint: "F5",
+    }
+    SelectDebugConfig {
+        id: "select_debug_config",
+        title: "Debug: Select and Start Debugging",
+        hint: "",
+    }
+    AddDebugConfig {
+        id: "add_debug_config",
+        title: "Debug: Add Configuration…",
+        hint: "",
+    }
+    StopDebugging {
+        id: "stop_debugging",
+        title: "Debug: Stop Debugging",
+        hint: "Shift+F5",
+    }
+    PauseDebugging {
+        id: "pause_debugging",
+        title: "Debug: Pause",
+        hint: "F6",
+    }
+    SwitchDebugSession {
+        id: "switch_debug_session",
+        title: "Debug: Switch Session",
+        hint: "Cmd+Opt+Shift+G",
+    }
+    RestartDebugging {
+        id: "restart_debugging",
+        title: "Debug: Restart",
+        hint: "Shift+Cmd+F5",
+    }
+    ToggleBreakpoint {
+        id: "toggle_breakpoint",
+        title: "Debug: Toggle Breakpoint",
+        hint: "F9",
+    }
+    EditBreakpointCondition {
+        id: "edit_breakpoint_condition",
+        title: "Debug: Add Conditional Breakpoint",
+        hint: "Shift+F9",
+    }
+    EditLogpoint {
+        id: "edit_logpoint",
+        title: "Debug: Add Logpoint",
+        hint: "Shift+Alt+F9",
+    }
+    ShowIncomingCalls {
+        id: "show_incoming_calls",
+        title: "Calls: Show Incoming Calls",
+        hint: "Cmd+K H",
+    }
+    ShowOutgoingCalls {
+        id: "show_outgoing_calls",
+        title: "Calls: Show Outgoing Calls",
+        hint: "Cmd+K Shift+H",
+    }
+    ShowSupertypes {
+        id: "show_supertypes",
+        title: "Types: Show Supertypes",
+        hint: "Cmd+K Shift+U",
+    }
+    ShowSubtypes {
+        id: "show_subtypes",
+        title: "Types: Show Subtypes",
+        hint: "Cmd+K Shift+D",
+    }
+    ToggleCodeLens {
+        id: "toggle_code_lens",
+        title: "Editor: Toggle CodeLens",
+        hint: "",
+    }
+    RunCodeLens {
+        id: "run_code_lens",
+        title: "Editor: Run CodeLens on This Line",
+        hint: "Cmd+K Shift+E",
+    }
+    DebugAddHitCountBreakpoint {
+        id: "debug_add_hit_count_breakpoint",
+        title: "Debug: Add Hit Count Breakpoint",
+        hint: "",
+    }
+    DebugAddFunctionBreakpoint {
+        id: "debug_add_function_breakpoint",
+        title: "Debug: Add Function Breakpoint",
+        hint: "",
+    }
+    DebugRemoveFunctionBreakpoints {
+        id: "debug_remove_function_breakpoints",
+        title: "Debug: Remove All Function Breakpoints",
+        hint: "",
+    }
+    DebugRunToCursor {
+        id: "debug_run_to_cursor",
+        title: "Debug: Run to Cursor",
+        hint: "Ctrl+F10",
+    }
+    DebugBreakOnValueChange {
+        id: "debug_break_on_value_change",
+        title: "Debug: Break When Value Changes",
+        hint: "",
+    }
+    DebugRemoveDataBreakpoints {
+        id: "debug_remove_data_breakpoints",
+        title: "Debug: Remove All Data Breakpoints",
+        hint: "",
+    }
+    OpenSearchEditor {
+        id: "open_search_editor",
+        title: "Search: Open Results in Editor",
+        hint: "Cmd+K Shift+F",
+    }
+    RerunSearchEditor {
+        id: "rerun_search_editor",
+        title: "Search Editor: Rerun",
+        hint: "Cmd+K Shift+R",
+    }
+    RebaseAbort {
+        id: "rebase_abort",
+        title: "Rebase: Abort",
+        hint: "",
+    }
+    GitContinueOperation {
+        id: "git_continue_operation",
+        title: "Git: Continue Rebase, Cherry-Pick or Revert",
+        hint: "",
+    }
+    GitSkipOperation {
+        id: "git_skip_operation",
+        title: "Git: Skip Commit (Rebase, Cherry-Pick or Revert)",
+        hint: "",
+    }
+    GitAbortOperation {
+        id: "git_abort_operation",
+        title: "Git: Abort Merge, Rebase, Cherry-Pick, Revert or Bisect",
+        hint: "",
+    }
     /// Source Control's Tags menu on the palette (#1582), so each can be
     /// bound to a key.
-    GitCreateTag,
-    GitPushTags,
-    GitDeleteRemoteTag,
+    GitCreateTag {
+        id: "git_create_tag",
+        title: "Git: Create Tag",
+        hint: "",
+    }
+    GitPushTags {
+        id: "git_push_tags",
+        title: "Git: Push Tags",
+        hint: "",
+    }
+    GitDeleteRemoteTag {
+        id: "git_delete_remote_tag",
+        title: "Git: Delete Remote Tag",
+        hint: "",
+    }
     /// The Commit button's and menus' everyday actions on the palette
     /// (#871), so each is reachable, and bindable, from the keyboard.
-    GitCommit,
-    GitPush,
-    GitPull,
-    GitSync,
-    GitCheckoutTo,
-    GitStash,
-    ToggleTerminalSuggestions,
-    ToggleScreenReader,
-    OpenKeyboardShortcuts,
-    SwitchProfile,
-    ToggleInlineSuggestions,
-    StepOver,
+    GitCommit {
+        id: "git_commit",
+        title: "Git: Commit",
+        hint: "",
+    }
+    GitPush {
+        id: "git_push",
+        title: "Git: Push",
+        hint: "",
+    }
+    GitPull {
+        id: "git_pull",
+        title: "Git: Pull",
+        hint: "",
+    }
+    GitSync {
+        id: "git_sync",
+        title: "Git: Sync",
+        hint: "",
+    }
+    GitCheckoutTo {
+        id: "git_checkout_to",
+        title: "Git: Checkout to\u{2026}",
+        hint: "",
+    }
+    GitStash {
+        id: "git_stash",
+        title: "Git: Stash",
+        hint: "",
+    }
+    ToggleTerminalSuggestions {
+        id: "toggle_terminal_suggestions",
+        title: "Terminal: Toggle Command Suggestions",
+        hint: "",
+    }
+    ToggleScreenReader {
+        id: "toggle_screen_reader",
+        title: "Accessibility: Toggle Screen Reader Mode",
+        hint: "",
+    }
+    OpenKeyboardShortcuts {
+        id: "open_keyboard_shortcuts",
+        title: "Preferences: Open Keyboard Shortcuts",
+        hint: "Cmd+K Cmd+S",
+    }
+    SwitchProfile {
+        id: "switch_profile",
+        title: "Profiles: Switch Profile",
+        hint: "",
+    }
+    ToggleInlineSuggestions {
+        id: "toggle_inline_suggestions",
+        title: "Editor: Toggle Inline Suggestions",
+        hint: "Cmd+K Shift+G",
+    }
+    StepOver {
+        id: "step_over",
+        title: "Debug: Step Over",
+        hint: "F10",
+    }
     /// Debug: Continue / Step Into / Step Out (#1543): the F5 / F11 /
     /// Shift+F11 actions as commands, so the palette finds them and
     /// `keybindings.json` can rebind them.
-    ContinueDebugging,
-    StepInto,
-    StepOut,
+    ContinueDebugging {
+        id: "continue",
+        title: "Debug: Continue",
+        hint: "F5",
+    }
+    StepInto {
+        id: "step_into",
+        title: "Debug: Step Into",
+        hint: "F11",
+    }
+    StepOut {
+        id: "step_out",
+        title: "Debug: Step Out",
+        hint: "Shift+F11",
+    }
     /// Debug: Step Into Target (#1543): pick which call on the paused line
     /// to step into (DAP `stepInTargets`).
-    StepIntoTarget,
-    ToggleRaisedExceptions,
-    AttachPythonProcess,
-    ColorTheme,
-    KeyboardShortcuts,
-    UpdateCroft,
-    OpenSettings,
-    OpenSettingsEditor,
-    OpenSettingsJson,
-    OpenWorkspaceSettingsJson,
-    OpenWorkspaceSettingsLocalJson,
-    OpenKeybindingsJson,
-    ConfigureSnippets,
-    OpenTriggersJson,
-    OpenAgentsJson,
-    OpenMatchersJson,
-    ToggleTerminalTimestamps,
-    ToggleLogHighlight,
-    CollapseTerminalPane,
-    RestoreTerminalPanes,
-    ToggleSecretRedaction,
-    RevealRedactedSecrets,
-    RunTask,
-    RunBuildTask,
-    RerunLastTask,
-    SearchFromTerminal,
+    StepIntoTarget {
+        id: "step_into_target",
+        title: "Debug: Step Into Target",
+        hint: "",
+    }
+    ToggleRaisedExceptions {
+        id: "toggle_raised_exceptions",
+        title: "Debug: Toggle Break on Raised Exceptions",
+        hint: "Alt+F9",
+    }
+    AttachPythonProcess {
+        id: "attach_python_process",
+        title: "Debug: Attach to Python Process",
+        hint: "Ctrl+F5",
+    }
+    RunTask {
+        id: "run_task",
+        title: "Tasks: Run Task",
+        hint: "",
+    }
+    RunBuildTask {
+        id: "run_build_task",
+        title: "Tasks: Run Build Task",
+        hint: "Cmd+Shift+B",
+    }
+    RerunLastTask {
+        id: "rerun_last_task",
+        title: "Tasks: Rerun Last Task",
+        hint: "",
+    }
+    ColorTheme {
+        id: "color_theme",
+        title: "Preferences: Color Theme",
+        hint: "Cmd+K Cmd+T",
+    }
+    KeyboardShortcuts {
+        id: "keyboard_shortcuts",
+        title: "Help: Keyboard Shortcuts Reference",
+        hint: "F1",
+    }
+    UpdateCroft {
+        id: "update_croft",
+        title: "Help: Update croft (Relaunch or Rebuild)",
+        hint: "Cmd+Shift+F9",
+    }
+    OpenSettings {
+        id: "open_settings",
+        title: "Preferences: Open Settings",
+        // Palette-only by default; the whole point of the keybindings.json
+        // loader is that a user can bind these (the seeded template shows
+        // Cmd+, -> open_settings as the example).
+        hint: "",
+    }
+    OpenSettingsEditor {
+        id: "open_settings_editor",
+        title: "Preferences: Open Settings (UI)",
+        hint: "",
+    }
+    OpenSettingsJson {
+        id: "open_settings_json",
+        title: "Preferences: Open Settings (JSON)",
+        hint: "",
+    }
+    OpenWorkspaceSettingsJson {
+        id: "open_workspace_settings_json",
+        title: "Preferences: Open Workspace Settings (JSON)",
+        hint: "",
+    }
+    OpenWorkspaceSettingsLocalJson {
+        id: "open_workspace_settings_local_json",
+        title: "Preferences: Open Workspace Settings — Local (JSON)",
+        hint: "",
+    }
+    OpenKeybindingsJson {
+        id: "open_keybindings_json",
+        title: "Preferences: Open Keyboard Shortcuts (JSON)",
+        hint: "",
+    }
+    ConfigureSnippets {
+        id: "configure_snippets",
+        title: "Preferences: Configure User Snippets",
+        hint: "",
+    }
+    OpenTriggersJson {
+        id: "open_triggers_json",
+        title: "Preferences: Open Terminal Triggers (JSON)",
+        hint: "",
+    }
+    OpenAgentsJson {
+        id: "open_agents_json",
+        title: "Preferences: Open Agent Lanes (JSON)",
+        hint: "",
+    }
+    OpenMatchersJson {
+        id: "open_matchers_json",
+        title: "Preferences: Open Problem Matchers (JSON)",
+        hint: "",
+    }
+    ToggleTerminalTimestamps {
+        id: "toggle_terminal_timestamps",
+        title: "Terminal: Toggle Timestamps",
+        hint: "",
+    }
+    ToggleLogHighlight {
+        id: "toggle_log_highlight",
+        title: "Log: Toggle Highlighting (tailspin)",
+        hint: "",
+    }
+    CollapseTerminalPane {
+        id: "collapse_terminal_pane",
+        title: "Terminal: Collapse Pane",
+        hint: "Cmd+K [",
+    }
+    RestoreTerminalPanes {
+        id: "restore_terminal_panes",
+        title: "Terminal: Restore All Collapsed Panes",
+        hint: "Cmd+K ]",
+    }
+    ToggleSecretRedaction {
+        id: "toggle_secret_redaction",
+        title: "Terminal: Toggle Secret Redaction",
+        hint: "",
+    }
+    RevealRedactedSecrets {
+        id: "reveal_redacted_secrets",
+        title: "Terminal: Reveal Redacted Secrets for 10s",
+        hint: "",
+    }
+    SearchFromTerminal {
+        id: "search_from_terminal",
+        title: "Terminal: Search & Replace from Last grep/rg",
+        hint: "",
+    }
     /// Multiplayer: list who is attached to this persistent session and
     /// grant/revoke write control or disconnect them (docs/MULTIPLAYER.md).
-    SessionParticipants,
+    SessionParticipants {
+        id: "session_participants",
+        title: "Session: Participants",
+        hint: "Cmd+K A",
+    }
     /// Detach the client that invoked it from the persistent session; the
     /// session keeps running (#679).
-    SessionDetach,
+    SessionDetach {
+        id: "session_detach",
+        title: "Session: Detach",
+        hint: "Cmd+K Shift+Q",
+    }
     /// Cancel the AI pilot's token stream into a shared file; the pilot
     /// reverts the streamed text (`croft pair`, docs/MULTIPLAYER.md).
-    CollabCancelStream,
+    CollabCancelStream {
+        id: "collab_cancel_stream",
+        title: "Collab: Cancel AI Stream",
+        hint: "Cmd+K X",
+    }
     /// Ask the resident navigator about the caret line or selection (opens
     /// the instruction box; the navigator may edit on the resulting turn).
-    AskNavigator,
-    AskNavigatorAboutCapture,
+    AskNavigator {
+        id: "navigator_ask",
+        title: "Navigator: Ask About Line or Selection",
+        hint: "Cmd+K Q",
+    }
+    AskNavigatorAboutCapture {
+        id: "captures_ask_navigator",
+        title: "Captures: Ask Navigator About This Line",
+        hint: "",
+    }
     /// Re-root the workspace onto the host the active pane is ssh'd into (#364).
-    OpenWorkspaceOnSshHost,
+    OpenWorkspaceOnSshHost {
+        id: "remote_open_workspace_on_ssh_host",
+        title: "Remote: Open Workspace on This Pane's Host",
+        hint: "",
+    }
     /// Step the editor back through the branch's commits (#371).
-    ScrubHistory,
-    DebugInstallDelve,
+    ScrubHistory {
+        id: "scm_scrub_history",
+        title: "Source Control: Scrub History",
+        hint: "",
+    }
+    DebugInstallDelve {
+        id: "debug_install_delve",
+        title: "Debug: Install Go Debugger (delve)",
+        hint: "",
+    }
     /// Remote: Sync Config Now (#262): push the syncable config to a host.
-    RemoteSyncConfigNow,
+    RemoteSyncConfigNow {
+        id: "remote_sync_config_now",
+        title: "Remote: Sync Config Now",
+        hint: "",
+    }
     /// Remote: Drop to Local (#2071): end this remote croft and go back to
     /// the local one it was launched from.
-    DropToLocal,
-    StopAutoApprove,
-    ScrubOpenHere,
-    ScrubDiffToWorkingTree,
+    DropToLocal {
+        id: "drop_to_local",
+        title: "Remote: Drop to Local",
+        // Its own chord (#2071): Cmd+Shift+L, which it shared, selects
+        // all occurrences everywhere, a remote session included.
+        hint: "Cmd+K L",
+    }
+    StopAutoApprove {
+        id: "agents_stop_auto_approve",
+        title: "Agents: Stop Auto-Approving",
+        hint: "",
+    }
+    ScrubOpenHere {
+        id: "scm_scrub_open_here",
+        title: "Source Control: Open Scrubbed File Here",
+        hint: "",
+    }
+    ScrubDiffToWorkingTree {
+        id: "scm_scrub_diff_working_tree",
+        title: "Source Control: Diff Scrubbed File to Working Tree",
+        hint: "",
+    }
     /// Run one command across several ssh hosts and compare (#363).
-    FleetRun,
+    FleetRun {
+        id: "terminal_fleet_run",
+        title: "Terminal: Fleet Run",
+        hint: "",
+    }
     /// Open the symbol under the cursor as its own tab (#369).
-    OpenAsSymbolTab,
+    OpenAsSymbolTab {
+        id: "editor_open_symbol_tab",
+        title: "Editor: Open Symbol as Its Own Tab",
+        hint: "Cmd+K Shift+V",
+    }
     /// Load this PR's review threads as comment boxes (#366).
-    LoadReviewThreads,
-    ReviewAddComment,
-    ReviewSubmit,
-    ReviewToggleResolved,
-    ReviewDiscardPending,
-    ExportCommentsToPr,
-    NoteAdd,
-    NoteDelete,
+    LoadReviewThreads {
+        id: "review_load_threads",
+        title: "Review: Load PR Comments for This File",
+        hint: "",
+    }
+    ReviewAddComment {
+        id: "review_add_comment",
+        title: "Review: Add Comment on This Line",
+        hint: "",
+    }
+    ReviewSubmit {
+        id: "review_submit",
+        title: "Review: Submit Review",
+        hint: "",
+    }
+    ReviewToggleResolved {
+        id: "review_toggle_resolved",
+        title: "Review: Resolve or Unresolve Thread",
+        hint: "",
+    }
+    ReviewDiscardPending {
+        id: "review_discard_pending",
+        title: "Review: Discard Pending Comments",
+        hint: "",
+    }
+    ExportCommentsToPr {
+        id: "scm_export_comments_to_pr",
+        title: "Source Control: Export Comments to Pull Request",
+        hint: "",
+    }
+    NoteAdd {
+        id: "note_add",
+        title: "Notes: Add Note on This Line",
+        hint: "Cmd+K N",
+    }
+    NoteDelete {
+        id: "note_delete",
+        title: "Notes: Delete Note",
+        hint: "",
+    }
     /// Start or stop recording the active terminal as an asciicast (#356).
-    ToggleSessionRecording,
+    ToggleSessionRecording {
+        id: "session_toggle_recording",
+        title: "Session: Record Terminal as Asciicast",
+        hint: "",
+    }
     /// Create a git worktree lane for an agent to work in (#348).
-    NewWorktreeLane,
-    ReviewPullRequest,
+    NewWorktreeLane {
+        id: "agent_new_worktree_lane",
+        title: "Agent: New Worktree Lane",
+        hint: "Cmd+K Shift+L",
+    }
+    ReviewPullRequest {
+        id: "review_pull_request",
+        title: "Source Control: Review Pull Request",
+        hint: "",
+    }
     /// Remove the current worktree lane, refusing when it is dirty (#348).
-    CloseWorktreeLane,
+    CloseWorktreeLane {
+        id: "agent_close_worktree_lane",
+        title: "Agent: Close Worktree Lane",
+        hint: "",
+    }
     /// Point the COMMITS graph at what the current lane added (#348).
-    DiffWorktreeLane,
+    DiffWorktreeLane {
+        id: "agent_diff_worktree_lane",
+        title: "Agent: Diff Lane Against Its Base",
+        // No chord: the lane commands that have one are the ones you
+        // reach mid-flow; a diff is deliberate and the palette is where
+        // you go for it.
+        hint: "",
+    }
     /// Mark every file every agent changed as reviewed (#345).
-    MarkAgentLaneReviewed,
+    MarkAgentLaneReviewed {
+        id: "agents_mark_reviewed",
+        title: "Agents: Mark Changed Files Reviewed",
+        hint: "",
+    }
     /// Summarise each agent's review queue (#345).
-    ShowAgentLane,
+    ShowAgentLane {
+        id: "agents_show_lane",
+        title: "Agents: Show Changed Files",
+        hint: "",
+    }
     /// Show the Explorer's AGENT LANE section, open (#345).
-    OpenAgentLaneSection,
+    OpenAgentLaneSection {
+        id: "agents_open_lane",
+        title: "Agents: Open Agent Lane",
+        hint: "",
+    }
+    /// Mark the active file reviewed in every agent lane holding it (#345).
+    MarkAgentFileReviewed {
+        id: "agents_mark_file_reviewed",
+        title: "Agents: Mark This File Reviewed",
+        hint: "",
+    }
     /// Diff the active file against the snapshot it was last reviewed
     /// against (#345).
-    DiffAgentFileSinceReview,
+    DiffAgentFileSinceReview {
+        id: "agents_diff_since_review",
+        title: "Agents: Diff This File Since Review",
+        hint: "",
+    }
     /// Pick any file an agent changed and open its diff since review, from
     /// the keyboard (#345).
-    PickAgentLaneFile,
-    /// Mark the active file reviewed in every agent lane holding it (#345).
-    MarkAgentFileReviewed,
+    PickAgentLaneFile {
+        id: "agents_pick_changed_file",
+        title: "Agents: Review a Changed File…",
+        hint: "",
+    }
     /// Have the navigator fix the diagnostic under the caret as a streamed,
     /// cancellable edit (#374).
-    FixProblemWithNavigator,
+    FixProblemWithNavigator {
+        id: "problems_fix_navigator",
+        title: "Problems: Fix With Navigator",
+        hint: "",
+    }
     /// Send the `.http` request under the caret; the response opens as a
     /// tab (#370).
-    SendHttpRequest,
+    SendHttpRequest {
+        id: "http_send_request",
+        title: "HTTP: Send Request Under Caret",
+        hint: "Cmd+Enter",
+    }
     /// Copy the `.http` request under the caret as a curl command (#370).
-    CopyHttpRequestAsCurl,
+    CopyHttpRequestAsCurl {
+        id: "http_copy_curl",
+        title: "HTTP: Copy Request as curl",
+        hint: "",
+    }
     /// Pick the named environment of the `.http` env files whose values
     /// fill requests (#924).
-    SwitchHttpEnvironment,
+    SwitchHttpEnvironment {
+        id: "http_switch_environment",
+        title: "HTTP: Switch Environment",
+        hint: "",
+    }
     /// Hand the navigator the floor on the active file: a comment-only
     /// review turn, its say anchored as comment boxes.
-    YieldToNavigator,
+    YieldToNavigator {
+        id: "navigator_yield",
+        title: "Navigator: Yield the Turn",
+        hint: "Cmd+K Y",
+    }
     /// Activate or deactivate the workspace's resident navigator (writes
     /// the pair record `croft pair` uses; the tick loop seats or unseats).
-    ToggleNavigator,
+    ToggleNavigator {
+        id: "navigator_toggle",
+        title: "Navigator: Activate or Deactivate",
+        hint: "",
+    }
     /// Drop every navigator comment box.
-    ClearNavigatorNotes,
+    ClearNavigatorNotes {
+        id: "navigator_clear_notes",
+        title: "Navigator: Clear Comments",
+        hint: "",
+    }
     /// Toggle the navigator's proactive comment-only looks (a completed
     /// construct plus a typing pause hands it the floor on its own).
-    ToggleProactiveNavigator,
+    ToggleProactiveNavigator {
+        id: "navigator_toggle_proactive",
+        title: "Navigator: Toggle Proactive Comments",
+        hint: "",
+    }
     /// Focus the active file's next navigator comment box (F4).
-    NextComment,
+    NextComment {
+        id: "navigator_next_comment",
+        title: "Navigator: Next Comment",
+        hint: "F4",
+    }
     /// Ignore the focused navigator comment box, or the next one from the
     /// caret (Shift+F4).
-    IgnoreComment,
+    IgnoreComment {
+        id: "navigator_ignore_comment",
+        title: "Navigator: Ignore Comment",
+        hint: "Shift+F4",
+    }
 }
-
-/// Every command, in palette display order. Single source of truth for both
-/// the empty-query list and the test that guards the count.
-pub const ALL_COMMANDS: &[Command] = &[
-    Command::MoveLineUp,
-    Command::MoveLineDown,
-    Command::CopyLineUp,
-    Command::CopyLineDown,
-    Command::ToggleLineComment,
-    Command::ToggleBlockComment,
-    Command::JoinLines,
-    Command::InsertLineBelow,
-    Command::InsertLineAbove,
-    Command::DeleteLine,
-    Command::KillToEndOfLine,
-    Command::TransformUpper,
-    Command::TransformLower,
-    Command::TransformTitle,
-    Command::TransformSnake,
-    Command::TransformCamel,
-    Command::TransformPascal,
-    Command::TransformKebab,
-    Command::SortLinesAscending,
-    Command::SortLinesDescending,
-    Command::IncrementNumber,
-    Command::DecrementNumber,
-    Command::TrimTrailingWhitespace,
-    Command::EmmetExpandAbbreviation,
-    Command::EmmetWrapWithAbbreviation,
-    Command::EmmetRemoveTag,
-    Command::EmmetUpdateTag,
-    Command::EmmetBalanceOutward,
-    Command::EmmetBalanceInward,
-    Command::EmmetMatchTag,
-    Command::ToggleWordWrap,
-    Command::ExpandSelection,
-    Command::ShrinkSelection,
-    Command::ReplaceInFile,
-    Command::ToggleFindInSelection,
-    Command::MergeAcceptCurrent,
-    Command::MergeAcceptIncoming,
-    Command::MergeAcceptBoth,
-    Command::MergeAcceptAllCurrent,
-    Command::MergeAcceptAllIncoming,
-    Command::MergeNextConflict,
-    Command::MergePrevConflict,
-    Command::GoToNextChange,
-    Command::GoToPrevChange,
-    Command::GoToNextProblem,
-    Command::GoToPrevProblem,
-    Command::MergeComplete,
-    Command::MergeOpenEditor,
-    Command::MergeToggleBase,
-    Command::MergeAcceptBothReverse,
-    Command::MergeIgnore,
-    Command::DebugAddWatch,
-    Command::DebugClearWatch,
-    Command::PeekDefinition,
-    Command::PeekReferences,
-    Command::GoToDefinition,
-    Command::GoToReferences,
-    Command::GoToDeclaration,
-    Command::GoToTypeDefinition,
-    Command::GoToImplementations,
-    Command::SwitchHeaderSource,
-    Command::RenameSymbol,
-    Command::TriggerSuggest,
-    Command::TriggerParameterHints,
-    Command::ShowHover,
-    Command::MouseAddCursorAtClick,
-    Command::MouseGoToDefinitionAtClick,
-    Command::MouseOpenLinkAtClick,
-    Command::ClearBuildDiagnostics,
-    Command::StageHunk,
-    Command::UnstageHunk,
-    Command::RevertHunk,
-    Command::GitUndoLastCommit,
-    Command::RustExpandMacro,
-    Command::RustParentModule,
-    Command::RustOpenCargoToml,
-    Command::RustRebuildProcMacros,
-    Command::RustReloadWorkspace,
-    Command::GitCopyPermalink,
-    Command::GitCopyHeadLink,
-    Command::GitOpenOnRemote,
-    Command::GitViewStash,
-    Command::GitOpenLineCommit,
-    Command::GitCopyLineCommitHash,
-    Command::AddCursorAbove,
-    Command::AddCursorBelow,
-    Command::ColumnSelectUp,
-    Command::ColumnSelectDown,
-    Command::ColumnSelectLeft,
-    Command::ColumnSelectRight,
-    Command::ColumnSelectPageUp,
-    Command::ColumnSelectPageDown,
-    Command::ToggleColumnSelection,
-    Command::AddSelectionToNextMatch,
-    Command::SelectAllOccurrences,
-    Command::AddCursorsToLineEnds,
-    Command::ExpandLineSelection,
-    Command::JumpToBracket,
-    Command::SelectToBracket,
-    Command::TransposeCharacters,
-    Command::IndentationToSpaces,
-    Command::IndentationToTabs,
-    Command::TrimFinalNewlines,
-    Command::ToggleOverviewRuler,
-    Command::ToggleBookmark,
-    Command::NextBookmark,
-    Command::PreviousBookmark,
-    Command::ClearBookmarks,
-    Command::ViewBookmarks,
-    Command::FormatDocument,
-    Command::FormatSelection,
-    Command::ChangeColorPresentation,
-    Command::ToggleFormatOnType,
-    Command::ToggleFormatOnSave,
-    Command::QuickFix,
-    Command::ToggleFold,
-    Command::FoldAll,
-    Command::UnfoldAll,
-    Command::FoldAllComments,
-    Command::FoldAllRegions,
-    Command::UnfoldAllRegions,
-    Command::FoldLevel1,
-    Command::FoldLevel2,
-    Command::FoldLevel3,
-    Command::FoldLevel4,
-    Command::FoldLevel5,
-    Command::FoldLevel6,
-    Command::FoldLevel7,
-    Command::FoldRecursively,
-    Command::UnfoldRecursively,
-    Command::SaveFile,
-    Command::SaveAs,
-    Command::SaveWithSudo,
-    Command::RevertFile,
-    Command::SaveAll,
-    Command::NewFile,
-    Command::NewUntitledFile,
-    Command::NewFolder,
-    Command::Undo,
-    Command::Redo,
-    Command::SelectAll,
-    Command::ToggleAutoSave,
-    Command::ToggleAutoSaveOnFocusChange,
-    Command::ToggleInlineBlame,
-    Command::ToggleLiveRun,
-    Command::ToggleProvenance,
-    Command::DiffToggleGroupBySeat,
-    Command::ToggleIndentGuides,
-    Command::ToggleBracketColors,
-    Command::ToggleRenderWhitespace,
-    Command::CycleLineNumbers,
-    Command::ToggleInlineValues,
-    Command::ToggleInlayHints,
-    Command::ToggleMarkdownPreview,
-    Command::OpenMarkdownPreviewToSide,
-    Command::RunCodeBlockAtCursor,
-    Command::RestoreSnapshot,
-    Command::CloseEditor,
-    Command::ReopenClosedEditor,
-    Command::ZoxideJump,
-    Command::CloseOtherEditors,
-    Command::CloseEditorsToTheRight,
-    Command::CloseSavedEditors,
-    Command::CloseAllEditors,
-    Command::PinEditor,
-    Command::UnpinEditor,
-    Command::KeepEditor,
-    Command::MoveEditorLeftInGroup,
-    Command::MoveEditorRightInGroup,
-    Command::MoveEditorToNextGroup,
-    Command::MoveEditorToPreviousGroup,
-    Command::SplitEditor,
-    Command::FocusLeftEditorGroup,
-    Command::FocusRightEditorGroup,
-    Command::QuickOpen,
-    Command::TakeTheTour,
-    Command::SponsorCroft,
-    Command::SarifNextResult,
-    Command::SarifPreviousResult,
-    Command::SarifOpenCodeScanning,
-    Command::SarifLoadCodeScanning,
-    Command::GoToSymbol,
-    Command::GoToWorkspaceSymbol,
-    Command::NavigateBack,
-    Command::NavigateForward,
-    Command::GoToLastEditLocation,
-    Command::ToggleVimMode,
-    Command::MacroStartStopRecording,
-    Command::MacroReplayLast,
-    Command::MacroReplayTimes,
-    Command::ShowExplorer,
-    Command::FocusBreadcrumbs,
-    Command::ShowSearch,
-    Command::ReplaceInFiles,
-    Command::SearchToggleMatchCase,
-    Command::SearchToggleWholeWord,
-    Command::SearchToggleRegex,
-    Command::SearchTogglePreserveCase,
-    Command::SearchToggleDetails,
-    Command::ShowSourceControl,
-    Command::AddWorkspaceFolder,
-    Command::RemoveWorkspaceFolder,
-    Command::SaveWorkspaceAs,
-    Command::OpenWorkspaceFromFile,
-    Command::ReopenAsHex,
-    Command::ReopenAsPreview,
-    Command::ReopenAsText,
-    Command::NotebookRunAll,
-    Command::NotebookInterrupt,
-    Command::NotebookRestart,
-    Command::NotebookSelectKernel,
-    Command::RestartLanguageServers,
-    Command::RestartLanguageServersForFile,
-    Command::TestingRunWithCoverage,
-    Command::CoverageClear,
-    Command::TestingInstallCoverageTool,
-    Command::TestingShowCoverageReport,
-    Command::DeveloperShowMemoryUsage,
-    Command::ToggleScreencastMode,
-    Command::RunTestAtCursorWithCoverage,
-    Command::TestingToggleWatchAll,
-    Command::TestingGoToFirstFailure,
-    Command::TestingCancelRun,
-    Command::HexFindNext,
-    Command::SheetInsertRowBelow,
-    Command::SheetDeleteRow,
-    Command::SheetInsertColRight,
-    Command::SheetDeleteCol,
-    Command::MediaOpenExternal,
-    Command::ShowRunDebug,
-    Command::ShowRemote,
-    Command::ShowExtensions,
-    Command::CompareExtensionsWithVscode,
-    Command::ShowTesting,
-    Command::ShowCodeQL,
-    Command::CodeqlRunQuery,
-    Command::CodeqlRunQuerySuite,
-    Command::CodeqlRemoveDatabase,
-    Command::CodeqlRenameDatabase,
-    Command::CodeqlSortDatabases,
-    Command::CodeqlRevealDatabase,
-    Command::CodeqlUpgradeDatabase,
-    Command::CodeqlClearCache,
-    Command::CodeqlTrimCache,
-    Command::CodeqlTrimCacheToOverlay,
-    Command::CodeqlAddDatabaseSource,
-    Command::CodeqlDeleteUnusedDatabases,
-    Command::CodeqlRemoveHistory,
-    Command::CodeqlRenameHistory,
-    Command::CodeqlSortHistory,
-    Command::CodeqlViewQuery,
-    Command::CodeqlCreateQuery,
-    Command::CodeqlRunPack,
-    Command::CodeqlRunQueryOnDatabases,
-    Command::CodeqlCancelQueue,
-    Command::CodeqlCopyVersion,
-    Command::CodeqlDownloadCli,
-    Command::CodeqlCheckCliUpdates,
-    Command::CodeqlInstallPackDependencies,
-    Command::CodeqlDownloadPacks,
-    Command::CodeqlRunPublishedPack,
-    Command::CodeqlQuickQuery,
-    Command::CodeqlCompareResults,
-    Command::CodeqlShowEvaluatorLog,
-    Command::CodeqlShowEvaluatorLogSummary,
-    Command::CodeqlShowEvaluatorLogViewer,
-    Command::CodeqlShowQueryLog,
-    Command::CodeqlComparePerformance,
-    Command::CodeqlPreviewQueryHelp,
-    Command::CodeqlExportResults,
-    Command::CodeqlSetUpController,
-    Command::CodeqlAddVariantRepo,
-    Command::CodeqlAddVariantList,
-    Command::CodeqlAddVariantOwner,
-    Command::CodeqlVariantCodeSearch,
-    Command::CodeqlOpenVariantConfig,
-    Command::CodeqlOpenVariantOnGithub,
-    Command::CodeqlRunVariantAnalysis,
-    Command::CodeqlOpenVariantResults,
-    Command::CodeqlExportVariantResults,
-    Command::CodeqlCopyVariantRepoList,
-    Command::CodeqlViewVariantLogs,
-    Command::CodeqlRunTests,
-    Command::CodeqlDebugQuery,
-    Command::CodeqlDebugSelection,
-    Command::CodeqlResultsUp,
-    Command::CodeqlResultsDown,
-    Command::CodeqlResultsLeft,
-    Command::CodeqlResultsRight,
-    Command::SheetSortByColumn,
-    Command::CodeqlQuickEval,
-    Command::CodeqlQuickEvalCount,
-    Command::CodeqlViewAst,
-    Command::CodeqlOpenModelEditor,
-    Command::CodeqlModelEndpoint,
-    Command::CodeqlOpenReferencedFile,
-    Command::CodeqlViewAlertsCsv,
-    Command::CodeqlViewAlertsSarif,
-    Command::CodeqlViewResultsCsv,
-    Command::CodeqlShowResultSet,
-    Command::CodeqlViewCfg,
-    Command::CodeqlRunAllQueries,
-    Command::CodeqlRunSelectedQueries,
-    Command::CodeqlCancelRunningQuery,
-    Command::CodeqlAcceptTestOutput,
-    Command::CodeqlFocusSideBar,
-    Command::CodeqlOpenResultsDirectory,
-    Command::RunTestAtCursor,
-    Command::TestingRunAll,
-    Command::TestingRunFile,
-    Command::TestingRerunFailed,
-    Command::TestingRerunLast,
-    Command::DebugTestAtCursor,
-    Command::ToggleSideBar,
-    Command::ToggleAutoHideSideBar,
-    Command::ToggleSecondarySideBar,
-    Command::ToggleZenMode,
-    Command::ToggleCenteredLayout,
-    Command::ToggleTerminal,
-    Command::ToggleActivityBar,
-    Command::ToggleStatusBar,
-    Command::ToggleSideBarPosition,
-    Command::SetPanelAlignment,
-    Command::SetQuickInputPosition,
-    Command::CustomizeLayout,
-    Command::FocusTerminal,
-    Command::ShowProblems,
-    Command::ShowOutput,
-    Command::OutputSelectChannel,
-    Command::ShowPorts,
-    Command::ShowCaptures,
-    Command::ToggleMinimap,
-    Command::ProblemsCheckProject,
-    Command::ProblemsToggleProjectAuto,
-    Command::ProblemsToggleScope,
-    Command::DiffToggleIgnoreWhitespace,
-    Command::NewTerminal,
-    Command::RunSelectedText,
-    Command::FocusNextTerminal,
-    Command::FocusPreviousTerminal,
-    Command::TerminalClear,
-    Command::TerminalRename,
-    Command::TerminalKill,
-    Command::TerminalSplit,
-    Command::TerminalNewWithProfile,
-    Command::TerminalQuickSelect,
-    Command::TerminalCopyMode,
-    Command::TerminalCommandHistory,
-    Command::TerminalOpenScrollback,
-    Command::StartDebugging,
-    Command::SelectDebugConfig,
-    Command::AddDebugConfig,
-    Command::StopDebugging,
-    Command::PauseDebugging,
-    Command::SwitchDebugSession,
-    Command::RestartDebugging,
-    Command::ToggleBreakpoint,
-    Command::EditBreakpointCondition,
-    Command::EditLogpoint,
-    Command::ShowIncomingCalls,
-    Command::ShowOutgoingCalls,
-    Command::ShowSupertypes,
-    Command::ShowSubtypes,
-    Command::ToggleCodeLens,
-    Command::RunCodeLens,
-    Command::DebugAddHitCountBreakpoint,
-    Command::DebugAddFunctionBreakpoint,
-    Command::DebugRemoveFunctionBreakpoints,
-    Command::DebugRunToCursor,
-    Command::DebugBreakOnValueChange,
-    Command::DebugRemoveDataBreakpoints,
-    Command::OpenSearchEditor,
-    Command::RerunSearchEditor,
-    Command::RebaseAbort,
-    Command::GitContinueOperation,
-    Command::GitSkipOperation,
-    Command::GitAbortOperation,
-    Command::GitCreateTag,
-    Command::GitPushTags,
-    Command::GitDeleteRemoteTag,
-    Command::GitCommit,
-    Command::GitPush,
-    Command::GitPull,
-    Command::GitSync,
-    Command::GitCheckoutTo,
-    Command::GitStash,
-    Command::ToggleTerminalSuggestions,
-    Command::ToggleScreenReader,
-    Command::OpenKeyboardShortcuts,
-    Command::SwitchProfile,
-    Command::ToggleInlineSuggestions,
-    Command::StepOver,
-    Command::ContinueDebugging,
-    Command::StepInto,
-    Command::StepOut,
-    Command::StepIntoTarget,
-    Command::ToggleRaisedExceptions,
-    Command::AttachPythonProcess,
-    Command::RunTask,
-    Command::RunBuildTask,
-    Command::RerunLastTask,
-    Command::ColorTheme,
-    Command::KeyboardShortcuts,
-    Command::UpdateCroft,
-    Command::OpenSettings,
-    Command::OpenSettingsEditor,
-    Command::OpenSettingsJson,
-    Command::OpenWorkspaceSettingsJson,
-    Command::OpenWorkspaceSettingsLocalJson,
-    Command::OpenKeybindingsJson,
-    Command::ConfigureSnippets,
-    Command::OpenTriggersJson,
-    Command::OpenAgentsJson,
-    Command::OpenMatchersJson,
-    Command::ToggleTerminalTimestamps,
-    Command::ToggleLogHighlight,
-    Command::CollapseTerminalPane,
-    Command::RestoreTerminalPanes,
-    Command::ToggleSecretRedaction,
-    Command::RevealRedactedSecrets,
-    Command::SearchFromTerminal,
-    Command::SessionParticipants,
-    Command::SessionDetach,
-    Command::CollabCancelStream,
-    Command::AskNavigator,
-    Command::AskNavigatorAboutCapture,
-    Command::OpenWorkspaceOnSshHost,
-    Command::ScrubHistory,
-    Command::DebugInstallDelve,
-    Command::RemoteSyncConfigNow,
-    Command::DropToLocal,
-    Command::StopAutoApprove,
-    Command::ScrubOpenHere,
-    Command::ScrubDiffToWorkingTree,
-    Command::FleetRun,
-    Command::OpenAsSymbolTab,
-    Command::LoadReviewThreads,
-    Command::ReviewAddComment,
-    Command::ReviewSubmit,
-    Command::ReviewToggleResolved,
-    Command::ReviewDiscardPending,
-    Command::ExportCommentsToPr,
-    Command::NoteAdd,
-    Command::NoteDelete,
-    Command::ToggleSessionRecording,
-    Command::NewWorktreeLane,
-    Command::ReviewPullRequest,
-    Command::CloseWorktreeLane,
-    Command::DiffWorktreeLane,
-    Command::MarkAgentLaneReviewed,
-    Command::ShowAgentLane,
-    Command::OpenAgentLaneSection,
-    Command::MarkAgentFileReviewed,
-    Command::DiffAgentFileSinceReview,
-    Command::PickAgentLaneFile,
-    Command::FixProblemWithNavigator,
-    Command::SendHttpRequest,
-    Command::CopyHttpRequestAsCurl,
-    Command::SwitchHttpEnvironment,
-    Command::YieldToNavigator,
-    Command::ToggleNavigator,
-    Command::ClearNavigatorNotes,
-    Command::ToggleProactiveNavigator,
-    Command::NextComment,
-    Command::IgnoreComment,
-];
 
 /// The Customize Layout popup as palette commands (#852): the popup itself,
 /// then one command per row group in the popup's order. VS Code's titles
@@ -1113,1473 +2595,6 @@ pub const LAYOUT_COMMANDS: &[Command] = &[
 ];
 
 impl Command {
-    /// The human-readable label shown in the palette and matched against the
-    /// query. Mirrors VS Code's command titles.
-    pub fn title(self) -> &'static str {
-        match self {
-            Command::MoveLineUp => "Move Line Up",
-            Command::MoveLineDown => "Move Line Down",
-            Command::CopyLineUp => "Copy Line Up",
-            Command::CopyLineDown => "Copy Line Down",
-            Command::ToggleLineComment => "Toggle Line Comment",
-            Command::ToggleBlockComment => "Toggle Block Comment",
-            Command::JoinLines => "Join Lines",
-            Command::InsertLineBelow => "Insert Line Below",
-            Command::InsertLineAbove => "Insert Line Above",
-            Command::DeleteLine => "Delete Line",
-            Command::KillToEndOfLine => "Kill to End of Line",
-            Command::TransformUpper => "Transform to Uppercase",
-            Command::TransformLower => "Transform to Lowercase",
-            Command::TransformTitle => "Transform to Title Case",
-            Command::TransformSnake => "Transform to Snake Case",
-            Command::TransformCamel => "Transform to Camel Case",
-            Command::TransformPascal => "Transform to Pascal Case",
-            Command::TransformKebab => "Transform to Kebab Case",
-            Command::SortLinesAscending => "Sort Lines Ascending",
-            Command::SortLinesDescending => "Sort Lines Descending",
-            Command::IncrementNumber => "Increment Number Under Cursor",
-            Command::DecrementNumber => "Decrement Number Under Cursor",
-            Command::TrimTrailingWhitespace => "Trim Trailing Whitespace",
-            Command::EmmetExpandAbbreviation => "Emmet: Expand Abbreviation",
-            Command::EmmetWrapWithAbbreviation => "Emmet: Wrap with Abbreviation",
-            Command::EmmetRemoveTag => "Emmet: Remove Tag",
-            Command::EmmetUpdateTag => "Emmet: Update Tag",
-            Command::EmmetBalanceOutward => "Emmet: Balance (outward)",
-            Command::EmmetBalanceInward => "Emmet: Balance (inward)",
-            Command::EmmetMatchTag => "Emmet: Go to Matching Pair",
-            Command::ToggleWordWrap => "View: Toggle Word Wrap",
-            Command::ExpandSelection => "Expand Selection",
-            Command::ShrinkSelection => "Shrink Selection",
-            Command::ReplaceInFile => "Replace in File",
-            Command::ToggleFindInSelection => "Find: Toggle Find in Selection",
-            Command::MergeAcceptCurrent => "Merge Conflict: Accept Current",
-            Command::MergeAcceptIncoming => "Merge Conflict: Accept Incoming",
-            Command::MergeAcceptBoth => "Merge Conflict: Accept Both",
-            Command::MergeAcceptAllCurrent => "Merge Conflict: Accept All Current",
-            Command::MergeAcceptAllIncoming => "Merge Conflict: Accept All Incoming",
-            Command::MergeNextConflict => "Merge Conflict: Next Conflict",
-            Command::MergePrevConflict => "Merge Conflict: Previous Conflict",
-            Command::GoToNextChange => "Go to Next Change",
-            Command::GoToPrevChange => "Go to Previous Change",
-            Command::GoToNextProblem => "Go to Next Problem",
-            Command::GoToPrevProblem => "Go to Previous Problem",
-            Command::MergeComplete => "Merge: Complete Merge (stage file)",
-            Command::MergeOpenEditor => "Merge: Open Merge Editor",
-            Command::MergeToggleBase => "Merge: Show Base",
-            Command::MergeAcceptBothReverse => "Merge: Accept Combination (Incoming First)",
-            Command::MergeIgnore => "Merge: Ignore (Keep Base)",
-            Command::DebugAddWatch => "Debug: Add Watch Expression",
-            Command::DebugClearWatch => "Debug: Remove All Watch Expressions",
-            Command::PeekDefinition => "Peek Definition",
-            Command::PeekReferences => "Peek References",
-            Command::GoToDefinition => "Go to Definition",
-            Command::GoToReferences => "Go to References",
-            Command::GoToDeclaration => "Go to Declaration",
-            Command::GoToTypeDefinition => "Go to Type Definition",
-            Command::GoToImplementations => "Go to Implementations",
-            Command::SwitchHeaderSource => "C/C++: Switch Header/Source",
-            Command::RenameSymbol => "Rename Symbol",
-            Command::TriggerSuggest => "Trigger Suggest",
-            Command::TriggerParameterHints => "Trigger Parameter Hints",
-            Command::ShowHover => "Show or Focus Hover",
-            Command::MouseAddCursorAtClick => "Mouse: Add Cursor at Click",
-            Command::MouseGoToDefinitionAtClick => "Mouse: Go to Definition at Click",
-            Command::MouseOpenLinkAtClick => "Mouse: Open Link at Click",
-            Command::ClearBuildDiagnostics => "Problems: Clear Build Diagnostics",
-            Command::StageHunk => "Git: Stage Hunk",
-            Command::UnstageHunk => "Git: Unstage Hunk",
-            Command::RevertHunk => "Git: Revert Hunk",
-            Command::GitUndoLastCommit => "Git: Undo Last Commit",
-            Command::RustExpandMacro => "Rust: Expand Macro Recursively at Caret",
-            Command::RustParentModule => "Rust: Locate Parent Module",
-            Command::RustOpenCargoToml => "Rust: Open Cargo.toml",
-            Command::RustRebuildProcMacros => "Rust: Rebuild Proc Macros and Build Scripts",
-            Command::RustReloadWorkspace => "Rust: Reload Workspace",
-            Command::GitCopyPermalink => "Git: Copy Permalink",
-            Command::GitCopyHeadLink => "Git: Copy Head Link",
-            Command::GitOpenOnRemote => "Git: Open on Remote",
-
-            Command::GitViewStash => "Git: View Stash\u{2026}",
-            Command::GitOpenLineCommit => "Git: Open Commit for Line",
-            Command::GitCopyLineCommitHash => "Git: Copy Commit Hash for Line",
-            Command::AddCursorAbove => "Add Cursor Above",
-            Command::AddCursorBelow => "Add Cursor Below",
-            Command::ColumnSelectUp => "Column Select Up",
-            Command::ColumnSelectDown => "Column Select Down",
-            Command::ColumnSelectLeft => "Column Select Left",
-            Command::ColumnSelectRight => "Column Select Right",
-            Command::ColumnSelectPageUp => "Column Select Page Up",
-            Command::ColumnSelectPageDown => "Column Select Page Down",
-            Command::ToggleColumnSelection => "View: Toggle Column Selection Mode",
-            Command::AddSelectionToNextMatch => "Add Selection to Next Find Match",
-            Command::SelectAllOccurrences => "Select All Occurrences of Find Match",
-            Command::AddCursorsToLineEnds => "Add Cursors to Line Ends",
-            Command::ExpandLineSelection => "Expand Line Selection",
-            Command::JumpToBracket => "Go to Bracket",
-            Command::SelectToBracket => "Select to Bracket",
-            Command::TransposeCharacters => "Transpose Characters around the Cursor",
-            Command::IndentationToSpaces => "Convert Indentation to Spaces",
-            Command::IndentationToTabs => "Convert Indentation to Tabs",
-            Command::TrimFinalNewlines => "Trim Final Newlines",
-            Command::ToggleOverviewRuler => "View: Toggle Overview Ruler",
-            Command::ToggleBookmark => "Bookmarks: Toggle Bookmark",
-            Command::NextBookmark => "Bookmarks: Next Bookmark",
-            Command::PreviousBookmark => "Bookmarks: Previous Bookmark",
-            Command::ClearBookmarks => "Bookmarks: Clear All in File",
-            Command::ViewBookmarks => "Bookmarks: View Bookmarks",
-            Command::FormatDocument => "Format Document",
-            Command::FormatSelection => "Format Selection",
-            Command::ChangeColorPresentation => "Change Color Presentation",
-            Command::ToggleFormatOnType => "Preferences: Toggle Format on Type",
-            Command::ToggleFormatOnSave => "Preferences: Toggle Format on Save",
-            Command::QuickFix => "Quick Fix",
-            Command::ToggleFold => "Toggle Fold",
-            Command::FoldAll => "Fold All",
-            Command::UnfoldAll => "Unfold All",
-            Command::FoldAllComments => "Fold All Block Comments",
-            Command::FoldAllRegions => "Fold All Regions",
-            Command::UnfoldAllRegions => "Unfold All Regions",
-            Command::FoldLevel1 => "Fold Level 1",
-            Command::FoldLevel2 => "Fold Level 2",
-            Command::FoldLevel3 => "Fold Level 3",
-            Command::FoldLevel4 => "Fold Level 4",
-            Command::FoldLevel5 => "Fold Level 5",
-            Command::FoldLevel6 => "Fold Level 6",
-            Command::FoldLevel7 => "Fold Level 7",
-            Command::FoldRecursively => "Fold Recursively",
-            Command::UnfoldRecursively => "Unfold Recursively",
-            Command::SaveFile => "File: Save",
-            Command::SaveAs => "File: Save As…",
-            Command::SaveWithSudo => "File: Save with Sudo",
-            Command::RevertFile => "File: Revert File",
-            Command::SaveAll => "File: Save All",
-            Command::NewFile => "File: New File…",
-            Command::NewUntitledFile => "File: New Untitled Text File",
-            Command::NewFolder => "File: New Folder…",
-            Command::Undo => "Undo",
-            Command::Redo => "Redo",
-            Command::SelectAll => "Select All",
-            Command::ToggleAutoSave => "File: Toggle Auto Save",
-            Command::ToggleAutoSaveOnFocusChange => "File: Toggle Auto Save on Focus Change",
-            Command::ToggleInlineBlame => "Git: Toggle Inline Blame",
-            Command::ToggleLiveRun => "Python: Toggle Live Run",
-            Command::ToggleProvenance => "Editor: Toggle Provenance",
-            Command::DiffToggleGroupBySeat => "Diff: Toggle Group by Seat",
-            Command::ToggleIndentGuides => "View: Toggle Indent Guides",
-            Command::ToggleBracketColors => "Editor: Toggle Bracket Pair Colorization",
-            Command::ToggleRenderWhitespace => "View: Toggle Render Whitespace",
-            Command::CycleLineNumbers => "View: Change Line Numbers (On, Relative, Interval, Off)",
-            Command::ToggleInlineValues => "Debug: Toggle Inline Values",
-            Command::ToggleInlayHints => "Editor: Toggle Inlay Hints",
-            Command::ToggleMarkdownPreview => "Markdown: Toggle Preview",
-            Command::OpenMarkdownPreviewToSide => "Markdown: Open Preview to the Side",
-            Command::RunCodeBlockAtCursor => "Markdown: Run Code Block at Cursor",
-            Command::RestoreSnapshot => "Local History: Restore Snapshot",
-            Command::CloseEditor => "View: Close Editor",
-            Command::ReopenClosedEditor => "View: Reopen Closed Editor",
-            Command::ZoxideJump => "Explorer: Jump to Directory (zoxide)",
-            Command::CloseOtherEditors => "View: Close Other Editors in Group",
-            Command::CloseEditorsToTheRight => "View: Close Editors to the Right in Group",
-            Command::CloseSavedEditors => "View: Close Saved Editors in Group",
-            Command::CloseAllEditors => "View: Close All Editors",
-            Command::PinEditor => "View: Pin Editor",
-            Command::UnpinEditor => "View: Unpin Editor",
-            Command::KeepEditor => "View: Keep Editor",
-            Command::MoveEditorLeftInGroup => "View: Move Editor Left",
-            Command::MoveEditorRightInGroup => "View: Move Editor Right",
-            Command::MoveEditorToNextGroup => "View: Move Editor into Next Group",
-            Command::MoveEditorToPreviousGroup => "View: Move Editor into Previous Group",
-            Command::SplitEditor => "View: Split Editor",
-            Command::FocusLeftEditorGroup => "View: Focus Left Editor Group",
-            Command::FocusRightEditorGroup => "View: Focus Right Editor Group",
-            Command::QuickOpen => "Go to File",
-            Command::TakeTheTour => "Help: Take the Tour",
-            Command::SponsorCroft => "Help: Sponsor croft",
-            Command::SarifNextResult => "SARIF: Next Result",
-            Command::SarifPreviousResult => "SARIF: Previous Result",
-            Command::SarifOpenCodeScanning => "SARIF: Open GitHub Code Scanning Analysis",
-            Command::SarifLoadCodeScanning => "SARIF: Load Code Scanning Results for This Branch",
-            Command::GoToSymbol => "Go to Symbol in Editor",
-            Command::GoToWorkspaceSymbol => "Go to Symbol in Workspace",
-            Command::NavigateBack => "Go Back",
-            Command::NavigateForward => "Go Forward",
-            Command::GoToLastEditLocation => "Go to Last Edit Location",
-            Command::ToggleVimMode => "Toggle Vim Mode",
-            Command::MacroStartStopRecording => "Macro: Start/Stop Recording",
-            Command::MacroReplayLast => "Macro: Replay Last",
-            Command::MacroReplayTimes => "Macro: Replay N Times…",
-            Command::ShowExplorer => "View: Show Explorer",
-            Command::FocusBreadcrumbs => "View: Focus and Select Breadcrumbs",
-            Command::ShowSearch => "View: Show Search",
-            Command::ReplaceInFiles => "Search: Replace in Files",
-            Command::SearchToggleMatchCase => "Search: Toggle Match Case",
-            Command::SearchToggleWholeWord => "Search: Toggle Match Whole Word",
-            Command::SearchToggleRegex => "Search: Toggle Use Regular Expression",
-            Command::SearchTogglePreserveCase => "Search: Toggle Preserve Case",
-            Command::SearchToggleDetails => "Search: Toggle Search Details",
-            Command::ShowSourceControl => "View: Show Source Control",
-            Command::AddWorkspaceFolder => "Workspaces: Add Folder to Workspace",
-            Command::SaveWorkspaceAs => "Workspaces: Save Workspace As",
-            Command::OpenWorkspaceFromFile => "Workspaces: Open Workspace from File",
-            Command::ReopenAsHex => "File: Reopen as Hex",
-            Command::ReopenAsPreview => "File: Reopen as Preview",
-            Command::ReopenAsText => "File: Reopen as Text",
-            Command::NotebookRunAll => "Notebook: Run All Cells",
-            Command::NotebookInterrupt => "Notebook: Interrupt Kernel",
-            Command::NotebookRestart => "Notebook: Restart Kernel",
-            Command::NotebookSelectKernel => "Notebook: Select Kernel",
-            Command::RestartLanguageServers => "Language Servers: Restart All",
-            Command::RestartLanguageServersForFile => "Language Servers: Restart for This File",
-            Command::TestingRunWithCoverage => "Testing: Run All Tests with Coverage",
-            Command::CoverageClear => "Coverage: Clear",
-            Command::TestingInstallCoverageTool => "Testing: Install Coverage Tool",
-            Command::TestingShowCoverageReport => "Testing: Show Coverage Report",
-            Command::DeveloperShowMemoryUsage => "Developer: Show Memory Usage",
-            Command::ToggleScreencastMode => "Developer: Toggle Screencast Mode",
-            Command::RunTestAtCursorWithCoverage => "Testing: Run Test at Cursor with Coverage",
-            Command::TestingToggleWatchAll => "Testing: Toggle Watch All Tests",
-            Command::TestingGoToFirstFailure => "Testing: Go to First Failure",
-            Command::TestingCancelRun => "Testing: Cancel Test Run",
-            Command::HexFindNext => "Hex: Find Next",
-            Command::SheetInsertRowBelow => "Sheet: Insert Row Below",
-            Command::SheetDeleteRow => "Sheet: Delete Row",
-            Command::SheetInsertColRight => "Sheet: Insert Column Right",
-            Command::SheetDeleteCol => "Sheet: Delete Column",
-            Command::MediaOpenExternal => "Media: Open in System Player",
-            Command::RemoveWorkspaceFolder => "Workspaces: Remove Folder from Workspace",
-            Command::ShowRunDebug => "View: Show Run and Debug",
-            Command::ShowRemote => "View: Show Remote",
-            Command::ShowExtensions => "View: Show Extensions",
-            Command::CompareExtensionsWithVscode => "Extensions: Compare with VS Code",
-            Command::ShowTesting => "View: Show Testing",
-            Command::ShowCodeQL => "View: Show CodeQL",
-            Command::CodeqlRunQuery => "CodeQL: Run Query on Selected Database",
-            Command::CodeqlRunQuerySuite => "CodeQL: Run Query Suite",
-            Command::CodeqlRemoveDatabase => "CodeQL: Remove Database",
-            Command::CodeqlRenameDatabase => "CodeQL: Rename Database",
-            Command::CodeqlSortDatabases => "CodeQL: Sort Databases",
-            Command::CodeqlRevealDatabase => "CodeQL: Reveal Database in Explorer",
-            Command::CodeqlUpgradeDatabase => "CodeQL: Upgrade Database",
-            Command::CodeqlClearCache => "CodeQL: Clear Cache",
-            Command::CodeqlTrimCache => "CodeQL: Trim Cache",
-            Command::CodeqlTrimCacheToOverlay => "CodeQL: Trim Cache to Overlay Base",
-            Command::CodeqlAddDatabaseSource => "CodeQL: Add Database Source to Workspace",
-            Command::CodeqlDeleteUnusedDatabases => "CodeQL: Delete Unused Databases",
-            Command::CodeqlRemoveHistory => "CodeQL: Remove Query History Entry",
-            Command::CodeqlRenameHistory => "CodeQL: Rename Query History Entry",
-            Command::CodeqlSortHistory => "CodeQL: Sort Query History",
-            Command::CodeqlViewQuery => "CodeQL: View Query",
-            Command::CodeqlCreateQuery => "CodeQL: Create Query",
-            Command::CodeqlRunPack => "CodeQL: Run Queries in Pack",
-            Command::CodeqlRunQueryOnDatabases => "CodeQL: Run Query on Multiple Databases",
-            Command::CodeqlCancelQueue => "CodeQL: Cancel Queued Queries",
-            Command::CodeqlCopyVersion => "CodeQL: Copy Version Information",
-            Command::CodeqlDownloadCli => "CodeQL: Download CLI",
-            Command::CodeqlCheckCliUpdates => "CodeQL: Check for CLI Updates",
-            Command::CodeqlInstallPackDependencies => "CodeQL: Install Pack Dependencies",
-            Command::CodeqlDownloadPacks => "CodeQL: Download Packs",
-            Command::CodeqlRunPublishedPack => "CodeQL: Run Queries in Published Pack",
-            Command::CodeqlQuickQuery => "CodeQL: Quick Query",
-            Command::CodeqlCompareResults => "CodeQL: Compare Query Results",
-            Command::CodeqlShowEvaluatorLog => "CodeQL: Show Evaluator Log (Raw JSON)",
-            Command::CodeqlShowEvaluatorLogSummary => "CodeQL: Show Evaluator Log (Summary Text)",
-            Command::CodeqlShowEvaluatorLogViewer => "CodeQL: Show Evaluator Log (Viewer)",
-            Command::CodeqlShowQueryLog => "CodeQL: Show Query Log",
-            Command::CodeqlComparePerformance => "CodeQL: Compare Performance",
-            Command::CodeqlPreviewQueryHelp => "CodeQL: Preview Query Help",
-            Command::CodeqlExportResults => "CodeQL: Export Results",
-            Command::CodeqlSetUpController => "CodeQL: Set Up Controller Repository",
-            Command::CodeqlAddVariantRepo => "CodeQL: Add Variant Analysis Repository",
-            Command::CodeqlAddVariantList => "CodeQL: Add Variant Analysis Repository List",
-            Command::CodeqlAddVariantOwner => "CodeQL: Add Variant Analysis Owner",
-            Command::CodeqlVariantCodeSearch => "CodeQL: Add Repositories with GitHub Code Search",
-            Command::CodeqlOpenVariantConfig => "CodeQL: Open Variant Analysis Config File",
-            Command::CodeqlOpenVariantOnGithub => {
-                "CodeQL: Open Variant Analysis Repository on GitHub"
-            }
-            Command::CodeqlRunVariantAnalysis => "CodeQL: Run Variant Analysis",
-            Command::CodeqlOpenVariantResults => "CodeQL: Open Variant Analysis Results",
-            Command::CodeqlExportVariantResults => "CodeQL: Export Variant Analysis Results",
-            Command::CodeqlCopyVariantRepoList => "CodeQL: Copy Variant Analysis Repository List",
-            Command::CodeqlViewVariantLogs => "CodeQL: View Variant Analysis Logs",
-            Command::CodeqlRunTests => "CodeQL: Run Tests",
-            Command::CodeqlDebugQuery => "CodeQL: Debug Query",
-            Command::CodeqlDebugSelection => "CodeQL: Debug Selection",
-            Command::CodeqlResultsUp => "CodeQL: Previous Result",
-            Command::CodeqlResultsDown => "CodeQL: Next Result",
-            Command::CodeqlResultsLeft => "CodeQL: Previous Result Column",
-            Command::CodeqlResultsRight => "CodeQL: Next Result Column",
-            Command::SheetSortByColumn => "Sheet: Sort by Column",
-            Command::CodeqlQuickEval => "CodeQL: Quick Evaluation",
-            Command::CodeqlQuickEvalCount => "CodeQL: Quick Evaluation Count",
-            Command::CodeqlViewAst => "CodeQL: View AST",
-            Command::CodeqlOpenModelEditor => "CodeQL: Open Model Editor",
-            Command::CodeqlModelEndpoint => "CodeQL: Model Endpoint",
-            Command::CodeqlOpenReferencedFile => "CodeQL: Open Referenced File",
-            Command::CodeqlViewAlertsCsv => "CodeQL: View Alerts (CSV)",
-            Command::CodeqlViewAlertsSarif => "CodeQL: View Alerts (SARIF)",
-            Command::CodeqlViewResultsCsv => "CodeQL: View Results (CSV)",
-            Command::CodeqlShowResultSet => "CodeQL: Show Result Set",
-            Command::CodeqlViewCfg => "CodeQL: View CFG",
-            Command::CodeqlRunAllQueries => "CodeQL: Run All Queries in Workspace",
-            Command::CodeqlRunSelectedQueries => "CodeQL: Run Queries in Selected Files",
-            Command::CodeqlCancelRunningQuery => "CodeQL: Cancel Running Query",
-            Command::CodeqlAcceptTestOutput => "CodeQL: Accept Test Output",
-            Command::CodeqlFocusSideBar => "CodeQL: Focus Side Bar",
-            Command::CodeqlOpenResultsDirectory => "CodeQL: Open Query Results Directory",
-            Command::RunTestAtCursor => "Testing: Run Test at Cursor",
-            Command::TestingRunAll => "Testing: Run All Tests",
-            Command::TestingRunFile => "Testing: Run Tests in Current File",
-            Command::TestingRerunFailed => "Testing: Rerun Failed Tests",
-            Command::TestingRerunLast => "Testing: Rerun Last Run",
-            Command::DebugTestAtCursor => "Testing: Debug Test at Cursor",
-            Command::ToggleSideBar => "View: Toggle Primary Side Bar",
-            Command::ToggleAutoHideSideBar => "View: Toggle Auto-Hide Side Bar",
-            Command::ToggleSecondarySideBar => "View: Toggle Secondary Side Bar",
-            Command::ToggleZenMode => "View: Toggle Zen Mode",
-            Command::ToggleCenteredLayout => "View: Toggle Centered Layout",
-            Command::ToggleTerminal => "View: Toggle Terminal",
-            Command::ToggleActivityBar => "View: Toggle Activity Bar Visibility",
-            Command::ToggleStatusBar => "View: Toggle Status Bar Visibility",
-            Command::ToggleSideBarPosition => "View: Toggle Primary Side Bar Position",
-            Command::SetPanelAlignment => "View: Set Panel Alignment…",
-            Command::SetQuickInputPosition => "View: Set Quick Input Position…",
-            Command::CustomizeLayout => "View: Customize Layout…",
-            Command::FocusTerminal => "Terminal: Focus Terminal",
-            Command::ShowProblems => "View: Show Problems",
-            Command::ShowOutput => "View: Show Output",
-            Command::OutputSelectChannel => "Output: Select Channel…",
-            Command::ShowPorts => "View: Show Ports",
-            Command::ShowCaptures => "View: Show Captures",
-            Command::ToggleMinimap => "View: Toggle Minimap",
-            Command::ProblemsCheckProject => "Problems: Check Whole Project",
-            Command::ProblemsToggleProjectAuto => {
-                "Problems: Whole-Project Check Auto-Run (Auto / On / Off)"
-            }
-            Command::ProblemsToggleScope => "Problems: Toggle Scope (Open Files / Whole Project)",
-            Command::DiffToggleIgnoreWhitespace => "Diff: Toggle Ignore Whitespace",
-            Command::NewTerminal => "Terminal: Create New Terminal",
-            Command::RunSelectedText => "Terminal: Run Selected Text in Active Terminal",
-            Command::FocusNextTerminal => "Terminal: Focus Next Terminal",
-            Command::FocusPreviousTerminal => "Terminal: Focus Previous Terminal",
-            Command::TerminalClear => "Terminal: Clear",
-            Command::TerminalRename => "Terminal: Rename",
-            Command::TerminalKill => "Terminal: Kill the Active Terminal Instance",
-            Command::TerminalSplit => "Terminal: Split Terminal",
-            Command::TerminalNewWithProfile => "Terminal: Create New Terminal (With Profile)",
-            Command::TerminalQuickSelect => "Terminal: Quick Select",
-            Command::TerminalCopyMode => "Terminal: Enter Copy Mode",
-            Command::TerminalCommandHistory => "Terminal: Show Command History",
-            Command::TerminalOpenScrollback => "Terminal: Open Scrollback in Editor",
-            Command::StartDebugging => "Debug: Start Debugging",
-            Command::SelectDebugConfig => "Debug: Select and Start Debugging",
-            Command::AddDebugConfig => "Debug: Add Configuration…",
-            Command::StopDebugging => "Debug: Stop Debugging",
-            Command::PauseDebugging => "Debug: Pause",
-            Command::SwitchDebugSession => "Debug: Switch Session",
-            Command::RestartDebugging => "Debug: Restart",
-            Command::ToggleBreakpoint => "Debug: Toggle Breakpoint",
-            Command::EditBreakpointCondition => "Debug: Add Conditional Breakpoint",
-            Command::EditLogpoint => "Debug: Add Logpoint",
-            Command::ShowIncomingCalls => "Calls: Show Incoming Calls",
-            Command::ShowOutgoingCalls => "Calls: Show Outgoing Calls",
-            Command::ShowSupertypes => "Types: Show Supertypes",
-            Command::ShowSubtypes => "Types: Show Subtypes",
-            Command::ToggleCodeLens => "Editor: Toggle CodeLens",
-            Command::RunCodeLens => "Editor: Run CodeLens on This Line",
-            Command::DebugAddHitCountBreakpoint => "Debug: Add Hit Count Breakpoint",
-            Command::DebugAddFunctionBreakpoint => "Debug: Add Function Breakpoint",
-            Command::DebugRemoveFunctionBreakpoints => "Debug: Remove All Function Breakpoints",
-            Command::DebugRunToCursor => "Debug: Run to Cursor",
-            Command::DebugBreakOnValueChange => "Debug: Break When Value Changes",
-            Command::DebugRemoveDataBreakpoints => "Debug: Remove All Data Breakpoints",
-            Command::OpenSearchEditor => "Search: Open Results in Editor",
-            Command::RerunSearchEditor => "Search Editor: Rerun",
-            Command::RebaseAbort => "Rebase: Abort",
-            Command::GitContinueOperation => "Git: Continue Rebase, Cherry-Pick or Revert",
-            Command::GitSkipOperation => "Git: Skip Commit (Rebase, Cherry-Pick or Revert)",
-            Command::GitAbortOperation => "Git: Abort Merge, Rebase, Cherry-Pick, Revert or Bisect",
-            Command::GitCreateTag => "Git: Create Tag",
-            Command::GitPushTags => "Git: Push Tags",
-            Command::GitDeleteRemoteTag => "Git: Delete Remote Tag",
-            Command::GitCommit => "Git: Commit",
-            Command::GitPush => "Git: Push",
-            Command::GitPull => "Git: Pull",
-            Command::GitSync => "Git: Sync",
-            Command::GitCheckoutTo => "Git: Checkout to\u{2026}",
-            Command::GitStash => "Git: Stash",
-            Command::ToggleTerminalSuggestions => "Terminal: Toggle Command Suggestions",
-            Command::ToggleScreenReader => "Accessibility: Toggle Screen Reader Mode",
-            Command::OpenKeyboardShortcuts => "Preferences: Open Keyboard Shortcuts",
-            Command::SwitchProfile => "Profiles: Switch Profile",
-            Command::ToggleInlineSuggestions => "Editor: Toggle Inline Suggestions",
-            Command::StepOver => "Debug: Step Over",
-            Command::ContinueDebugging => "Debug: Continue",
-            Command::StepInto => "Debug: Step Into",
-            Command::StepOut => "Debug: Step Out",
-            Command::StepIntoTarget => "Debug: Step Into Target",
-            Command::ToggleRaisedExceptions => "Debug: Toggle Break on Raised Exceptions",
-            Command::AttachPythonProcess => "Debug: Attach to Python Process",
-            Command::RunTask => "Tasks: Run Task",
-            Command::RunBuildTask => "Tasks: Run Build Task",
-            Command::RerunLastTask => "Tasks: Rerun Last Task",
-            Command::ColorTheme => "Preferences: Color Theme",
-            Command::KeyboardShortcuts => "Help: Keyboard Shortcuts Reference",
-            Command::UpdateCroft => "Help: Update croft (Relaunch or Rebuild)",
-            Command::OpenSettings => "Preferences: Open Settings",
-            Command::OpenSettingsEditor => "Preferences: Open Settings (UI)",
-            Command::OpenSettingsJson => "Preferences: Open Settings (JSON)",
-            Command::OpenWorkspaceSettingsJson => "Preferences: Open Workspace Settings (JSON)",
-            Command::OpenWorkspaceSettingsLocalJson => {
-                "Preferences: Open Workspace Settings — Local (JSON)"
-            }
-            Command::OpenKeybindingsJson => "Preferences: Open Keyboard Shortcuts (JSON)",
-            Command::ConfigureSnippets => "Preferences: Configure User Snippets",
-            Command::OpenTriggersJson => "Preferences: Open Terminal Triggers (JSON)",
-            Command::OpenAgentsJson => "Preferences: Open Agent Lanes (JSON)",
-            Command::OpenMatchersJson => "Preferences: Open Problem Matchers (JSON)",
-            Command::ToggleTerminalTimestamps => "Terminal: Toggle Timestamps",
-            Command::ToggleLogHighlight => "Log: Toggle Highlighting (tailspin)",
-            Command::CollapseTerminalPane => "Terminal: Collapse Pane",
-            Command::RestoreTerminalPanes => "Terminal: Restore All Collapsed Panes",
-            Command::ToggleSecretRedaction => "Terminal: Toggle Secret Redaction",
-            Command::RevealRedactedSecrets => "Terminal: Reveal Redacted Secrets for 10s",
-            Command::SearchFromTerminal => "Terminal: Search & Replace from Last grep/rg",
-            Command::SessionParticipants => "Session: Participants",
-            Command::SessionDetach => "Session: Detach",
-            Command::CollabCancelStream => "Collab: Cancel AI Stream",
-            Command::AskNavigator => "Navigator: Ask About Line or Selection",
-            Command::AskNavigatorAboutCapture => "Captures: Ask Navigator About This Line",
-            Command::OpenWorkspaceOnSshHost => "Remote: Open Workspace on This Pane's Host",
-            Command::ScrubHistory => "Source Control: Scrub History",
-            Command::DebugInstallDelve => "Debug: Install Go Debugger (delve)",
-            Command::RemoteSyncConfigNow => "Remote: Sync Config Now",
-            Command::DropToLocal => "Remote: Drop to Local",
-            Command::StopAutoApprove => "Agents: Stop Auto-Approving",
-            Command::ScrubOpenHere => "Source Control: Open Scrubbed File Here",
-            Command::ScrubDiffToWorkingTree => "Source Control: Diff Scrubbed File to Working Tree",
-            Command::FleetRun => "Terminal: Fleet Run",
-            Command::OpenAsSymbolTab => "Editor: Open Symbol as Its Own Tab",
-            Command::LoadReviewThreads => "Review: Load PR Comments for This File",
-            Command::ReviewAddComment => "Review: Add Comment on This Line",
-            Command::ReviewSubmit => "Review: Submit Review",
-            Command::ReviewToggleResolved => "Review: Resolve or Unresolve Thread",
-            Command::ReviewDiscardPending => "Review: Discard Pending Comments",
-            Command::ExportCommentsToPr => "Source Control: Export Comments to Pull Request",
-            Command::NoteAdd => "Notes: Add Note on This Line",
-            Command::NoteDelete => "Notes: Delete Note",
-            Command::ToggleSessionRecording => "Session: Record Terminal as Asciicast",
-            Command::NewWorktreeLane => "Agent: New Worktree Lane",
-            Command::ReviewPullRequest => "Source Control: Review Pull Request",
-            Command::CloseWorktreeLane => "Agent: Close Worktree Lane",
-            Command::DiffWorktreeLane => "Agent: Diff Lane Against Its Base",
-            Command::MarkAgentLaneReviewed => "Agents: Mark Changed Files Reviewed",
-            Command::ShowAgentLane => "Agents: Show Changed Files",
-            Command::OpenAgentLaneSection => "Agents: Open Agent Lane",
-            Command::MarkAgentFileReviewed => "Agents: Mark This File Reviewed",
-            Command::DiffAgentFileSinceReview => "Agents: Diff This File Since Review",
-            Command::PickAgentLaneFile => "Agents: Review a Changed File…",
-            Command::FixProblemWithNavigator => "Problems: Fix With Navigator",
-            Command::SendHttpRequest => "HTTP: Send Request Under Caret",
-            Command::CopyHttpRequestAsCurl => "HTTP: Copy Request as curl",
-            Command::SwitchHttpEnvironment => "HTTP: Switch Environment",
-            Command::YieldToNavigator => "Navigator: Yield the Turn",
-            Command::ToggleNavigator => "Navigator: Activate or Deactivate",
-            Command::ClearNavigatorNotes => "Navigator: Clear Comments",
-            Command::ToggleProactiveNavigator => "Navigator: Toggle Proactive Comments",
-            Command::NextComment => "Navigator: Next Comment",
-            Command::IgnoreComment => "Navigator: Ignore Comment",
-        }
-    }
-
-    /// The default key-binding hint shown right-aligned on the row, or an
-    /// empty string for palette-only commands. The label uses the macOS chord
-    /// names; on Linux/Android the command modifier is `Ctrl`, and
-    /// [`platform_hint`] spells it that way where it is shown.
-    pub fn keybinding_hint(self) -> &'static str {
-        match self {
-            Command::MoveLineUp => "Alt+↑",
-            Command::MoveLineDown => "Alt+↓",
-            Command::CopyLineUp => "Shift+Alt+↑",
-            Command::CopyLineDown => "Shift+Alt+↓",
-            Command::JoinLines => "Cmd+Opt+Shift+J",
-            Command::InsertLineBelow => "Cmd+Enter",
-            Command::InsertLineAbove => "Cmd+Shift+Enter",
-            Command::DeleteLine => "Cmd+Shift+K",
-            // macOS keeps `Ctrl+K`; off it `Ctrl+K` is the `Cmd+K` leader
-            // except in vim mode (#843), so the palette is the way there.
-            Command::KillToEndOfLine => {
-                if cfg!(target_os = "macos") {
-                    "Ctrl+K"
-                } else {
-                    ""
-                }
-            }
-            Command::TransformUpper => "Cmd+Opt+Shift+U",
-            Command::TransformLower => "Cmd+Opt+Shift+L",
-            Command::TransformTitle => "Cmd+Opt+Shift+C",
-            Command::TransformSnake
-            | Command::TransformCamel
-            | Command::TransformPascal
-            | Command::TransformKebab => "",
-            Command::SortLinesAscending => "Cmd+Opt+Shift+A",
-            Command::SortLinesDescending => "Cmd+Opt+Shift+D",
-            Command::IncrementNumber => "Cmd+Opt+=",
-            Command::DecrementNumber => "Cmd+Opt+-",
-            Command::TrimTrailingWhitespace => "Cmd+Opt+Shift+W",
-            Command::EmmetExpandAbbreviation => "Cmd+Opt+Shift+E",
-            Command::EmmetWrapWithAbbreviation => "",
-            Command::EmmetRemoveTag => "",
-            Command::EmmetUpdateTag => "",
-            Command::EmmetBalanceOutward => "",
-            Command::EmmetBalanceInward => "",
-            Command::EmmetMatchTag => "",
-            Command::ToggleLineComment => "Cmd+/",
-            Command::ToggleBlockComment => "Shift+Alt+A",
-            Command::ToggleWordWrap => "Alt+Z",
-            Command::ExpandSelection => "Shift+Alt+\u{2192}",
-            Command::ShrinkSelection => "Shift+Alt+\u{2190}",
-            Command::ReplaceInFile => "Cmd+Opt+F",
-            Command::ToggleFindInSelection => "Alt+L",
-            Command::ToggleAutoSave => "",
-            Command::ToggleAutoSaveOnFocusChange => "",
-            Command::ToggleInlineBlame => "",
-            Command::ToggleLiveRun => "Cmd+K V",
-            Command::ToggleProvenance => "",
-            Command::DiffToggleGroupBySeat => "",
-            Command::ToggleIndentGuides => "",
-            Command::ToggleBracketColors => "",
-            Command::ToggleRenderWhitespace => "",
-            Command::CycleLineNumbers => "",
-            Command::ToggleInlineValues => "",
-            Command::ToggleInlayHints => "",
-            Command::ToggleMarkdownPreview => "Cmd+Shift+V",
-            Command::OpenMarkdownPreviewToSide => "Cmd+K V",
-            Command::RunCodeBlockAtCursor => "Cmd+Enter",
-            Command::RestoreSnapshot => "",
-            Command::MergeAcceptCurrent => "Cmd+.",
-            Command::MergeAcceptIncoming => "Cmd+.",
-            Command::MergeAcceptBoth => "Cmd+.",
-            Command::MergeAcceptAllCurrent => "",
-            Command::MergeAcceptAllIncoming => "",
-            Command::MergeNextConflict => "F7",
-            Command::MergePrevConflict => "Shift+F7",
-            Command::GoToNextChange => "F7",
-            Command::GoToPrevChange => "Shift+F7",
-            // No default chord: F8 is the perf toggle here. Bind one in
-            // keybindings.json, or import VS Code's F8 / Shift+F8.
-            Command::GoToNextProblem => "",
-            Command::GoToPrevProblem => "",
-            Command::MergeComplete => "",
-            Command::MergeOpenEditor => "",
-            Command::MergeToggleBase => "",
-            Command::MergeAcceptBothReverse => "",
-            Command::MergeIgnore => "",
-            Command::DebugAddWatch => "",
-            Command::DebugClearWatch => "",
-            Command::PeekDefinition => "Alt+F12",
-            Command::PeekReferences => "Alt+Shift+F12",
-            Command::GoToDefinition => "F12",
-            Command::GoToReferences => "Shift+F12",
-            Command::GoToDeclaration => "Ctrl+Shift+F12",
-            Command::GoToTypeDefinition => "Ctrl+F12",
-            Command::GoToImplementations => "Cmd+F12",
-            Command::SwitchHeaderSource => "Alt+O",
-            Command::RenameSymbol => "F2",
-            Command::TriggerSuggest => "Ctrl+Space",
-            // No chord of its own: VS Code's Ctrl+Shift+Space is the
-            // terminal's Quick Select here. Typing `(` or `,` asks too.
-            Command::TriggerParameterHints => "",
-            Command::ShowHover => "Cmd+K Cmd+I",
-            Command::MouseAddCursorAtClick => "",
-            Command::MouseGoToDefinitionAtClick => "",
-            Command::MouseOpenLinkAtClick => "",
-            Command::ClearBuildDiagnostics => "",
-            Command::StageHunk => "S in diff",
-            Command::UnstageHunk => "U in diff",
-            Command::RevertHunk => "R in diff",
-            Command::GitUndoLastCommit => "",
-            Command::RustExpandMacro
-            | Command::RustParentModule
-            | Command::RustOpenCargoToml
-            | Command::RustRebuildProcMacros
-            | Command::RustReloadWorkspace => "",
-            Command::GitCopyPermalink | Command::GitCopyHeadLink | Command::GitOpenOnRemote => "",
-
-            Command::GitViewStash => "",
-            Command::GitOpenLineCommit | Command::GitCopyLineCommitHash => "",
-            Command::AddCursorAbove => "Cmd+Opt+↑",
-            Command::AddCursorBelow => "Cmd+Opt+↓",
-            Command::ColumnSelectUp => "Cmd+Shift+Opt+↑",
-            Command::ColumnSelectDown => "Cmd+Shift+Opt+↓",
-            Command::ColumnSelectLeft => "Cmd+Shift+Opt+←",
-            Command::ColumnSelectRight => "Cmd+Shift+Opt+→",
-            Command::ColumnSelectPageUp => "Cmd+Shift+Opt+PageUp",
-            Command::ColumnSelectPageDown => "Cmd+Shift+Opt+PageDown",
-            Command::ToggleColumnSelection => "",
-            Command::AddSelectionToNextMatch => "Cmd+D",
-            Command::SelectAllOccurrences => "Cmd+Shift+L",
-            Command::AddCursorsToLineEnds => "Shift+Alt+I",
-            Command::ExpandLineSelection => "Cmd+L",
-            Command::JumpToBracket => "Cmd+Shift+\\",
-            Command::SelectToBracket => "Cmd+Opt+\\",
-            Command::TransposeCharacters => "Ctrl+T",
-            Command::IndentationToSpaces => "Cmd+Opt+Shift+S",
-            Command::IndentationToTabs => "Cmd+Opt+Shift+T",
-            Command::TrimFinalNewlines => "Cmd+Opt+Shift+N",
-            Command::ToggleOverviewRuler => "",
-            Command::ToggleBookmark => "Cmd+Opt+Shift+K",
-            Command::NextBookmark => "Cmd+Opt+.",
-            Command::PreviousBookmark => "Cmd+Opt+,",
-            Command::ClearBookmarks => "Cmd+Opt+Shift+B",
-            Command::ViewBookmarks => "Cmd+K Cmd+M",
-            Command::FormatDocument => "Cmd+Opt+Shift+F",
-            Command::FormatSelection => "Cmd+K Cmd+F",
-            Command::ChangeColorPresentation => "",
-            Command::ToggleFormatOnType => "",
-            Command::ToggleFormatOnSave => "Cmd+K F",
-            Command::QuickFix => "Cmd+.",
-            Command::ToggleFold => "Cmd+K Cmd+L",
-            Command::FoldAll => "Cmd+K Cmd+0",
-            Command::UnfoldAll => "Cmd+K Cmd+J",
-            Command::FoldAllComments => "Cmd+K Cmd+/",
-            Command::FoldAllRegions => "Cmd+K Cmd+8",
-            Command::UnfoldAllRegions => "Cmd+K Cmd+9",
-            Command::FoldLevel1 => "Cmd+K Cmd+1",
-            Command::FoldLevel2 => "Cmd+K Cmd+2",
-            Command::FoldLevel3 => "Cmd+K Cmd+3",
-            Command::FoldLevel4 => "Cmd+K Cmd+4",
-            Command::FoldLevel5 => "Cmd+K Cmd+5",
-            Command::FoldLevel6 => "Cmd+K Cmd+6",
-            Command::FoldLevel7 => "Cmd+K Cmd+7",
-            // VS Code's Cmd+K Cmd+[ / ] collapse and restore terminal panes
-            // here, so these two are palette commands, bindable by id.
-            Command::FoldRecursively => "",
-            Command::UnfoldRecursively => "",
-            Command::SaveFile => "Cmd+S",
-            Command::SaveAs => "",
-            Command::SaveWithSudo => "",
-            Command::RevertFile => "",
-            // VS Code's macOS chord; its Linux `Ctrl+K S` is Select for
-            // Compare here, so Linux takes `Ctrl+Alt+S` instead.
-            Command::SaveAll => "Cmd+Opt+S",
-            // Palette-only: the Explorer's `Cmd+F` / `Cmd+Shift+N` are Find
-            // and unbound outside it, so neither is the command's chord.
-            Command::NewFile => "",
-            Command::NewUntitledFile => "Cmd+N",
-            Command::NewFolder => "",
-            Command::Undo => "Cmd+Z",
-            Command::Redo => "Shift+Cmd+Z",
-            Command::SelectAll => "Cmd+A",
-            Command::CloseEditor => "Cmd+W",
-            Command::ReopenClosedEditor => "Cmd+K Shift+W",
-            Command::ZoxideJump => "Cmd+Z in Explorer",
-            // Not VS Code's ⌥⌘T, which iTerm2 keeps for New Tab and a Linux
-            // desktop for a new terminal (#2072).
-            Command::CloseOtherEditors => "Cmd+K Shift+X",
-            Command::CloseEditorsToTheRight => "Cmd+K →",
-            Command::CloseSavedEditors => "Cmd+K U",
-            Command::CloseAllEditors => "Cmd+K W",
-            // One chord toggles, as VS Code's `Ctrl+K Shift+Enter` serves
-            // both through their `when` clauses.
-            Command::PinEditor => "Cmd+K P",
-            Command::UnpinEditor => "Cmd+K P",
-            Command::KeepEditor => "Cmd+K Shift+P",
-            // VS Code's Linux and Windows chords; its macOS Cmd+K
-            // Cmd+Shift+Left / Right are rebindable by id.
-            Command::MoveEditorLeftInGroup => "Ctrl+Shift+PageUp",
-            Command::MoveEditorRightInGroup => "Ctrl+Shift+PageDown",
-            // VS Code's Ctrl+Alt+Left / Right already move croft's caret a
-            // word (they carry Alt), so these two are palette commands,
-            // bindable by id.
-            Command::MoveEditorToNextGroup => "",
-            Command::MoveEditorToPreviousGroup => "",
-            Command::SplitEditor => "Cmd+\\",
-            Command::FocusLeftEditorGroup => "Cmd+Opt+←",
-            Command::FocusRightEditorGroup => "Cmd+Opt+→",
-            Command::QuickOpen => "Cmd+P",
-            Command::TakeTheTour => "",
-            Command::SponsorCroft => "",
-            Command::SarifNextResult => "",
-            Command::SarifPreviousResult => "",
-            Command::SarifOpenCodeScanning => "",
-            Command::SarifLoadCodeScanning => "",
-            Command::GoToSymbol => "Cmd+Shift+O",
-            Command::GoToWorkspaceSymbol => "Cmd+P #",
-            Command::NavigateBack => "Ctrl+-",
-            Command::NavigateForward => "Ctrl+Shift+-",
-            Command::GoToLastEditLocation => "Cmd+K Cmd+Q",
-            Command::ToggleVimMode => "Cmd+E",
-            Command::MacroStartStopRecording => "",
-            Command::MacroReplayLast => "",
-            Command::MacroReplayTimes => "",
-            Command::ShowExplorer => "Cmd+Shift+E",
-            Command::FocusBreadcrumbs => "Cmd+Shift+.",
-            Command::ShowSearch => "Cmd+Shift+F",
-            Command::ReplaceInFiles => "Cmd+Shift+H",
-            // VS Code's search-input keys, live while a Search input has
-            // focus; run from the palette they reveal the side bar first.
-            Command::SearchToggleMatchCase => "Alt+C",
-            Command::SearchToggleWholeWord => "Alt+W",
-            Command::SearchToggleRegex => "Alt+R",
-            Command::SearchTogglePreserveCase => "Alt+P",
-            // VS Code binds none that is free here (its Ctrl+Shift+J is
-            // croft's maximize-terminal); D for details.
-            Command::SearchToggleDetails => "Alt+D",
-            Command::ShowSourceControl => "Cmd+Shift+S",
-            Command::AddWorkspaceFolder => "",
-            Command::SaveWorkspaceAs => "",
-            Command::OpenWorkspaceFromFile => "",
-            Command::ReopenAsHex => "",
-            Command::ReopenAsPreview => "",
-            Command::ReopenAsText => "",
-            Command::NotebookRunAll => "",
-            Command::NotebookInterrupt => "",
-            Command::NotebookRestart => "",
-            Command::NotebookSelectKernel => "",
-            Command::RestartLanguageServers => "",
-            Command::RestartLanguageServersForFile => "",
-            Command::TestingRunWithCoverage => "",
-            Command::CoverageClear => "",
-            Command::TestingInstallCoverageTool => "",
-            Command::TestingShowCoverageReport => "",
-            Command::DeveloperShowMemoryUsage => "",
-            Command::ToggleScreencastMode => "Shift+F8",
-            Command::RunTestAtCursorWithCoverage => "",
-            Command::TestingToggleWatchAll => "",
-            Command::TestingGoToFirstFailure => "",
-            Command::TestingCancelRun => "",
-            Command::HexFindNext => "F3",
-            Command::SheetInsertRowBelow => "",
-            Command::SheetDeleteRow => "",
-            Command::SheetInsertColRight => "",
-            Command::SheetDeleteCol => "",
-            Command::MediaOpenExternal => "",
-            Command::RemoveWorkspaceFolder => "",
-            Command::ShowRunDebug => "Cmd+Shift+D",
-            Command::ShowRemote => "Cmd+Shift+R",
-            Command::ShowExtensions => "Cmd+Shift+X",
-            Command::CompareExtensionsWithVscode => "",
-            Command::ShowTesting => "Cmd+K B",
-            Command::ShowCodeQL => "",
-            Command::CodeqlRunQuery => "",
-            Command::CodeqlRunQuerySuite => "",
-            Command::CodeqlRemoveDatabase => "",
-            Command::CodeqlRenameDatabase => "",
-            Command::CodeqlSortDatabases => "",
-            Command::CodeqlRevealDatabase => "",
-            Command::CodeqlUpgradeDatabase => "",
-            Command::CodeqlClearCache => "",
-            Command::CodeqlTrimCache => "",
-            Command::CodeqlTrimCacheToOverlay => "",
-            Command::CodeqlAddDatabaseSource => "",
-            Command::CodeqlDeleteUnusedDatabases => "",
-            Command::CodeqlRemoveHistory => "",
-            Command::CodeqlRenameHistory => "",
-            Command::CodeqlSortHistory => "",
-            Command::CodeqlViewQuery => "",
-            Command::CodeqlCreateQuery => "",
-            Command::CodeqlRunPack => "",
-            Command::CodeqlRunQueryOnDatabases => "",
-            Command::CodeqlCancelQueue => "",
-            Command::CodeqlCopyVersion => "",
-            Command::CodeqlDownloadCli => "",
-            Command::CodeqlCheckCliUpdates => "",
-            Command::CodeqlInstallPackDependencies => "",
-            Command::CodeqlDownloadPacks => "",
-            Command::CodeqlRunPublishedPack => "",
-            Command::CodeqlQuickQuery => "",
-            Command::CodeqlCompareResults => "",
-            Command::CodeqlShowEvaluatorLog => "",
-            Command::CodeqlShowEvaluatorLogSummary => "",
-            Command::CodeqlShowEvaluatorLogViewer => "",
-            Command::CodeqlShowQueryLog => "",
-            Command::CodeqlComparePerformance => "",
-            Command::CodeqlPreviewQueryHelp => "",
-            Command::CodeqlExportResults => "",
-            Command::CodeqlSetUpController => "",
-            Command::CodeqlAddVariantRepo => "",
-            Command::CodeqlAddVariantList => "",
-            Command::CodeqlAddVariantOwner => "",
-            Command::CodeqlVariantCodeSearch => "",
-            Command::CodeqlOpenVariantConfig => "",
-            Command::CodeqlOpenVariantOnGithub => "",
-            Command::CodeqlRunVariantAnalysis => "",
-            Command::CodeqlOpenVariantResults => "",
-            Command::CodeqlExportVariantResults => "",
-            Command::CodeqlCopyVariantRepoList => "",
-            Command::CodeqlViewVariantLogs => "",
-            Command::CodeqlRunTests => "",
-            Command::CodeqlDebugQuery => "",
-            Command::CodeqlDebugSelection => "",
-            Command::CodeqlResultsUp => "",
-            Command::CodeqlResultsDown => "",
-            Command::CodeqlResultsLeft => "",
-            Command::CodeqlResultsRight => "",
-            Command::SheetSortByColumn => "",
-            Command::CodeqlQuickEval => "",
-            Command::CodeqlQuickEvalCount => "",
-            Command::CodeqlViewAst => "",
-            Command::CodeqlOpenModelEditor => "",
-            Command::CodeqlModelEndpoint => "",
-            Command::CodeqlOpenReferencedFile => "",
-            Command::CodeqlViewAlertsCsv => "",
-            Command::CodeqlViewAlertsSarif => "",
-            Command::CodeqlViewResultsCsv => "",
-            Command::CodeqlShowResultSet => "",
-            Command::CodeqlViewCfg => "",
-            Command::CodeqlRunAllQueries => "",
-            Command::CodeqlRunSelectedQueries => "",
-            Command::CodeqlCancelRunningQuery => "",
-            Command::CodeqlAcceptTestOutput => "",
-            Command::CodeqlFocusSideBar => "",
-            Command::CodeqlOpenResultsDirectory => "",
-            Command::RunTestAtCursor => "Cmd+K Enter",
-            Command::TestingRunAll => "",
-            Command::TestingRunFile => "",
-            Command::TestingRerunFailed => "",
-            Command::TestingRerunLast => "",
-            Command::DebugTestAtCursor => "Cmd+K Shift+Enter",
-            Command::ToggleSideBar => "Cmd+B",
-            Command::ToggleAutoHideSideBar => "",
-            Command::ToggleSecondarySideBar => "Cmd+Opt+B",
-            Command::ToggleZenMode => "Cmd+K Z",
-            Command::ToggleCenteredLayout => "",
-            Command::ToggleTerminal => "Ctrl+J",
-            Command::ToggleActivityBar => "",
-            Command::ToggleStatusBar => "",
-            Command::ToggleSideBarPosition => "",
-            Command::SetPanelAlignment => "",
-            Command::SetQuickInputPosition => "",
-            Command::CustomizeLayout => "",
-            Command::FocusTerminal => "Cmd+Shift+T",
-            Command::ShowProblems => "Cmd+Shift+M",
-            Command::ShowOutput => "Cmd+Shift+U",
-            Command::OutputSelectChannel => "",
-            Command::ShowPorts => "",
-            Command::ShowCaptures => "",
-            Command::ToggleMinimap => "Cmd+Opt+M",
-            Command::ProblemsCheckProject => "",
-            Command::ProblemsToggleProjectAuto => "",
-            Command::ProblemsToggleScope => "",
-            Command::DiffToggleIgnoreWhitespace => "",
-            Command::NewTerminal => "Cmd+T",
-            Command::RunSelectedText => "",
-            Command::FocusNextTerminal => "Cmd+]",
-            Command::FocusPreviousTerminal => "Cmd+[",
-            Command::TerminalClear => "Cmd+K K",
-            Command::TerminalRename => "Cmd+K R",
-            Command::TerminalKill => "",
-            Command::TerminalSplit => "",
-            Command::TerminalNewWithProfile => "",
-            Command::TerminalQuickSelect => "Ctrl+Shift+Space",
-            Command::TerminalCopyMode => "Ctrl+Shift+Y",
-            Command::TerminalCommandHistory => "Ctrl+Shift+H",
-            Command::TerminalOpenScrollback => "Cmd+K D",
-            Command::KeyboardShortcuts => "F1",
-            Command::UpdateCroft => "Cmd+Shift+F9",
-            Command::StartDebugging => "F5",
-            Command::SelectDebugConfig => "",
-            Command::AddDebugConfig => "",
-            Command::StopDebugging => "Shift+F5",
-            Command::PauseDebugging => "F6",
-            Command::SwitchDebugSession => "Cmd+Opt+Shift+G",
-            Command::ToggleBreakpoint => "F9",
-            Command::StepOver => "F10",
-            Command::ContinueDebugging => "F5",
-            Command::StepInto => "F11",
-            Command::StepOut => "Shift+F11",
-            Command::StepIntoTarget => "",
-            Command::RestartDebugging => "Shift+Cmd+F5",
-            Command::EditBreakpointCondition => "Shift+F9",
-            Command::EditLogpoint => "Shift+Alt+F9",
-            Command::ShowIncomingCalls => "Cmd+K H",
-            Command::ShowOutgoingCalls => "Cmd+K Shift+H",
-            Command::ShowSupertypes => "Cmd+K Shift+U",
-            Command::ShowSubtypes => "Cmd+K Shift+D",
-            Command::ToggleCodeLens => "",
-            Command::RunCodeLens => "Cmd+K Shift+E",
-            Command::DebugAddHitCountBreakpoint => "",
-            Command::DebugAddFunctionBreakpoint => "",
-            Command::DebugRemoveFunctionBreakpoints => "",
-            Command::DebugRunToCursor => "Ctrl+F10",
-            Command::DebugBreakOnValueChange => "",
-            Command::DebugRemoveDataBreakpoints => "",
-            Command::OpenSearchEditor => "Cmd+K Shift+F",
-            Command::RerunSearchEditor => "Cmd+K Shift+R",
-            Command::RebaseAbort => "",
-            Command::GitContinueOperation => "",
-            Command::GitSkipOperation => "",
-            Command::GitAbortOperation => "",
-            Command::GitCreateTag => "",
-            Command::GitPushTags => "",
-            Command::GitDeleteRemoteTag => "",
-            Command::GitCommit => "",
-            Command::GitPush => "",
-            Command::GitPull => "",
-            Command::GitSync => "",
-            Command::GitCheckoutTo => "",
-            Command::GitStash => "",
-            Command::ToggleTerminalSuggestions => "",
-            Command::ToggleScreenReader => "",
-            Command::OpenKeyboardShortcuts => "Cmd+K Cmd+S",
-            Command::SwitchProfile => "",
-            Command::ToggleInlineSuggestions => "Cmd+K Shift+G",
-            Command::ToggleRaisedExceptions => "Alt+F9",
-            Command::AttachPythonProcess => "Ctrl+F5",
-            Command::RunTask => "",
-            Command::RunBuildTask => "Cmd+Shift+B",
-            Command::RerunLastTask => "",
-            Command::ColorTheme => "Cmd+K Cmd+T",
-            // Palette-only by default; the whole point of the keybindings.json
-            // loader is that a user can bind these (the seeded template shows
-            // Cmd+, -> open_settings as the example).
-            Command::OpenSettings => "",
-            Command::OpenSettingsEditor => "",
-            Command::OpenSettingsJson => "",
-            Command::OpenWorkspaceSettingsJson => "",
-            Command::OpenWorkspaceSettingsLocalJson => "",
-            Command::OpenKeybindingsJson => "",
-            Command::ConfigureSnippets => "",
-            Command::OpenTriggersJson => "",
-            Command::OpenAgentsJson => "",
-            Command::OpenMatchersJson => "",
-            Command::ToggleTerminalTimestamps => "",
-            Command::ToggleLogHighlight => "",
-            Command::CollapseTerminalPane => "Cmd+K [",
-            Command::RestoreTerminalPanes => "Cmd+K ]",
-            Command::ToggleSecretRedaction => "",
-            Command::RevealRedactedSecrets => "",
-            Command::SearchFromTerminal => "",
-            Command::SessionParticipants => "Cmd+K A",
-            Command::SessionDetach => "Cmd+K Shift+Q",
-            Command::CollabCancelStream => "Cmd+K X",
-            Command::AskNavigator => "Cmd+K Q",
-            Command::AskNavigatorAboutCapture => "",
-            Command::OpenWorkspaceOnSshHost => "",
-            Command::ScrubHistory => "",
-            Command::DebugInstallDelve => "",
-            Command::RemoteSyncConfigNow => "",
-            // Its own chord (#2071): Cmd+Shift+L, which it shared, selects
-            // all occurrences everywhere, a remote session included.
-            Command::DropToLocal => "Cmd+K L",
-            Command::StopAutoApprove => "",
-            Command::ScrubOpenHere => "",
-            Command::ScrubDiffToWorkingTree => "",
-            Command::FleetRun => "",
-            Command::OpenAsSymbolTab => "Cmd+K Shift+V",
-            Command::LoadReviewThreads => "",
-            Command::ReviewAddComment => "",
-            Command::ReviewSubmit => "",
-            Command::ReviewToggleResolved => "",
-            Command::ReviewDiscardPending => "",
-            Command::ExportCommentsToPr => "",
-            Command::NoteAdd => "Cmd+K N",
-            Command::NoteDelete => "",
-            Command::ToggleSessionRecording => "",
-            Command::NewWorktreeLane => "Cmd+K Shift+L",
-            Command::ReviewPullRequest => "",
-            Command::CloseWorktreeLane => "",
-            // No chord: the lane commands that have one are the ones you
-            // reach mid-flow; a diff is deliberate and the palette is where
-            // you go for it.
-            Command::DiffWorktreeLane => "",
-            Command::MarkAgentLaneReviewed => "",
-            Command::ShowAgentLane => "",
-            Command::OpenAgentLaneSection => "",
-            Command::MarkAgentFileReviewed => "",
-            Command::DiffAgentFileSinceReview => "",
-            Command::PickAgentLaneFile => "",
-            Command::FixProblemWithNavigator => "",
-            Command::SendHttpRequest => "Cmd+Enter",
-            Command::CopyHttpRequestAsCurl => "",
-            Command::SwitchHttpEnvironment => "",
-            Command::YieldToNavigator => "Cmd+K Y",
-            Command::ToggleNavigator => "",
-            Command::ClearNavigatorNotes => "",
-            Command::ToggleProactiveNavigator => "",
-            Command::NextComment => "F4",
-            Command::IgnoreComment => "Shift+F4",
-        }
-        // No catch-all: every Command must carry an accelerator (croft tenet),
-        // so adding a variant fails to compile until its hint is supplied.
-    }
-
-    /// The stable snake_case identifier used in `keybindings.json`. This is the
-    /// contract a user's config binds against, so the strings must never drift
-    /// once shipped (unlike `title`, which is display-only). No catch-all: a new
-    /// variant fails to compile until it declares an id.
-    pub fn id(self) -> &'static str {
-        match self {
-            Command::MoveLineUp => "move_line_up",
-            Command::MoveLineDown => "move_line_down",
-            Command::CopyLineUp => "copy_line_up",
-            Command::CopyLineDown => "copy_line_down",
-            Command::ToggleLineComment => "toggle_line_comment",
-            Command::ToggleBlockComment => "toggle_block_comment",
-            Command::JoinLines => "join_lines",
-            Command::InsertLineBelow => "insert_line_below",
-            Command::InsertLineAbove => "insert_line_above",
-            Command::DeleteLine => "delete_line",
-            Command::KillToEndOfLine => "kill_to_end_of_line",
-            Command::TransformUpper => "transform_upper",
-            Command::TransformLower => "transform_lower",
-            Command::TransformTitle => "transform_title",
-            Command::TransformSnake => "transform_snake",
-            Command::TransformCamel => "transform_camel",
-            Command::TransformPascal => "transform_pascal",
-            Command::TransformKebab => "transform_kebab",
-            Command::SortLinesAscending => "sort_lines_ascending",
-            Command::SortLinesDescending => "sort_lines_descending",
-            Command::IncrementNumber => "increment_number",
-            Command::DecrementNumber => "decrement_number",
-            Command::TrimTrailingWhitespace => "trim_trailing_whitespace",
-            Command::EmmetExpandAbbreviation => "emmet_expand_abbreviation",
-            Command::EmmetWrapWithAbbreviation => "emmet_wrap_with_abbreviation",
-            Command::EmmetRemoveTag => "emmet_remove_tag",
-            Command::EmmetUpdateTag => "emmet_update_tag",
-            Command::EmmetBalanceOutward => "emmet_balance_outward",
-            Command::EmmetBalanceInward => "emmet_balance_inward",
-            Command::EmmetMatchTag => "emmet_match_tag",
-            Command::ToggleWordWrap => "toggle_word_wrap",
-            Command::ExpandSelection => "expand_selection",
-            Command::ShrinkSelection => "shrink_selection",
-            Command::ReplaceInFile => "replace_in_file",
-            Command::ToggleFindInSelection => "toggle_find_in_selection",
-            Command::MergeAcceptCurrent => "merge_accept_current",
-            Command::MergeAcceptIncoming => "merge_accept_incoming",
-            Command::MergeAcceptBoth => "merge_accept_both",
-            Command::MergeAcceptAllCurrent => "merge_accept_all_current",
-            Command::MergeAcceptAllIncoming => "merge_accept_all_incoming",
-            Command::MergeNextConflict => "merge_next_conflict",
-            Command::MergePrevConflict => "merge_prev_conflict",
-            Command::GoToNextChange => "next_change",
-            Command::GoToPrevChange => "previous_change",
-            Command::GoToNextProblem => "next_problem",
-            Command::GoToPrevProblem => "previous_problem",
-            Command::MergeComplete => "merge_complete",
-            Command::MergeOpenEditor => "merge_open_editor",
-            Command::MergeToggleBase => "merge_toggle_base",
-            Command::MergeAcceptBothReverse => "merge_accept_both_reverse",
-            Command::MergeIgnore => "merge_ignore",
-            Command::DebugAddWatch => "debug_add_watch",
-            Command::DebugClearWatch => "debug_clear_watch",
-            Command::PeekDefinition => "peek_definition",
-            Command::PeekReferences => "peek_references",
-            Command::GoToDefinition => "go_to_definition",
-            Command::GoToReferences => "go_to_references",
-            Command::GoToDeclaration => "go_to_declaration",
-            Command::GoToTypeDefinition => "go_to_type_definition",
-            Command::GoToImplementations => "go_to_implementations",
-            Command::SwitchHeaderSource => "switch_header_source",
-            Command::RenameSymbol => "rename_symbol",
-            Command::TriggerSuggest => "trigger_suggest",
-            Command::TriggerParameterHints => "trigger_parameter_hints",
-            Command::ShowHover => "show_hover",
-            Command::MouseAddCursorAtClick => "mouse_add_cursor_at_click",
-            Command::MouseGoToDefinitionAtClick => "mouse_go_to_definition_at_click",
-            Command::MouseOpenLinkAtClick => "mouse_open_link_at_click",
-            Command::ClearBuildDiagnostics => "clear_build_diagnostics",
-            Command::StageHunk => "stage_hunk",
-            Command::UnstageHunk => "unstage_hunk",
-            Command::RevertHunk => "revert_hunk",
-            Command::GitUndoLastCommit => "git_undo_last_commit",
-            Command::RustExpandMacro => "rust_expand_macro",
-            Command::RustParentModule => "rust_parent_module",
-            Command::RustOpenCargoToml => "rust_open_cargo_toml",
-            Command::RustRebuildProcMacros => "rust_rebuild_proc_macros",
-            Command::RustReloadWorkspace => "rust_reload_workspace",
-            Command::GitCopyPermalink => "git_copy_permalink",
-            Command::GitCopyHeadLink => "git_copy_head_link",
-            Command::GitOpenOnRemote => "git_open_on_remote",
-
-            Command::GitViewStash => "git_view_stash",
-            Command::GitOpenLineCommit => "git_open_line_commit",
-            Command::GitCopyLineCommitHash => "git_copy_line_commit_hash",
-            Command::AddCursorAbove => "add_cursor_above",
-            Command::AddCursorBelow => "add_cursor_below",
-            Command::ColumnSelectUp => "column_select_up",
-            Command::ColumnSelectDown => "column_select_down",
-            Command::ColumnSelectLeft => "column_select_left",
-            Command::ColumnSelectRight => "column_select_right",
-            Command::ColumnSelectPageUp => "column_select_page_up",
-            Command::ColumnSelectPageDown => "column_select_page_down",
-            Command::ToggleColumnSelection => "toggle_column_selection",
-            Command::AddSelectionToNextMatch => "add_selection_to_next_match",
-            Command::SelectAllOccurrences => "select_all_occurrences",
-            Command::AddCursorsToLineEnds => "add_cursors_to_line_ends",
-            Command::ExpandLineSelection => "expand_line_selection",
-            Command::JumpToBracket => "jump_to_bracket",
-            Command::SelectToBracket => "select_to_bracket",
-            Command::TransposeCharacters => "transpose_characters",
-            Command::IndentationToSpaces => "indentation_to_spaces",
-            Command::IndentationToTabs => "indentation_to_tabs",
-            Command::TrimFinalNewlines => "trim_final_newlines",
-            Command::ToggleOverviewRuler => "toggle_overview_ruler",
-            Command::ToggleBookmark => "toggle_bookmark",
-            Command::NextBookmark => "next_bookmark",
-            Command::PreviousBookmark => "previous_bookmark",
-            Command::ClearBookmarks => "clear_bookmarks",
-            Command::ViewBookmarks => "view_bookmarks",
-            Command::FormatDocument => "format_document",
-            Command::FormatSelection => "format_selection",
-            Command::ChangeColorPresentation => "change_color_presentation",
-            Command::ToggleFormatOnType => "toggle_format_on_type",
-            Command::ToggleFormatOnSave => "toggle_format_on_save",
-            Command::QuickFix => "quick_fix",
-            Command::ToggleFold => "toggle_fold",
-            Command::FoldAll => "fold_all",
-            Command::UnfoldAll => "unfold_all",
-            Command::FoldAllComments => "fold_all_comments",
-            Command::FoldAllRegions => "fold_all_regions",
-            Command::UnfoldAllRegions => "unfold_all_regions",
-            Command::FoldLevel1 => "fold_level_1",
-            Command::FoldLevel2 => "fold_level_2",
-            Command::FoldLevel3 => "fold_level_3",
-            Command::FoldLevel4 => "fold_level_4",
-            Command::FoldLevel5 => "fold_level_5",
-            Command::FoldLevel6 => "fold_level_6",
-            Command::FoldLevel7 => "fold_level_7",
-            Command::FoldRecursively => "fold_recursively",
-            Command::UnfoldRecursively => "unfold_recursively",
-            Command::SaveFile => "save_file",
-            Command::SaveAs => "save_as",
-            Command::SaveWithSudo => "save_with_sudo",
-            Command::RevertFile => "revert_file",
-            Command::SaveAll => "save_all",
-            Command::NewFile => "new_file",
-            Command::NewUntitledFile => "new_untitled_file",
-            Command::NewFolder => "new_folder",
-            Command::Undo => "undo",
-            Command::Redo => "redo",
-            Command::SelectAll => "select_all",
-            Command::ToggleAutoSave => "toggle_auto_save",
-            Command::ToggleAutoSaveOnFocusChange => "toggle_auto_save_on_focus_change",
-            Command::ToggleInlineBlame => "toggle_inline_blame",
-            Command::ToggleLiveRun => "toggle_live_run",
-            Command::ToggleProvenance => "toggle_provenance",
-            Command::DiffToggleGroupBySeat => "diff_toggle_group_by_seat",
-            Command::ToggleIndentGuides => "toggle_indent_guides",
-            Command::ToggleBracketColors => "toggle_bracket_colors",
-            Command::ToggleRenderWhitespace => "toggle_render_whitespace",
-            Command::CycleLineNumbers => "cycle_line_numbers",
-            Command::ToggleInlineValues => "toggle_inline_values",
-            Command::ToggleInlayHints => "toggle_inlay_hints",
-            Command::ToggleMarkdownPreview => "toggle_markdown_preview",
-            Command::OpenMarkdownPreviewToSide => "open_markdown_preview_to_side",
-            Command::RunCodeBlockAtCursor => "run_code_block_at_cursor",
-            Command::RestoreSnapshot => "restore_snapshot",
-            Command::CloseEditor => "close_editor",
-            Command::ReopenClosedEditor => "reopen_closed_editor",
-            Command::ZoxideJump => "zoxide_jump",
-            Command::CloseOtherEditors => "close_other_editors",
-            Command::CloseEditorsToTheRight => "close_editors_to_the_right",
-            Command::CloseSavedEditors => "close_saved_editors",
-            Command::CloseAllEditors => "close_all_editors",
-            Command::PinEditor => "pin_editor",
-            Command::UnpinEditor => "unpin_editor",
-            Command::KeepEditor => "keep_editor",
-            Command::MoveEditorLeftInGroup => "move_editor_left_in_group",
-            Command::MoveEditorRightInGroup => "move_editor_right_in_group",
-            Command::MoveEditorToNextGroup => "move_editor_to_next_group",
-            Command::MoveEditorToPreviousGroup => "move_editor_to_previous_group",
-            Command::SplitEditor => "split_editor",
-            Command::FocusLeftEditorGroup => "focus_left_editor_group",
-            Command::FocusRightEditorGroup => "focus_right_editor_group",
-            Command::QuickOpen => "quick_open",
-            Command::TakeTheTour => "help_take_the_tour",
-            Command::SponsorCroft => "help_sponsor_croft",
-            Command::SarifNextResult => "sarif_next_result",
-            Command::SarifPreviousResult => "sarif_previous_result",
-            Command::SarifOpenCodeScanning => "sarif_open_code_scanning",
-            Command::SarifLoadCodeScanning => "sarif_load_code_scanning",
-            Command::GoToSymbol => "go_to_symbol",
-            Command::GoToWorkspaceSymbol => "go_to_workspace_symbol",
-            Command::NavigateBack => "navigate_back",
-            Command::NavigateForward => "navigate_forward",
-            Command::GoToLastEditLocation => "go_to_last_edit_location",
-            Command::ToggleVimMode => "toggle_vim_mode",
-            Command::MacroStartStopRecording => "macro_record",
-            Command::MacroReplayLast => "macro_replay_last",
-            Command::MacroReplayTimes => "macro_replay_times",
-            Command::ShowExplorer => "show_explorer",
-            Command::FocusBreadcrumbs => "breadcrumbs_focus_and_select",
-            Command::ShowSearch => "show_search",
-            Command::ReplaceInFiles => "replace_in_files",
-            Command::SearchToggleMatchCase => "search_toggle_match_case",
-            Command::SearchToggleWholeWord => "search_toggle_whole_word",
-            Command::SearchToggleRegex => "search_toggle_regex",
-            Command::SearchTogglePreserveCase => "search_toggle_preserve_case",
-            Command::SearchToggleDetails => "search_toggle_details",
-            Command::ShowSourceControl => "show_source_control",
-            Command::AddWorkspaceFolder => "add_workspace_folder",
-            Command::SaveWorkspaceAs => "save_workspace_as",
-            Command::OpenWorkspaceFromFile => "open_workspace_from_file",
-            Command::ReopenAsHex => "reopen_as_hex",
-            Command::ReopenAsPreview => "reopen_as_preview",
-            Command::ReopenAsText => "reopen_as_text",
-            Command::NotebookRunAll => "notebook_run_all",
-            Command::NotebookInterrupt => "notebook_interrupt",
-            Command::NotebookRestart => "notebook_restart",
-            Command::NotebookSelectKernel => "notebook_select_kernel",
-            Command::RestartLanguageServers => "restart_language_servers",
-            Command::RestartLanguageServersForFile => "restart_language_servers_for_file",
-            Command::TestingRunWithCoverage => "testing_run_with_coverage",
-            Command::CoverageClear => "coverage_clear",
-            Command::TestingInstallCoverageTool => "testing_install_coverage_tool",
-            Command::TestingShowCoverageReport => "testing_show_coverage_report",
-            Command::DeveloperShowMemoryUsage => "developer_show_memory_usage",
-            Command::ToggleScreencastMode => "toggle_screencast_mode",
-            Command::RunTestAtCursorWithCoverage => "run_test_at_cursor_with_coverage",
-            Command::TestingToggleWatchAll => "testing_toggle_watch_all",
-            Command::TestingGoToFirstFailure => "testing_go_to_first_failure",
-            Command::TestingCancelRun => "testing_cancel_run",
-            Command::HexFindNext => "hex_find_next",
-            Command::SheetInsertRowBelow => "sheet_insert_row_below",
-            Command::SheetDeleteRow => "sheet_delete_row",
-            Command::SheetInsertColRight => "sheet_insert_col_right",
-            Command::SheetDeleteCol => "sheet_delete_col",
-            Command::MediaOpenExternal => "media_open_external",
-            Command::RemoveWorkspaceFolder => "remove_workspace_folder",
-            Command::ShowRunDebug => "show_run_debug",
-            Command::ShowRemote => "show_remote",
-            Command::ShowExtensions => "show_extensions",
-            Command::CompareExtensionsWithVscode => "compare_extensions_with_vscode",
-            Command::ShowTesting => "show_testing",
-            Command::ShowCodeQL => "show_codeql",
-            Command::CodeqlRunQuery => "codeql_run_query",
-            Command::CodeqlRunQuerySuite => "codeql_run_query_suite",
-            Command::CodeqlRemoveDatabase => "codeql_remove_database",
-            Command::CodeqlRenameDatabase => "codeql_rename_database",
-            Command::CodeqlSortDatabases => "codeql_sort_databases",
-            Command::CodeqlRevealDatabase => "codeql_reveal_database",
-            Command::CodeqlUpgradeDatabase => "codeql_upgrade_database",
-            Command::CodeqlClearCache => "codeql_clear_cache",
-            Command::CodeqlTrimCache => "codeql_trim_cache",
-            Command::CodeqlTrimCacheToOverlay => "codeql_trim_cache_to_overlay_base",
-            Command::CodeqlAddDatabaseSource => "codeql_add_database_source",
-            Command::CodeqlDeleteUnusedDatabases => "codeql_delete_unused_databases",
-            Command::CodeqlRemoveHistory => "codeql_remove_history",
-            Command::CodeqlRenameHistory => "codeql_rename_history",
-            Command::CodeqlSortHistory => "codeql_sort_history",
-            Command::CodeqlViewQuery => "codeql_view_query",
-            Command::CodeqlCreateQuery => "codeql_create_query",
-            Command::CodeqlRunPack => "codeql_run_pack",
-            Command::CodeqlRunQueryOnDatabases => "codeql_run_query_on_databases",
-            Command::CodeqlCancelQueue => "codeql_cancel_queue",
-            Command::CodeqlCopyVersion => "codeql_copy_version_information",
-            Command::CodeqlDownloadCli => "codeql_download_cli",
-            Command::CodeqlCheckCliUpdates => "codeql_check_for_cli_updates",
-            Command::CodeqlInstallPackDependencies => "codeql_install_pack_dependencies",
-            Command::CodeqlDownloadPacks => "codeql_download_packs",
-            Command::CodeqlRunPublishedPack => "codeql_run_published_pack",
-            Command::CodeqlQuickQuery => "codeql_quick_query",
-            Command::CodeqlCompareResults => "codeql_compare_query_results",
-            Command::CodeqlShowEvaluatorLog => "codeql_show_evaluator_log",
-            Command::CodeqlShowEvaluatorLogSummary => "codeql_show_evaluator_log_summary",
-            Command::CodeqlShowEvaluatorLogViewer => "codeql_show_evaluator_log_viewer",
-            Command::CodeqlShowQueryLog => "codeql_show_query_log",
-            Command::CodeqlComparePerformance => "codeql_compare_performance",
-            Command::CodeqlPreviewQueryHelp => "codeql_preview_query_help",
-            Command::CodeqlExportResults => "codeql_export_results",
-            Command::CodeqlSetUpController => "codeql_set_up_controller_repository",
-            Command::CodeqlAddVariantRepo => "codeql_add_variant_analysis_repository",
-            Command::CodeqlAddVariantList => "codeql_add_variant_analysis_list",
-            Command::CodeqlAddVariantOwner => "codeql_add_variant_analysis_owner",
-            Command::CodeqlVariantCodeSearch => "codeql_add_repositories_with_code_search",
-            Command::CodeqlOpenVariantConfig => "codeql_open_variant_analysis_config",
-            Command::CodeqlOpenVariantOnGithub => "codeql_open_variant_analysis_on_github",
-            Command::CodeqlRunVariantAnalysis => "codeql_run_variant_analysis",
-            Command::CodeqlOpenVariantResults => "codeql_open_variant_analysis_results",
-            Command::CodeqlExportVariantResults => "codeql_export_variant_analysis_results",
-            Command::CodeqlCopyVariantRepoList => "codeql_copy_variant_repo_list",
-            Command::CodeqlViewVariantLogs => "codeql_view_variant_logs",
-            Command::CodeqlRunTests => "codeql_run_tests",
-            Command::CodeqlDebugQuery => "codeql_debug_query",
-            Command::CodeqlDebugSelection => "codeql_debug_selection",
-            Command::CodeqlResultsUp => "codeql_results_up",
-            Command::CodeqlResultsDown => "codeql_results_down",
-            Command::CodeqlResultsLeft => "codeql_results_left",
-            Command::CodeqlResultsRight => "codeql_results_right",
-            Command::SheetSortByColumn => "sheet_sort_by_column",
-            Command::CodeqlQuickEval => "codeql_quick_eval",
-            Command::CodeqlQuickEvalCount => "codeql_quick_eval_count",
-            Command::CodeqlViewAst => "codeql_view_ast",
-            Command::CodeqlOpenModelEditor => "codeql_open_model_editor",
-            Command::CodeqlModelEndpoint => "codeql_model_endpoint",
-            Command::CodeqlOpenReferencedFile => "codeql_open_referenced_file",
-            Command::CodeqlViewAlertsCsv => "codeql_view_alerts_csv",
-            Command::CodeqlViewAlertsSarif => "codeql_view_alerts_sarif",
-            Command::CodeqlViewResultsCsv => "codeql_view_results_csv",
-            Command::CodeqlShowResultSet => "codeql_show_result_set",
-            Command::CodeqlViewCfg => "codeql_view_cfg",
-            Command::CodeqlRunAllQueries => "codeql_run_all_queries",
-            Command::CodeqlRunSelectedQueries => "codeql_run_selected_queries",
-            Command::CodeqlCancelRunningQuery => "codeql_cancel_running_query",
-            Command::CodeqlAcceptTestOutput => "codeql_accept_test_output",
-            Command::CodeqlFocusSideBar => "codeql_focus_side_bar",
-            Command::CodeqlOpenResultsDirectory => "codeql_open_results_directory",
-            Command::RunTestAtCursor => "run_test_at_cursor",
-            Command::TestingRunAll => "testing_run_all",
-            Command::TestingRunFile => "testing_run_file",
-            Command::TestingRerunFailed => "testing_rerun_failed",
-            Command::TestingRerunLast => "testing_rerun_last",
-            Command::DebugTestAtCursor => "debug_test_at_cursor",
-            Command::ToggleSideBar => "toggle_side_bar",
-            Command::ToggleAutoHideSideBar => "toggle_auto_hide_side_bar",
-            Command::ToggleSecondarySideBar => "toggle_secondary_side_bar",
-            Command::ToggleZenMode => "toggle_zen_mode",
-            Command::ToggleCenteredLayout => "toggle_centered_layout",
-            Command::ToggleTerminal => "toggle_terminal",
-            Command::ToggleActivityBar => "toggle_activity_bar",
-            Command::ToggleStatusBar => "toggle_status_bar",
-            Command::ToggleSideBarPosition => "toggle_side_bar_position",
-            Command::SetPanelAlignment => "set_panel_alignment",
-            Command::SetQuickInputPosition => "set_quick_input_position",
-            Command::CustomizeLayout => "customize_layout",
-            Command::FocusTerminal => "focus_terminal",
-            Command::ShowProblems => "show_problems",
-            Command::ShowOutput => "show_output",
-            Command::OutputSelectChannel => "output_select_channel",
-            Command::ShowPorts => "show_ports",
-            Command::ShowCaptures => "show_captures",
-            Command::ToggleMinimap => "toggle_minimap",
-            Command::ProblemsCheckProject => "problems_check_project",
-            Command::ProblemsToggleProjectAuto => "problems_toggle_project_auto",
-            Command::ProblemsToggleScope => "problems_toggle_scope",
-            Command::DiffToggleIgnoreWhitespace => "diff_toggle_ignore_whitespace",
-            Command::NewTerminal => "new_terminal",
-            Command::RunSelectedText => "run_selected_text",
-            Command::FocusNextTerminal => "focus_next_terminal",
-            Command::FocusPreviousTerminal => "focus_previous_terminal",
-            Command::TerminalClear => "terminal_clear",
-            Command::TerminalRename => "terminal_rename",
-            Command::TerminalKill => "terminal_kill",
-            Command::TerminalSplit => "terminal_split",
-            Command::TerminalNewWithProfile => "terminal_new_with_profile",
-            Command::TerminalQuickSelect => "terminal_quick_select",
-            Command::TerminalCopyMode => "terminal_copy_mode",
-            Command::TerminalCommandHistory => "terminal_command_history",
-            Command::TerminalOpenScrollback => "terminal_open_scrollback",
-            Command::StartDebugging => "start_debugging",
-            Command::SelectDebugConfig => "select_debug_config",
-            Command::AddDebugConfig => "add_debug_config",
-            Command::StopDebugging => "stop_debugging",
-            Command::PauseDebugging => "pause_debugging",
-            Command::SwitchDebugSession => "switch_debug_session",
-            Command::RestartDebugging => "restart_debugging",
-            Command::ToggleBreakpoint => "toggle_breakpoint",
-            Command::EditBreakpointCondition => "edit_breakpoint_condition",
-            Command::EditLogpoint => "edit_logpoint",
-            Command::ShowIncomingCalls => "show_incoming_calls",
-            Command::ShowOutgoingCalls => "show_outgoing_calls",
-            Command::ShowSupertypes => "show_supertypes",
-            Command::ShowSubtypes => "show_subtypes",
-            Command::ToggleCodeLens => "toggle_code_lens",
-            Command::RunCodeLens => "run_code_lens",
-            Command::DebugAddHitCountBreakpoint => "debug_add_hit_count_breakpoint",
-            Command::DebugAddFunctionBreakpoint => "debug_add_function_breakpoint",
-            Command::DebugRemoveFunctionBreakpoints => "debug_remove_function_breakpoints",
-            Command::DebugRunToCursor => "debug_run_to_cursor",
-            Command::DebugBreakOnValueChange => "debug_break_on_value_change",
-            Command::DebugRemoveDataBreakpoints => "debug_remove_data_breakpoints",
-            Command::OpenSearchEditor => "open_search_editor",
-            Command::RerunSearchEditor => "rerun_search_editor",
-            Command::RebaseAbort => "rebase_abort",
-            Command::GitContinueOperation => "git_continue_operation",
-            Command::GitSkipOperation => "git_skip_operation",
-            Command::GitAbortOperation => "git_abort_operation",
-            Command::GitCreateTag => "git_create_tag",
-            Command::GitPushTags => "git_push_tags",
-            Command::GitDeleteRemoteTag => "git_delete_remote_tag",
-            Command::GitCommit => "git_commit",
-            Command::GitPush => "git_push",
-            Command::GitPull => "git_pull",
-            Command::GitSync => "git_sync",
-            Command::GitCheckoutTo => "git_checkout_to",
-            Command::GitStash => "git_stash",
-            Command::ToggleTerminalSuggestions => "toggle_terminal_suggestions",
-            Command::ToggleScreenReader => "toggle_screen_reader",
-            Command::OpenKeyboardShortcuts => "open_keyboard_shortcuts",
-            Command::SwitchProfile => "switch_profile",
-            Command::ToggleInlineSuggestions => "toggle_inline_suggestions",
-            Command::StepOver => "step_over",
-            Command::ContinueDebugging => "continue",
-            Command::StepInto => "step_into",
-            Command::StepOut => "step_out",
-            Command::StepIntoTarget => "step_into_target",
-            Command::ToggleRaisedExceptions => "toggle_raised_exceptions",
-            Command::AttachPythonProcess => "attach_python_process",
-            Command::ColorTheme => "color_theme",
-            Command::KeyboardShortcuts => "keyboard_shortcuts",
-            Command::UpdateCroft => "update_croft",
-            Command::OpenSettings => "open_settings",
-            Command::OpenSettingsEditor => "open_settings_editor",
-            Command::OpenSettingsJson => "open_settings_json",
-            Command::OpenWorkspaceSettingsJson => "open_workspace_settings_json",
-            Command::OpenWorkspaceSettingsLocalJson => "open_workspace_settings_local_json",
-            Command::OpenKeybindingsJson => "open_keybindings_json",
-            Command::ConfigureSnippets => "configure_snippets",
-            Command::OpenTriggersJson => "open_triggers_json",
-            Command::OpenAgentsJson => "open_agents_json",
-            Command::OpenMatchersJson => "open_matchers_json",
-            Command::ToggleTerminalTimestamps => "toggle_terminal_timestamps",
-            Command::ToggleLogHighlight => "toggle_log_highlight",
-            Command::CollapseTerminalPane => "collapse_terminal_pane",
-            Command::RestoreTerminalPanes => "restore_terminal_panes",
-            Command::ToggleSecretRedaction => "toggle_secret_redaction",
-            Command::RevealRedactedSecrets => "reveal_redacted_secrets",
-            Command::SearchFromTerminal => "search_from_terminal",
-            Command::SessionParticipants => "session_participants",
-            Command::SessionDetach => "session_detach",
-            Command::CollabCancelStream => "collab_cancel_stream",
-            Command::AskNavigator => "navigator_ask",
-            Command::AskNavigatorAboutCapture => "captures_ask_navigator",
-            Command::OpenWorkspaceOnSshHost => "remote_open_workspace_on_ssh_host",
-            Command::ScrubHistory => "scm_scrub_history",
-            Command::DebugInstallDelve => "debug_install_delve",
-            Command::RemoteSyncConfigNow => "remote_sync_config_now",
-            Command::DropToLocal => "drop_to_local",
-            Command::StopAutoApprove => "agents_stop_auto_approve",
-            Command::ScrubOpenHere => "scm_scrub_open_here",
-            Command::ScrubDiffToWorkingTree => "scm_scrub_diff_working_tree",
-            Command::FleetRun => "terminal_fleet_run",
-            Command::OpenAsSymbolTab => "editor_open_symbol_tab",
-            Command::LoadReviewThreads => "review_load_threads",
-            Command::ReviewAddComment => "review_add_comment",
-            Command::ReviewSubmit => "review_submit",
-            Command::ReviewToggleResolved => "review_toggle_resolved",
-            Command::ReviewDiscardPending => "review_discard_pending",
-            Command::ExportCommentsToPr => "scm_export_comments_to_pr",
-            Command::NoteAdd => "note_add",
-            Command::NoteDelete => "note_delete",
-            Command::ToggleSessionRecording => "session_toggle_recording",
-            Command::NewWorktreeLane => "agent_new_worktree_lane",
-            Command::ReviewPullRequest => "review_pull_request",
-            Command::CloseWorktreeLane => "agent_close_worktree_lane",
-            Command::DiffWorktreeLane => "agent_diff_worktree_lane",
-            Command::MarkAgentLaneReviewed => "agents_mark_reviewed",
-            Command::ShowAgentLane => "agents_show_lane",
-            Command::OpenAgentLaneSection => "agents_open_lane",
-            Command::MarkAgentFileReviewed => "agents_mark_file_reviewed",
-            Command::DiffAgentFileSinceReview => "agents_diff_since_review",
-            Command::PickAgentLaneFile => "agents_pick_changed_file",
-            Command::FixProblemWithNavigator => "problems_fix_navigator",
-            Command::SendHttpRequest => "http_send_request",
-            Command::CopyHttpRequestAsCurl => "http_copy_curl",
-            Command::SwitchHttpEnvironment => "http_switch_environment",
-            Command::YieldToNavigator => "navigator_yield",
-            Command::ToggleNavigator => "navigator_toggle",
-            Command::ClearNavigatorNotes => "navigator_clear_notes",
-            Command::ToggleProactiveNavigator => "navigator_toggle_proactive",
-            Command::NextComment => "navigator_next_comment",
-            Command::IgnoreComment => "navigator_ignore_comment",
-            Command::RunTask => "run_task",
-            Command::RunBuildTask => "run_build_task",
-            Command::RerunLastTask => "rerun_last_task",
-        }
-    }
-
     /// An extra word the palette matches this command on, beyond its
     /// title: "layout" for the Customize Layout commands (#852), whose
     /// VS Code names mostly don't say it, the tab menu's "Keep Open" for
