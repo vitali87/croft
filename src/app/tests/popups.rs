@@ -222,8 +222,10 @@ fn every_popup_holds_an_editor_picture_back() {
     );
 }
 
-/// The terminal, Markdown and minimap pictures and the SSH illustration wait
-/// for every pop-up too: each asks the same question as the editor's.
+/// The terminal, Markdown and minimap pictures, the SSH illustration and the
+/// welcome logo wait for every pop-up too: each asks the same question as
+/// the editor's. The welcome logo had a list of its own that missed
+/// Settings, the confirms, the prompt and an agent's proposal (Codex, #2660).
 #[test]
 fn every_picture_waits_for_every_popup() {
     fn app_with_pictures(root: &Path) -> App {
@@ -273,6 +275,28 @@ fn every_picture_waits_for_every_popup() {
         ]
     }
 
+    /// A blank workspace showing the welcome screen, its logo baked and due.
+    fn app_with_welcome_logo(root: &Path) -> App {
+        let mut app = App::new(root.to_path_buf()).unwrap();
+        app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::ITerm2;
+        app.cell_pixel = Some((8, 16));
+        app.overlays.welcome.set_layout(WelcomeLayout {
+            cell_x: 40,
+            cell_y: 4,
+            cell_w: 20,
+            cell_h: 6,
+        });
+        app.overlays.welcome.set_image(String::from("welcome logo"));
+        app.overlays.welcome.mark_dirty();
+        app
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let welcome = app_with_welcome_logo(tmp.path());
+    assert!(
+        welcome.welcome_image_emit_payload().is_some(),
+        "with no pop-up open the welcome logo is sent"
+    );
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_pictures(tmp.path());
     assert!(!app.pictures_held_back());
@@ -290,6 +314,17 @@ fn every_picture_waits_for_every_popup() {
             held_back(&mut app),
             [true; 4],
             "{p:?} must hold back the terminal, Markdown and minimap pictures and the SSH illustration"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let mut welcome = app_with_welcome_logo(tmp.path());
+        let _hook = open(&mut welcome, p);
+        assert!(
+            welcome.editor.is_blank_initial() && !welcome.terminal_maximized,
+            "{p:?}: opening it must leave the welcome screen up, or this proves nothing"
+        );
+        assert!(
+            welcome.welcome_image_emit_payload().is_none(),
+            "{p:?} must hold back the welcome logo"
         );
     }
 }
