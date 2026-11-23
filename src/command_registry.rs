@@ -6,9 +6,10 @@
 
 /// Declares every built-in command once, as one row: the variant (under its
 /// docs), its `keybindings.json` id, its title and its default shortcut hint,
-/// with the reason beside any hint that is empty or unusual. From the rows
-/// come [`Command`], [`ALL_COMMANDS`] in the rows' order, and
-/// [`Command::id`], [`Command::title`] and [`Command::keybinding_hint`]. A row
+/// with the reason beside any hint that is empty or unusual, and its
+/// [`Group`] when it has one. From the rows come [`Command`], [`ALL_COMMANDS`]
+/// in the rows' order, [`Command::id`], [`Command::title`],
+/// [`Command::keybinding_hint`], [`Command::from_id`] and [`Command::group`]. A row
 /// without all three fields does not compile, so no command can ship without
 /// an id, a title or a decision about its shortcut (croft tenet: everything
 /// has a shortcut, or says why not).
@@ -18,7 +19,8 @@ macro_rules! commands {
         $variant:ident {
             id: $id:literal,
             title: $title:literal,
-            hint: $hint:expr $(,)?
+            hint: $hint:expr,
+            $(group: $group:ident,)?
         }
     )*) => {
         /// One invokable command. The order of variants is the order commands
@@ -60,8 +62,49 @@ macro_rules! commands {
                     $(Command::$variant => $id,)*
                 }
             }
+
+            /// Resolve a `keybindings.json` command id back to its [`Command`].
+            /// Returns `None` for an unknown id so a typo in the user's config is
+            /// ignored rather than fatal. Two rows with one id would be an
+            /// unreachable pattern here, which the build refuses.
+            pub fn from_id(id: &str) -> Option<Command> {
+                match id {
+                    $($id => Some(Command::$variant),)*
+                    _ => None,
+                }
+            }
+
+            /// The group a row declares, if any: a command's behaviour that
+            /// hangs on its group is read from the row, never from its title.
+            pub fn group(self) -> Option<Group> {
+                match self {
+                    $(Command::$variant => group_of!($($group)?),)*
+                }
+            }
         }
     };
+}
+
+/// A row's optional `group:` as an `Option<Group>`.
+macro_rules! group_of {
+    () => {
+        None
+    };
+    ($group:ident) => {
+        Some(Group::$group)
+    };
+}
+
+/// A set of commands that behave alike, declared on their rows in
+/// [`commands!`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Group {
+    /// The terminal's commands ("Terminal: …"): a `keybindings.json` chord
+    /// for one runs it while the terminal has focus (#1562).
+    Terminal,
+    /// The CodeQL extension's side bar and commands ("CodeQL: …"), which
+    /// leave the palette until CodeQL is added and enabled (#1842).
+    CodeQl,
 }
 
 commands! {
@@ -1335,276 +1378,331 @@ commands! {
         id: "show_codeql",
         title: "View: Show CodeQL",
         hint: "",
+        group: CodeQl,
     }
     CodeqlRunQuery {
         id: "codeql_run_query",
         title: "CodeQL: Run Query on Selected Database",
         hint: "",
+        group: CodeQl,
     }
     CodeqlRunQuerySuite {
         id: "codeql_run_query_suite",
         title: "CodeQL: Run Query Suite",
         hint: "",
+        group: CodeQl,
     }
     CodeqlRemoveDatabase {
         id: "codeql_remove_database",
         title: "CodeQL: Remove Database",
         hint: "",
+        group: CodeQl,
     }
     CodeqlRenameDatabase {
         id: "codeql_rename_database",
         title: "CodeQL: Rename Database",
         hint: "",
+        group: CodeQl,
     }
     CodeqlSortDatabases {
         id: "codeql_sort_databases",
         title: "CodeQL: Sort Databases",
         hint: "",
+        group: CodeQl,
     }
     CodeqlRevealDatabase {
         id: "codeql_reveal_database",
         title: "CodeQL: Reveal Database in Explorer",
         hint: "",
+        group: CodeQl,
     }
     CodeqlUpgradeDatabase {
         id: "codeql_upgrade_database",
         title: "CodeQL: Upgrade Database",
         hint: "",
+        group: CodeQl,
     }
     CodeqlClearCache {
         id: "codeql_clear_cache",
         title: "CodeQL: Clear Cache",
         hint: "",
+        group: CodeQl,
     }
     CodeqlTrimCache {
         id: "codeql_trim_cache",
         title: "CodeQL: Trim Cache",
         hint: "",
+        group: CodeQl,
     }
     CodeqlTrimCacheToOverlay {
         id: "codeql_trim_cache_to_overlay_base",
         title: "CodeQL: Trim Cache to Overlay Base",
         hint: "",
+        group: CodeQl,
     }
     CodeqlAddDatabaseSource {
         id: "codeql_add_database_source",
         title: "CodeQL: Add Database Source to Workspace",
         hint: "",
+        group: CodeQl,
     }
     CodeqlDeleteUnusedDatabases {
         id: "codeql_delete_unused_databases",
         title: "CodeQL: Delete Unused Databases",
         hint: "",
+        group: CodeQl,
     }
     CodeqlRemoveHistory {
         id: "codeql_remove_history",
         title: "CodeQL: Remove Query History Entry",
         hint: "",
+        group: CodeQl,
     }
     CodeqlRenameHistory {
         id: "codeql_rename_history",
         title: "CodeQL: Rename Query History Entry",
         hint: "",
+        group: CodeQl,
     }
     CodeqlSortHistory {
         id: "codeql_sort_history",
         title: "CodeQL: Sort Query History",
         hint: "",
+        group: CodeQl,
     }
     CodeqlViewQuery {
         id: "codeql_view_query",
         title: "CodeQL: View Query",
         hint: "",
+        group: CodeQl,
     }
     CodeqlCreateQuery {
         id: "codeql_create_query",
         title: "CodeQL: Create Query",
         hint: "",
+        group: CodeQl,
     }
     CodeqlRunPack {
         id: "codeql_run_pack",
         title: "CodeQL: Run Queries in Pack",
         hint: "",
+        group: CodeQl,
     }
     CodeqlRunQueryOnDatabases {
         id: "codeql_run_query_on_databases",
         title: "CodeQL: Run Query on Multiple Databases",
         hint: "",
+        group: CodeQl,
     }
     CodeqlCancelQueue {
         id: "codeql_cancel_queue",
         title: "CodeQL: Cancel Queued Queries",
         hint: "",
+        group: CodeQl,
     }
     CodeqlCopyVersion {
         id: "codeql_copy_version_information",
         title: "CodeQL: Copy Version Information",
         hint: "",
+        group: CodeQl,
     }
     CodeqlDownloadCli {
         id: "codeql_download_cli",
         title: "CodeQL: Download CLI",
         hint: "",
+        group: CodeQl,
     }
     CodeqlCheckCliUpdates {
         id: "codeql_check_for_cli_updates",
         title: "CodeQL: Check for CLI Updates",
         hint: "",
+        group: CodeQl,
     }
     CodeqlInstallPackDependencies {
         id: "codeql_install_pack_dependencies",
         title: "CodeQL: Install Pack Dependencies",
         hint: "",
+        group: CodeQl,
     }
     CodeqlDownloadPacks {
         id: "codeql_download_packs",
         title: "CodeQL: Download Packs",
         hint: "",
+        group: CodeQl,
     }
     CodeqlRunPublishedPack {
         id: "codeql_run_published_pack",
         title: "CodeQL: Run Queries in Published Pack",
         hint: "",
+        group: CodeQl,
     }
     CodeqlQuickQuery {
         id: "codeql_quick_query",
         title: "CodeQL: Quick Query",
         hint: "",
+        group: CodeQl,
     }
     CodeqlCompareResults {
         id: "codeql_compare_query_results",
         title: "CodeQL: Compare Query Results",
         hint: "",
+        group: CodeQl,
     }
     CodeqlShowEvaluatorLog {
         id: "codeql_show_evaluator_log",
         title: "CodeQL: Show Evaluator Log (Raw JSON)",
         hint: "",
+        group: CodeQl,
     }
     CodeqlShowEvaluatorLogSummary {
         id: "codeql_show_evaluator_log_summary",
         title: "CodeQL: Show Evaluator Log (Summary Text)",
         hint: "",
+        group: CodeQl,
     }
     CodeqlShowEvaluatorLogViewer {
         id: "codeql_show_evaluator_log_viewer",
         title: "CodeQL: Show Evaluator Log (Viewer)",
         hint: "",
+        group: CodeQl,
     }
     CodeqlShowQueryLog {
         id: "codeql_show_query_log",
         title: "CodeQL: Show Query Log",
         hint: "",
+        group: CodeQl,
     }
     CodeqlComparePerformance {
         id: "codeql_compare_performance",
         title: "CodeQL: Compare Performance",
         hint: "",
+        group: CodeQl,
     }
     CodeqlPreviewQueryHelp {
         id: "codeql_preview_query_help",
         title: "CodeQL: Preview Query Help",
         hint: "",
+        group: CodeQl,
     }
     CodeqlExportResults {
         id: "codeql_export_results",
         title: "CodeQL: Export Results",
         hint: "",
+        group: CodeQl,
     }
     CodeqlSetUpController {
         id: "codeql_set_up_controller_repository",
         title: "CodeQL: Set Up Controller Repository",
         hint: "",
+        group: CodeQl,
     }
     CodeqlAddVariantRepo {
         id: "codeql_add_variant_analysis_repository",
         title: "CodeQL: Add Variant Analysis Repository",
         hint: "",
+        group: CodeQl,
     }
     CodeqlAddVariantList {
         id: "codeql_add_variant_analysis_list",
         title: "CodeQL: Add Variant Analysis Repository List",
         hint: "",
+        group: CodeQl,
     }
     CodeqlAddVariantOwner {
         id: "codeql_add_variant_analysis_owner",
         title: "CodeQL: Add Variant Analysis Owner",
         hint: "",
+        group: CodeQl,
     }
     CodeqlVariantCodeSearch {
         id: "codeql_add_repositories_with_code_search",
         title: "CodeQL: Add Repositories with GitHub Code Search",
         hint: "",
+        group: CodeQl,
     }
     CodeqlOpenVariantConfig {
         id: "codeql_open_variant_analysis_config",
         title: "CodeQL: Open Variant Analysis Config File",
         hint: "",
+        group: CodeQl,
     }
     CodeqlOpenVariantOnGithub {
         id: "codeql_open_variant_analysis_on_github",
         title: "CodeQL: Open Variant Analysis Repository on GitHub",
         hint: "",
+        group: CodeQl,
     }
     CodeqlRunVariantAnalysis {
         id: "codeql_run_variant_analysis",
         title: "CodeQL: Run Variant Analysis",
         hint: "",
+        group: CodeQl,
     }
     CodeqlOpenVariantResults {
         id: "codeql_open_variant_analysis_results",
         title: "CodeQL: Open Variant Analysis Results",
         hint: "",
+        group: CodeQl,
     }
     CodeqlExportVariantResults {
         id: "codeql_export_variant_analysis_results",
         title: "CodeQL: Export Variant Analysis Results",
         hint: "",
+        group: CodeQl,
     }
     CodeqlCopyVariantRepoList {
         id: "codeql_copy_variant_repo_list",
         title: "CodeQL: Copy Variant Analysis Repository List",
         hint: "",
+        group: CodeQl,
     }
     CodeqlViewVariantLogs {
         id: "codeql_view_variant_logs",
         title: "CodeQL: View Variant Analysis Logs",
         hint: "",
+        group: CodeQl,
     }
     CodeqlRunTests {
         id: "codeql_run_tests",
         title: "CodeQL: Run Tests",
         hint: "",
+        group: CodeQl,
     }
     CodeqlDebugQuery {
         id: "codeql_debug_query",
         title: "CodeQL: Debug Query",
         hint: "",
+        group: CodeQl,
     }
     CodeqlDebugSelection {
         id: "codeql_debug_selection",
         title: "CodeQL: Debug Selection",
         hint: "",
+        group: CodeQl,
     }
     CodeqlResultsUp {
         id: "codeql_results_up",
         title: "CodeQL: Previous Result",
         hint: "",
+        group: CodeQl,
     }
     CodeqlResultsDown {
         id: "codeql_results_down",
         title: "CodeQL: Next Result",
         hint: "",
+        group: CodeQl,
     }
     CodeqlResultsLeft {
         id: "codeql_results_left",
         title: "CodeQL: Previous Result Column",
         hint: "",
+        group: CodeQl,
     }
     CodeqlResultsRight {
         id: "codeql_results_right",
         title: "CodeQL: Next Result Column",
         hint: "",
+        group: CodeQl,
     }
     SheetSortByColumn {
         id: "sheet_sort_by_column",
@@ -1615,86 +1713,103 @@ commands! {
         id: "codeql_quick_eval",
         title: "CodeQL: Quick Evaluation",
         hint: "",
+        group: CodeQl,
     }
     CodeqlQuickEvalCount {
         id: "codeql_quick_eval_count",
         title: "CodeQL: Quick Evaluation Count",
         hint: "",
+        group: CodeQl,
     }
     CodeqlViewAst {
         id: "codeql_view_ast",
         title: "CodeQL: View AST",
         hint: "",
+        group: CodeQl,
     }
     CodeqlOpenModelEditor {
         id: "codeql_open_model_editor",
         title: "CodeQL: Open Model Editor",
         hint: "",
+        group: CodeQl,
     }
     CodeqlModelEndpoint {
         id: "codeql_model_endpoint",
         title: "CodeQL: Model Endpoint",
         hint: "",
+        group: CodeQl,
     }
     CodeqlOpenReferencedFile {
         id: "codeql_open_referenced_file",
         title: "CodeQL: Open Referenced File",
         hint: "",
+        group: CodeQl,
     }
     CodeqlViewAlertsCsv {
         id: "codeql_view_alerts_csv",
         title: "CodeQL: View Alerts (CSV)",
         hint: "",
+        group: CodeQl,
     }
     CodeqlViewAlertsSarif {
         id: "codeql_view_alerts_sarif",
         title: "CodeQL: View Alerts (SARIF)",
         hint: "",
+        group: CodeQl,
     }
     CodeqlViewResultsCsv {
         id: "codeql_view_results_csv",
         title: "CodeQL: View Results (CSV)",
         hint: "",
+        group: CodeQl,
     }
     CodeqlShowResultSet {
         id: "codeql_show_result_set",
         title: "CodeQL: Show Result Set",
         hint: "",
+        group: CodeQl,
     }
     CodeqlViewCfg {
         id: "codeql_view_cfg",
         title: "CodeQL: View CFG",
         hint: "",
+        group: CodeQl,
     }
     CodeqlRunAllQueries {
         id: "codeql_run_all_queries",
         title: "CodeQL: Run All Queries in Workspace",
         hint: "",
+        group: CodeQl,
     }
     CodeqlRunSelectedQueries {
         id: "codeql_run_selected_queries",
         title: "CodeQL: Run Queries in Selected Files",
         hint: "",
+        group: CodeQl,
     }
     CodeqlCancelRunningQuery {
         id: "codeql_cancel_running_query",
         title: "CodeQL: Cancel Running Query",
         hint: "",
+        group: CodeQl,
     }
     CodeqlAcceptTestOutput {
         id: "codeql_accept_test_output",
         title: "CodeQL: Accept Test Output",
         hint: "",
+        group: CodeQl,
     }
     CodeqlFocusSideBar {
         id: "codeql_focus_side_bar",
         title: "CodeQL: Focus Side Bar",
         hint: "",
+        group: CodeQl,
     }
     CodeqlOpenResultsDirectory {
         id: "codeql_open_results_directory",
         title: "CodeQL: Open Query Results Directory",
         hint: "",
+        group: CodeQl,
     }
     RunTestAtCursor {
         id: "run_test_at_cursor",
@@ -1802,6 +1917,7 @@ commands! {
         id: "focus_terminal",
         title: "Terminal: Focus Terminal",
         hint: "Cmd+Shift+T",
+        group: Terminal,
     }
     ShowProblems {
         id: "show_problems",
@@ -1860,6 +1976,7 @@ commands! {
         id: "new_terminal",
         title: "Terminal: Create New Terminal",
         hint: "Cmd+T",
+        group: Terminal,
     }
     /// Terminal: Run Selected Text in Active Terminal (#1292): the
     /// editor's selection, or the caret's line, run in the active pane.
@@ -1867,6 +1984,7 @@ commands! {
         id: "run_selected_text",
         title: "Terminal: Run Selected Text in Active Terminal",
         hint: "",
+        group: Terminal,
     }
     /// Terminal: Focus Next / Previous Terminal (#843): Cmd+] / Cmd+[, which
     /// have no `Ctrl` form (`Ctrl+[` is `Esc`).
@@ -1874,11 +1992,13 @@ commands! {
         id: "focus_next_terminal",
         title: "Terminal: Focus Next Terminal",
         hint: "Cmd+]",
+        group: Terminal,
     }
     FocusPreviousTerminal {
         id: "focus_previous_terminal",
         title: "Terminal: Focus Previous Terminal",
         hint: "Cmd+[",
+        group: Terminal,
     }
     /// The terminal's own actions as commands (#1562): before, each was a
     /// fixed chord or a right-click row only, so the palette could not find
@@ -1888,46 +2008,55 @@ commands! {
         id: "terminal_clear",
         title: "Terminal: Clear",
         hint: "Cmd+K K",
+        group: Terminal,
     }
     TerminalRename {
         id: "terminal_rename",
         title: "Terminal: Rename",
         hint: "Cmd+K R",
+        group: Terminal,
     }
     TerminalKill {
         id: "terminal_kill",
         title: "Terminal: Kill the Active Terminal Instance",
         hint: "",
+        group: Terminal,
     }
     TerminalSplit {
         id: "terminal_split",
         title: "Terminal: Split Terminal",
         hint: "",
+        group: Terminal,
     }
     TerminalNewWithProfile {
         id: "terminal_new_with_profile",
         title: "Terminal: Create New Terminal (With Profile)",
         hint: "",
+        group: Terminal,
     }
     TerminalQuickSelect {
         id: "terminal_quick_select",
         title: "Terminal: Quick Select",
         hint: "Ctrl+Shift+Space",
+        group: Terminal,
     }
     TerminalCopyMode {
         id: "terminal_copy_mode",
         title: "Terminal: Enter Copy Mode",
         hint: "Ctrl+Shift+Y",
+        group: Terminal,
     }
     TerminalCommandHistory {
         id: "terminal_command_history",
         title: "Terminal: Show Command History",
         hint: "Ctrl+Shift+H",
+        group: Terminal,
     }
     TerminalOpenScrollback {
         id: "terminal_open_scrollback",
         title: "Terminal: Open Scrollback in Editor",
         hint: "Cmd+K D",
+        group: Terminal,
     }
     // --- Run / debug ---
     StartDebugging {
@@ -2123,6 +2252,7 @@ commands! {
         id: "toggle_terminal_suggestions",
         title: "Terminal: Toggle Command Suggestions",
         hint: "",
+        group: Terminal,
     }
     ToggleScreenReader {
         id: "toggle_screen_reader",
@@ -2271,6 +2401,7 @@ commands! {
         id: "toggle_terminal_timestamps",
         title: "Terminal: Toggle Timestamps",
         hint: "",
+        group: Terminal,
     }
     ToggleLogHighlight {
         id: "toggle_log_highlight",
@@ -2281,26 +2412,31 @@ commands! {
         id: "collapse_terminal_pane",
         title: "Terminal: Collapse Pane",
         hint: "Cmd+K [",
+        group: Terminal,
     }
     RestoreTerminalPanes {
         id: "restore_terminal_panes",
         title: "Terminal: Restore All Collapsed Panes",
         hint: "Cmd+K ]",
+        group: Terminal,
     }
     ToggleSecretRedaction {
         id: "toggle_secret_redaction",
         title: "Terminal: Toggle Secret Redaction",
         hint: "",
+        group: Terminal,
     }
     RevealRedactedSecrets {
         id: "reveal_redacted_secrets",
         title: "Terminal: Reveal Redacted Secrets for 10s",
         hint: "",
+        group: Terminal,
     }
     SearchFromTerminal {
         id: "search_from_terminal",
         title: "Terminal: Search & Replace from Last grep/rg",
         hint: "",
+        group: Terminal,
     }
     /// Multiplayer: list who is attached to this persistent session and
     /// grant/revoke write control or disconnect them (docs/MULTIPLAYER.md).
@@ -2387,6 +2523,7 @@ commands! {
         id: "terminal_fleet_run",
         title: "Terminal: Fleet Run",
         hint: "",
+        group: Terminal,
     }
     /// Open the symbol under the cursor as its own tab (#369).
     OpenAsSymbolTab {
@@ -2627,27 +2764,20 @@ impl Command {
         }
     }
 
-    /// Resolve a `keybindings.json` command id back to its [`Command`]. Returns
-    /// `None` for an unknown id so a typo in the user's config is ignored rather
-    /// than fatal.
-    pub fn from_id(id: &str) -> Option<Command> {
-        ALL_COMMANDS.iter().copied().find(|c| c.id() == id)
-    }
-
     /// Whether a `keybindings.json` chord for this command runs it while the
     /// terminal has focus, instead of going to the shell (#1562). VS Code
     /// sends its terminal commands' chords past the shell the same way
     /// (`terminal.integrated.commandsToSkipShell`): a user who binds
     /// Terminal: Clear means it for the terminal.
     pub fn skips_the_shell(self) -> bool {
-        self.title().starts_with("Terminal: ")
+        self.group() == Some(Group::Terminal)
     }
 
     /// Whether this command belongs to the CodeQL extension: its side bar,
     /// or one of its "CodeQL:" commands. CodeQL is not built in (#1842), so
     /// these leave the palette until it is added and enabled.
     pub fn is_codeql(self) -> bool {
-        self == Command::ShowCodeQL || self.title().starts_with("CodeQL: ")
+        self.group() == Some(Group::CodeQl)
     }
 }
 
@@ -2731,6 +2861,19 @@ pub fn glyph_hint_for_platform(glyphs: &str, macos: bool) -> std::borrow::Cow<'_
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2062: the lookup made from the table finds every command by its id,
+    /// and nothing for an id no row has, as the old scan of every command
+    /// did.
+    #[test]
+    fn every_id_resolves_to_its_command() {
+        for cmd in ALL_COMMANDS {
+            assert_eq!(Command::from_id(cmd.id()), Some(*cmd), "{cmd:?}");
+        }
+        for unknown in ["", "no_such_command", "Move_Line_Up", "move_line_up "] {
+            assert_eq!(Command::from_id(unknown), None, "{unknown:?}");
+        }
+    }
 
     #[test]
     fn every_command_has_a_nonempty_title() {
