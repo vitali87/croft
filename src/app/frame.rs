@@ -413,10 +413,14 @@ impl App {
     }
 
     /// Render the frame the terminal is sent: [`Self::render`], with every
-    /// colour fitted to the terminal's depth (#1433).
+    /// colour fitted to the terminal's depth (#1433), and no underline
+    /// colour for a terminal that would misread one (#2661).
     pub(super) fn render_for_terminal(&mut self, frame: &mut ratatui::Frame) {
         self.render(frame);
         self.color_depth.fit_buffer(frame.buffer_mut());
+        if !self.underline_colors {
+            crate::color_depth::drop_underline_colors(frame.buffer_mut());
+        }
     }
 
     pub(super) fn render(&mut self, frame: &mut ratatui::Frame) {

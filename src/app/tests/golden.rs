@@ -39,8 +39,9 @@
 //!   nothing but the tick polls, and the embedded terminal's shell, which no
 //!   scene shows, still look at the real folders.
 //! * The terminal's environment (`TERM`, `COLORTERM`, `TERM_PROGRAM`,
-//!   `SSH_*`, Termux's markers, `CROFT_FORCE_*`) is read into App fields at
-//!   startup; [`hermetic`] overwrites them (`color_depth`,
+//!   `VTE_VERSION`, `SSH_*`, Termux's markers, `CROFT_FORCE_*`,
+//!   `CROFT_UNDERLINE_COLORS`) is read into App fields at startup;
+//!   [`hermetic`] overwrites them (`color_depth`, `underline_colors`,
 //!   `inline_protocol`, `sixel_supported`, `cell_pixel`, `is_remote`,
 //!   `persistence_warning`, `osk_auto`) as soon as the App is built, so what
 //!   a scene does runs on the pinned values, and again just before drawing,
@@ -681,6 +682,7 @@ impl Backend for GoldenBackend {
 /// before drawing, since a theme switch reads the environment again.
 fn hermetic(app: &mut App, depth: crate::color_depth::ColorDepth) {
     app.color_depth = depth;
+    app.underline_colors = true;
     app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::None;
     app.sixel_supported = false;
     app.cell_pixel = None;

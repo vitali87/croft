@@ -2140,6 +2140,9 @@ pub struct App {
     /// (#1433): the `color_depth` setting, else what the terminal's
     /// environment advertises.
     pub(crate) color_depth: crate::color_depth::ColorDepth,
+    /// Whether the terminal reads underline colours (#2661); when it does
+    /// not, each frame drops them before it is written.
+    pub(crate) underline_colors: bool,
     /// Which panes are worktree lanes' (#348), by pane uid: saved with the
     /// terminal session so a relaunch seats the agent again, and consulted
     /// when a lane closes so its pane goes with it.
@@ -4530,6 +4533,9 @@ impl App {
                 .unwrap_or_else(|| {
                     crate::color_depth::ColorDepth::detect(|name| std::env::var(name).ok())
                 }),
+            underline_colors: crate::color_depth::underline_colors_supported(|name| {
+                std::env::var(name).ok()
+            }),
             lane_panes: std::collections::BTreeMap::new(),
             tree_clipboard: None,
             tree_typeahead: None,

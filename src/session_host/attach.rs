@@ -187,6 +187,40 @@ pub(super) fn reconnect_after_swap(socket: &Path) -> Option<UnixStream> {
     None
 }
 
+/// Writes the session's screen bytes to this client's terminal, removing
+/// underline colours on the way when the terminal cannot read them (#2661).
+pub(super) struct ScreenWriter {
+    strip: Option<(crate::color_depth::UnderlineColorFilter, Vec<u8>)>,
+}
+
+impl ScreenWriter {
+    /// For the terminal this process writes to: what its environment says,
+    /// including the answer a local croft carried over SSH.
+    pub(super) fn for_this_terminal() -> Self {
+        Self::new(crate::color_depth::underline_colors_supported(|name| {
+            std::env::var(name).ok()
+        }))
+    }
+
+    pub(super) fn new(underline_colors: bool) -> Self {
+        Self {
+            strip: (!underline_colors).then(Default::default),
+        }
+    }
+
+    pub(super) fn write(&mut self, out: &mut impl Write, bytes: &[u8]) -> Result<()> {
+        match &mut self.strip {
+            None => out.write_all(bytes),
+            Some((filter, scratch)) => {
+                scratch.clear();
+                filter.feed(bytes, scratch);
+                out.write_all(scratch)
+            }
+        }
+        .context("writing to terminal")
+    }
+}
+
 pub(super) fn attach_client_pump(
     stream: &mut UnixStream,
     tx: &Arc<Mutex<UnixStream>>,
@@ -396,8 +430,11 @@ pub(super) fn attach_client_pump(
     // phase's reader carries any partial frame; its buffered PTY bytes
     // replay first so nothing raced away.
     let mut out = std::io::stdout().lock();
+    // The inner croft draws underline colours for every client (#2661);
+    // this client removes them when its own terminal cannot read them.
+    let mut screen = ScreenWriter::for_this_terminal();
     for bytes in pending.drain(..) {
-        out.write_all(&bytes).context("writing to terminal")?;
+        screen.write(&mut out, &bytes)?;
     }
     out.flush().context("flushing terminal")?;
     // The connection closing without an Exit frame: this client detached
@@ -430,7 +467,7 @@ pub(super) fn attach_client_pump(
         for frame in reader.push(&buf[..n]) {
             match frame {
                 Frame::Bytes(bytes) => {
-                    out.write_all(&bytes).context("writing to terminal")?;
+                    screen.write(&mut out, &bytes)?;
                     out.flush().context("flushing terminal")?;
                 }
                 Frame::Control(Control::Exit { code }) => return Ok(PumpOutcome::Exit(code)),

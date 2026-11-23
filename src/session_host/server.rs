@@ -89,6 +89,10 @@ pub(crate) fn serve_with_token(
     // The inner croft re-asserts terminal modes on WINCH under this flag
     // (the dead-mouse-on-reattach fix); the mux relies on that machinery.
     cmd.env("CROFT_SESSION_PERSISTENT", "1");
+    // Clients attach from different terminals over the session's life, so
+    // the inner croft draws underline colours and each client removes them
+    // for a terminal that cannot read them (`ScreenWriter`, #2661).
+    cmd.env(crate::color_depth::UNDERLINE_COLORS_ENV, "1");
     // Let the inner croft find its host and authenticate a privileged
     // control channel (participants UI: grant/revoke/kick).
     cmd.env("CROFT_SESSION_SOCKET", socket.as_os_str());
