@@ -248,7 +248,7 @@ impl LspManager {
     /// come through, so nothing it says lands where nothing would clear it.
     pub fn drain_diagnostics(&self) -> Option<DiagnosticsUpdate> {
         loop {
-            let u = self.diagnostics_rx.try_recv().ok()?;
+            let u = self.replies.diagnostics.try_recv().ok()?;
             let registered = self
                 .registered_servers
                 .values()
@@ -262,7 +262,7 @@ impl LspManager {
     /// Test hook: deliver `update` as if a server had published it.
     #[cfg(test)]
     pub fn push_diagnostics_for_test(&self, update: DiagnosticsUpdate) {
-        let _ = self.diagnostics_test_tx.send(update);
+        let _ = self.reply_test_tx.diagnostics.send(update);
     }
 
     /// Returns and clears the "a server asked us to re-pull workspace

@@ -85,7 +85,7 @@ impl LspManager {
     /// The app keeps a per-server progress map so the status bar can show or
     /// clear "Indexing…", and shows the messages.
     pub fn drain_server_update(&self) -> Option<ServerUpdate> {
-        self.progress_rx.try_recv().ok()
+        self.replies.progress.try_recv().ok()
     }
 
     /// Returns and clears the "a language server was restarted" flag (#694).

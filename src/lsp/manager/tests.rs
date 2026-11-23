@@ -70,7 +70,7 @@ impl LspManager {
         &mut self,
     ) -> std_mpsc::Sender<CompletionResult> {
         let (tx, rx) = std_mpsc::channel();
-        self.completion_rx = rx;
+        self.replies.completion = rx;
         tx
     }
 }
@@ -5974,4 +5974,33 @@ fn symbols_already_in_file_order_and_flat_replies_are_unchanged() {
         .map(|s| s.name)
         .collect();
     assert_eq!(names, ["a", "b"]);
+}
+
+/// #2062: whole-document and as-you-type formatting share one reply type, so
+/// only their names keep them apart in the reply bundles. Each reply reaches
+/// its own drain and never the other's.
+#[test]
+fn each_formatting_reply_reaches_its_own_drain() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let manager = LspManager::new(tmp.path().to_path_buf()).expect("manager");
+    let reply = |request_id| FormatResult {
+        request_id,
+        path: PathBuf::from("demo.rs"),
+        edits: None,
+        unsupported: false,
+        server: None,
+    };
+    manager.reply_test_tx.formatting.send(reply(1)).unwrap();
+    manager
+        .reply_test_tx
+        .on_type_formatting
+        .send(reply(2))
+        .unwrap();
+    assert_eq!(manager.drain_formatting().map(|r| r.request_id), Some(1));
+    assert_eq!(
+        manager.drain_on_type_formatting().map(|r| r.request_id),
+        Some(2)
+    );
+    assert!(manager.drain_formatting().is_none());
+    assert!(manager.drain_on_type_formatting().is_none());
 }

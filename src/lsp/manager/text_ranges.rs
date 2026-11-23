@@ -69,13 +69,14 @@ impl LspManager {
     /// answered.
     #[cfg(test)]
     pub fn push_document_highlights_for_test(&self, result: DocumentHighlightsResult) {
-        self.doc_highlights_test_tx
+        self.reply_test_tx
+            .document_highlights
             .send(result)
             .expect("highlights channel open");
     }
 
     pub fn drain_document_highlights(&self) -> Option<DocumentHighlightsResult> {
-        self.doc_highlights_rx.try_recv().ok()
+        self.replies.document_highlights.try_recv().ok()
     }
 
     /// Ask which spans rename together with the caret's (#254). Same
@@ -102,17 +103,17 @@ impl LspManager {
     }
 
     pub fn drain_linked_editing(&self) -> Option<LinkedEditingResult> {
-        self.linked_editing_rx.try_recv().ok()
+        self.replies.linked_editing.try_recv().ok()
     }
 
     /// Test hook: deliver `result` as if a server had answered.
     #[cfg(test)]
     pub fn push_linked_editing_for_test(&self, result: LinkedEditingResult) {
-        let _ = self.linked_editing_test_tx.send(result);
+        let _ = self.reply_test_tx.linked_editing.send(result);
     }
 
     pub fn drain_selection_ranges(&self) -> Option<SelectionRangesResult> {
-        self.selection_ranges_rx.try_recv().ok()
+        self.replies.selection_ranges.try_recv().ok()
     }
 }
 

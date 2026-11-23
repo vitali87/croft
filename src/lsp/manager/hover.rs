@@ -28,13 +28,16 @@ impl LspManager {
     }
 
     pub fn drain_hover(&self) -> Option<HoverResult> {
-        self.hover_rx.try_recv().ok()
+        self.replies.hover.try_recv().ok()
     }
 
     /// Test hook: deliver a hover reply as if a server had answered.
     #[cfg(test)]
     pub fn push_hover_for_test(&self, result: HoverResult) {
-        self.hover_test_tx.send(result).expect("hover channel open");
+        self.reply_test_tx
+            .hover
+            .send(result)
+            .expect("hover channel open");
     }
 
     /// Send one of rust-analyzer's own requests (#1626) for the caret at
@@ -60,7 +63,7 @@ impl LspManager {
     }
 
     pub fn drain_rust_analyzer(&self) -> Option<RustAnalyzerResult> {
-        self.rust_analyzer_rx.try_recv().ok()
+        self.replies.rust_analyzer.try_recv().ok()
     }
 }
 

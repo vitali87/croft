@@ -128,7 +128,7 @@ impl LspManager {
     }
 
     pub fn drain_completion(&self) -> Option<CompletionResult> {
-        self.completion_rx.try_recv().ok()
+        self.replies.completion.try_recv().ok()
     }
 
     pub fn request_signature_help(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
@@ -141,7 +141,7 @@ impl LspManager {
     }
 
     pub fn drain_signature_help(&self) -> Option<SignatureHelpResult> {
-        self.signature_help_rx.try_recv().ok()
+        self.replies.signature_help.try_recv().ok()
     }
 
     /// Ask the server that offers inline completions for ghost text at the
@@ -157,13 +157,13 @@ impl LspManager {
     }
 
     pub fn drain_inline_completion(&self) -> Option<InlineCompletionResult> {
-        self.inline_completion_rx.try_recv().ok()
+        self.replies.inline_completion.try_recv().ok()
     }
 
     /// Test hook: deliver `result` as if a server had answered.
     #[cfg(test)]
     pub fn push_inline_completion_for_test(&self, result: InlineCompletionResult) {
-        let _ = self.inline_completion_test_tx.send(result);
+        let _ = self.reply_test_tx.inline_completion.send(result);
     }
 
     /// Whether a running server at `path`'s project root offers inline

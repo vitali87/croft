@@ -81,11 +81,11 @@ impl LspManager {
     }
 
     pub fn drain_prepare_rename(&self) -> Option<PrepareRenameResult> {
-        self.prepare_rename_rx.try_recv().ok()
+        self.replies.prepare_rename.try_recv().ok()
     }
 
     pub fn drain_rename(&self) -> Option<RenameResult> {
-        self.rename_rx.try_recv().ok()
+        self.replies.rename.try_recv().ok()
     }
 
     /// Ask every interested server for its edit before `renames` happen
@@ -99,7 +99,7 @@ impl LspManager {
     }
 
     pub fn drain_will_rename_files(&self) -> Option<WillRenameFilesResult> {
-        self.will_rename_files_rx.try_recv().ok()
+        self.replies.will_rename_files.try_recv().ok()
     }
 
     /// Tell interested servers that `renames` happened (#610).
