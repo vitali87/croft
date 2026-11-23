@@ -1,1 +1,0 @@
-fix: The Source Control icon's count is the same with and without pictures and matches VS Code's: every change row in every workspace folder's repository. A partly staged file counts twice (Staged Changes and Changes), and terminals without pictures no longer hide changes in other workspace folders. The REPOSITORIES overview counts the same way.
