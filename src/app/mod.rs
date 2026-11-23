@@ -2022,38 +2022,11 @@ pub struct App {
     /// save (#178/#194): armed by the save that held them back, distinct
     /// from `force_save_armed` (the disk-conflict consent).
     formula_overwrite_armed: bool,
-    /// Pre-encoded inline-image for the source-control change-count badge (an
-    /// accent pill + count, VS Code's `activityBarBadge`), emitted at z=1 over
-    /// the SCM activity icon's bottom-right. `None` when there are no changes,
-    /// not in a repo, or image rendering is off (the glyph path draws a text
-    /// badge instead). Rebuilt by `refresh_scm_change_badge` when the change
-    /// set, theme, or cell size shifts.
-    scm_change_badge: Option<String>,
-    /// Change count the cached `scm_change_badge` was built for; drives the
-    /// dirty check and the badge's on-screen cell width.
-    scm_change_badge_count: usize,
-    /// Pre-encoded inline-image for the Explorer change badge: the count of
-    /// open editors with unsaved edits (VS Code's Explorer activity badge),
-    /// emitted at z=1 over the Explorer icon's bottom-right. `None` when nothing
-    /// is unsaved or image rendering is off. Mirrors the SCM badge plumbing;
-    /// rebuilt by `refresh_explorer_unsaved_badge`.
-    explorer_unsaved_badge: Option<String>,
-    /// Unsaved-file count the cached `explorer_unsaved_badge` was built for.
-    explorer_unsaved_count: usize,
-    /// Pre-encoded inline-image for the Remote icon's forwarded-ports badge
-    /// (VS Code's Ports view count), emitted at z=1 over the Remote icon. `None`
-    /// when no port is forwarded or image rendering is off. Same plumbing as the
-    /// other count badges; rebuilt by `refresh_remote_ports_badge`.
-    remote_ports_badge: Option<String>,
-    /// Forwarded-port count the cached `remote_ports_badge` was built for.
-    remote_ports_count: usize,
-    /// Pre-encoded inline-image for the Testing icon's failing-test count badge
-    /// (red pill, VS Code's Testing badge), emitted at z=1 over the beaker icon.
-    /// `None` when nothing is failing or image rendering is off. Same plumbing as
-    /// the other count badges; rebuilt by `refresh_testing_badge`.
-    testing_badge: Option<String>,
-    /// Failing-test count the cached `testing_badge` was built for.
-    testing_badge_count: usize,
+    /// The activity-bar count badges, indexed by [`ActivityIcon`] (VS Code's
+    /// `activityBarBadge`): unsaved files on the Explorer, Source Control
+    /// changes, forwarded ports on Remote and failed tests on Testing (see
+    /// [`ActivityIcon::badge`]). Kept current by `refresh_activity_badges`.
+    activity_badges: [CountBadge; ActivityIcon::ALL.len()],
     /// Problem count the cached `overlays.problems_badge` circle was built for;
     /// gates the per-frame rebuild in `refresh_problems_badge`.
     problems_badge_count: usize,
@@ -4507,14 +4480,7 @@ impl App {
             welcome_bake: None,
             last_pdf_wheel: None,
             formula_overwrite_armed: false,
-            scm_change_badge: None,
-            scm_change_badge_count: 0,
-            explorer_unsaved_badge: None,
-            explorer_unsaved_count: 0,
-            remote_ports_badge: None,
-            remote_ports_count: 0,
-            testing_badge: None,
-            testing_badge_count: 0,
+            activity_badges: Default::default(),
             problems_badge_count: 0,
             problems_badge_cell: None,
             inline_protocol: crate::iterm2_inline::detect_inline_image_protocol(),

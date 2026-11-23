@@ -4501,3 +4501,102 @@ fn every_activity_icon_is_found_under_the_pointer_and_named() {
         "CodeQL is not added by default, so it has no block"
     );
 }
+
+/// #2062: one count-badge type serves every activity-bar badge. It is built
+/// again only when its count changes (or after the pictures were baked
+/// again), it clears at zero, it only tracks the count where pictures are
+/// off, and it sits on its icon's bottom-right cells, as wide as the count.
+#[test]
+fn an_activity_badge_is_built_again_only_when_its_count_changes() {
+    use ratatui::layout::Rect;
+    let mut badge = CountBadge::default();
+    let builds = std::cell::Cell::new(0);
+    let build = |n: usize| {
+        builds.set(builds.get() + 1);
+        Some(format!("BADGE{n}"))
+    };
+    assert!(
+        badge.refresh(3, true, || build(3)),
+        "a new count changes it"
+    );
+    assert!(
+        !badge.refresh(3, true, || build(3)),
+        "the same count does not"
+    );
+    assert_eq!(builds.get(), 1, "and is not built again");
+    let icon = Rect::new(0, 4, 4, 2);
+    let width = crate::iterm2_inline::count_badge_cells_w;
+    assert_eq!(
+        badge.placed(icon),
+        Some((Rect::new(4 - width(3), 5, width(3), 1), "BADGE3")),
+        "on the icon's bottom row, against its right edge"
+    );
+    assert!(badge.refresh(12, true, || build(12)));
+    assert_eq!(
+        badge.placed(icon),
+        Some((Rect::new(4 - width(12), 5, width(12), 1), "BADGE12")),
+        "as wide as the count needs"
+    );
+    badge.invalidate();
+    assert!(
+        badge.refresh(12, true, || build(12)),
+        "new pictures rebuild it"
+    );
+    assert_eq!(builds.get(), 3);
+    assert!(badge.refresh(0, true, || build(0)), "zero changes it");
+    assert_eq!(badge.placed(icon), None, "and clears the picture");
+    assert_eq!(builds.get(), 3, "without building one");
+    assert!(
+        badge.refresh(5, false, || build(5)),
+        "without pictures the count still changes"
+    );
+    assert_eq!(badge.placed(icon), None, "but no picture is built");
+    assert_eq!(builds.get(), 3);
+}
+
+/// #2062: a count badge goes out as a picture over its icon's bottom-right
+/// cells, after every icon, so it is drawn on top. Here the Explorer's
+/// unsaved-file badge, built as a Kitty picture with the badge's own id.
+#[test]
+fn the_explorer_badge_goes_out_over_its_icon_after_every_icon() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "aaa").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
+    app.format_on_save = false;
+    app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::Kitty;
+    app.cell_pixel = Some((8, 16));
+    app.overlays.activity.set_images(empty_activity_images());
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.unsaved_count(), 1);
+    draw(&mut app, 120, 40);
+    let sent = app.pending_activity_image_overlays();
+    let explorer = app.sidebar_areas.activity_icons[ActivityIcon::Explorer];
+    let width = crate::iterm2_inline::count_badge_cells_w(1);
+    let corner = (
+        explorer.x + explorer.width - width,
+        explorer.y + explorer.height - 1,
+    );
+    let badge_at = sent
+        .iter()
+        .position(|(at, _)| *at == corner)
+        .expect("the badge goes out at the Explorer icon's bottom-right");
+    let shown_icons = ActivityIcon::ALL
+        .into_iter()
+        .filter(|&icon| app.sidebar_areas.activity_icons[icon].width > 0)
+        .count();
+    assert!(
+        badge_at >= shown_icons,
+        "after every icon: {badge_at} of {sent:?}"
+    );
+    let id = crate::iterm2_inline::KITTY_ID_EXPLORER_BADGE;
+    assert!(
+        sent[badge_at].1.contains(&format!("i={id}")),
+        "built with the Explorer badge's own picture id"
+    );
+}

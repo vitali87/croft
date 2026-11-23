@@ -7816,9 +7816,10 @@ fn the_source_control_badge_counts_every_row_in_every_folder() {
     }
 
     // With pictures: the count the badge picture is built for.
-    app.refresh_scm_change_badge();
+    app.refresh_activity_badges();
     assert_eq!(
-        app.scm_change_badge_count, 3,
+        app.activity_badges[ActivityIcon::SourceControl as usize].count(),
+        3,
         "two rows for the partly staged file in A, one for B's edit"
     );
 

@@ -271,7 +271,7 @@ impl App {
             }
         }
         if changed {
-            self.refresh_scm_change_badge();
+            self.refresh_activity_badges();
             // The overview rows track the same drains that feed the badge
             // (#162 review: sync_focus_flags runs on focus TRANSITIONS,
             // not per tick, so background-repo updates lagged).
