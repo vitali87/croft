@@ -1,1 +1,0 @@
-fix: The Command Palette, the Keyboard Shortcuts view and KEYBINDINGS.md no longer list Cmd+Opt+Shift+C (Ctrl+Alt+Shift+C off macOS) for Transform to Title Case: that chord copies the file's relative path, as in VS Code, and Title Case has no chord there either. KEYBINDINGS.md now lists Copy Relative Path (#2648).
