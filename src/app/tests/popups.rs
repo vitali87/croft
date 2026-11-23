@@ -23,7 +23,7 @@ fn picture_app(root: &Path) -> App {
 /// catch-all, so a pop-up cannot join the list without a way to open it
 /// here. An agent's proposal is a real one, sent through the edit hook;
 /// the returned stream is the hook's end, kept open while the test runs.
-fn open(app: &mut App, p: Popup) -> Option<std::os::unix::net::UnixStream> {
+pub(super) fn open(app: &mut App, p: Popup) -> Option<std::os::unix::net::UnixStream> {
     match p {
         Popup::Prompt => {
             app.prompt = Some(Prompt {

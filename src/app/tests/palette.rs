@@ -2932,3 +2932,59 @@ fn every_command_matches_the_saved_registry() {
     }
     super::golden::check_text("commands", &text);
 }
+
+/// The bug (#2669): the editor's caret was placed under every pop-up but
+/// the right-click menu, the New File box and the list picker, so on a
+/// boxed theme it blinked inside Settings, Quick Open, every confirm and the
+/// rest, and on Croft Loch inside every pop-up that is not a quick input.
+/// An open pop-up has the keys: only its own caret may show. The rule the
+/// pictures use to put the caret back agrees with the frame's.
+#[test]
+fn no_pane_caret_blinks_through_a_popup() {
+    use crate::app::popups::Popup;
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.txt");
+    std::fs::write(&file, "one\ntwo\n").unwrap();
+    let draw = |app: &mut App| {
+        let backend = super::golden::GoldenBackend {
+            inner: ratatui::backend::TestBackend::new(120, 40),
+            caret_shown: false,
+        };
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        app.cursor_blink.poke();
+        term.draw(|f| app.render(f)).unwrap();
+        let shown = term.backend().caret_shown;
+        let at = ratatui::backend::Backend::get_cursor_position(term.backend_mut()).unwrap();
+        (shown, (at.x, at.y))
+    };
+    let mut wrong = Vec::new();
+    for theme in [
+        crate::theme::Theme::BLACK,
+        crate::theme::Theme::from_id("loch"),
+    ] {
+        for p in Popup::ALL {
+            let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+            app.apply_theme(theme);
+            app.editor.open_in_new_tab(&file).unwrap();
+            app.focus_pane(Pane::Editor);
+            let (shown, editor_caret) = draw(&mut app);
+            assert!(shown, "the editor's caret shows with no pop-up open");
+            let _hook = super::popups::open(&mut app, p);
+            let (shown, at) = draw(&mut app);
+            if shown && at == editor_caret {
+                wrong.push(format!("{p:?} on {}", theme.id()));
+            }
+            assert_eq!(
+                app.cursor_should_be_visible(),
+                shown,
+                "{p:?} on {}: the pictures' caret rule must agree with the frame's",
+                theme.id()
+            );
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "the editor's caret blinked through these pop-ups: {}",
+        wrong.join(", ")
+    );
+}

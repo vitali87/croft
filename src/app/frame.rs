@@ -244,10 +244,9 @@ impl App {
         if self.quick_input_owns_caret() {
             return self.quick_input_caret().is_some();
         }
-        // A list picker (View Bookmarks, Quick Fix, ...) is the thing being
-        // typed into; the editor's caret behind it would only point at text it
-        // is not about to edit.
-        if self.list_picker.is_some() {
+        // Any other pop-up has the keys: a pane's caret behind it would only
+        // point at text it is not about to edit (#2669).
+        if self.popup_open() {
             return false;
         }
         let editor_caret = if self.editor.diff.is_some() {
@@ -283,7 +282,8 @@ impl App {
     /// picker or an input prompt) has the terminal's caret: on a `surfaces`
     /// theme, which draws no caret block in the query, the caret goes there
     /// and no pane's caret blinks through the card. A boxed theme paints its
-    /// own caret and keeps its caret rules as they were.
+    /// own caret block in the query; no pane's caret shows there either
+    /// (#2669).
     pub(super) fn quick_input_owns_caret(&self) -> bool {
         self.theme.surfaces().is_some()
             && (self.command_palette.is_some()
@@ -2465,17 +2465,18 @@ impl App {
             frame.set_cursor_position((cx, cy));
         }
 
-        // Show the host terminal's hardware caret only when the editor is
-        // focused and has no modal overlay. The DECSCUSR style is set to
-        // BlinkingBar at startup, so the terminal blinks a thin vertical
-        // line over the cursor cell without replacing its character.
-        if self.focus == Pane::Editor
-            && !quick_input
-            && self.context_menu.is_none()
-            && self.prompt.is_none()
-            && self.list_picker.is_none()
-            && self.cursor_visible_phase()
-        {
+        // A pane's caret shows only while no pop-up or right-click menu is
+        // open: an open one has the keys, and a caret blinking through it
+        // would point at text it is not about to edit (#2669). The quick
+        // inputs, the New File box and the list picker are pop-ups too.
+        let pane_caret =
+            self.context_menu.is_none() && !self.popup_open() && self.cursor_visible_phase();
+
+        // Show the host terminal's hardware caret when the editor is focused.
+        // The DECSCUSR style is set to BlinkingBar at startup, so the
+        // terminal blinks a thin vertical line over the cursor cell without
+        // replacing its character.
+        if self.focus == Pane::Editor && pane_caret {
             let pos = if self.editor.diff.is_some() {
                 self.editor.diff_caret_screen_pos()
             } else {
@@ -2492,10 +2493,7 @@ impl App {
         // flat with no native caret cell.
         if self.focus == Pane::Tree
             && self.sidebar_view == SidebarView::SourceControl
-            && !quick_input
-            && self.context_menu.is_none()
-            && self.prompt.is_none()
-            && self.cursor_visible_phase()
+            && pane_caret
             && let Some((cx, cy)) = self.source_control.cursor_screen_pos()
         {
             frame.set_cursor_position((cx, cy));
@@ -2507,20 +2505,14 @@ impl App {
         // caret at all (Extensions).
         if self.focus == Pane::Tree
             && self.sidebar_view == SidebarView::Search
-            && !quick_input
-            && self.context_menu.is_none()
-            && self.prompt.is_none()
-            && self.cursor_visible_phase()
+            && pane_caret
             && let Some((cx, cy)) = self.search.cursor_screen_pos()
         {
             frame.set_cursor_position((cx, cy));
         }
         if self.focus == Pane::Tree
             && self.sidebar_view == SidebarView::Extensions
-            && !quick_input
-            && self.context_menu.is_none()
-            && self.prompt.is_none()
-            && self.cursor_visible_phase()
+            && pane_caret
             && let Some((cx, cy)) = self.extensions.cursor_screen_pos()
         {
             frame.set_cursor_position((cx, cy));

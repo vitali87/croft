@@ -623,9 +623,9 @@ fn golden_scenes_are_skipped_only_in_a_published_crate_without_goldens() {
 const MAX_FRAMES: usize = 4;
 
 /// `TestBackend`, plus whether the caret is shown, which it keeps private.
-struct GoldenBackend {
-    inner: TestBackend,
-    caret_shown: bool,
+pub(super) struct GoldenBackend {
+    pub(super) inner: TestBackend,
+    pub(super) caret_shown: bool,
 }
 
 impl Backend for GoldenBackend {
