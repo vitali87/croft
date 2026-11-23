@@ -32,6 +32,7 @@ mod misc;
 mod navigation;
 mod notebook;
 mod palette;
+mod popups;
 mod problems;
 mod remote;
 mod review;
