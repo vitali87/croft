@@ -557,151 +557,23 @@ impl WorkerState {
             for (config, result) in outcomes {
                 match result {
                     Ok(client) => {
-                        let caps = client.capabilities();
-                        // A capability that can be sent as a bare `false` (the
-                        // bool-or-options shapes) must be read as its inner bool:
-                        // `Option::is_some` treats `Some(false)` as supported,
-                        // which made croft call `textDocument/declaration` on
-                        // vtsls (which advertises `declarationProvider: false`)
-                        // and get a -32601 "Unhandled method" back.
-                        let supports = caps.completion_provider.is_some();
-                        let completion_triggers = completion_triggers_of(caps);
-                        let supports_signature_help =
-                            signature_help_supported(&caps.signature_help_provider);
-                        let supports_workspace_diagnostics =
-                            workspace_diagnostics_supported(&caps.diagnostic_provider);
-                        let supports_document_diagnostics = caps.diagnostic_provider.is_some();
-                        let diagnostic_identifier =
-                            diagnostic_identifier_of(&caps.diagnostic_provider);
-                        let save_notify = save_notify_of(&caps.text_document_sync);
-                        let supports_hover = hover_supported(&caps.hover_provider);
-                        let supports_definition = one_of_supported(&caps.definition_provider);
-                        let supports_document_symbol =
-                            one_of_supported(&caps.document_symbol_provider);
-                        let supports_declaration =
-                            declaration_supported(&caps.declaration_provider);
-                        let supports_type_definition =
-                            type_definition_supported(&caps.type_definition_provider);
-                        let supports_implementation =
-                            implementation_supported(&caps.implementation_provider);
-                        let supports_references = one_of_supported(&caps.references_provider);
-                        let supports_document_highlight =
-                            one_of_supported(&caps.document_highlight_provider);
-                        let supports_linked_editing =
-                            linked_editing_supported(&caps.linked_editing_range_provider);
-                        let supports_inline_completion =
-                            one_of_supported(&caps.inline_completion_provider);
-                        let supports_selection_range =
-                            selection_range_supported(&caps.selection_range_provider);
-                        let supports_call_hierarchy =
-                            call_hierarchy_supported(&caps.call_hierarchy_provider);
-                        let supports_type_hierarchy = client.supports_type_hierarchy();
-                        let supports_workspace_symbols =
-                            one_of_supported(&caps.workspace_symbol_provider);
-                        let supports_rename = one_of_supported(&caps.rename_provider);
-                        let supports_prepare_rename =
-                            prepare_rename_supported(&caps.rename_provider);
-                        let supports_formatting =
-                            one_of_supported(&caps.document_formatting_provider);
-                        let on_type_triggers =
-                            caps.document_on_type_formatting_provider.as_ref().map(|o| {
-                                let mut t = o.first_trigger_character.clone();
-                                for more in o.more_trigger_character.iter().flatten() {
-                                    t.push_str(more);
-                                }
-                                t
-                            });
-                        let supports_range_formatting =
-                            one_of_supported(&caps.document_range_formatting_provider);
-                        let supports_code_action =
-                            code_action_supported(&caps.code_action_provider);
-                        let semantic_legend = semantic_legend_of(caps).map(Arc::new);
-                        let semantic_supports_range = semantic_tokens_range_supported(caps);
-                        let supports_inlay_hints = one_of_supported(&caps.inlay_hint_provider);
-                        let supports_document_link = caps.document_link_provider.is_some();
-                        let supports_code_lens = caps.code_lens_provider.is_some();
-                        let code_lens_resolve = caps
-                            .code_lens_provider
-                            .as_ref()
-                            .and_then(|o| o.resolve_provider)
-                            .unwrap_or(false);
-                        let server_commands = Arc::new(
-                            caps.execute_command_provider
-                                .as_ref()
-                                .map(|o| o.commands.clone())
-                                .unwrap_or_default(),
-                        );
-                        let supports_folding_range =
-                            folding_range_supported(&caps.folding_range_provider);
-                        let supports_document_color =
-                            color_provider_supported(&caps.color_provider);
-                        let file_ops = caps
-                            .workspace
-                            .as_ref()
-                            .and_then(|w| w.file_operations.as_ref());
-                        let compile = |reg: Option<
-                            &lsp_types::FileOperationRegistrationOptions,
-                        >| {
-                            reg.map(|r| {
-                                Arc::new(crate::lsp::file_ops::FileOpFilters::from_registration(r))
-                            })
-                        };
-                        let will_rename = compile(file_ops.and_then(|f| f.will_rename.as_ref()));
-                        let did_rename = compile(file_ops.and_then(|f| f.did_rename.as_ref()));
+                        let support =
+                            server_support(client.capabilities(), client.supports_type_hierarchy());
                         log_file::log(&format!(
-                            "lsp[{}] spawned, root={} supports_completion={supports} supports_signature_help={supports_signature_help} supports_hover={supports_hover} supports_definition={supports_definition} supports_declaration={supports_declaration} supports_type_definition={supports_type_definition} supports_implementation={supports_implementation} supports_references={supports_references} supports_rename={supports_rename}",
+                            "lsp[{}] spawned, root={} supports_completion={} supports_signature_help={} supports_hover={} supports_definition={} supports_declaration={} supports_type_definition={} supports_implementation={} supports_references={} supports_rename={}",
                             config.name,
-                            root.display()
+                            root.display(),
+                            support.supports_completion,
+                            support.supports_signature_help,
+                            support.supports_hover,
+                            support.supports_definition,
+                            support.supports_declaration,
+                            support.supports_type_definition,
+                            support.supports_implementation,
+                            support.supports_references,
+                            support.supports_rename,
                         ));
-                        spawned.push(ManagedClient {
-                            name: config.name.to_string(),
-                            client: Arc::new(TokioMutex::new(client)),
-                            supports_completion: supports,
-                            completion_triggers,
-                            supports_signature_help,
-                            supports_workspace_diagnostics,
-                            diagnostic_identifier,
-                            diagnostic_result_ids: Arc::new(TokioMutex::new(
-                                DiagnosticResultIds::default(),
-                            )),
-                            diagnostic_pull_stalled: Arc::new(AtomicBool::new(false)),
-                            save_notify,
-                            supports_document_diagnostics,
-                            document_pull_stalled: Arc::new(AtomicBool::new(false)),
-                            prepare_rename_stalled: Arc::new(AtomicBool::new(false)),
-                            document_pull_generations: Arc::new(StdMutex::new(HashMap::new())),
-                            supports_hover,
-                            supports_definition,
-                            supports_document_symbol,
-                            supports_declaration,
-                            supports_type_definition,
-                            supports_implementation,
-                            supports_references,
-                            supports_document_highlight,
-                            supports_linked_editing,
-                            supports_inline_completion,
-                            supports_selection_range,
-                            supports_call_hierarchy,
-                            supports_type_hierarchy,
-                            supports_workspace_symbols,
-                            supports_rename,
-                            supports_prepare_rename,
-                            supports_formatting,
-                            on_type_triggers,
-                            supports_range_formatting,
-                            supports_code_action,
-                            semantic_legend,
-                            semantic_supports_range,
-                            supports_inlay_hints,
-                            supports_document_link,
-                            supports_code_lens,
-                            code_lens_resolve,
-                            server_commands,
-                            supports_folding_range,
-                            supports_document_color,
-                            will_rename,
-                            did_rename,
-                        });
+                        spawned.push(ManagedClient::new(config.name.to_string(), client, support));
                     }
                     Err(e) => {
                         log_file::log(&format!("lsp[{}] spawn failed: {e}", config.name));
