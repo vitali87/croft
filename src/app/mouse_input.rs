@@ -53,18 +53,7 @@ impl App {
         // Activity bar: always visible, so it is checked regardless of which
         // sidebar view is open.
         if let Some(icon) = self.activity_icon_at(col, row) {
-            return Some(match icon {
-                ActivityIcon::Explorer => "Explorer",
-                ActivityIcon::Search => "Search",
-                ActivityIcon::SourceControl => "Source Control",
-                ActivityIcon::Remote => "Remote",
-                ActivityIcon::RunDebug => "Run and Debug",
-                ActivityIcon::Extensions => "Extensions",
-                ActivityIcon::Testing => "Testing",
-                ActivityIcon::CodeQL => "CodeQL",
-                ActivityIcon::Sponsor => "Sponsor croft",
-                ActivityIcon::Settings => "Manage",
-            });
+            return Some(icon.label());
         }
         // Sidebar header actions, dispatched by the view that owns them so a
         // panel's stored geometry is never consulted once another view has

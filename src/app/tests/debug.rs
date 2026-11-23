@@ -509,7 +509,7 @@ fn click_on_run_debug_icon_switches_sidebar_to_run_debug() {
     let backend = ratatui::backend::TestBackend::new(80, 30);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
-    let run = app.sidebar_areas.run_debug_icon;
+    let run = app.sidebar_areas.activity_icons[ActivityIcon::RunDebug];
     assert!(run.height > 0, "run-debug icon must be laid out");
     app.handle_mouse(crossterm::event::MouseEvent {
         kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),

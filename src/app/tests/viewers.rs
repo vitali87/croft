@@ -4132,3 +4132,66 @@ fn the_activity_bar_pictures_share_one_caret_guard() {
     write_inline_images(&mut batch_of_one, [(5, 9, &b"PICTURE"[..])], true);
     assert_eq!(one, batch_of_one);
 }
+
+/// #2062: every activity-bar icon's pictures come out of the icon table
+/// exactly as the per-icon code baked them: its own picture and Kitty id,
+/// the view icons centered, the gear and the heart lower, the heart in its
+/// own ink and with no selected picture.
+#[test]
+fn every_activity_icon_bakes_as_it_did_before_the_table() {
+    use crate::iterm2_inline as ki;
+    let input = ChromeBakeInput {
+        protocol: ki::InlineImageProtocol::Kitty,
+        cell: (8, 16),
+        is_tmux: false,
+        icon_bg: ::image::Rgba([30, 30, 30, 255]),
+        icon_ink: ki::IconInk::default(),
+        sponsor_ink: ki::IconInk::new((200, 60, 120), (230, 90, 150), (0, 0, 0)),
+    };
+    let images = App::bake_chrome_images(&input)
+        .activity
+        .expect("the activity icons bake");
+    let (w, h) = (ACTIVITY_BAR_WIDTH, ACTIVITY_ICON_HEIGHT);
+    let canvas = (8 * u32::from(w), 16 * u32::from(h));
+    let lower = i64::from(canvas.1);
+    let picture = |src: &[u8], state: ki::IconState, ink: ki::IconInk, bias: i64, id: u32| {
+        let png =
+            ki::compose_icon_svg(src, canvas.0, canvas.1, state, ink, input.icon_bg, bias).unwrap();
+        let raw = ki::build_inline_image(input.protocol, &png, w, h, false, id).unwrap();
+        ki::maybe_tmux_wrap(input.protocol, false, raw)
+    };
+    // The recipe each icon had before the table: picture, offset, Kitty id.
+    let before = [
+        (ki::EXPLORER_SRC_SVG, 0, ki::KITTY_ID_EXPLORER),
+        (ki::SEARCH_SRC_SVG, 0, ki::KITTY_ID_SEARCH),
+        (ki::SOURCE_CONTROL_SRC_SVG, 0, ki::KITTY_ID_SOURCE_CONTROL),
+        (ki::REMOTE_SRC_SVG, 0, ki::KITTY_ID_REMOTE),
+        (ki::RUN_DEBUG_SRC_SVG, 0, ki::KITTY_ID_RUN_DEBUG_BAR),
+        (ki::EXTENSIONS_SRC_SVG, 0, ki::KITTY_ID_EXTENSIONS),
+        (ki::TESTING_SRC_SVG, 0, ki::KITTY_ID_TESTING),
+        (ki::CODEQL_SRC_SVG, 0, ki::KITTY_ID_CODEQL),
+        (ki::SPONSOR_HEART_SRC_SVG, lower, ki::KITTY_ID_SPONSOR),
+        (ki::SETTINGS_GEAR_SRC_SVG, lower, ki::KITTY_ID_SETTINGS),
+    ];
+    for (icon, (src, bias, id)) in ActivityIcon::ALL.into_iter().zip(before) {
+        let ink = if icon == ActivityIcon::Sponsor {
+            input.sponsor_ink
+        } else {
+            input.icon_ink
+        };
+        let baked = &images.icons[icon as usize];
+        let active = (icon != ActivityIcon::Sponsor)
+            .then(|| picture(src, ki::IconState::Active, ink, bias, id));
+        assert_eq!(baked.active, active, "{icon:?} selected");
+        assert_eq!(
+            baked.inactive,
+            picture(src, ki::IconState::Inactive, ink, bias, id),
+            "{icon:?} at rest"
+        );
+        assert_eq!(
+            baked.hovered,
+            picture(src, ki::IconState::Hovered, ink, bias, id),
+            "{icon:?} hovered"
+        );
+    }
+}

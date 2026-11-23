@@ -248,33 +248,24 @@ fn fallback_popup_rect(full: Rect, max_w_cap: u16) -> Rect {
 
 #[derive(Default, Clone, Copy)]
 struct SidebarAreas {
-    /// Block occupied by the Explorer activity-bar icon, in absolute coords.
-    /// Multi-row when image rendering is active; the hit-test still uses the
-    /// whole block.
-    explorer_icon: Rect,
-    /// Block occupied by the Search activity-bar icon, in absolute coords.
-    search_icon: Rect,
-    /// Block occupied by the Source Control activity-bar icon, in absolute coords.
-    source_control_icon: Rect,
-    /// Block occupied by the Remote Explorer activity-bar icon, in absolute coords.
-    remote_icon: Rect,
-    /// Block occupied by the Run and Debug activity-bar icon, in absolute coords.
-    run_debug_icon: Rect,
-    /// Block occupied by the Extensions activity-bar icon, in absolute coords.
-    extensions_icon: Rect,
-    /// Block occupied by the Testing (beaker) activity-bar icon, in absolute coords.
-    testing_icon: Rect,
-    /// Block occupied by the CodeQL (QL) activity-bar icon; empty while the
-    /// built-in CodeQL extension is disabled.
-    codeql_icon: Rect,
-    /// Block occupied by the sponsor heart directly above the settings gear;
-    /// empty when the bar is too short for it. Clicking it opens croft's
-    /// GitHub Sponsors page.
-    sponsor_icon: Rect,
-    /// Block occupied by the settings gear, bottom-anchored on the activity
-    /// bar (VS Code's "Manage" button). Asymmetric to the view icons up top;
-    /// clicking it opens the settings menu (Color Theme picker).
-    settings_icon: Rect,
+    /// Where each activity-bar icon sits. Clicking the sponsor heart opens
+    /// croft's GitHub Sponsors page; the settings gear, bottom-anchored like
+    /// VS Code's "Manage" button, opens the settings menu.
+    activity_icons: ActivityBlocks,
+}
+
+/// One activity-bar icon's pre-encoded pictures, one per state, so a hover
+/// only swaps which one is sent and never bakes again.
+#[cfg_attr(test, derive(Default))]
+pub struct ActivityIconImages {
+    /// Shown while the icon is selected: its view is open, or for the
+    /// settings gear its menu is, so the button reads as pressed. `None` for
+    /// the sponsor heart, which opens a web page and is never selected.
+    active: Option<String>,
+    /// At rest.
+    inactive: String,
+    /// Brightened while the pointer rests on it.
+    hovered: String,
 }
 
 /// Pre-encoded iTerm2 OSC-1337 inline-image escape sequences for each icon
@@ -283,40 +274,8 @@ struct SidebarAreas {
 /// frame draw, since ratatui's bg-clear overdraws the image.
 #[cfg_attr(test, derive(Default))]
 pub struct ActivityBarImages {
-    explorer_active: String,
-    explorer_inactive: String,
-    explorer_hovered: String,
-    search_active: String,
-    search_inactive: String,
-    search_hovered: String,
-    source_control_active: String,
-    source_control_inactive: String,
-    source_control_hovered: String,
-    remote_active: String,
-    remote_inactive: String,
-    remote_hovered: String,
-    run_debug_active: String,
-    run_debug_inactive: String,
-    run_debug_hovered: String,
-    extensions_active: String,
-    extensions_inactive: String,
-    extensions_hovered: String,
-    testing_active: String,
-    testing_inactive: String,
-    testing_hovered: String,
-    codeql_active: String,
-    codeql_inactive: String,
-    codeql_hovered: String,
-    /// The sponsor heart. It opens a web page rather than a view or a menu,
-    /// so it is never selected and has no active variant.
-    sponsor_inactive: String,
-    sponsor_hovered: String,
-    /// The settings gear. `active` is shown while its menu is open so the
-    /// button reads as pressed, mirroring the view icons' selected state;
-    /// `hovered` brightens it while the pointer rests on it.
-    settings_active: String,
-    settings_inactive: String,
-    settings_hovered: String,
+    /// Each activity-bar icon's pictures, indexed by [`ActivityIcon`].
+    icons: [ActivityIconImages; ActivityIcon::ALL.len()],
     /// Customize Layout toolbar icons (top-right of the editor / welcome),
     /// baked OPAQUE at the 4×2-cell toolbar box so they paint in front of the
     /// container's top line. The side-bar / panel icons carry an on/off pair

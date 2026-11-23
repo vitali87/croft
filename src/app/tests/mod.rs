@@ -458,38 +458,29 @@ fn menu_row_actions(app: &App, file: &Path) -> Vec<MenuAction> {
     all
 }
 
+/// Activity-bar pictures that are all empty, for tests that only need
+/// croft to be drawing pictures. The sponsor heart has no active picture,
+/// as when it is baked.
+fn empty_activity_images() -> ActivityBarImages {
+    ActivityBarImages {
+        icons: ActivityIcon::ALL.map(|icon| ActivityIconImages {
+            active: (icon != ActivityIcon::Sponsor).then(String::new),
+            inactive: String::new(),
+            hovered: String::new(),
+        }),
+        ..ActivityBarImages::default()
+    }
+}
+
 fn dummy_activity_images() -> ActivityBarImages {
     let s = || String::from("\x1b]1337;File=inline=1:Zm9v\x07");
     ActivityBarImages {
-        explorer_active: s(),
-        explorer_inactive: s(),
-        explorer_hovered: s(),
-        search_active: s(),
-        search_inactive: s(),
-        search_hovered: s(),
-        source_control_active: s(),
-        source_control_inactive: s(),
-        source_control_hovered: s(),
-        remote_active: s(),
-        remote_inactive: s(),
-        remote_hovered: s(),
-        run_debug_active: s(),
-        run_debug_inactive: s(),
-        run_debug_hovered: s(),
-        extensions_active: s(),
-        extensions_inactive: s(),
-        extensions_hovered: s(),
-        testing_active: s(),
-        testing_inactive: s(),
-        testing_hovered: s(),
-        codeql_active: s(),
-        codeql_inactive: s(),
-        codeql_hovered: s(),
-        sponsor_inactive: s(),
-        sponsor_hovered: s(),
-        settings_active: s(),
-        settings_inactive: s(),
-        settings_hovered: s(),
+        // The sponsor heart is never selected, so it has no active picture.
+        icons: ActivityIcon::ALL.map(|icon| ActivityIconImages {
+            active: (icon != ActivityIcon::Sponsor).then(s),
+            inactive: s(),
+            hovered: s(),
+        }),
         layout_sidebar_on: s(),
         layout_sidebar_on_hover: s(),
         layout_sidebar_off: s(),

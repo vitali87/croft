@@ -496,24 +496,38 @@ impl App {
                 encode(src, ki::IconState::Hovered, icon_ink, off_y_bias, id)?,
             ))
         };
-        // The sponsor heart (#1940) wears its own pink, and is never selected,
-        // so it bakes only its resting and hovered states. It shares the gear's
+        // One icon's pictures, from its source in the table. The view icons
+        // sit centered and the gear bottom-aligns (`gear_off_y_bias`). The
+        // sponsor heart (#1940) wears its own pink and is never selected, so
+        // it bakes only its resting and hovered states; it shares the gear's
         // bias so the two keep the view icons' spacing between them.
-        let sponsor_imgs = (|| {
-            let heart = |state| {
-                encode(
-                    ki::SPONSOR_HEART_SRC_SVG,
-                    state,
-                    sponsor_ink,
-                    gear_off_y_bias,
-                    ki::KITTY_ID_SPONSOR,
-                )
+        let bake_icon = |icon: ActivityIcon| -> Option<ActivityIconImages> {
+            let (src, id) = icon.picture();
+            if icon == ActivityIcon::Sponsor {
+                let heart = |state| encode(src, state, sponsor_ink, gear_off_y_bias, id);
+                return Some(ActivityIconImages {
+                    active: None,
+                    inactive: heart(ki::IconState::Inactive)?,
+                    hovered: heart(ki::IconState::Hovered)?,
+                });
+            }
+            let off_y_bias = if icon == ActivityIcon::Settings {
+                gear_off_y_bias
+            } else {
+                0
             };
-            Some((
-                heart(ki::IconState::Inactive)?,
-                heart(ki::IconState::Hovered)?,
-            ))
-        })();
+            let (active, inactive, hovered) = bake(src, off_y_bias, id)?;
+            Some(ActivityIconImages {
+                active: Some(active),
+                inactive,
+                hovered,
+            })
+        };
+        let icons = ActivityIcon::ALL
+            .into_iter()
+            .map(bake_icon)
+            .collect::<Option<Vec<_>>>()
+            .and_then(|icons| icons.try_into().ok());
         // Customize Layout toolbar icons: baked OPAQUE on the editor bg at the
         // 4×2-cell box so they paint IN FRONT of the container's top line
         // (the line sits behind the icon's solid background). `Inactive` is the
@@ -563,79 +577,26 @@ impl App {
                 bake_layout_pair(ki::LAYOUT_CUSTOMIZE_SRC_SVG, ki::KITTY_ID_LAYOUT_CUSTOMIZE)?;
             Some((so, soh, sf, sfh, po, poh, pf, pfh, cu, cuh))
         })();
-        let activity = if let (
-            Some((ea, ei, eh)),
-            Some((sa, si, sh)),
-            Some((sca, sci, sch)),
-            Some((ra, ri, rh)),
-            Some((rda, rdi, rdh)),
-            Some((exta, exti, exth)),
-            Some((tsta, tsti, tsth)),
-            Some((cqa, cqi, cqh)),
-            Some((spi, sph)),
-            Some((gea, gei, geh)),
-            Some((lso, lsoh, lsf, lsfh, lpo, lpoh, lpf, lpfh, lcu, lcuh)),
-        ) = (
-            bake(ki::EXPLORER_SRC_SVG, 0, ki::KITTY_ID_EXPLORER),
-            bake(ki::SEARCH_SRC_SVG, 0, ki::KITTY_ID_SEARCH),
-            bake(ki::SOURCE_CONTROL_SRC_SVG, 0, ki::KITTY_ID_SOURCE_CONTROL),
-            bake(ki::REMOTE_SRC_SVG, 0, ki::KITTY_ID_REMOTE),
-            bake(ki::RUN_DEBUG_SRC_SVG, 0, ki::KITTY_ID_RUN_DEBUG_BAR),
-            bake(ki::EXTENSIONS_SRC_SVG, 0, ki::KITTY_ID_EXTENSIONS),
-            bake(ki::TESTING_SRC_SVG, 0, ki::KITTY_ID_TESTING),
-            bake(ki::CODEQL_SRC_SVG, 0, ki::KITTY_ID_CODEQL),
-            sponsor_imgs,
-            bake(
-                ki::SETTINGS_GEAR_SRC_SVG,
-                gear_off_y_bias,
-                ki::KITTY_ID_SETTINGS,
-            ),
-            layout_imgs,
-        ) {
-            Some(ActivityBarImages {
-                explorer_active: ea,
-                explorer_inactive: ei,
-                explorer_hovered: eh,
-                search_active: sa,
-                search_inactive: si,
-                search_hovered: sh,
-                source_control_active: sca,
-                source_control_inactive: sci,
-                source_control_hovered: sch,
-                remote_active: ra,
-                remote_inactive: ri,
-                remote_hovered: rh,
-                run_debug_active: rda,
-                run_debug_inactive: rdi,
-                run_debug_hovered: rdh,
-                extensions_active: exta,
-                extensions_inactive: exti,
-                extensions_hovered: exth,
-                testing_active: tsta,
-                testing_inactive: tsti,
-                testing_hovered: tsth,
-                codeql_active: cqa,
-                codeql_inactive: cqi,
-                codeql_hovered: cqh,
-                sponsor_inactive: spi,
-                sponsor_hovered: sph,
-                settings_active: gea,
-                settings_inactive: gei,
-                settings_hovered: geh,
-                layout_sidebar_on: lso,
-                layout_sidebar_on_hover: lsoh,
-                layout_sidebar_off: lsf,
-                layout_sidebar_off_hover: lsfh,
-                layout_panel_on: lpo,
-                layout_panel_on_hover: lpoh,
-                layout_panel_off: lpf,
-                layout_panel_off_hover: lpfh,
-                layout_customize: lcu,
-                layout_customize_hover: lcuh,
-            })
-        } else {
-            None
-        };
+        let activity =
+            if let (Some(icons), Some((lso, lsoh, lsf, lsfh, lpo, lpoh, lpf, lpfh, lcu, lcuh))) =
+                (icons, layout_imgs)
+            {
+                Some(ActivityBarImages {
+                    icons,
+                    layout_sidebar_on: lso,
+                    layout_sidebar_on_hover: lsoh,
+                    layout_sidebar_off: lsf,
+                    layout_sidebar_off_hover: lsfh,
+                    layout_panel_on: lpo,
+                    layout_panel_on_hover: lpoh,
+                    layout_panel_off: lpf,
+                    layout_panel_off_hover: lpfh,
+                    layout_customize: lcu,
+                    layout_customize_hover: lcuh,
+                })
+            } else {
+                None
+            };
         // Run-and-Debug headline icon: the same debug-alt PNG used in the
         // activity bar, fitted to the panel's icon block (RUN_DEBUG_ICON_CELLS_W
         // cells wide × RUN_DEBUG_ICON_CELLS_H cells tall) and tinted at icon-
@@ -1127,104 +1088,16 @@ impl App {
         let Some(images) = self.overlays.activity.images() else {
             return Vec::new();
         };
-        let exp_block = self.sidebar_areas.explorer_icon;
-        let sea_block = self.sidebar_areas.search_icon;
-        let scm_block = self.sidebar_areas.source_control_icon;
-        let rem_block = self.sidebar_areas.remote_icon;
-        let rdb_block = self.sidebar_areas.run_debug_icon;
-        let ext_block = self.sidebar_areas.extensions_icon;
-        let tst_block = self.sidebar_areas.testing_icon;
-        // Optional: absent while CodeQL is disabled, so not part of the
-        // all-or-nothing readiness below.
-        let cql_block = self.sidebar_areas.codeql_icon;
+        let icons = self.sidebar_areas.activity_icons;
         // The activity bar is all-or-nothing: emit its icons only when every
-        // block is laid out (a partial bar would look broken). When it's hidden
-        // (Customize Layout / Zen) the blocks are zero-width and skipped, but
-        // the layout toolbar icons below still emit independently.
-        let activity_ready = exp_block.width > 0
-            && sea_block.width > 0
-            && scm_block.width > 0
-            && rem_block.width > 0
-            && rdb_block.width > 0
-            && ext_block.width > 0
-            && tst_block.width > 0;
-        // Three-way per icon: the selected view shows the active (pilled)
-        // variant; otherwise the pointer-hovered icon brightens (no pill); the
-        // rest stay muted. Selected always wins over hovered.
-        let hov = self.hovered_activity_icon;
-        let exp_state = if self.activity_view_active(SidebarView::Explorer) {
-            &images.explorer_active
-        } else if hov == Some(ActivityIcon::Explorer) {
-            &images.explorer_hovered
-        } else {
-            &images.explorer_inactive
-        };
-        let sea_state = if self.activity_view_active(SidebarView::Search) {
-            &images.search_active
-        } else if hov == Some(ActivityIcon::Search) {
-            &images.search_hovered
-        } else {
-            &images.search_inactive
-        };
-        let scm_state = if self.activity_view_active(SidebarView::SourceControl) {
-            &images.source_control_active
-        } else if hov == Some(ActivityIcon::SourceControl) {
-            &images.source_control_hovered
-        } else {
-            &images.source_control_inactive
-        };
-        let rem_state = if self.activity_view_active(SidebarView::Remote) {
-            &images.remote_active
-        } else if hov == Some(ActivityIcon::Remote) {
-            &images.remote_hovered
-        } else {
-            &images.remote_inactive
-        };
-        let rdb_state = if self.activity_view_active(SidebarView::RunDebug) {
-            &images.run_debug_active
-        } else if hov == Some(ActivityIcon::RunDebug) {
-            &images.run_debug_hovered
-        } else {
-            &images.run_debug_inactive
-        };
-        let ext_state = if self.activity_view_active(SidebarView::Extensions) {
-            &images.extensions_active
-        } else if hov == Some(ActivityIcon::Extensions) {
-            &images.extensions_hovered
-        } else {
-            &images.extensions_inactive
-        };
-        let tst_state = if self.activity_view_active(SidebarView::Testing) {
-            &images.testing_active
-        } else if hov == Some(ActivityIcon::Testing) {
-            &images.testing_hovered
-        } else {
-            &images.testing_inactive
-        };
-        let cql_state = if self.activity_view_active(SidebarView::CodeQL) {
-            &images.codeql_active
-        } else if hov == Some(ActivityIcon::CodeQL) {
-            &images.codeql_hovered
-        } else {
-            &images.codeql_inactive
-        };
-        // The heart and the gear are bottom-anchored and may be absent on a
-        // short bar (empty block). The heart is never selected; the gear
-        // reads "active" while its menu/picker is open.
-        let spo_block = self.sidebar_areas.sponsor_icon;
-        let spo_state = if hov == Some(ActivityIcon::Sponsor) {
-            &images.sponsor_hovered
-        } else {
-            &images.sponsor_inactive
-        };
-        let set_block = self.sidebar_areas.settings_icon;
-        let set_state = if self.settings_menu_active() {
-            &images.settings_active
-        } else if hov == Some(ActivityIcon::Settings) {
-            &images.settings_hovered
-        } else {
-            &images.settings_inactive
-        };
+        // icon that is always there is laid out (a partial bar would look
+        // broken). When it's hidden (Customize Layout / Zen) the blocks are
+        // zero-width and skipped, but the layout toolbar icons below still
+        // emit independently.
+        let activity_ready = ActivityIcon::ALL
+            .into_iter()
+            .filter(|icon| !icon.optional())
+            .all(|icon| icons[icon].width > 0);
         // The shortcuts modal and file finder are centered over the editor
         // column, not the far-left activity bar, so the icons stay visible
         // beside them. Suppress an icon only when its block actually
@@ -1249,24 +1122,15 @@ impl App {
         };
         let mut blocks: Vec<(Rect, &str)> = Vec::new();
         if activity_ready {
-            blocks.extend_from_slice(&[
-                (exp_block, exp_state.as_str()),
-                (sea_block, sea_state.as_str()),
-                (scm_block, scm_state.as_str()),
-                (rem_block, rem_state.as_str()),
-                (rdb_block, rdb_state.as_str()),
-                (ext_block, ext_state.as_str()),
-                (tst_block, tst_state.as_str()),
-            ]);
-            if cql_block.width > 0 {
-                blocks.push((cql_block, cql_state.as_str()));
+            for icon in ActivityIcon::ALL {
+                if icons[icon].width > 0 {
+                    blocks.push((icons[icon], self.activity_icon_picture(images, icon)));
+                }
             }
-            if spo_block.width > 0 {
-                blocks.push((spo_block, spo_state.as_str()));
-            }
-            if set_block.width > 0 {
-                blocks.push((set_block, set_state.as_str()));
-            }
+            let exp_block = icons[ActivityIcon::Explorer];
+            let scm_block = icons[ActivityIcon::SourceControl];
+            let rem_block = icons[ActivityIcon::Remote];
+            let tst_block = icons[ActivityIcon::Testing];
             // Change-count badge over the SCM icon's bottom-right corner. Pushed
             // after the SCM icon so the iTerm2 path (last writer wins each cell)
             // paints it on top; the Kitty path baked it at z=1 for the same
@@ -1369,6 +1233,22 @@ impl App {
             .filter(|(block, _)| block.width > 0 && visible(*block))
             .map(|(block, state)| ((block.x, block.y), state))
             .collect()
+    }
+
+    /// The picture `icon` shows this frame, three ways: selected (with its
+    /// pill), else brightened under the pointer, else at rest. Selected
+    /// always wins over hovered.
+    fn activity_icon_picture<'a>(
+        &self,
+        images: &'a ActivityBarImages,
+        icon: ActivityIcon,
+    ) -> &'a str {
+        let pictures = &images.icons[icon as usize];
+        match &pictures.active {
+            Some(active) if self.activity_icon_selected(icon) => active,
+            _ if self.hovered_activity_icon == Some(icon) => &pictures.hovered,
+            _ => &pictures.inactive,
+        }
     }
 
     /// True while the activity-bar gear's menu or theme picker is open, so the

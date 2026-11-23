@@ -7827,7 +7827,7 @@ fn the_source_control_badge_counts_every_row_in_every_folder() {
     let backend = ratatui::backend::TestBackend::new(120, 40);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
-    let block = app.sidebar_areas.source_control_icon;
+    let block = app.sidebar_areas.activity_icons[ActivityIcon::SourceControl];
     let corner = (
         block.x + block.width - 1,
         block.y + block.height.saturating_sub(1),

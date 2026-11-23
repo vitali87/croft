@@ -37,6 +37,131 @@ impl ActivityIcon {
             ActivityIcon::Sponsor | ActivityIcon::Settings => None,
         }
     }
+
+    /// Every icon, in the order the bar draws them, sends their pictures and
+    /// hit-tests them (#2062). Where each sits on the bar is [`Self::slot`]:
+    /// Run and Debug is drawn after Remote but sits above it.
+    pub(super) const ALL: [ActivityIcon; 10] = [
+        ActivityIcon::Explorer,
+        ActivityIcon::Search,
+        ActivityIcon::SourceControl,
+        ActivityIcon::Remote,
+        ActivityIcon::RunDebug,
+        ActivityIcon::Extensions,
+        ActivityIcon::Testing,
+        ActivityIcon::CodeQL,
+        ActivityIcon::Sponsor,
+        ActivityIcon::Settings,
+    ];
+
+    /// A view icon's place in the stack down from the top of the bar; `None`
+    /// for the sponsor heart and the settings gear, which are anchored to
+    /// the bottom. CodeQL is last, so disabling it moves no other icon.
+    pub(super) fn slot(self) -> Option<u16> {
+        match self {
+            ActivityIcon::Explorer => Some(0),
+            ActivityIcon::Search => Some(1),
+            ActivityIcon::SourceControl => Some(2),
+            ActivityIcon::RunDebug => Some(3),
+            ActivityIcon::Remote => Some(4),
+            ActivityIcon::Extensions => Some(5),
+            ActivityIcon::Testing => Some(6),
+            ActivityIcon::CodeQL => Some(7),
+            ActivityIcon::Sponsor | ActivityIcon::Settings => None,
+        }
+    }
+
+    /// The name the icon's tooltip shows.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            ActivityIcon::Explorer => "Explorer",
+            ActivityIcon::Search => "Search",
+            ActivityIcon::SourceControl => "Source Control",
+            ActivityIcon::Remote => "Remote",
+            ActivityIcon::RunDebug => "Run and Debug",
+            ActivityIcon::Extensions => "Extensions",
+            ActivityIcon::Testing => "Testing",
+            ActivityIcon::CodeQL => "CodeQL",
+            ActivityIcon::Sponsor => "Sponsor croft",
+            ActivityIcon::Settings => "Manage",
+        }
+    }
+
+    /// The picture drawn for the icon where the terminal shows pictures,
+    /// and its Kitty image id, which its states share so swapping one for
+    /// another replaces the picture in place.
+    pub(super) fn picture(self) -> (&'static [u8], u32) {
+        use crate::iterm2_inline as ki;
+        match self {
+            ActivityIcon::Explorer => (ki::EXPLORER_SRC_SVG, ki::KITTY_ID_EXPLORER),
+            ActivityIcon::Search => (ki::SEARCH_SRC_SVG, ki::KITTY_ID_SEARCH),
+            ActivityIcon::SourceControl => {
+                (ki::SOURCE_CONTROL_SRC_SVG, ki::KITTY_ID_SOURCE_CONTROL)
+            }
+            ActivityIcon::Remote => (ki::REMOTE_SRC_SVG, ki::KITTY_ID_REMOTE),
+            ActivityIcon::RunDebug => (ki::RUN_DEBUG_SRC_SVG, ki::KITTY_ID_RUN_DEBUG_BAR),
+            ActivityIcon::Extensions => (ki::EXTENSIONS_SRC_SVG, ki::KITTY_ID_EXTENSIONS),
+            ActivityIcon::Testing => (ki::TESTING_SRC_SVG, ki::KITTY_ID_TESTING),
+            ActivityIcon::CodeQL => (ki::CODEQL_SRC_SVG, ki::KITTY_ID_CODEQL),
+            ActivityIcon::Sponsor => (ki::SPONSOR_HEART_SRC_SVG, ki::KITTY_ID_SPONSOR),
+            ActivityIcon::Settings => (ki::SETTINGS_GEAR_SRC_SVG, ki::KITTY_ID_SETTINGS),
+        }
+    }
+
+    /// Whether the icon can be missing from a laid-out bar: CodeQL's until
+    /// the CodeQL extension is added, and the sponsor heart and the settings
+    /// gear on a bar too short for them. The rest are always there.
+    pub(super) fn optional(self) -> bool {
+        matches!(
+            self,
+            ActivityIcon::CodeQL | ActivityIcon::Sponsor | ActivityIcon::Settings
+        )
+    }
+
+    /// The codicon drawn for the icon on a terminal without pictures.
+    pub(super) fn glyph(self) -> char {
+        match self {
+            ActivityIcon::Explorer => crate::icons::ACTIVITY_EXPLORER,
+            ActivityIcon::Search => crate::icons::ACTIVITY_SEARCH,
+            ActivityIcon::SourceControl => crate::icons::ACTIVITY_SOURCE_CONTROL,
+            ActivityIcon::Remote => crate::icons::ACTIVITY_REMOTE,
+            ActivityIcon::RunDebug => crate::icons::ACTIVITY_RUN_DEBUG,
+            ActivityIcon::Extensions => crate::icons::ACTIVITY_EXTENSIONS,
+            ActivityIcon::Testing => crate::icons::ACTIVITY_TESTING,
+            ActivityIcon::CodeQL => crate::icons::ACTIVITY_CODEQL,
+            ActivityIcon::Sponsor => crate::icons::ACTIVITY_SPONSOR,
+            ActivityIcon::Settings => crate::icons::ACTIVITY_SETTINGS,
+        }
+    }
+}
+
+/// The cell block each activity-bar icon took on the last frame, in
+/// absolute coordinates, indexed by [`ActivityIcon`]. An icon's block is
+/// several rows tall when pictures are drawn, and the hit test uses all of
+/// it. A block is empty while its icon is not shown: CodeQL's while the
+/// built-in CodeQL extension is disabled, and the sponsor heart's and the
+/// settings gear's when the bar is too short for them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ActivityBlocks([Rect; ActivityIcon::ALL.len()]);
+
+impl ActivityBlocks {
+    /// Every icon's block, in [`ActivityIcon::ALL`]'s order.
+    pub(super) fn all(&self) -> &[Rect] {
+        &self.0
+    }
+}
+
+impl std::ops::Index<ActivityIcon> for ActivityBlocks {
+    type Output = Rect;
+    fn index(&self, icon: ActivityIcon) -> &Rect {
+        &self.0[icon as usize]
+    }
+}
+
+impl std::ops::IndexMut<ActivityIcon> for ActivityBlocks {
+    fn index_mut(&mut self, icon: ActivityIcon) -> &mut Rect {
+        &mut self.0[icon as usize]
+    }
 }
 
 /// Where the activity bar's sponsor heart leads (#1940).
@@ -257,107 +382,17 @@ pub(super) fn activity_icon_glyph_x(bar: Rect) -> u16 {
     bar.x + bar.width / 2
 }
 
-pub(super) fn activity_explorer_y(bar: Rect) -> u16 {
-    bar.y + 1
+/// The top row of the view icon in `slot` (see [`ActivityIcon::slot`]): the
+/// stack starts one row below the top of the bar, one icon (and gap) apart.
+pub(super) fn activity_view_y(bar: Rect, slot: u16) -> u16 {
+    bar.y + 1 + slot * (ACTIVITY_ICON_HEIGHT + ACTIVITY_ICON_GAP)
 }
 
-pub(super) fn activity_search_y(bar: Rect) -> u16 {
-    activity_explorer_y(bar) + ACTIVITY_ICON_HEIGHT + ACTIVITY_ICON_GAP
-}
-
-pub(super) fn activity_source_control_y(bar: Rect) -> u16 {
-    activity_search_y(bar) + ACTIVITY_ICON_HEIGHT + ACTIVITY_ICON_GAP
-}
-
-pub(super) fn activity_run_debug_y(bar: Rect) -> u16 {
-    activity_source_control_y(bar) + ACTIVITY_ICON_HEIGHT + ACTIVITY_ICON_GAP
-}
-
-pub(super) fn activity_remote_y(bar: Rect) -> u16 {
-    activity_run_debug_y(bar) + ACTIVITY_ICON_HEIGHT + ACTIVITY_ICON_GAP
-}
-
-pub(super) fn activity_extensions_y(bar: Rect) -> u16 {
-    activity_remote_y(bar) + ACTIVITY_ICON_HEIGHT + ACTIVITY_ICON_GAP
-}
-
-pub(super) fn activity_testing_y(bar: Rect) -> u16 {
-    activity_extensions_y(bar) + ACTIVITY_ICON_HEIGHT + ACTIVITY_ICON_GAP
-}
-
-pub(super) fn activity_explorer_block(bar: Rect) -> Rect {
+/// The block of the view icon in `slot`, the bar's full width.
+pub(super) fn activity_view_block(bar: Rect, slot: u16) -> Rect {
     Rect {
         x: bar.x,
-        y: activity_explorer_y(bar),
-        width: bar.width,
-        height: ACTIVITY_ICON_HEIGHT,
-    }
-}
-
-pub(super) fn activity_search_block(bar: Rect) -> Rect {
-    Rect {
-        x: bar.x,
-        y: activity_search_y(bar),
-        width: bar.width,
-        height: ACTIVITY_ICON_HEIGHT,
-    }
-}
-
-pub(super) fn activity_source_control_block(bar: Rect) -> Rect {
-    Rect {
-        x: bar.x,
-        y: activity_source_control_y(bar),
-        width: bar.width,
-        height: ACTIVITY_ICON_HEIGHT,
-    }
-}
-
-pub(super) fn activity_remote_block(bar: Rect) -> Rect {
-    Rect {
-        x: bar.x,
-        y: activity_remote_y(bar),
-        width: bar.width,
-        height: ACTIVITY_ICON_HEIGHT,
-    }
-}
-
-pub(super) fn activity_run_debug_block(bar: Rect) -> Rect {
-    Rect {
-        x: bar.x,
-        y: activity_run_debug_y(bar),
-        width: bar.width,
-        height: ACTIVITY_ICON_HEIGHT,
-    }
-}
-
-pub(super) fn activity_extensions_block(bar: Rect) -> Rect {
-    Rect {
-        x: bar.x,
-        y: activity_extensions_y(bar),
-        width: bar.width,
-        height: ACTIVITY_ICON_HEIGHT,
-    }
-}
-
-pub(super) fn activity_testing_block(bar: Rect) -> Rect {
-    Rect {
-        x: bar.x,
-        y: activity_testing_y(bar),
-        width: bar.width,
-        height: ACTIVITY_ICON_HEIGHT,
-    }
-}
-
-/// The QL icon (#578), last of the view icons so disabling CodeQL moves no
-/// other icon.
-pub(super) fn activity_codeql_y(bar: Rect) -> u16 {
-    activity_testing_y(bar) + ACTIVITY_ICON_HEIGHT + ACTIVITY_ICON_GAP
-}
-
-pub(super) fn activity_codeql_block(bar: Rect) -> Rect {
-    Rect {
-        x: bar.x,
-        y: activity_codeql_y(bar),
+        y: activity_view_y(bar, slot),
         width: bar.width,
         height: ACTIVITY_ICON_HEIGHT,
     }
@@ -371,7 +406,7 @@ pub(super) fn activity_codeql_block(bar: Rect) -> Rect {
 ///
 /// Reserves a 1-cell bottom inset (`ACTIVITY_ICON_HEIGHT + 1`) so the gap below
 /// the gear matches the 1-cell top inset the view icons get from
-/// `activity_explorer_y`'s `bar.y + 1`. Without it the gear hugged the row
+/// `activity_view_y`'s `bar.y + 1`. Without it the gear hugged the row
 /// directly above the status bar, reading as lopsidedly low.
 pub(super) const ACTIVITY_BOTTOM_INSET: u16 = 1;
 
@@ -395,12 +430,13 @@ pub(super) fn activity_settings_block(bar: Rect, codeql_shown: bool) -> Rect {
 /// must not reach. The last view icon is CodeQL's only once it is added
 /// (#1842).
 pub(super) fn activity_last_view_bottom(bar: Rect, codeql_shown: bool) -> u16 {
-    let last_view_y = if codeql_shown {
-        activity_codeql_y(bar)
+    let last = if codeql_shown {
+        ActivityIcon::CodeQL
     } else {
-        activity_testing_y(bar)
+        ActivityIcon::Testing
     };
-    last_view_y + ACTIVITY_ICON_HEIGHT
+    let slot = last.slot().expect("CodeQL and Testing are view icons");
+    activity_view_y(bar, slot) + ACTIVITY_ICON_HEIGHT
 }
 
 /// The sponsor heart (#1940), stacked directly above the gear as VS Code
@@ -674,29 +710,32 @@ impl App {
     /// same per-icon rectangles the click handler hit-tests, so hover and
     /// click target exactly the same cells.
     pub(super) fn activity_icon_at(&self, col: u16, row: u16) -> Option<ActivityIcon> {
-        let a = &self.sidebar_areas;
-        if rect_contains(a.explorer_icon, col, row) {
-            Some(ActivityIcon::Explorer)
-        } else if rect_contains(a.search_icon, col, row) {
-            Some(ActivityIcon::Search)
-        } else if rect_contains(a.source_control_icon, col, row) {
-            Some(ActivityIcon::SourceControl)
-        } else if rect_contains(a.remote_icon, col, row) {
-            Some(ActivityIcon::Remote)
-        } else if rect_contains(a.run_debug_icon, col, row) {
-            Some(ActivityIcon::RunDebug)
-        } else if rect_contains(a.extensions_icon, col, row) {
-            Some(ActivityIcon::Extensions)
-        } else if rect_contains(a.testing_icon, col, row) {
-            Some(ActivityIcon::Testing)
-        } else if rect_contains(a.codeql_icon, col, row) {
-            Some(ActivityIcon::CodeQL)
-        } else if rect_contains(a.sponsor_icon, col, row) {
-            Some(ActivityIcon::Sponsor)
-        } else if rect_contains(a.settings_icon, col, row) {
-            Some(ActivityIcon::Settings)
-        } else {
-            None
+        ActivityIcon::ALL
+            .into_iter()
+            .find(|&icon| rect_contains(self.sidebar_areas.activity_icons[icon], col, row))
+    }
+
+    /// Whether `icon` shows as selected: its view is the one open, or, for
+    /// the settings gear, its menu is open. The sponsor heart never is.
+    pub(super) fn activity_icon_selected(&self, icon: ActivityIcon) -> bool {
+        match icon.view() {
+            Some(view) => self.activity_view_active(view),
+            None => icon == ActivityIcon::Settings && self.settings_menu_active(),
+        }
+    }
+
+    /// The count drawn at the corner of `icon` on a terminal without
+    /// pictures, where 0 draws none: unsaved files on the Explorer, every
+    /// folder's Source Control rows on Source Control (the same count as with
+    /// pictures, #2629), forwarded ports on Remote and failed tests on
+    /// Testing.
+    fn activity_glyph_count(&self, icon: ActivityIcon) -> usize {
+        match icon {
+            ActivityIcon::Explorer => self.unsaved_count(),
+            ActivityIcon::SourceControl => self.scm_change_count(),
+            ActivityIcon::Remote => self.ports.forwarded_count(),
+            ActivityIcon::Testing => self.testing.failed_count(),
+            _ => 0,
         }
     }
 
@@ -704,7 +743,7 @@ impl App {
     /// onto the screen, so a bottom-anchored gear pops the menu upward — the
     /// same direction VS Code's "Manage" menu opens.
     pub(super) fn settings_menu_origin(&self) -> (u16, u16) {
-        let gear = self.sidebar_areas.settings_icon;
+        let gear = self.sidebar_areas.activity_icons[ActivityIcon::Settings];
         (gear.x + gear.width, gear.y)
     }
 
@@ -1385,40 +1424,26 @@ impl App {
         }
         let active_bar = self.theme.activity_icon_pill();
         let bg_color = bg.bg.unwrap_or(Color::Reset);
-        let explorer_block = activity_explorer_block(area);
-        let search_block = activity_search_block(area);
-        let source_control_block = activity_source_control_block(area);
-        let remote_block = activity_remote_block(area);
-        let run_debug_block = activity_run_debug_block(area);
-        let extensions_block = activity_extensions_block(area);
-        let testing_block = activity_testing_block(area);
-        let codeql_block = if self.is_extension_enabled("codeql") {
-            activity_codeql_block(area)
-        } else {
-            Rect::default()
-        };
-        let settings_block = activity_settings_block(area, codeql_block.width > 0);
-        let sponsor_block = activity_sponsor_block(area, codeql_block.width > 0);
+        let mut blocks = ActivityBlocks::default();
+        for icon in ActivityIcon::ALL {
+            if let Some(slot) = icon.slot() {
+                blocks[icon] = activity_view_block(area, slot);
+            }
+        }
+        if !self.is_extension_enabled("codeql") {
+            blocks[ActivityIcon::CodeQL] = Rect::default();
+        }
+        let codeql_shown = blocks[ActivityIcon::CodeQL].width > 0;
+        blocks[ActivityIcon::Settings] = activity_settings_block(area, codeql_shown);
+        blocks[ActivityIcon::Sponsor] = activity_sponsor_block(area, codeql_shown);
         // The baked icons cover their own rows in the chrome tone; Croft
         // Loch paints only the rows between them, so no icon cell is ever
         // rewritten under its image.
         if self.overlays.activity.has_images()
             && let Some(s) = self.theme.surfaces()
         {
-            let icons = [
-                explorer_block,
-                search_block,
-                source_control_block,
-                remote_block,
-                run_debug_block,
-                extensions_block,
-                testing_block,
-                codeql_block,
-                sponsor_block,
-                settings_block,
-            ];
             for y in area.top()..area.bottom() {
-                if !icons.iter().any(|b| y >= b.top() && y < b.bottom()) {
+                if !blocks.all().iter().any(|b| y >= b.top() && y < b.bottom()) {
                     frame.render_widget(
                         ratatui::widgets::Block::default().style(Style::default().bg(s.chrome())),
                         Rect {
@@ -1431,28 +1456,9 @@ impl App {
                 }
             }
         }
-        let explorer_active = self.activity_view_active(SidebarView::Explorer);
-        let search_active = self.activity_view_active(SidebarView::Search);
-        let source_control_active = self.activity_view_active(SidebarView::SourceControl);
-        let remote_active = self.activity_view_active(SidebarView::Remote);
-        let run_debug_active = self.activity_view_active(SidebarView::RunDebug);
-        let extensions_active = self.activity_view_active(SidebarView::Extensions);
-        let testing_active = self.activity_view_active(SidebarView::Testing);
-        let codeql_active = self.activity_view_active(SidebarView::CodeQL);
-        let settings_active = self.settings_menu_active();
         // Hover brightens the glyph (like active) but draws no selection pill,
         // mirroring the image path's hovered variant. Selected wins over hover.
         let hov = self.hovered_activity_icon;
-        let explorer_hovered = hov == Some(ActivityIcon::Explorer);
-        let search_hovered = hov == Some(ActivityIcon::Search);
-        let source_control_hovered = hov == Some(ActivityIcon::SourceControl);
-        let remote_hovered = hov == Some(ActivityIcon::Remote);
-        let run_debug_hovered = hov == Some(ActivityIcon::RunDebug);
-        let extensions_hovered = hov == Some(ActivityIcon::Extensions);
-        let testing_hovered = hov == Some(ActivityIcon::Testing);
-        let codeql_hovered = hov == Some(ActivityIcon::CodeQL);
-        let sponsor_hovered = hov == Some(ActivityIcon::Sponsor);
-        let settings_hovered = hov == Some(ActivityIcon::Settings);
 
         // Same palette the baked icons use, so an image-less terminal renders
         // the bar in the same colors as an image-capable one instead of a
@@ -1554,112 +1560,46 @@ impl App {
             // pill on the leftmost column. iTerm2's image path bakes the
             // pill into the PNG itself, so this branch is only used on
             // terminals that can't render OSC-1337.
-            render_glyph(
-                frame,
-                explorer_block,
-                crate::icons::ACTIVITY_EXPLORER,
-                explorer_active,
-                explorer_hovered,
-            );
-            render_count_badge(frame, explorer_block, self.unsaved_count());
-            render_glyph(
-                frame,
-                search_block,
-                crate::icons::ACTIVITY_SEARCH,
-                search_active,
-                search_hovered,
-            );
-            render_glyph(
-                frame,
-                source_control_block,
-                crate::icons::ACTIVITY_SOURCE_CONTROL,
-                source_control_active,
-                source_control_hovered,
-            );
-            render_count_badge(frame, source_control_block, self.scm_change_count());
-            render_glyph(
-                frame,
-                remote_block,
-                crate::icons::ACTIVITY_REMOTE,
-                remote_active,
-                remote_hovered,
-            );
-            render_count_badge(frame, remote_block, self.ports.forwarded_count());
-            render_glyph(
-                frame,
-                run_debug_block,
-                crate::icons::ACTIVITY_RUN_DEBUG,
-                run_debug_active,
-                run_debug_hovered,
-            );
-            render_glyph(
-                frame,
-                extensions_block,
-                crate::icons::ACTIVITY_EXTENSIONS,
-                extensions_active,
-                extensions_hovered,
-            );
-            render_glyph(
-                frame,
-                testing_block,
-                crate::icons::ACTIVITY_TESTING,
-                testing_active,
-                testing_hovered,
-            );
-            render_count_badge(frame, testing_block, self.testing.failed_count());
-            if codeql_block.width > 0 {
-                render_glyph(
-                    frame,
-                    codeql_block,
-                    crate::icons::ACTIVITY_CODEQL,
-                    codeql_active,
-                    codeql_hovered,
-                );
-            }
-            if sponsor_block.width > 0 {
-                // The heart's own pink, not the bar's greys (see the bake).
-                let color = if sponsor_hovered {
-                    self.theme.activity_sponsor_hover()
-                } else {
-                    self.theme.activity_sponsor()
-                };
-                frame.render_widget(
-                    ratatui::widgets::Paragraph::new(crate::icons::ACTIVITY_SPONSOR.to_string())
-                        .style(
+            for icon in ActivityIcon::ALL {
+                let block = blocks[icon];
+                if block.width == 0 {
+                    continue;
+                }
+                if icon == ActivityIcon::Sponsor {
+                    // The heart's own pink, not the bar's greys (see the bake).
+                    let color = if hov == Some(icon) {
+                        self.theme.activity_sponsor_hover()
+                    } else {
+                        self.theme.activity_sponsor()
+                    };
+                    frame.render_widget(
+                        ratatui::widgets::Paragraph::new(icon.glyph().to_string()).style(
                             Style::default()
                                 .fg(color)
                                 .bg(bg_color)
                                 .add_modifier(glyph_mods),
                         ),
-                    Rect {
-                        x: glyph_x,
-                        y: sponsor_block.y + sponsor_block.height.saturating_sub(1) / 2,
-                        width: 1,
-                        height: 1,
-                    },
-                );
-            }
-            if settings_block.width > 0 {
+                        Rect {
+                            x: glyph_x,
+                            y: block.y + block.height.saturating_sub(1) / 2,
+                            width: 1,
+                            height: 1,
+                        },
+                    );
+                    continue;
+                }
                 render_glyph(
                     frame,
-                    settings_block,
-                    crate::icons::ACTIVITY_SETTINGS,
-                    settings_active,
-                    settings_hovered,
+                    block,
+                    icon.glyph(),
+                    self.activity_icon_selected(icon),
+                    hov == Some(icon),
                 );
+                render_count_badge(frame, block, self.activity_glyph_count(icon));
             }
         }
 
-        self.sidebar_areas.explorer_icon = explorer_block;
-        self.sidebar_areas.search_icon = search_block;
-        self.sidebar_areas.source_control_icon = source_control_block;
-        self.sidebar_areas.remote_icon = remote_block;
-        self.sidebar_areas.run_debug_icon = run_debug_block;
-        self.sidebar_areas.extensions_icon = extensions_block;
-        self.sidebar_areas.testing_icon = testing_block;
-        self.sidebar_areas.codeql_icon = codeql_block;
-        self.sidebar_areas.sponsor_icon = sponsor_block;
-        self.sidebar_areas.settings_icon = settings_block;
+        self.sidebar_areas.activity_icons = blocks;
     }
 
     pub(super) fn set_sidebar_view(&mut self, view: SidebarView) {

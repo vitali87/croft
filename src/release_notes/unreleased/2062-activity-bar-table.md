@@ -1,0 +1,1 @@
+refactor: Groundwork for the refactor program (#2062): the activity bar's icons are described in one table (where each sits, its tooltip name and its glyph), which places, draws and hit-tests them instead of ten copies of the same code. Nothing changes in use.
