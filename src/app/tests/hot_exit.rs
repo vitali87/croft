@@ -2771,3 +2771,93 @@ fn a_restored_editor_focus_is_drawn_on_the_editor() {
     assert!(next.editor.focused, "the editor draws focused");
     assert!(!next.tree.focused, "the Explorer does not");
 }
+
+/// #2670: screen reader mode read the pane behind eight pop-ups (the
+/// connect dialog, F1, the branch picker, command history, Jump to
+/// Directory, the process list and both symbol pickers) and had nothing to
+/// say for the stash-drop and terminal-paste questions. Every pop-up is read
+/// in place of what it covers.
+#[test]
+fn every_popup_is_read_instead_of_the_pane_behind_it() {
+    use crate::app::popups::Popup;
+    let mut behind_read = Vec::new();
+    for p in Popup::ALL {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("notes.txt");
+        std::fs::write(&file, "one\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open(&file).unwrap();
+        app.focus_pane(Pane::Editor);
+        let behind = app.a11y_snapshot();
+        let _hook = super::popups::open(&mut app, p);
+        let snap = app.a11y_snapshot();
+        if snap.focus == behind.focus && snap.item == behind.item {
+            behind_read.push(format!("{p:?} ({:?})", snap.focus));
+        }
+    }
+    assert!(
+        behind_read.is_empty(),
+        "screen reader mode read the pane behind these pop-ups: {}",
+        behind_read.join(", ")
+    );
+}
+
+/// #2670: the two questions that had no words say what they ask and which
+/// key does what.
+#[test]
+fn the_stash_drop_and_terminal_paste_questions_are_announced() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.pending_stash_drop = Some(PendingStashDrop {
+        root: tmp.path().to_path_buf(),
+        oid: String::from("0123abcd"),
+        label: String::from("stash@{0}: WIP on main"),
+    });
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Drop stash?");
+    assert_eq!(
+        snap.item.as_deref(),
+        Some(
+            "stash@{0}: WIP on main. This permanently deletes the stash. \
+             Y, yes, drop it. N or Escape, no"
+        )
+    );
+    app.pending_stash_drop = None;
+    app.pending_terminal_paste = Some(b"echo a\necho b\n".to_vec());
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Paste 2 lines into the terminal?");
+    assert_eq!(
+        snap.item.as_deref(),
+        Some(
+            "Each line break is an Enter here, so the lines run as they land. \
+             echo a; echo b. \
+             Y or Enter, paste. L, paste as one line. N or Escape, cancel"
+        )
+    );
+}
+
+/// #2670: the connect dialog reads what it asks and the keys for that step,
+/// never what was typed into it.
+#[test]
+fn the_connect_dialog_reads_its_question_but_not_the_password() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let mut dialog = crate::widgets::connect_dialog::ConnectDialog::new(String::from("devbox"));
+    dialog.set_prompt(
+        crate::remote_connect::PromptKind::Password,
+        String::from("dev@devbox's password:"),
+    );
+    for c in "hunter2".chars() {
+        dialog.push_input_char(c);
+    }
+    app.connect_dialog = Some(dialog);
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Connect to devbox");
+    let item = snap.item.unwrap_or_default();
+    assert!(item.contains("dev@devbox's password:"), "{item}");
+    assert!(
+        item.ends_with("Type the answer. Enter, send. Escape, cancel"),
+        "{item}"
+    );
+    assert!(!item.contains("hunter2"), "the password is never read: {item}");
+}
