@@ -746,10 +746,18 @@ thread_local! {
     pub static PLAIN_HOST_FRAMES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Whether croft runs inside tmux (or GNU screen), which must be told to pass
+/// a picture through to the terminal around it. Read from the environment the
+/// first time it is asked and kept (#2062): croft never changes `TERM` or
+/// `TMUX` while it runs, so every later answer would be the same, and the
+/// pictures built on background threads get the same answer as the rest.
 pub fn detect_tmux() -> bool {
-    let term = std::env::var("TERM").ok();
-    let tmux = std::env::var("TMUX").ok();
-    is_tmux_env(term.as_deref(), tmux.as_deref())
+    static INSIDE_TMUX: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *INSIDE_TMUX.get_or_init(|| {
+        let term = std::env::var("TERM").ok();
+        let tmux = std::env::var("TMUX").ok();
+        is_tmux_env(term.as_deref(), tmux.as_deref())
+    })
 }
 
 /// Bake an opaque PNG that exactly fills `(canvas_w_px, canvas_h_px)`. The
@@ -1496,6 +1504,18 @@ mod tests {
     #[test]
     fn screen_term_is_tmux_like() {
         assert!(is_tmux_env(Some("screen-256color"), None));
+    }
+
+    /// #2062: the tmux answer is the environment's, and the same each time it
+    /// is asked, so pictures built anywhere in croft are wrapped alike.
+    #[test]
+    fn the_tmux_answer_is_the_environments_every_time() {
+        let from_env = is_tmux_env(
+            std::env::var("TERM").ok().as_deref(),
+            std::env::var("TMUX").ok().as_deref(),
+        );
+        assert_eq!(detect_tmux(), from_env);
+        assert_eq!(detect_tmux(), from_env);
     }
 
     #[test]

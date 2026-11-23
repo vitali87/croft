@@ -1,0 +1,1 @@
+refactor: Groundwork for the refactor program (#2062): every inline picture croft draws, from the editor's previews to the PROBLEMS badge, goes out through one writer that sends the same bytes as before. Nothing changes in use.
