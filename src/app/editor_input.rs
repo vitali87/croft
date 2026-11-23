@@ -3018,6 +3018,9 @@ pub(super) fn is_vim_chord_y(key: KeyEvent) -> bool {
     is_vim_chord_letter(key, 'y')
 }
 
+/// `Cmd+Shift+G` / `Ctrl+Shift+G`: the bottom of the file, or the line a
+/// pending count names. Opt is rejected: `Cmd+Opt+Shift+G` is Debug: Switch
+/// Session, which leaves the caret alone when no session runs (#2647).
 pub(super) fn is_vim_goto_bottom(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;
@@ -3025,7 +3028,7 @@ pub(super) fn is_vim_goto_bottom(key: KeyEvent) -> bool {
     if !c.eq_ignore_ascii_case(&'g') {
         return false;
     }
-    if !key.modifiers.contains(KeyModifiers::SHIFT) {
+    if !key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::ALT) {
         return false;
     }
     key.modifiers.contains(KeyModifiers::SUPER) || key.modifiers.contains(KeyModifiers::CONTROL)
