@@ -100,6 +100,8 @@ pub use symbols::OutlineKind;
 pub use symbols::OutlineSymbol;
 pub use symbols::WorkspaceSymbolItem;
 use symbols::*;
+#[cfg(test)]
+pub use text_ranges::DocumentHighlightsResult;
 pub use text_ranges::LinkedEditingResult;
 pub use text_ranges::OccurrenceItem;
 use text_ranges::*;
@@ -505,6 +507,10 @@ pub struct LspManager {
     impl_rx: std_mpsc::Receiver<ImplementationResult>,
     ref_rx: std_mpsc::Receiver<ReferencesResult>,
     doc_highlights_rx: std_mpsc::Receiver<DocumentHighlightsResult>,
+    /// Test hook: a sender into `doc_highlights_rx`, so app tests can
+    /// answer a documentHighlight request without a server.
+    #[cfg(test)]
+    doc_highlights_test_tx: std_mpsc::Sender<DocumentHighlightsResult>,
     linked_editing_rx: std_mpsc::Receiver<LinkedEditingResult>,
     /// Test hook: a sender into `linked_editing_rx`, so app tests can
     /// answer a linkedEditingRange request without a server.
@@ -611,6 +617,8 @@ impl LspManager {
         let (impl_tx, impl_rx) = std_mpsc::channel();
         let (ref_tx, ref_rx) = std_mpsc::channel();
         let (doc_highlights_tx, doc_highlights_rx) = std_mpsc::channel();
+        #[cfg(test)]
+        let doc_highlights_test_tx = doc_highlights_tx.clone();
         let (linked_editing_tx, linked_editing_rx) = std_mpsc::channel();
         #[cfg(test)]
         let linked_editing_test_tx = linked_editing_tx.clone();
@@ -724,6 +732,8 @@ impl LspManager {
             impl_rx,
             ref_rx,
             doc_highlights_rx,
+            #[cfg(test)]
+            doc_highlights_test_tx,
             linked_editing_rx,
             #[cfg(test)]
             linked_editing_test_tx,
