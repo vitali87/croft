@@ -148,9 +148,14 @@ fn open(app: &mut App, p: Popup) -> Option<std::os::unix::net::UnixStream> {
             app.shortcuts_modal = Some(crate::widgets::shortcuts::ShortcutsModal::default());
         }
         Popup::ConnectDialog => {
-            app.connect_dialog = Some(crate::widgets::connect_dialog::ConnectDialog::new(
-                String::from("devbox"),
-            ));
+            // Waiting for a password, so it has a field to type into.
+            let mut dialog =
+                crate::widgets::connect_dialog::ConnectDialog::new(String::from("devbox"));
+            dialog.set_prompt(
+                crate::remote_connect::PromptKind::Password,
+                String::from("devbox's password:"),
+            );
+            app.connect_dialog = Some(dialog);
         }
         Popup::Approval => {
             use std::io::Write;
@@ -587,5 +592,194 @@ fn an_editor_picture_waits_for_a_tab_tooltip_drawn_over_it() {
     assert!(
         app.editor_image_payload(0).is_none(),
         "the tab tooltip is drawn over the picture, so the picture waits"
+    );
+}
+
+/// An app with `notes.txt` open in the editor and a terminal running a
+/// program that prints nothing, so every byte written toward it is one the
+/// test sent. `behind` is the pane that has the focus under the pop-ups.
+fn paste_app(root: &Path, behind: Pane) -> App {
+    let path = root.join("notes.txt");
+    std::fs::write(&path, "keep\n").unwrap();
+    let mut app = App::new(root.to_path_buf()).unwrap();
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), String::from("sleep 30")],
+        root,
+    )
+    .unwrap();
+    app.active_terminal = 0;
+    app.editor.open(&path).unwrap();
+    app.focus_pane(behind);
+    app
+}
+
+/// Every place typed or pasted text can land: the file, the shell, and the
+/// field of each pop-up that has one.
+fn typed_text(app: &App) -> Vec<(&'static str, Option<String>)> {
+    vec![
+        ("the file", Some(app.editor.lines.join("\n"))),
+        (
+            "the shell",
+            Some(String::from_utf8_lossy(&app.terminals[0].written_bytes_for_test()).into_owned()),
+        ),
+        (
+            "New File box",
+            app.prompt.as_ref().map(|p| p.buffer.clone()),
+        ),
+        (
+            "Quick Open",
+            app.file_finder.as_ref().map(|f| f.query.clone()),
+        ),
+        (
+            "palette",
+            app.command_palette.as_ref().map(|p| p.query.clone()),
+        ),
+        (
+            "Go to Symbol",
+            app.go_to_symbol.as_ref().map(|p| p.query.clone()),
+        ),
+        (
+            "workspace symbols",
+            app.workspace_symbols.as_ref().map(|p| p.query.clone()),
+        ),
+        (
+            "Jump to Directory",
+            app.zoxide_jump.as_ref().map(|p| p.query.clone()),
+        ),
+        (
+            "command history",
+            app.command_history_popup.as_ref().map(|p| p.query.clone()),
+        ),
+        (
+            "branch picker",
+            app.branch_picker.as_ref().map(|p| p.query.clone()),
+        ),
+        (
+            "Settings search",
+            app.settings_editor.as_ref().map(|e| e.query.clone()),
+        ),
+        (
+            "input box",
+            app.input_prompt.as_ref().map(|p| p.value.clone()),
+        ),
+        (
+            "list picker",
+            app.list_picker.as_ref().map(|p| p.query.clone()),
+        ),
+        (
+            "password box",
+            app.connect_dialog.as_ref().map(|d| d.input.clone()),
+        ),
+        (
+            "refusal reason",
+            app.approval_ui.as_ref().and_then(|u| u.reason.clone()),
+        ),
+    ]
+}
+
+/// Open `popups` in turn over a fresh app, then either type `text` or paste
+/// it, and say where it landed.
+fn land(
+    popups: &[Popup],
+    behind: Pane,
+    paste: bool,
+    text: &str,
+) -> Vec<(&'static str, Option<String>)> {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = paste_app(tmp.path(), behind);
+    let _hooks: Vec<_> = popups.iter().map(|&p| open(&mut app, p)).collect();
+    for &p in popups {
+        assert!(p.is_open(&app), "{p:?} must count as open");
+    }
+    if paste {
+        app.handle_paste(text);
+    } else {
+        for c in text.chars() {
+            app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+                .unwrap();
+        }
+    }
+    typed_text(&app)
+}
+
+/// The places where pasting `zx` and typing it end up differently. The
+/// startup warning, which takes the first key to close itself, drops a paste
+/// whole: there, a paste must change nothing, as typing nothing does.
+fn paste_differs_from_typing(popups: &[Popup], behind: Pane) -> Vec<String> {
+    let typing = if popups.last() == Some(&Popup::TerminalWarning) {
+        ""
+    } else {
+        "zx"
+    };
+    let typed = land(popups, behind, false, typing);
+    let pasted = land(popups, behind, true, "zx");
+    typed
+        .iter()
+        .zip(&pasted)
+        .filter(|(t, p)| t != p)
+        .map(|((place, t), (_, p))| format!("{place}: typed {t:?}, pasted {p:?}"))
+        .collect()
+}
+
+/// The bug (#2665): a paste went to one of six pop-ups or the New File box,
+/// and otherwise to the pane behind. Under the other 22 pop-ups, the SSH
+/// password box, the branch picker, Settings, an agent's proposal and every
+/// confirm among them, it was typed into the file or the shell the pop-up
+/// hides. A paste now lands where typing the same text does: in the field
+/// of a pop-up that has one, and nowhere under one that has none.
+#[test]
+fn a_paste_lands_where_typing_does_under_every_popup() {
+    let mut wrong = Vec::new();
+    for (behind, name) in [(Pane::Editor, "editor"), (Pane::Terminal, "terminal")] {
+        for p in Popup::ALL {
+            let differs = paste_differs_from_typing(&[p], behind);
+            if !differs.is_empty() {
+                wrong.push(format!("{p:?} over the {name}: {}", differs.join("; ")));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "a paste went somewhere typing does not:\n{}",
+        wrong.join("\n")
+    );
+}
+
+/// An agent's proposal can arrive over any pop-up and takes the keys from
+/// it; a paste must not go into the pop-up underneath either (#2665).
+#[test]
+fn a_proposal_arriving_over_a_popup_takes_the_paste_as_it_takes_the_keys() {
+    let mut wrong = Vec::new();
+    for p in Popup::ALL.into_iter().filter(|&p| p != Popup::Approval) {
+        let differs = paste_differs_from_typing(&[p, Popup::Approval], Pane::Editor);
+        if !differs.is_empty() {
+            wrong.push(format!("{p:?}: {}", differs.join("; ")));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "under a proposal, a paste went somewhere typing does not:\n{}",
+        wrong.join("\n")
+    );
+}
+
+/// The reason for refusing an agent's edit, once `r` has opened it, takes a
+/// paste as it takes typing, without the line break that would send it.
+#[test]
+fn a_paste_goes_into_the_reason_for_refusing_an_edit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = paste_app(tmp.path(), Pane::Editor);
+    let _hook = open(&mut app, Popup::Approval);
+    app.approval_ui.as_mut().unwrap().reason = Some(String::from("not "));
+    app.handle_paste("this way\n");
+    assert_eq!(
+        app.approval_ui.as_ref().unwrap().reason.as_deref(),
+        Some("not this way")
+    );
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        "keep",
+        "nothing reaches the file"
     );
 }
