@@ -1,5 +1,6 @@
-//! What croft tells a server it can do: the client capabilities sent at initialize, and
-//! the standard semantic token types and modifiers it declares.
+//! What croft and a server tell each other they can do: the client capabilities sent
+//! at initialize, the standard semantic token types and modifiers croft declares, and
+//! what each server's reply says it supports.
 
 use super::*;
 
@@ -357,5 +358,160 @@ pub(super) fn build_client_capabilities() -> ClientCapabilities {
             }
         })),
         ..Default::default()
+    }
+}
+
+/// What one server said it can do, read off its initialize reply as it
+/// starts. The fields are named, and mean, as on [`ManagedClient`], which
+/// keeps them for the server's life.
+pub(super) struct ServerSupport {
+    pub(super) supports_completion: bool,
+    pub(super) completion_triggers: String,
+    pub(super) supports_signature_help: bool,
+    pub(super) supports_workspace_diagnostics: bool,
+    pub(super) diagnostic_identifier: Option<String>,
+    pub(super) save_notify: SaveNotify,
+    pub(super) supports_document_diagnostics: bool,
+    pub(super) supports_hover: bool,
+    pub(super) supports_definition: bool,
+    pub(super) supports_document_symbol: bool,
+    pub(super) supports_declaration: bool,
+    pub(super) supports_type_definition: bool,
+    pub(super) supports_implementation: bool,
+    pub(super) supports_references: bool,
+    pub(super) supports_document_highlight: bool,
+    pub(super) supports_linked_editing: bool,
+    pub(super) supports_inline_completion: bool,
+    pub(super) supports_selection_range: bool,
+    pub(super) supports_call_hierarchy: bool,
+    pub(super) supports_type_hierarchy: bool,
+    pub(super) supports_workspace_symbols: bool,
+    pub(super) supports_rename: bool,
+    pub(super) supports_prepare_rename: bool,
+    pub(super) supports_formatting: bool,
+    pub(super) on_type_triggers: Option<String>,
+    pub(super) supports_range_formatting: bool,
+    pub(super) supports_code_action: bool,
+    pub(super) semantic_legend: Option<Arc<Vec<String>>>,
+    pub(super) semantic_supports_range: bool,
+    pub(super) supports_inlay_hints: bool,
+    pub(super) supports_document_link: bool,
+    pub(super) supports_code_lens: bool,
+    pub(super) code_lens_resolve: bool,
+    pub(super) server_commands: Arc<Vec<String>>,
+    pub(super) supports_folding_range: bool,
+    pub(super) supports_document_color: bool,
+    pub(super) will_rename: Option<Arc<crate::lsp::file_ops::FileOpFilters>>,
+    pub(super) did_rename: Option<Arc<crate::lsp::file_ops::FileOpFilters>>,
+}
+
+/// Read [`ServerSupport`] off a server's capabilities. `type_hierarchy` comes
+/// from the raw initialize reply instead, because [`ServerCapabilities`]
+/// cannot carry `typeHierarchyProvider` in `lsp-types` 0.95 (#613).
+pub(super) fn server_support(caps: &ServerCapabilities, type_hierarchy: bool) -> ServerSupport {
+    // A capability that can be sent as a bare `false` (the bool-or-options
+    // shapes) must be read as its inner bool: `Option::is_some` treats
+    // `Some(false)` as supported, which made croft call
+    // `textDocument/declaration` on vtsls (which advertises
+    // `declarationProvider: false`) and get a -32601 "Unhandled method" back.
+    let supports_completion = caps.completion_provider.is_some();
+    let completion_triggers = completion_triggers_of(caps);
+    let supports_signature_help = signature_help_supported(&caps.signature_help_provider);
+    let supports_workspace_diagnostics = workspace_diagnostics_supported(&caps.diagnostic_provider);
+    let supports_document_diagnostics = caps.diagnostic_provider.is_some();
+    let diagnostic_identifier = diagnostic_identifier_of(&caps.diagnostic_provider);
+    let save_notify = save_notify_of(&caps.text_document_sync);
+    let supports_hover = hover_supported(&caps.hover_provider);
+    let supports_definition = one_of_supported(&caps.definition_provider);
+    let supports_document_symbol = one_of_supported(&caps.document_symbol_provider);
+    let supports_declaration = declaration_supported(&caps.declaration_provider);
+    let supports_type_definition = type_definition_supported(&caps.type_definition_provider);
+    let supports_implementation = implementation_supported(&caps.implementation_provider);
+    let supports_references = one_of_supported(&caps.references_provider);
+    let supports_document_highlight = one_of_supported(&caps.document_highlight_provider);
+    let supports_linked_editing = linked_editing_supported(&caps.linked_editing_range_provider);
+    let supports_inline_completion = one_of_supported(&caps.inline_completion_provider);
+    let supports_selection_range = selection_range_supported(&caps.selection_range_provider);
+    let supports_call_hierarchy = call_hierarchy_supported(&caps.call_hierarchy_provider);
+    let supports_type_hierarchy = type_hierarchy;
+    let supports_workspace_symbols = one_of_supported(&caps.workspace_symbol_provider);
+    let supports_rename = one_of_supported(&caps.rename_provider);
+    let supports_prepare_rename = prepare_rename_supported(&caps.rename_provider);
+    let supports_formatting = one_of_supported(&caps.document_formatting_provider);
+    let on_type_triggers = caps.document_on_type_formatting_provider.as_ref().map(|o| {
+        let mut t = o.first_trigger_character.clone();
+        for more in o.more_trigger_character.iter().flatten() {
+            t.push_str(more);
+        }
+        t
+    });
+    let supports_range_formatting = one_of_supported(&caps.document_range_formatting_provider);
+    let supports_code_action = code_action_supported(&caps.code_action_provider);
+    let semantic_legend = semantic_legend_of(caps).map(Arc::new);
+    let semantic_supports_range = semantic_tokens_range_supported(caps);
+    let supports_inlay_hints = one_of_supported(&caps.inlay_hint_provider);
+    let supports_document_link = caps.document_link_provider.is_some();
+    let supports_code_lens = caps.code_lens_provider.is_some();
+    let code_lens_resolve = caps
+        .code_lens_provider
+        .as_ref()
+        .and_then(|o| o.resolve_provider)
+        .unwrap_or(false);
+    let server_commands = Arc::new(
+        caps.execute_command_provider
+            .as_ref()
+            .map(|o| o.commands.clone())
+            .unwrap_or_default(),
+    );
+    let supports_folding_range = folding_range_supported(&caps.folding_range_provider);
+    let supports_document_color = color_provider_supported(&caps.color_provider);
+    let file_ops = caps
+        .workspace
+        .as_ref()
+        .and_then(|w| w.file_operations.as_ref());
+    let compile = |reg: Option<&lsp_types::FileOperationRegistrationOptions>| {
+        reg.map(|r| Arc::new(crate::lsp::file_ops::FileOpFilters::from_registration(r)))
+    };
+    let will_rename = compile(file_ops.and_then(|f| f.will_rename.as_ref()));
+    let did_rename = compile(file_ops.and_then(|f| f.did_rename.as_ref()));
+    ServerSupport {
+        supports_completion,
+        completion_triggers,
+        supports_signature_help,
+        supports_workspace_diagnostics,
+        diagnostic_identifier,
+        save_notify,
+        supports_document_diagnostics,
+        supports_hover,
+        supports_definition,
+        supports_document_symbol,
+        supports_declaration,
+        supports_type_definition,
+        supports_implementation,
+        supports_references,
+        supports_document_highlight,
+        supports_linked_editing,
+        supports_inline_completion,
+        supports_selection_range,
+        supports_call_hierarchy,
+        supports_type_hierarchy,
+        supports_workspace_symbols,
+        supports_rename,
+        supports_prepare_rename,
+        supports_formatting,
+        on_type_triggers,
+        supports_range_formatting,
+        supports_code_action,
+        semantic_legend,
+        semantic_supports_range,
+        supports_inlay_hints,
+        supports_document_link,
+        supports_code_lens,
+        code_lens_resolve,
+        server_commands,
+        supports_folding_range,
+        supports_document_color,
+        will_rename,
+        did_rename,
     }
 }

@@ -483,69 +483,15 @@ pub struct LspManager {
     /// and be persisted to the content-keyed cache.
     semantic_generation: std::sync::atomic::AtomicU64,
     cmd_tx: tokio_mpsc::UnboundedSender<Cmd>,
-    completion_rx: std_mpsc::Receiver<CompletionResult>,
-    signature_help_rx: std_mpsc::Receiver<SignatureHelpResult>,
-    hover_rx: std_mpsc::Receiver<HoverResult>,
-    /// Test hook: a sender into `hover_rx`, so app tests can answer a
-    /// hover request without a server.
+    /// Every kind of reply the worker sends back, each on its own channel.
+    replies: Replies,
+    /// Test hook: a sender into every reply channel, so app tests can
+    /// answer a request without a server.
     #[cfg(test)]
-    hover_test_tx: std_mpsc::Sender<HoverResult>,
-    rust_analyzer_rx: std_mpsc::Receiver<RustAnalyzerResult>,
-    def_rx: std_mpsc::Receiver<DefinitionResult>,
-    /// Test hooks: senders into the three jump channels, so app tests can
-    /// answer a definition, declaration or type definition request
-    /// without a server.
-    #[cfg(test)]
-    jump_test_tx: (
-        std_mpsc::Sender<DefinitionResult>,
-        std_mpsc::Sender<DeclarationResult>,
-        std_mpsc::Sender<TypeDefinitionResult>,
-    ),
-    doc_symbols_rx: std_mpsc::Receiver<DocumentSymbolsResult>,
-    decl_rx: std_mpsc::Receiver<DeclarationResult>,
-    type_def_rx: std_mpsc::Receiver<TypeDefinitionResult>,
-    impl_rx: std_mpsc::Receiver<ImplementationResult>,
-    ref_rx: std_mpsc::Receiver<ReferencesResult>,
-    doc_highlights_rx: std_mpsc::Receiver<DocumentHighlightsResult>,
-    /// Test hook: a sender into `doc_highlights_rx`, so app tests can
-    /// answer a documentHighlight request without a server.
-    #[cfg(test)]
-    doc_highlights_test_tx: std_mpsc::Sender<DocumentHighlightsResult>,
-    linked_editing_rx: std_mpsc::Receiver<LinkedEditingResult>,
-    /// Test hook: a sender into `linked_editing_rx`, so app tests can
-    /// answer a linkedEditingRange request without a server.
-    #[cfg(test)]
-    linked_editing_test_tx: std_mpsc::Sender<LinkedEditingResult>,
-    inline_completion_rx: std_mpsc::Receiver<InlineCompletionResult>,
-    /// Test hook: a sender into `inline_completion_rx`, so app tests can
-    /// answer an inlineCompletion request without a server.
-    #[cfg(test)]
-    inline_completion_test_tx: std_mpsc::Sender<InlineCompletionResult>,
+    reply_test_tx: ResultSenders,
     /// Test hook: the text each document was last opened or changed with.
     #[cfg(test)]
     synced_texts: std::sync::Mutex<HashMap<PathBuf, String>>,
-    selection_ranges_rx: std_mpsc::Receiver<SelectionRangesResult>,
-    calls_rx: std_mpsc::Receiver<CallHierarchyResult>,
-    ws_symbols_rx: std_mpsc::Receiver<WorkspaceSymbolsResult>,
-    rename_rx: std_mpsc::Receiver<RenameResult>,
-    prepare_rename_rx: std_mpsc::Receiver<PrepareRenameResult>,
-    will_rename_files_rx: std_mpsc::Receiver<WillRenameFilesResult>,
-    format_rx: std_mpsc::Receiver<FormatResult>,
-    on_type_rx: std_mpsc::Receiver<FormatResult>,
-    code_action_rx: std_mpsc::Receiver<CodeActionResult>,
-    semantic_rx: std_mpsc::Receiver<SemanticTokensUpdate>,
-    inlay_rx: std_mpsc::Receiver<InlayHintsUpdate>,
-    links_rx: std_mpsc::Receiver<DocumentLinksUpdate>,
-    code_lens_rx: std_mpsc::Receiver<CodeLensUpdate>,
-    folding_rx: std_mpsc::Receiver<FoldingRangesUpdate>,
-    colors_rx: std_mpsc::Receiver<DocumentColorsUpdate>,
-    color_presentations_rx: std_mpsc::Receiver<ColorPresentationsResult>,
-    diagnostics_rx: std_mpsc::Receiver<DiagnosticsUpdate>,
-    /// Test hook: a sender into `diagnostics_rx`, so app tests can deliver
-    /// a server's report without a server.
-    #[cfg(test)]
-    diagnostics_test_tx: std_mpsc::Sender<DiagnosticsUpdate>,
-    progress_rx: std_mpsc::Receiver<ServerUpdate>,
     capability_support: CapabilitySupport,
     semantic_refresh: Arc<AtomicBool>,
     inlay_refresh: Arc<AtomicBool>,
@@ -602,49 +548,9 @@ impl LspManager {
     pub fn new(workspace_root: PathBuf) -> Result<Self> {
         let runtime = LspRuntime::new()?;
         let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel();
-        let (completion_tx, completion_rx) = std_mpsc::channel();
-        let (signature_help_tx, signature_help_rx) = std_mpsc::channel();
-        let (hover_tx, hover_rx) = std_mpsc::channel();
+        let (senders, replies) = reply_channels();
         #[cfg(test)]
-        let hover_test_tx = hover_tx.clone();
-        let (rust_analyzer_tx, rust_analyzer_rx) = std_mpsc::channel();
-        let (def_tx, def_rx) = std_mpsc::channel();
-        let (doc_symbols_tx, doc_symbols_rx) = std_mpsc::channel();
-        let (decl_tx, decl_rx) = std_mpsc::channel();
-        let (type_def_tx, type_def_rx) = std_mpsc::channel();
-        #[cfg(test)]
-        let jump_test_tx = (def_tx.clone(), decl_tx.clone(), type_def_tx.clone());
-        let (impl_tx, impl_rx) = std_mpsc::channel();
-        let (ref_tx, ref_rx) = std_mpsc::channel();
-        let (doc_highlights_tx, doc_highlights_rx) = std_mpsc::channel();
-        #[cfg(test)]
-        let doc_highlights_test_tx = doc_highlights_tx.clone();
-        let (linked_editing_tx, linked_editing_rx) = std_mpsc::channel();
-        #[cfg(test)]
-        let linked_editing_test_tx = linked_editing_tx.clone();
-        let (inline_completion_tx, inline_completion_rx) = std_mpsc::channel();
-        #[cfg(test)]
-        let inline_completion_test_tx = inline_completion_tx.clone();
-        let (selection_ranges_tx, selection_ranges_rx) = std_mpsc::channel();
-        let (calls_tx, calls_rx) = std_mpsc::channel();
-        let (ws_symbols_tx, ws_symbols_rx) = std_mpsc::channel();
-        let (rename_tx, rename_rx) = std_mpsc::channel();
-        let (prepare_rename_tx, prepare_rename_rx) = std_mpsc::channel();
-        let (will_rename_files_tx, will_rename_files_rx) = std_mpsc::channel();
-        let (format_tx, format_rx) = std_mpsc::channel();
-        let (on_type_tx, on_type_rx) = std_mpsc::channel();
-        let (code_action_tx, code_action_rx) = std_mpsc::channel();
-        let (semantic_tx, semantic_rx) = std_mpsc::channel();
-        let (inlay_tx, inlay_rx) = std_mpsc::channel();
-        let (links_tx, links_rx) = std_mpsc::channel();
-        let (code_lens_tx, code_lens_rx) = std_mpsc::channel();
-        let (folding_tx, folding_rx) = std_mpsc::channel();
-        let (colors_tx, colors_rx) = std_mpsc::channel();
-        let (color_presentations_tx, color_presentations_rx) = std_mpsc::channel();
-        let (diagnostics_tx, diagnostics_rx) = std_mpsc::channel();
-        #[cfg(test)]
-        let diagnostics_test_tx = diagnostics_tx.clone();
-        let (progress_tx, progress_rx) = std_mpsc::channel();
+        let reply_test_tx = senders.clone();
         let capability_support: CapabilitySupport =
             Arc::new(StdMutex::new(LangCapabilitySupport::default()));
         let semantic_refresh = Arc::new(AtomicBool::new(false));
@@ -674,39 +580,7 @@ impl LspManager {
             root,
             registry,
             cmd_rx,
-            ResultSenders {
-                completion: completion_tx,
-                signature_help: signature_help_tx,
-                hover: hover_tx,
-                rust_analyzer: rust_analyzer_tx,
-                definition: def_tx,
-                document_symbols: doc_symbols_tx,
-                declaration: decl_tx,
-                type_definition: type_def_tx,
-                implementation: impl_tx,
-                references: ref_tx,
-                document_highlights: doc_highlights_tx,
-                linked_editing: linked_editing_tx,
-                inline_completion: inline_completion_tx,
-                selection_ranges: selection_ranges_tx,
-                call_hierarchy: calls_tx,
-                workspace_symbols: ws_symbols_tx,
-                rename: rename_tx,
-                prepare_rename: prepare_rename_tx,
-                will_rename_files: will_rename_files_tx,
-                formatting: format_tx,
-                on_type_formatting: on_type_tx,
-                code_action: code_action_tx,
-                semantic_tokens: semantic_tx,
-                inlay_hints: inlay_tx,
-                document_links: links_tx,
-                code_lens: code_lens_tx,
-                folding_ranges: folding_tx,
-                document_colors: colors_tx,
-                color_presentations: color_presentations_tx,
-                diagnostics: diagnostics_tx,
-                progress: progress_tx,
-            },
+            senders,
             capability_support.clone(),
             semantic_refresh.clone(),
             inlay_refresh.clone(),
@@ -717,51 +591,11 @@ impl LspManager {
             registered_servers,
             semantic_generation: std::sync::atomic::AtomicU64::new(0),
             cmd_tx,
-            completion_rx,
-            signature_help_rx,
-            hover_rx,
+            replies,
             #[cfg(test)]
-            hover_test_tx,
-            rust_analyzer_rx,
-            def_rx,
-            #[cfg(test)]
-            jump_test_tx,
-            doc_symbols_rx,
-            decl_rx,
-            type_def_rx,
-            impl_rx,
-            ref_rx,
-            doc_highlights_rx,
-            #[cfg(test)]
-            doc_highlights_test_tx,
-            linked_editing_rx,
-            #[cfg(test)]
-            linked_editing_test_tx,
-            inline_completion_rx,
-            #[cfg(test)]
-            inline_completion_test_tx,
+            reply_test_tx,
             #[cfg(test)]
             synced_texts: Default::default(),
-            selection_ranges_rx,
-            calls_rx,
-            ws_symbols_rx,
-            rename_rx,
-            prepare_rename_rx,
-            will_rename_files_rx,
-            format_rx,
-            on_type_rx,
-            code_action_rx,
-            semantic_rx,
-            inlay_rx,
-            links_rx,
-            code_lens_rx,
-            folding_rx,
-            colors_rx,
-            color_presentations_rx,
-            diagnostics_rx,
-            #[cfg(test)]
-            diagnostics_test_tx,
-            progress_rx,
             capability_support,
             semantic_refresh,
             inlay_refresh,
@@ -907,6 +741,100 @@ struct ManagedClient {
     did_rename: Option<Arc<crate::lsp::file_ops::FileOpFilters>>,
 }
 
+impl ManagedClient {
+    /// A started server's state: what it said it can do, and fresh
+    /// bookkeeping for the requests croft will send it.
+    fn new(name: String, client: LspClient, support: ServerSupport) -> Self {
+        let ServerSupport {
+            supports_completion,
+            completion_triggers,
+            supports_signature_help,
+            supports_workspace_diagnostics,
+            diagnostic_identifier,
+            save_notify,
+            supports_document_diagnostics,
+            supports_hover,
+            supports_definition,
+            supports_document_symbol,
+            supports_declaration,
+            supports_type_definition,
+            supports_implementation,
+            supports_references,
+            supports_document_highlight,
+            supports_linked_editing,
+            supports_inline_completion,
+            supports_selection_range,
+            supports_call_hierarchy,
+            supports_type_hierarchy,
+            supports_workspace_symbols,
+            supports_rename,
+            supports_prepare_rename,
+            supports_formatting,
+            on_type_triggers,
+            supports_range_formatting,
+            supports_code_action,
+            semantic_legend,
+            semantic_supports_range,
+            supports_inlay_hints,
+            supports_document_link,
+            supports_code_lens,
+            code_lens_resolve,
+            server_commands,
+            supports_folding_range,
+            supports_document_color,
+            will_rename,
+            did_rename,
+        } = support;
+        Self {
+            name,
+            client: Arc::new(TokioMutex::new(client)),
+            supports_completion,
+            completion_triggers,
+            supports_signature_help,
+            supports_workspace_diagnostics,
+            diagnostic_identifier,
+            diagnostic_result_ids: Arc::new(TokioMutex::new(DiagnosticResultIds::default())),
+            diagnostic_pull_stalled: Arc::new(AtomicBool::new(false)),
+            save_notify,
+            supports_document_diagnostics,
+            document_pull_stalled: Arc::new(AtomicBool::new(false)),
+            prepare_rename_stalled: Arc::new(AtomicBool::new(false)),
+            document_pull_generations: Arc::new(StdMutex::new(HashMap::new())),
+            supports_hover,
+            supports_definition,
+            supports_document_symbol,
+            supports_declaration,
+            supports_type_definition,
+            supports_implementation,
+            supports_references,
+            supports_document_highlight,
+            supports_linked_editing,
+            supports_inline_completion,
+            supports_selection_range,
+            supports_call_hierarchy,
+            supports_type_hierarchy,
+            supports_workspace_symbols,
+            supports_rename,
+            supports_prepare_rename,
+            supports_formatting,
+            on_type_triggers,
+            supports_range_formatting,
+            supports_code_action,
+            semantic_legend,
+            semantic_supports_range,
+            supports_inlay_hints,
+            supports_document_link,
+            supports_code_lens,
+            code_lens_resolve,
+            server_commands,
+            supports_folding_range,
+            supports_document_color,
+            will_rename,
+            did_rename,
+        }
+    }
+}
+
 /// Servers are keyed by language AND the file's project root, not language
 /// alone. A monorepo has one `.venv` (and `pyproject.toml`) per sub-project, so
 /// a single server rooted at croft's workspace root can't resolve any of them.
@@ -983,6 +911,8 @@ struct DocState {
 
 /// The reply channels the worker sends results back on, bundled so
 /// `worker_loop` keeps a small argument list as request kinds grow.
+/// [`Replies`] holds the other end of each; [`reply_channels`] makes both.
+#[cfg_attr(test, derive(Clone))]
 struct ResultSenders {
     completion: std_mpsc::Sender<CompletionResult>,
     signature_help: std_mpsc::Sender<SignatureHelpResult>,
@@ -1015,6 +945,148 @@ struct ResultSenders {
     color_presentations: std_mpsc::Sender<ColorPresentationsResult>,
     diagnostics: std_mpsc::Sender<DiagnosticsUpdate>,
     progress: std_mpsc::Sender<ServerUpdate>,
+}
+
+/// The app's end of the reply channels: one receiver per kind of reply,
+/// named and ordered as in [`ResultSenders`]. Each kind keeps its own
+/// channel, so one kind's replies arrive in the order they were sent and
+/// the app drains the kinds in its own fixed order each tick.
+struct Replies {
+    completion: std_mpsc::Receiver<CompletionResult>,
+    signature_help: std_mpsc::Receiver<SignatureHelpResult>,
+    hover: std_mpsc::Receiver<HoverResult>,
+    rust_analyzer: std_mpsc::Receiver<RustAnalyzerResult>,
+    definition: std_mpsc::Receiver<DefinitionResult>,
+    document_symbols: std_mpsc::Receiver<DocumentSymbolsResult>,
+    declaration: std_mpsc::Receiver<DeclarationResult>,
+    type_definition: std_mpsc::Receiver<TypeDefinitionResult>,
+    implementation: std_mpsc::Receiver<ImplementationResult>,
+    references: std_mpsc::Receiver<ReferencesResult>,
+    document_highlights: std_mpsc::Receiver<DocumentHighlightsResult>,
+    linked_editing: std_mpsc::Receiver<LinkedEditingResult>,
+    inline_completion: std_mpsc::Receiver<InlineCompletionResult>,
+    selection_ranges: std_mpsc::Receiver<SelectionRangesResult>,
+    call_hierarchy: std_mpsc::Receiver<CallHierarchyResult>,
+    workspace_symbols: std_mpsc::Receiver<WorkspaceSymbolsResult>,
+    rename: std_mpsc::Receiver<RenameResult>,
+    prepare_rename: std_mpsc::Receiver<PrepareRenameResult>,
+    will_rename_files: std_mpsc::Receiver<WillRenameFilesResult>,
+    formatting: std_mpsc::Receiver<FormatResult>,
+    on_type_formatting: std_mpsc::Receiver<FormatResult>,
+    code_action: std_mpsc::Receiver<CodeActionResult>,
+    semantic_tokens: std_mpsc::Receiver<SemanticTokensUpdate>,
+    inlay_hints: std_mpsc::Receiver<InlayHintsUpdate>,
+    document_links: std_mpsc::Receiver<DocumentLinksUpdate>,
+    code_lens: std_mpsc::Receiver<CodeLensUpdate>,
+    folding_ranges: std_mpsc::Receiver<FoldingRangesUpdate>,
+    document_colors: std_mpsc::Receiver<DocumentColorsUpdate>,
+    color_presentations: std_mpsc::Receiver<ColorPresentationsResult>,
+    diagnostics: std_mpsc::Receiver<DiagnosticsUpdate>,
+    progress: std_mpsc::Receiver<ServerUpdate>,
+}
+
+/// One channel per kind of reply: the worker's senders and the app's
+/// receivers, paired by name.
+fn reply_channels() -> (ResultSenders, Replies) {
+    let (completion, completion_rx) = std_mpsc::channel();
+    let (signature_help, signature_help_rx) = std_mpsc::channel();
+    let (hover, hover_rx) = std_mpsc::channel();
+    let (rust_analyzer, rust_analyzer_rx) = std_mpsc::channel();
+    let (definition, definition_rx) = std_mpsc::channel();
+    let (document_symbols, document_symbols_rx) = std_mpsc::channel();
+    let (declaration, declaration_rx) = std_mpsc::channel();
+    let (type_definition, type_definition_rx) = std_mpsc::channel();
+    let (implementation, implementation_rx) = std_mpsc::channel();
+    let (references, references_rx) = std_mpsc::channel();
+    let (document_highlights, document_highlights_rx) = std_mpsc::channel();
+    let (linked_editing, linked_editing_rx) = std_mpsc::channel();
+    let (inline_completion, inline_completion_rx) = std_mpsc::channel();
+    let (selection_ranges, selection_ranges_rx) = std_mpsc::channel();
+    let (call_hierarchy, call_hierarchy_rx) = std_mpsc::channel();
+    let (workspace_symbols, workspace_symbols_rx) = std_mpsc::channel();
+    let (rename, rename_rx) = std_mpsc::channel();
+    let (prepare_rename, prepare_rename_rx) = std_mpsc::channel();
+    let (will_rename_files, will_rename_files_rx) = std_mpsc::channel();
+    let (formatting, formatting_rx) = std_mpsc::channel();
+    let (on_type_formatting, on_type_formatting_rx) = std_mpsc::channel();
+    let (code_action, code_action_rx) = std_mpsc::channel();
+    let (semantic_tokens, semantic_tokens_rx) = std_mpsc::channel();
+    let (inlay_hints, inlay_hints_rx) = std_mpsc::channel();
+    let (document_links, document_links_rx) = std_mpsc::channel();
+    let (code_lens, code_lens_rx) = std_mpsc::channel();
+    let (folding_ranges, folding_ranges_rx) = std_mpsc::channel();
+    let (document_colors, document_colors_rx) = std_mpsc::channel();
+    let (color_presentations, color_presentations_rx) = std_mpsc::channel();
+    let (diagnostics, diagnostics_rx) = std_mpsc::channel();
+    let (progress, progress_rx) = std_mpsc::channel();
+    (
+        ResultSenders {
+            completion,
+            signature_help,
+            hover,
+            rust_analyzer,
+            definition,
+            document_symbols,
+            declaration,
+            type_definition,
+            implementation,
+            references,
+            document_highlights,
+            linked_editing,
+            inline_completion,
+            selection_ranges,
+            call_hierarchy,
+            workspace_symbols,
+            rename,
+            prepare_rename,
+            will_rename_files,
+            formatting,
+            on_type_formatting,
+            code_action,
+            semantic_tokens,
+            inlay_hints,
+            document_links,
+            code_lens,
+            folding_ranges,
+            document_colors,
+            color_presentations,
+            diagnostics,
+            progress,
+        },
+        Replies {
+            completion: completion_rx,
+            signature_help: signature_help_rx,
+            hover: hover_rx,
+            rust_analyzer: rust_analyzer_rx,
+            definition: definition_rx,
+            document_symbols: document_symbols_rx,
+            declaration: declaration_rx,
+            type_definition: type_definition_rx,
+            implementation: implementation_rx,
+            references: references_rx,
+            document_highlights: document_highlights_rx,
+            linked_editing: linked_editing_rx,
+            inline_completion: inline_completion_rx,
+            selection_ranges: selection_ranges_rx,
+            call_hierarchy: call_hierarchy_rx,
+            workspace_symbols: workspace_symbols_rx,
+            rename: rename_rx,
+            prepare_rename: prepare_rename_rx,
+            will_rename_files: will_rename_files_rx,
+            formatting: formatting_rx,
+            on_type_formatting: on_type_formatting_rx,
+            code_action: code_action_rx,
+            semantic_tokens: semantic_tokens_rx,
+            inlay_hints: inlay_hints_rx,
+            document_links: document_links_rx,
+            code_lens: code_lens_rx,
+            folding_ranges: folding_ranges_rx,
+            document_colors: document_colors_rx,
+            color_presentations: color_presentations_rx,
+            diagnostics: diagnostics_rx,
+            progress: progress_rx,
+        },
+    )
 }
 
 /// Normalise a `WorkspaceEdit` into per-file char-indexed spans. Handles both

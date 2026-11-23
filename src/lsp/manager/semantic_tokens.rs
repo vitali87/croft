@@ -78,7 +78,7 @@ impl LspManager {
     }
 
     pub fn drain_semantic_tokens(&self) -> Option<SemanticTokensUpdate> {
-        self.semantic_rx.try_recv().ok()
+        self.replies.semantic_tokens.try_recv().ok()
     }
 
     /// Returns and clears the "a server asked us to re-pull semantic tokens"

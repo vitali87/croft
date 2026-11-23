@@ -55,7 +55,7 @@ impl LspManager {
     }
 
     pub fn drain_on_type_formatting(&self) -> Option<FormatResult> {
-        self.on_type_rx.try_recv().ok()
+        self.replies.on_type_formatting.try_recv().ok()
     }
 
     /// The on-type trigger characters some spawned server advertises for
@@ -93,7 +93,7 @@ impl LspManager {
     }
 
     pub fn drain_formatting(&self) -> Option<FormatResult> {
-        self.format_rx.try_recv().ok()
+        self.replies.formatting.try_recv().ok()
     }
 
     /// Whether the server for `lang` implements `textDocument/formatting`.

@@ -1964,12 +1964,12 @@ fn linked_wake(app: &mut App) -> Option<u64> {
 
 /// The tick alone, the answer left to the caller.
 fn linked_tick_only(app: &mut App) -> Option<u64> {
-    let before = app.linked_request.as_ref().map(|r| r.0);
+    let before = app.linked_request.as_ref().map(|r| r.id);
     app.linked_observed_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
     app.tick_linked_editing();
     app.linked_request
         .as_ref()
-        .map(|r| r.0)
+        .map(|r| r.id)
         .filter(|id| Some(*id) != before)
 }
 

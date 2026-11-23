@@ -93,17 +93,19 @@ impl App {
         let Some(lsp) = self.lsp.as_ref() else {
             return false;
         };
-        let mut reply = None;
-        while let Some(result) = lsp.drain_declaration() {
-            if Some(result.request_id) == self.declaration_request_id {
-                reply = Some((result.target, result.unsupported));
-            }
-        }
-        let Some((target, unsupported)) = reply else {
+        let Some(reply) = take_reply(
+            &mut self.declaration_request_id,
+            || lsp.drain_declaration(),
+            |r| r.request_id,
+        ) else {
             return false;
         };
-        self.declaration_request_id = None;
-        self.finish_jump(target, unsupported, "Go to Declaration", "declaration");
+        self.finish_jump(
+            reply.target,
+            reply.unsupported,
+            "Go to Declaration",
+            "declaration",
+        );
         true
     }
 
@@ -111,19 +113,16 @@ impl App {
         let Some(lsp) = self.lsp.as_ref() else {
             return false;
         };
-        let mut reply = None;
-        while let Some(result) = lsp.drain_type_definition() {
-            if Some(result.request_id) == self.type_definition_request_id {
-                reply = Some((result.target, result.unsupported));
-            }
-        }
-        let Some((target, unsupported)) = reply else {
+        let Some(reply) = take_reply(
+            &mut self.type_definition_request_id,
+            || lsp.drain_type_definition(),
+            |r| r.request_id,
+        ) else {
             return false;
         };
-        self.type_definition_request_id = None;
         self.finish_jump(
-            target,
-            unsupported,
+            reply.target,
+            reply.unsupported,
             "Go to Type Definition",
             "type definition",
         );

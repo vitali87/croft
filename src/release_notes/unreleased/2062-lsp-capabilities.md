@@ -1,0 +1,1 @@
+refactor: Groundwork for the refactor program (#2062): what each language server says it can do is read in one function that tests can feed a server's reply to directly, instead of inline where the server starts. Nothing changes in use.
