@@ -1,1 +1,0 @@
-refactor: Groundwork for the refactor program (#2062): the activity bar's four count badges (unsaved files, Source Control changes, forwarded ports, failed tests) are one badge type kept with the icon table, refreshed in one place, instead of four copies of the same code. Nothing changes in use.
