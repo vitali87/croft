@@ -239,10 +239,23 @@ fn an_idle_background_pass_asks_for_no_redraw() {
     let _slot = crash_slot_lock();
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // Startup's own background work lands first, each in a pass that asks for
+    // a redraw: the file watcher's install, Go to File's index, and the
+    // terminal pane's first label lookup, which starts one label interval
+    // (1.5 s) after startup. A single quiet pass is not enough to say it has
+    // all landed: the label lookup comes well after the others.
+    let started = app.last_label_refresh;
     crate::test_budget::await_spawned(
         std::time::Duration::from_secs(5),
         "startup's background work to land",
-        || !tick_background(&mut app).changed,
+        || {
+            let quiet = !tick_background(&mut app).changed;
+            quiet
+                && !app.fs_watch.installing()
+                && app.file_finder_index.is_some()
+                && app.last_label_refresh > started
+                && app.label_pass.is_none()
+        },
     );
     for pass in 1..=20 {
         std::thread::sleep(std::time::Duration::from_millis(8));
