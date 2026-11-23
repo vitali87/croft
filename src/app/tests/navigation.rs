@@ -960,12 +960,25 @@ fn typing_in_a_large_file_does_not_reparse_its_outline_on_the_ui_thread() {
         app.editor.insert_char(c);
     }
     note_edit_for_outline(&mut app);
+    // What an inline re-parse would cost, measured here and now, so the
+    // check below holds on a busy machine: a fixed 250 ms failed on a CI
+    // runner, where the buffer's copy for the worker alone took about that
+    // long in this unoptimised build (#2672).
+    let path = app.editor.path.clone().unwrap();
+    let started = std::time::Instant::now();
+    let parsed = crate::outline_syntax::symbols_for_lines(&path, &app.editor.lines);
+    let parse = started.elapsed();
+    assert!(
+        parsed.iter().any(|s| s.name == "added"),
+        "the reference parse sees the edit"
+    );
     let started = std::time::Instant::now();
     app.sync_outline();
     let took = started.elapsed();
     assert!(
-        took < std::time::Duration::from_millis(250),
-        "a keystroke's outline sync took {took:?}"
+        took * 2 < parse,
+        "a keystroke's outline sync took {took:?}, against {parse:?} for one parse: \
+         the parse ran on the UI thread"
     );
     assert!(
         app.outline.symbols().iter().any(|s| s.name == "f59999"),
