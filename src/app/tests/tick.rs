@@ -2,12 +2,13 @@
 
 use super::*;
 
-/// Every poll and drain the background pass calls on the app, in order. The
-/// order is part of what the pass does: a crash notice comes before the polls
-/// that settle its task (#2609), the language servers are synced before the
-/// outline reads their edit count, a run's failure is announced after the
-/// Testing panel takes its results, and so on. A call added to the pass is
-/// added here where it runs; splitting the pass up keeps this list as it is.
+/// Every poll and drain the background pass calls on the app, in order, its
+/// steps included. The order is part of what the pass does: a crash notice
+/// comes before the polls that settle its task (#2609), the language servers
+/// are synced before the outline reads their edit count, a run's failure is
+/// announced after the Testing panel takes its results, and so on. A call added to the pass is
+/// added here where it runs; moving calls between steps keeps this list as
+/// it is.
 const BACKGROUND_PASS_CALLS: &[&str] = &[
     "app.sync_symbol_views",
     "app.poll_background_panic",
@@ -187,34 +188,54 @@ const BACKGROUND_PASS_CALLS: &[&str] = &[
     "app.lsp_last_seen.retain",
 ];
 
-/// The `app.` and `crate::` calls in the body of `tick_background`, in the
-/// order they appear, comments left out.
+/// The `app.` and `crate::` calls the background pass makes, in the order it
+/// makes them: the body of `tick_background`, with each of its steps (a
+/// function of `tick.rs` handed the app) read in where it is called.
+/// Comments are left out.
 fn background_pass_calls() -> Vec<String> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app/tick.rs");
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let mut calls = Vec::new();
+    read_pass_calls(&text, "tick_background", &mut calls);
+    calls
+}
+
+/// Append the calls in the body of `tick.rs`'s function `name` to `calls`,
+/// reading a step's calls in where the body calls the step.
+fn read_pass_calls(text: &str, name: &str, calls: &mut Vec<String>) {
+    let signature = format!("fn {name}(");
     let start = text
-        .find("fn tick_background(")
-        .expect("tick.rs defines tick_background");
-    let end = text[start..]
-        .find("\n}\n")
-        .map(|end| start + end)
-        .expect("tick_background ends");
-    let body: String = text[start..end]
+        .find(&signature)
+        .unwrap_or_else(|| panic!("tick.rs defines {name}"));
+    let open = start
+        + text[start..]
+            .find("{\n")
+            .unwrap_or_else(|| panic!("{name} has a body"));
+    let end = open
+        + text[open..]
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("{name} ends"));
+    let body: String = text[open..end]
         .lines()
         .map(|line| line.split("//").next().unwrap_or(""))
         .collect::<Vec<_>>()
         .join("\n");
-    let call = regex::Regex::new(r"\b(?:app|crate)(?:\s*(?:\.|::)\s*[a-z_][a-z0-9_]*)+\s*\(")
-        .expect("call pattern");
-    call.find_iter(&body)
-        .map(|m| {
-            m.as_str()
-                .chars()
-                .filter(|c| !c.is_whitespace() && *c != '(')
-                .collect()
-        })
-        .collect()
+    let call = regex::Regex::new(
+        r"\b(?:app|crate)(?:\s*(?:\.|::)\s*[a-z_][a-z0-9_]*)+\s*\(|\b([a-z_][a-z0-9_]*)\s*\(\s*app\b",
+    )
+    .expect("call pattern");
+    for found in call.captures_iter(&body) {
+        match found.get(1) {
+            Some(step) => read_pass_calls(text, step.as_str(), calls),
+            None => calls.push(
+                found[0]
+                    .chars()
+                    .filter(|c| !c.is_whitespace() && *c != '(')
+                    .collect(),
+            ),
+        }
+    }
 }
 
 /// The background pass runs every poll and drain in its pinned order.

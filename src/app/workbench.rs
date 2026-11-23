@@ -481,13 +481,7 @@ impl App {
     /// images) it only tracks the count for the dirty check; that path draws a
     /// text badge directly in `render_activity_bar`.
     pub(super) fn refresh_scm_change_badge(&mut self) {
-        // Across EVERY folder's repository (#161): work pending in a
-        // background folder must never be invisible. Single-folder, the
-        // sum is exactly the active repo's porcelain count.
-        let count: usize = std::iter::once(&self.git)
-            .chain(self.git_extra.iter().map(|(_, w)| w))
-            .map(|w| w.status().changed_count)
-            .sum();
+        let count = self.scm_change_count();
         if !self.overlays.activity.has_images() {
             self.scm_change_badge = None;
             if count != self.scm_change_badge_count {
@@ -511,6 +505,17 @@ impl App {
         );
         self.scm_change_badge_count = count;
         self.overlays.activity.mark_dirty();
+    }
+
+    /// The count on the Source Control icon, with or without pictures: the
+    /// Source Control rows of EVERY folder's repository (#161: work pending
+    /// in a background folder must never be invisible), a partly staged file
+    /// counting twice, as VS Code's badge counts (#2629).
+    pub(super) fn scm_change_count(&self) -> usize {
+        std::iter::once(&self.git)
+            .chain(self.git_extra.iter().map(|(_, w)| w))
+            .map(|w| w.status().changed_count)
+            .sum()
     }
 
     /// Build the inline-image for an activity-bar count badge (accent pill +
@@ -540,11 +545,7 @@ impl App {
             kitty_id,
             1,
         )?;
-        Some(crate::iterm2_inline::maybe_tmux_wrap(
-            self.inline_protocol,
-            crate::iterm2_inline::detect_tmux(),
-            raw,
-        ))
+        Some(self.wrap_for_terminal(raw))
     }
 
     /// Rebuild the cached Explorer unsaved-file badge when the count, theme, or
@@ -693,15 +694,14 @@ impl App {
     }
 
     /// The count drawn at the corner of `icon` on a terminal without
-    /// pictures, where 0 draws none: unsaved files on the Explorer, changes
-    /// on Source Control (inside a repository), forwarded ports on Remote
-    /// and failed tests on Testing.
+    /// pictures, where 0 draws none: unsaved files on the Explorer, every
+    /// folder's Source Control rows on Source Control (the same count as with
+    /// pictures, #2629), forwarded ports on Remote and failed tests on
+    /// Testing.
     fn activity_glyph_count(&self, icon: ActivityIcon) -> usize {
         match icon {
             ActivityIcon::Explorer => self.unsaved_count(),
-            ActivityIcon::SourceControl if self.scm_worker().status().in_repo => {
-                self.source_control.changes_count()
-            }
+            ActivityIcon::SourceControl => self.scm_change_count(),
             ActivityIcon::Remote => self.ports.forwarded_count(),
             ActivityIcon::Testing => self.testing.failed_count(),
             _ => 0,

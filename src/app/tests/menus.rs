@@ -50,7 +50,7 @@ fn tooltip_repaints_over_the_hero_without_hiding_it() {
         (hero.x, hero.y),
     ));
     app.ui_tooltip_area = Some(hero);
-    app.flush_no_repo_hero_overlay();
+    app.flush_no_repo_hero_overlay(&ratatui::buffer::Buffer::empty(app.last_frame_area));
     app.flush_tooltip_over_image();
     assert!(
         !app.consume_no_repo_hero_image_clear(),

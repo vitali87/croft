@@ -4071,38 +4071,38 @@ fn a_chrome_image_is_sent_only_when_it_could_be_missing() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let at = Rect::new(2, 2, 3, 1);
     let mut buf = Buffer::empty(Rect::new(0, 0, 20, 10));
-    app.drawn_buffer = Some(buf.clone());
     app.inline_protocol = InlineImageProtocol::ITerm2;
-    assert!(app.chrome_image_due("k", "img", at), "new");
+    assert!(app.chrome_image_due("k", "img", at, &buf), "new");
     app.end_chrome_flush();
-    assert!(!app.chrome_image_due("k", "img", at), "unchanged frame");
-    app.end_chrome_flush();
-    assert!(app.chrome_image_due("k", "img2", at), "changed");
     assert!(
-        app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1)),
+        !app.chrome_image_due("k", "img", at, &buf),
+        "unchanged frame"
+    );
+    app.end_chrome_flush();
+    assert!(app.chrome_image_due("k", "img2", at, &buf), "changed");
+    assert!(
+        app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1), &buf),
         "moved"
     );
     app.end_chrome_flush();
     buf[(2, 2)].set_symbol("x");
-    app.drawn_buffer = Some(buf.clone());
     assert!(
-        app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1)),
+        app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1), &buf),
         "a neighbour repainted on iTerm2"
     );
     app.end_chrome_flush();
     app.end_chrome_flush();
     assert!(
-        app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1)),
+        app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1), &buf),
         "back after a frame hidden"
     );
     app.end_chrome_flush();
     app.inline_protocol = InlineImageProtocol::Kitty;
-    assert!(app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1)));
+    assert!(app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1), &buf));
     app.end_chrome_flush();
     buf[(2, 3)].set_symbol("y");
-    app.drawn_buffer = Some(buf);
     assert!(
-        !app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1)),
+        !app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1), &buf),
         "Kitty ignores neighbours"
     );
 }

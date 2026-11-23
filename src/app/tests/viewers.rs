@@ -4080,3 +4080,55 @@ tool = "now"
         app.status
     );
 }
+
+/// #2062: every inline picture sent on its own goes out through one writer,
+/// which sends exactly the bytes each of the nine copies it replaced sent: the
+/// caret hidden and its place saved, a move to the picture's cell (row then
+/// column, each counted from 1), the picture, the caret put back where it
+/// was, and the caret shown again only when it should be visible.
+#[test]
+fn an_inline_picture_goes_out_inside_the_caret_guard() {
+    let mut shown = Vec::new();
+    write_inline_image(&mut shown, 4, 2, b"PICTURE", true);
+    assert_eq!(
+        shown,
+        b"\x1b[?25l\x1b[s\x1b[3;5HPICTURE\x1b[u\x1b[?25h".to_vec()
+    );
+    let mut hidden = Vec::new();
+    write_inline_image(&mut hidden, 0, 0, b"PICTURE", false);
+    assert_eq!(hidden, b"\x1b[?25l\x1b[s\x1b[1;1HPICTURE\x1b[u".to_vec());
+    let mut far = Vec::new();
+    write_inline_image(&mut far, 239, 66, b"", true);
+    assert_eq!(far, b"\x1b[?25l\x1b[s\x1b[67;240H\x1b[u\x1b[?25h".to_vec());
+}
+
+/// #2062: the activity bar's icons and badges go out through the same
+/// writer, together inside one caret guard (one hide-and-save before the
+/// first, one restore after the last), exactly as its own copy sent them; a
+/// batch with nothing on screen still sends the guard, as that copy did; and
+/// one picture on its own is the same bytes as a batch of one.
+#[test]
+fn the_activity_bar_pictures_share_one_caret_guard() {
+    let mut icons = Vec::new();
+    write_inline_images(
+        &mut icons,
+        [
+            (0, 1, &b"FILES"[..]),
+            (0, 3, &b"SEARCH"[..]),
+            (2, 3, &b"7"[..]),
+        ],
+        false,
+    );
+    assert_eq!(
+        icons,
+        b"\x1b[?25l\x1b[s\x1b[2;1HFILES\x1b[4;1HSEARCH\x1b[4;3H7\x1b[u".to_vec()
+    );
+    let mut none = Vec::new();
+    write_inline_images(&mut none, [], true);
+    assert_eq!(none, b"\x1b[?25l\x1b[s\x1b[u\x1b[?25h".to_vec());
+    let mut one = Vec::new();
+    write_inline_image(&mut one, 5, 9, b"PICTURE", true);
+    let mut batch_of_one = Vec::new();
+    write_inline_images(&mut batch_of_one, [(5, 9, &b"PICTURE"[..])], true);
+    assert_eq!(one, batch_of_one);
+}
