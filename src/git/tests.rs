@@ -309,19 +309,31 @@ fn parse_branch_treats_empty_as_none() {
 }
 
 #[test]
-fn porcelain_z_count_empty_means_clean() {
-    assert_eq!(porcelain_z_count(b""), 0);
-    assert_eq!(porcelain_z_count(b"\0"), 0);
+fn porcelain_z_rows_empty_means_clean() {
+    assert_eq!(porcelain_z_rows(b""), 0);
+    assert_eq!(porcelain_z_rows(b"\0"), 0);
 }
 
+/// #2629: one row per row of the Source Control list, as VS Code's count
+/// badge counts: a partly staged file is two, a rename's source record none.
 #[test]
-fn porcelain_z_count_counts_a_rename_once() {
-    assert_eq!(porcelain_z_count(b" M src/app.rs\0"), 1);
-    assert_eq!(porcelain_z_count(b"MM Cargo.toml\0 M src/lib.rs\0"), 2);
+fn porcelain_z_rows_counts_each_source_control_row() {
+    assert_eq!(porcelain_z_rows(b" M src/app.rs\0"), 1);
     assert_eq!(
-        porcelain_z_count(b"R  new.rs\0old.rs\0?? x.txt\0"),
-        2,
-        "a rename's source record is not a second change"
+        porcelain_z_rows(b"MM Cargo.toml\0 M src/lib.rs\0"),
+        3,
+        "a partly staged file is a Staged Changes row and a Changes row"
+    );
+    assert_eq!(
+        porcelain_z_rows(b"R  new.rs\0old.rs\0?? x.txt\0UU both.rs\0"),
+        3,
+        "a rename's source record is not a row; untracked and conflicted are one each"
+    );
+    let listed = parse_porcelain_changes(" M a\nMM b\nR  c -> d\n?? e\nUU f\n").len();
+    assert_eq!(
+        porcelain_z_rows(b" M a\0MM b\0R  d\0c\0?? e\0UU f\0"),
+        listed,
+        "the same count as the rows the panel lists"
     );
 }
 

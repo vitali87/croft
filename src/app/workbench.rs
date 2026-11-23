@@ -476,13 +476,7 @@ impl App {
     /// images) it only tracks the count for the dirty check; that path draws a
     /// text badge directly in `render_activity_bar`.
     pub(super) fn refresh_scm_change_badge(&mut self) {
-        // Across EVERY folder's repository (#161): work pending in a
-        // background folder must never be invisible. Single-folder, the
-        // sum is exactly the active repo's porcelain count.
-        let count: usize = std::iter::once(&self.git)
-            .chain(self.git_extra.iter().map(|(_, w)| w))
-            .map(|w| w.status().changed_count)
-            .sum();
+        let count = self.scm_change_count();
         if !self.overlays.activity.has_images() {
             self.scm_change_badge = None;
             if count != self.scm_change_badge_count {
@@ -506,6 +500,17 @@ impl App {
         );
         self.scm_change_badge_count = count;
         self.overlays.activity.mark_dirty();
+    }
+
+    /// The count on the Source Control icon, with or without pictures: the
+    /// Source Control rows of EVERY folder's repository (#161: work pending
+    /// in a background folder must never be invisible), a partly staged file
+    /// counting twice, as VS Code's badge counts (#2629).
+    pub(super) fn scm_change_count(&self) -> usize {
+        std::iter::once(&self.git)
+            .chain(self.git_extra.iter().map(|(_, w)| w))
+            .map(|w| w.status().changed_count)
+            .sum()
     }
 
     /// Build the inline-image for an activity-bar count badge (accent pill +
@@ -1575,12 +1580,7 @@ impl App {
                 source_control_active,
                 source_control_hovered,
             );
-            let scm_count = if self.scm_worker().status().in_repo {
-                self.source_control.changes_count()
-            } else {
-                0
-            };
-            render_count_badge(frame, source_control_block, scm_count);
+            render_count_badge(frame, source_control_block, self.scm_change_count());
             render_glyph(
                 frame,
                 remote_block,

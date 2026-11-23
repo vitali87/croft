@@ -7763,3 +7763,78 @@ fn copy_permalink_refuses_an_unpushed_commit() {
     empty.run_command(Command::GitCopyPermalink);
     assert_eq!(empty.status, "Open a file to link to its lines");
 }
+
+/// #2629: the Source Control badge counts the same with and without
+/// pictures, as VS Code's does: every row of every folder's repository. A
+/// partly staged file is two rows (Staged Changes and Changes), and a change
+/// in another workspace folder counts too (#161: work pending in a
+/// background folder must never be invisible).
+#[test]
+fn the_source_control_badge_counts_every_row_in_every_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mk_repo = |name: &str| {
+        let dir = tmp.path().join(name);
+        std::fs::create_dir(&dir).unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.email", "a@b"],
+            vec!["config", "user.name", "a"],
+        ] {
+            git_ok(&dir, &args);
+        }
+        std::fs::write(dir.join("f.txt"), "one\n").unwrap();
+        git_ok(&dir, &["add", "f.txt"]);
+        git_ok(&dir, &["commit", "-q", "-m", "first"]);
+        dir
+    };
+    // Folder A: f.txt partly staged (a staged edit and a later unstaged one).
+    let a = mk_repo("repa");
+    std::fs::write(a.join("f.txt"), "two\n").unwrap();
+    git_ok(&a, &["add", "f.txt"]);
+    std::fs::write(a.join("f.txt"), "three\n").unwrap();
+    // Folder B: one unstaged edit.
+    let b = mk_repo("repb");
+    std::fs::write(b.join("f.txt"), "changed\n").unwrap();
+
+    let mut app = App::new(a.clone()).unwrap();
+    app.add_workspace_folder(b.clone());
+    let b_canon = b.canonicalize().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let _ = app.drain_git_responses();
+        app.sync_focus_flags();
+        let a_dirty = app.git.status().dirty;
+        let b_dirty = app.git_worker_for_root(&b_canon).status().dirty;
+        if a_dirty && b_dirty {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "both repositories never reported their changes"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    // With pictures: the count the badge picture is built for.
+    app.refresh_scm_change_badge();
+    assert_eq!(
+        app.scm_change_badge_count, 3,
+        "two rows for the partly staged file in A, one for B's edit"
+    );
+
+    // Without pictures: the count drawn at the icon's bottom-right corner.
+    assert!(!app.overlays.activity.has_images());
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let block = app.sidebar_areas.source_control_icon;
+    let corner = (
+        block.x + block.width - 1,
+        block.y + block.height.saturating_sub(1),
+    );
+    assert_eq!(
+        term.backend().buffer()[corner].symbol(),
+        "3",
+        "the same count as with pictures"
+    );
+}
