@@ -33,9 +33,8 @@ fn past_sheet_cap(message: String) -> std::io::Error {
 /// parse: one of this module's caps ([`PastSheetCap`]), or an error from the
 /// workbook readers that says "too large", such as the zip reader's "Archive
 /// header is too large". The second was always read as a size refusal, by
-/// its wording, and still is: whether a workbook that fails that way should
-/// fall through to the hex viewer like other unreadable ones is its own
-/// question.
+/// its wording, and still is; a workbook that fails that way should fall
+/// through to the hex viewer like other unreadable ones (#2709).
 pub fn is_size_refusal(e: &std::io::Error) -> bool {
     e.get_ref().is_some_and(|inner| inner.is::<PastSheetCap>())
         || e.to_string().contains("too large")
