@@ -28,6 +28,7 @@ pub mod open_editors;
 pub mod osk;
 pub mod outline;
 pub mod output;
+pub mod picker_colours;
 pub mod picker_query;
 pub mod picker_rows;
 pub mod ports;

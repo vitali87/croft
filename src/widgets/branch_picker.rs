@@ -12,6 +12,7 @@
 //! and the one subprocess call stays off the render path.
 
 use crate::git::BranchInfo;
+use crate::widgets::picker_colours;
 use crate::widgets::picker_query;
 use ratatui::{
     buffer::Buffer,
@@ -238,9 +239,9 @@ pub fn render_branch_picker(
     );
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))))
+        .border_style(Style::default().fg(theme.ui(picker_colours::BORDER)))
         .title(title.clone())
-        .style(Style::default().bg(theme.ui(Color::Rgb(0x16, 0x18, 0x1f))));
+        .style(Style::default().bg(theme.ui(picker_colours::BODY)));
     let inner = Rect {
         x: rect.x + 1,
         y: rect.y + 1,
@@ -256,7 +257,7 @@ pub fn render_branch_picker(
         let (r, g, b) = crate::gradient::POPUP_SEL_BG;
         Color::Rgb(r, g, b)
     } else {
-        theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e))
+        theme.ui(picker_colours::SELECTION)
     };
     let tones = crate::widgets::surface::tones(theme);
 
@@ -266,11 +267,11 @@ pub fn render_branch_picker(
 
     // Prompt row with a blinking caret, identical treatment to the jumper.
     let query_style = Style::default()
-        .fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
+        .fg(theme.ui(picker_colours::TEXT))
         .add_modifier(Modifier::BOLD);
     let caret_style = Style::default()
-        .fg(theme.ui(Color::Rgb(0x16, 0x18, 0x1f)))
-        .bg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
+        .fg(theme.ui(picker_colours::BODY))
+        .bg(theme.ui(picker_colours::TEXT))
         .add_modifier(Modifier::SLOW_BLINK);
     let cursor = picker.cursor.min(picker.query.chars().count());
     let before: String = picker.query.chars().take(cursor).collect();
@@ -280,7 +281,7 @@ pub fn render_branch_picker(
     let prompt_line = Line::from(vec![
         Span::styled(
             "\u{ea68} ",
-            Style::default().fg(theme.ui(Color::Rgb(0x88, 0xc0, 0xd0))),
+            Style::default().fg(theme.ui(picker_colours::PROMPT)),
         ),
         Span::styled(before, query_style),
         Span::styled(caret_glyph, caret_style),
@@ -328,7 +329,7 @@ pub fn render_branch_picker(
         Widget::render(
             Paragraph::new(Line::from(Span::styled(
                 "  No branches",
-                Style::default().fg(theme.ui(Color::Rgb(0x7a, 0x82, 0x90))),
+                Style::default().fg(theme.ui(picker_colours::DIM)),
             ))),
             list_rect,
             buf,
@@ -355,7 +356,7 @@ pub fn render_branch_picker(
         let base = match tones {
             Some(t) => Style::default().fg(if is_selected { t.strong() } else { t.text() }),
             None if is_selected => Style::default().bg(sel_bg).fg(theme.ui(Color::White)),
-            None => Style::default().fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4))),
+            None => Style::default().fg(theme.ui(picker_colours::TEXT)),
         };
         let prefix = if is_selected && tones.is_none() {
             "> "
@@ -381,8 +382,7 @@ pub fn render_branch_picker(
                 ));
                 spans.push(Span::styled(b.display.clone(), base));
                 if b.is_remote {
-                    let muted =
-                        tones.map_or_else(|| theme.ui(Color::Rgb(0x7a, 0x82, 0x90)), |t| t.muted());
+                    let muted = tones.map_or_else(|| theme.ui(picker_colours::DIM), |t| t.muted());
                     spans.push(Span::styled(
                         "  (remote)".to_string(),
                         Style::default().fg(muted),
@@ -393,7 +393,7 @@ pub fn render_branch_picker(
                 let accent = match tones {
                     Some(t) => Style::default().fg(t.accent()),
                     None => Style::default()
-                        .fg(theme.ui(Color::Rgb(0x88, 0xc0, 0xd0)))
+                        .fg(theme.ui(picker_colours::PROMPT))
                         .add_modifier(Modifier::BOLD),
                 };
                 let accent_text = match tones {

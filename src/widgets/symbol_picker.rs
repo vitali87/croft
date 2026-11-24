@@ -18,6 +18,7 @@ use ratatui::{
 use crate::icons::for_outline_kind;
 use crate::lsp::manager::OutlineSymbol;
 use crate::widgets::file_finder::fuzzy_score;
+use crate::widgets::picker_colours;
 use crate::widgets::picker_query;
 
 pub struct SymbolPicker {
@@ -217,9 +218,9 @@ pub fn render_symbol_picker(
     );
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))))
+        .border_style(Style::default().fg(theme.ui(picker_colours::BORDER)))
         .title(title.clone())
-        .style(Style::default().bg(theme.ui(Color::Rgb(0x16, 0x18, 0x1f))));
+        .style(Style::default().bg(theme.ui(picker_colours::BODY)));
     let inner = Rect {
         x: rect.x + 1,
         y: rect.y + 1,
@@ -235,7 +236,7 @@ pub fn render_symbol_picker(
         let (r, g, b) = crate::gradient::POPUP_SEL_BG;
         Color::Rgb(r, g, b)
     } else {
-        theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e))
+        theme.ui(picker_colours::SELECTION)
     };
     let tones = crate::widgets::surface::tones(theme);
 
@@ -244,11 +245,11 @@ pub fn render_symbol_picker(
     }
 
     let query_style = Style::default()
-        .fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
+        .fg(theme.ui(picker_colours::TEXT))
         .add_modifier(Modifier::BOLD);
     let caret_style = Style::default()
-        .fg(theme.ui(Color::Rgb(0x16, 0x18, 0x1f)))
-        .bg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
+        .fg(theme.ui(picker_colours::BODY))
+        .bg(theme.ui(picker_colours::TEXT))
         .add_modifier(Modifier::SLOW_BLINK);
     let cursor = picker.cursor.min(picker.query.chars().count());
     let before: String = picker.query.chars().take(cursor).collect();
@@ -256,10 +257,7 @@ pub fn render_symbol_picker(
     let after: String = picker.query.chars().skip(cursor + 1).collect();
     let caret_glyph = if at.is_empty() { String::from(" ") } else { at };
     let prompt_line = Line::from(vec![
-        Span::styled(
-            "@ ",
-            Style::default().fg(theme.ui(Color::Rgb(0x88, 0xc0, 0xd0))),
-        ),
+        Span::styled("@ ", Style::default().fg(theme.ui(picker_colours::PROMPT))),
         Span::styled(before, query_style),
         Span::styled(caret_glyph, caret_style),
         Span::styled(after, query_style),
@@ -311,7 +309,7 @@ pub fn render_symbol_picker(
         Widget::render(
             Paragraph::new(Line::from(Span::styled(
                 msg,
-                Style::default().fg(theme.ui(Color::Rgb(0xa0, 0xb4, 0xd8))),
+                Style::default().fg(theme.ui(picker_colours::DETAIL_BRIGHT)),
             ))),
             list_rect,
             buf,
@@ -332,7 +330,7 @@ pub fn render_symbol_picker(
     if total == 0 {
         let empty = Line::from(Span::styled(
             String::from("  No symbols in this file"),
-            Style::default().fg(theme.ui(Color::Rgb(0x7a, 0x82, 0x90))),
+            Style::default().fg(theme.ui(picker_colours::DIM)),
         ));
         Widget::render(Paragraph::new(empty), list_rect, buf);
         return;
@@ -358,12 +356,12 @@ pub fn render_symbol_picker(
                 Style::default().bg(sel_bg).fg(theme.ui(Color::White)),
                 Style::default()
                     .bg(sel_bg)
-                    .fg(theme.ui(Color::Rgb(0xa0, 0xb4, 0xd8))),
+                    .fg(theme.ui(picker_colours::DETAIL_BRIGHT)),
                 Style::default().bg(sel_bg).fg(theme.ui(icon.color)),
             ),
             None => (
-                Style::default().fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4))),
-                Style::default().fg(theme.ui(Color::Rgb(0x8e, 0x95, 0xa4))),
+                Style::default().fg(theme.ui(picker_colours::TEXT)),
+                Style::default().fg(theme.ui(picker_colours::DETAIL)),
                 Style::default().fg(theme.ui(icon.color)),
             ),
         };
