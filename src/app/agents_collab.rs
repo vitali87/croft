@@ -1342,8 +1342,7 @@ impl App {
                     }
                 }
             };
-            collect(&self.editor.editors);
-            for group in self.editor_layout.inactive_groups() {
+            for group in self.editor_layout.all_groups(&self.editor) {
                 collect(&group.editors);
             }
             for file in files {
@@ -1381,8 +1380,7 @@ impl App {
                 ed.collab_doc_gen = session.doc_gen(&file).unwrap_or(0);
             }
         };
-        extract(&mut self.editor.editors);
-        for group in self.editor_layout.inactive_groups_mut() {
+        for group in self.editor_layout.all_groups_mut(&mut self.editor) {
             extract(&mut group.editors);
         }
 
@@ -1568,8 +1566,7 @@ impl App {
                 ed.collab_doc_gen = doc_gen;
             }
         };
-        attach(&mut self.editor.editors);
-        for group in self.editor_layout.inactive_groups_mut() {
+        for group in self.editor_layout.all_groups_mut(&mut self.editor) {
             attach(&mut group.editors);
         }
 
@@ -1724,13 +1721,13 @@ impl App {
                 && ed.image.is_none()
                 && ed.sheet.is_none()
         };
-        if let Some(ed) = self.editor.editors.iter().find(is_text) {
+        if let Some(ed) = self
+            .editor_layout
+            .all_groups(&self.editor)
+            .flat_map(|g| g.editors.iter())
+            .find(is_text)
+        {
             return Some(ed.lines.join("\n"));
-        }
-        for group in self.editor_layout.inactive_groups() {
-            if let Some(ed) = group.editors.iter().find(is_text) {
-                return Some(ed.lines.join("\n"));
-            }
         }
         if !path.is_file() {
             return None;
@@ -1809,16 +1806,13 @@ impl App {
             ed.collab_synced_seq = ed.edit_seq;
             ed.collab_doc_gen = doc_gen;
         };
-        for ed in self.editor.editors.iter_mut() {
+        for ed in self
+            .editor_layout
+            .all_groups_mut(&mut self.editor)
+            .flat_map(|g| g.editors.iter_mut())
+        {
             if ed.path.as_deref() == Some(path.as_path()) {
                 apply(ed);
-            }
-        }
-        for group in self.editor_layout.inactive_groups_mut() {
-            for ed in group.editors.iter_mut() {
-                if ed.path.as_deref() == Some(path.as_path()) {
-                    apply(ed);
-                }
             }
         }
     }
@@ -1865,16 +1859,13 @@ impl App {
         // Every matching TEXT tab (see apply_collab_spans): first-found let
         // a diff tab of the file swallow the snapshot while the text tab
         // went unmarked.
-        for ed in self.editor.editors.iter_mut() {
+        for ed in self
+            .editor_layout
+            .all_groups_mut(&mut self.editor)
+            .flat_map(|g| g.editors.iter_mut())
+        {
             if ed.path.as_deref() == Some(path.as_path()) {
                 finish(ed);
-            }
-        }
-        for group in self.editor_layout.inactive_groups_mut() {
-            for ed in group.editors.iter_mut() {
-                if ed.path.as_deref() == Some(path.as_path()) {
-                    finish(ed);
-                }
             }
         }
         self.status = format!("{file} is now live-shared");
