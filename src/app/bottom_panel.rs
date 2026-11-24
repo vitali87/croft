@@ -140,15 +140,7 @@ impl App {
             }
             self.markdown_lint_last_seen
                 .insert(path.clone(), (seq, lines));
-            let merged = self.merged_diagnostics(&path);
-            if self.editor.path.as_deref() == Some(path.as_path()) {
-                self.editor.apply_diagnostics(path.clone(), merged.clone());
-            }
-            for group in self.editor_layout.inactive_groups_mut() {
-                if group.path.as_deref() == Some(path.as_path()) {
-                    group.apply_diagnostics(path.clone(), merged.clone());
-                }
-            }
+            self.show_merged_diagnostics(&path);
         }
         let closed: Vec<PathBuf> = self
             .markdown_lint_last_seen
@@ -190,17 +182,19 @@ impl App {
         if by_server.is_empty() {
             self.lsp_diagnostics.remove(path);
         }
+        self.show_merged_diagnostics(path);
+        true
+    }
+
+    /// Hand `path`'s merged diagnostics to every editor group whose shown
+    /// tab is `path`, the focused group first.
+    pub(super) fn show_merged_diagnostics(&mut self, path: &Path) {
         let merged = self.merged_diagnostics(path);
-        if self.editor.path.as_deref() == Some(path) {
-            self.editor
-                .apply_diagnostics(path.to_path_buf(), merged.clone());
-        }
-        for group in self.editor_layout.inactive_groups_mut() {
+        for group in self.editor_layout.all_groups_mut(&mut self.editor) {
             if group.path.as_deref() == Some(path) {
                 group.apply_diagnostics(path.to_path_buf(), merged.clone());
             }
         }
-        true
     }
 
     /// Flatten the per-server diagnostics stored for `path` into one list for
