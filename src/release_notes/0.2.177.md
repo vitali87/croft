@@ -1,0 +1,1 @@
+fix: Screen reader mode now reads every pop-up instead of the pane behind it: the connect dialog's question (never what is typed), F1, the branch picker, command history, Jump to Directory, the process list, both symbol pickers, and the stash-drop and terminal-paste questions with their keys.

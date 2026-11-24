@@ -1440,6 +1440,30 @@ impl ShortcutsModal {
         out
     }
 
+    /// The first shortcut at or below the top of the visible list, as
+    /// screen reader mode reads it: its group, keys and what they do. The
+    /// line count matches [`Self::lines`]: a blank line between groups, the
+    /// group title and its rule, then one line per entry.
+    pub fn spoken_row(&self) -> Option<String> {
+        let top = usize::from(self.scroll);
+        let mut line = 0usize;
+        for (i, group) in SHORTCUT_GROUPS.iter().enumerate() {
+            line += usize::from(i > 0) + 2;
+            for entry in group.entries {
+                if line >= top {
+                    return Some(format!(
+                        "{}: {}, {}",
+                        group.title,
+                        entry.keys.trim(),
+                        entry.description
+                    ));
+                }
+                line += 1;
+            }
+        }
+        None
+    }
+
     pub fn scroll_down(&mut self, by: u16) {
         let max_scroll = self
             .last_content_height
