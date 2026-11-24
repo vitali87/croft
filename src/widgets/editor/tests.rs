@@ -5038,7 +5038,7 @@ fn gutter_stream_stop_glyph_renders_maps_clicks_and_outranks_the_play_glyph() {
     assert!(!e.stream_stop_at(sign_x, 2));
 }
 
-/// The sign cell answers a click with the glyph it shows: on the line an
+/// The sign cell answers a click with the glyph it shows (#2694): on the line an
 /// AI stream writes into, a breakpoint or the debugger's stop arrow
 /// outranks the stop square, so a click on it is the breakpoint lane's,
 /// never a cancel that reverts the stream.

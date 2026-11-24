@@ -60,6 +60,35 @@ impl OverviewMark {
     }
 }
 
+/// What a line's sign cell, the gutter's first column, shows: see
+/// [`Editor::sign_glyph`].
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum SignGlyph {
+    /// The debugger is stopped on this line.
+    Stop,
+    /// A breakpoint, in the look its kind wears.
+    Breakpoint(BreakpointMark),
+    /// An AI stream writes on this line; a click cancels it.
+    StreamStop,
+    /// The reader's bookmark.
+    Bookmark,
+    /// A test is defined on this line; a click runs the named test.
+    TestPlay(String),
+}
+
+/// The kind of breakpoint a [`SignGlyph::Breakpoint`] marks.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(super) enum BreakpointMark {
+    /// The adapter could not bind it.
+    Unverified,
+    /// It pauses only on a condition or a hit count.
+    Conditional,
+    /// It logs a message instead of pausing.
+    Logpoint,
+    /// A plain, live breakpoint.
+    Plain,
+}
+
 impl Editor {
     /// Toggle a debugger breakpoint on the cursor's current line for the active
     /// file. Returns `(path, 1-based line, now_set)` where `now_set` is `true`
@@ -197,65 +226,98 @@ impl Editor {
     /// name — the app runs it. Same geometry as the fold chevron, one cell
     /// left (`inner.x`, the sign margin the breakpoint dot shares).
     pub fn test_glyph_at(&self, col: u16, row: u16) -> Option<String> {
-        if col != self.last_inner.x || row < self.last_inner.y {
-            return None;
+        match self.sign_glyph(self.sign_line_at(col, row)?) {
+            Some(SignGlyph::TestPlay(name)) => Some(name),
+            _ => None,
         }
-        let (line, start, _) = self.text_row((row - self.last_inner.y) as usize)?;
-        // The glyph draws only on the definition's first visual row.
-        if self.wrap_enabled() && start != 0 {
-            return None;
-        }
-        // Render precedence: the stop arrow, breakpoint glyphs, and the
-        // AI-stream square all outrank the play bead in the shared sign
-        // cell — a click on one of those glyphs must not start a test run.
-        if self.sign_cell_taken(line) {
-            return None;
-        }
-        crate::testing::locate::test_fn_on_line(self.path.as_deref(), &self.lines, line)
-    }
-
-    /// Whether the sign cell of 0-based `line` is claimed by a glyph that
-    /// outranks the test play bead: the debugger's stop arrow, any
-    /// breakpoint glyph (dot, diamond, hollow ring), the AI-stream stop
-    /// square, or a bookmark flag — the same precedence the render pass
-    /// applies.
-    pub(super) fn sign_cell_taken(&self, line: usize) -> bool {
-        if self.stream_stop_line == Some(line) {
-            return true;
-        }
-        if self.is_bookmarked(line) {
-            return true;
-        }
-        let Some(path) = self.path.as_deref() else {
-            return false;
-        };
-        let here = line + 1; // gutter is 1-based
-        self.stop_line
-            .as_ref()
-            .is_some_and(|(p, l)| p == path && *l == here)
-            || self
-                .breakpoints
-                .get(path)
-                .is_some_and(|s| s.contains(&here))
     }
 
     /// Whether `(col, row)` lands on the AI-stream stop button in the sign
     /// margin: same geometry as [`test_glyph_at`](Self::test_glyph_at), only
-    /// on the streamed line's first visual row.
+    /// where the square is drawn. A debugger glyph that outranks it on the
+    /// streamed line takes the click instead.
     pub fn stream_stop_at(&self, col: u16, row: u16) -> bool {
-        let Some(stop_line) = self.stream_stop_line else {
-            return false;
-        };
+        self.stream_stop_line.is_some()
+            && self
+                .sign_line_at(col, row)
+                .is_some_and(|line| self.sign_glyph(line) == Some(SignGlyph::StreamStop))
+    }
+
+    /// The 0-based line whose sign cell is at `(col, row)`: the gutter's
+    /// first column, on a line's first visual row, where its glyph draws.
+    fn sign_line_at(&self, col: u16, row: u16) -> Option<usize> {
         if col != self.last_inner.x || row < self.last_inner.y {
-            return false;
+            return None;
         }
-        let Some((line, start, _)) = self.text_row((row - self.last_inner.y) as usize) else {
-            return false;
-        };
-        if self.wrap_enabled() && start != 0 {
-            return false;
+        let (line, start, _) = self.text_row((row - self.last_inner.y) as usize)?;
+        (!self.wrap_enabled() || start == 0).then_some(line)
+    }
+
+    /// The glyph the sign cell of 0-based `line` shows, the one rule the
+    /// render pass paints and a click answers by. One glyph per cell,
+    /// highest rank first: the debugger's stop arrow and a breakpoint
+    /// report machine state and are never hidden, then the AI stream's stop
+    /// square, then the reader's bookmark, then a test's play bead.
+    pub(super) fn sign_glyph(&self, line: usize) -> Option<SignGlyph> {
+        let here = line + 1; // the debugger's lines are 1-based
+        if let Some(path) = self.path.as_deref() {
+            if self
+                .stop_line
+                .as_ref()
+                .is_some_and(|(p, l)| p == path && *l == here)
+            {
+                return Some(SignGlyph::Stop);
+            }
+            if self
+                .breakpoints
+                .get(path)
+                .is_some_and(|s| s.contains(&here))
+            {
+                return Some(SignGlyph::Breakpoint(self.breakpoint_mark(path, here)));
+            }
         }
-        line == stop_line
+        if self.stream_stop_line == Some(line) {
+            return Some(SignGlyph::StreamStop);
+        }
+        if self.is_bookmarked(line) {
+            return Some(SignGlyph::Bookmark);
+        }
+        crate::testing::locate::test_fn_on_line(self.path.as_deref(), &self.lines, line)
+            .map(SignGlyph::TestPlay)
+    }
+
+    /// Which breakpoint glyph `path`'s 1-based line `here` wears: hollow
+    /// when the adapter could not bind it, a diamond for a condition or a
+    /// logpoint, a dot for a plain one.
+    fn breakpoint_mark(&self, path: &Path, here: usize) -> BreakpointMark {
+        if self
+            .unverified_breakpoints
+            .get(path)
+            .is_some_and(|s| s.contains(&here))
+        {
+            return BreakpointMark::Unverified;
+        }
+        // A hit count is a condition on the pause (#611), so it wears the
+        // conditional diamond too, as in VS Code.
+        if self
+            .breakpoint_conditions
+            .get(path)
+            .is_some_and(|c| c.contains_key(&here))
+            || self
+                .breakpoint_hit_conditions
+                .get(path)
+                .is_some_and(|h| h.contains_key(&here))
+        {
+            return BreakpointMark::Conditional;
+        }
+        if self
+            .breakpoint_logs
+            .get(path)
+            .is_some_and(|m| m.contains_key(&here))
+        {
+            return BreakpointMark::Logpoint;
+        }
+        BreakpointMark::Plain
     }
 
     /// This frame's screen row of `line`'s first visual row, when visible

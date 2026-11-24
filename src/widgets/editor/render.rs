@@ -948,116 +948,46 @@ impl Widget for &mut Editor {
                 );
             }
 
-            // Debugger gutter glyphs, on a logical line's first visual row only:
-            // a yellow stop arrow (▶) takes priority over a red breakpoint dot
-            // (●). Painted in the dedicated glyph margin at the far left
-            // (`inner.x`), VS Code-style, so it never crowds the line number or
-            // the code and the number-to-code gap is untouched.
+            // The sign cell: the dedicated glyph margin at the far left
+            // (`inner.x`), VS Code-style, so a glyph never crowds the line
+            // number or the code. One glyph, on a logical line's first visual
+            // row, chosen by `sign_glyph`, the rule a click answers by too.
             let sign_x = inner.x;
-            let mut sign_taken = false;
-            if (!wrap || row_start == 0)
-                && let Some(path) = self.path.as_deref()
+            if let Some(glyph) = (!wrap || row_start == 0)
+                .then(|| self.sign_glyph(line_idx))
+                .flatten()
             {
-                let here = line_idx + 1; // gutter is 1-based
-                let is_stop = self
-                    .stop_line
-                    .as_ref()
-                    .is_some_and(|(p, l)| p == path && *l == here);
-                let is_bp = self
-                    .breakpoints
-                    .get(path)
-                    .is_some_and(|s| s.contains(&here));
-                let is_unverified = self
-                    .unverified_breakpoints
-                    .get(path)
-                    .is_some_and(|s| s.contains(&here));
-                // A hit count is a condition on the pause (#611), so it wears
-                // the conditional diamond too, as in VS Code.
-                let is_conditional = self
-                    .breakpoint_conditions
-                    .get(path)
-                    .is_some_and(|c| c.contains_key(&here))
-                    || self
-                        .breakpoint_hit_conditions
-                        .get(path)
-                        .is_some_and(|h| h.contains_key(&here));
-                let is_logpoint = self
-                    .breakpoint_logs
-                    .get(path)
-                    .is_some_and(|m| m.contains_key(&here));
-                if is_stop {
-                    buf.set_string(
-                        sign_x,
-                        y,
-                        "▶",
-                        Style::default().fg(self.theme.ui(Color::Rgb(0xff, 0xcc, 0x00))),
-                    );
-                    sign_taken = true;
-                } else if is_bp {
-                    // Hollow dimmed ring when the adapter could not bind it; a
-                    // red diamond for a conditional breakpoint; an amber one
-                    // for a logpoint; a solid red dot for a plain, live one.
-                    let (glyph, color) = if is_unverified {
-                        ("○", self.theme.ui(Color::Rgb(0x99, 0x99, 0x99)))
-                    } else if is_conditional {
-                        ("◆", self.theme.ui(Color::Rgb(0xe5, 0x1c, 0x23)))
-                    } else if is_logpoint {
-                        ("◆", self.theme.ui(Color::Rgb(0xe5, 0xc0, 0x7b)))
-                    } else {
-                        ("●", self.theme.ui(Color::Rgb(0xe5, 0x1c, 0x23)))
-                    };
-                    buf.set_string(sign_x, y, glyph, Style::default().fg(color));
-                    sign_taken = true;
-                }
-            }
-
-            // AI-stream stop button (croft pair): while a pilot streams into
-            // this file, the row under its caret wears a stop square in the
-            // badge's orange; clicking it (or Cmd+K X) cancels and reverts
-            // the stream. Outranks the test play glyph; the debugger's
-            // glyphs above still win the shared cell.
-            if (!wrap || row_start == 0) && !sign_taken && self.stream_stop_line == Some(line_idx) {
-                buf.set_string(
-                    sign_x,
-                    y,
-                    "■",
-                    Style::default().fg(self.theme.ui(Color::Rgb(0xff, 0x9d, 0x2f))),
-                );
-                sign_taken = true;
-            }
-
-            // Bookmark flag: a reader's own mark, ranked below every debugger
-            // glyph and the AI-stream square (those report machine state and
-            // must never be hidden) but above the test play bead.
-            if (!wrap || row_start == 0) && !sign_taken && self.is_bookmarked(line_idx) {
-                buf.set_string(
-                    sign_x,
-                    y,
-                    "\u{2691}", // ⚑, a plain-Unicode flag: no Nerd Font needed
-                    Style::default().fg(self.theme.ui(Color::Rgb(0x4f, 0xc1, 0xff))),
-                );
-                sign_taken = true;
-            }
-
-            // Testing gutter glyph: the play button beside a test fn's
-            // definition (VS Code's run bead, in its testing green), sharing
-            // the sign cell with the debugger — whose stop arrow and
-            // breakpoint dot both outrank it.
-            if (!wrap || row_start == 0)
-                && !sign_taken
-                && crate::testing::locate::test_fn_on_line(
-                    self.path.as_deref(),
-                    &self.lines,
-                    line_idx,
-                )
-                .is_some()
-            {
-                buf.set_string(
-                    sign_x,
-                    y,
-                    "\u{eb2c}", // cod-play, the Testing panel's run glyph
-                    Style::default().fg(self.theme.ui(Color::Rgb(0x73, 0xc9, 0x91))),
-                );
+                let (symbol, color) = match glyph {
+                    // The debugger's yellow stop arrow.
+                    SignGlyph::Stop => ("▶", Color::Rgb(0xff, 0xcc, 0x00)),
+                    // Hollow dimmed ring when the adapter could not bind it;
+                    // a red diamond for a conditional breakpoint; an amber
+                    // one for a logpoint; a solid red dot for a plain one.
+                    SignGlyph::Breakpoint(BreakpointMark::Unverified) => {
+                        ("○", Color::Rgb(0x99, 0x99, 0x99))
+                    }
+                    SignGlyph::Breakpoint(BreakpointMark::Conditional) => {
+                        ("◆", Color::Rgb(0xe5, 0x1c, 0x23))
+                    }
+                    SignGlyph::Breakpoint(BreakpointMark::Logpoint) => {
+                        ("◆", Color::Rgb(0xe5, 0xc0, 0x7b))
+                    }
+                    SignGlyph::Breakpoint(BreakpointMark::Plain) => {
+                        ("●", Color::Rgb(0xe5, 0x1c, 0x23))
+                    }
+                    // AI-stream stop button (croft pair): while a pilot
+                    // streams into this file, the row under its caret wears
+                    // a stop square in the badge's orange; clicking it (or
+                    // Cmd+K X) cancels and reverts the stream.
+                    SignGlyph::StreamStop => ("■", Color::Rgb(0xff, 0x9d, 0x2f)),
+                    // ⚑, a plain-Unicode flag: no Nerd Font needed.
+                    SignGlyph::Bookmark => ("\u{2691}", Color::Rgb(0x4f, 0xc1, 0xff)),
+                    // The play button beside a test fn's definition, VS
+                    // Code's run bead in its testing green: cod-play, the
+                    // Testing panel's run glyph.
+                    SignGlyph::TestPlay(_) => ("\u{eb2c}", Color::Rgb(0x73, 0xc9, 0x91)),
+                };
+                buf.set_string(sign_x, y, symbol, Style::default().fg(self.theme.ui(color)));
             }
 
             // Fold chevron: on a foldable header's first visual row, in the
