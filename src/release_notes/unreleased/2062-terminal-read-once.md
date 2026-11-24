@@ -1,0 +1,1 @@
+refactor: The editor and the picture code read which terminal croft runs in once, when croft starts, instead of from the environment on every frame (#2062). Pictures and backgrounds look exactly as before.
