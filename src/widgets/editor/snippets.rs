@@ -279,50 +279,48 @@ impl Editor {
             String::new()
         };
 
-        self.pin_on_edit();
-        self.push_undo(EditKind::EmmetExpand);
-        self.last_edit_kind = None;
+        self.undoable_edit(EditKind::EmmetExpand, |this| {
+            this.last_edit_kind = None;
 
-        let chars: Vec<char> = line.chars().collect();
-        let before: String = chars[..start_col].iter().collect();
-        let after: String = chars[col.min(chars.len())..].iter().collect();
+            let chars: Vec<char> = line.chars().collect();
+            let before: String = chars[..start_col].iter().collect();
+            let after: String = chars[col.min(chars.len())..].iter().collect();
 
-        // `markup` always ends in a newline; the trailing line merges with
-        // whatever followed the abbreviation.
-        let body = markup.strip_suffix('\n').unwrap_or(&markup);
-        let mut out: Vec<String> = Vec::new();
-        let mut caret_row = row;
-        let mut caret_col = 0usize;
-        let mut consumed = 0usize;
-        for (i, seg) in body.split('\n').enumerate() {
-            let mut l = String::new();
-            if i == 0 {
-                l.push_str(&before);
-            } else {
-                l.push_str(&lead);
+            // `markup` always ends in a newline; the trailing line merges with
+            // whatever followed the abbreviation.
+            let body = markup.strip_suffix('\n').unwrap_or(&markup);
+            let mut out: Vec<String> = Vec::new();
+            let mut caret_row = row;
+            let mut caret_col = 0usize;
+            let mut consumed = 0usize;
+            for (i, seg) in body.split('\n').enumerate() {
+                let mut l = String::new();
+                if i == 0 {
+                    l.push_str(&before);
+                } else {
+                    l.push_str(&lead);
+                }
+                let text_start = l.chars().count();
+                l.push_str(seg);
+                // `caret` is a byte offset into `markup`; find the line holding
+                // it and convert to a char column on the rebuilt line.
+                let seg_end = consumed + seg.len();
+                if caret >= consumed && caret <= seg_end {
+                    caret_row = row + i;
+                    caret_col = text_start + seg[..caret - consumed].chars().count();
+                }
+                consumed = seg_end + 1; // the '\n' we split on
+                out.push(l);
             }
-            let text_start = l.chars().count();
-            l.push_str(seg);
-            // `caret` is a byte offset into `markup`; find the line holding
-            // it and convert to a char column on the rebuilt line.
-            let seg_end = consumed + seg.len();
-            if caret >= consumed && caret <= seg_end {
-                caret_row = row + i;
-                caret_col = text_start + seg[..caret - consumed].chars().count();
+            if let Some(last) = out.last_mut() {
+                last.push_str(&after);
             }
-            consumed = seg_end + 1; // the '\n' we split on
-            out.push(l);
-        }
-        if let Some(last) = out.last_mut() {
-            last.push_str(&after);
-        }
 
-        self.lines.splice(row..=row, out);
-        self.cursor_row = caret_row;
-        self.cursor_col = caret_col;
-        self.clear_selection();
-        self.mark_buffer_changed();
-        self.recompute_highlights();
+            this.lines.splice(row..=row, out);
+            this.cursor_row = caret_row;
+            this.cursor_col = caret_col;
+            this.clear_selection();
+        });
         self.ensure_cursor_col_visible();
         true
     }
@@ -365,21 +363,19 @@ impl Editor {
                 .count();
             (head, tail)
         };
-        self.pin_on_edit();
-        self.push_undo(EditKind::EmmetExpand);
-        self.last_edit_kind = None;
-        let old_end = self.lines.len() - tail;
-        let added = new.len() - tail - head;
-        self.lines
-            .splice(head..old_end, new[head..new.len() - tail].iter().cloned());
-        // Rows below the rewrite keep their seats; the rewritten rows are
-        // markup croft generated.
-        self.provenance.splice(head, old_end - head, added);
-        self.provenance
-            .record(head..head + added, crate::provenance::Seat::Generated);
-        self.provenance.truncate(self.lines.len());
-        self.mark_buffer_changed();
-        self.recompute_highlights();
+        self.undoable_edit(EditKind::EmmetExpand, |this| {
+            this.last_edit_kind = None;
+            let old_end = this.lines.len() - tail;
+            let added = new.len() - tail - head;
+            this.lines
+                .splice(head..old_end, new[head..new.len() - tail].iter().cloned());
+            // Rows below the rewrite keep their seats; the rewritten rows are
+            // markup croft generated.
+            this.provenance.splice(head, old_end - head, added);
+            this.provenance
+                .record(head..head + added, crate::provenance::Seat::Generated);
+            this.provenance.truncate(this.lines.len());
+        });
     }
 
     /// Emmet: Wrap with Abbreviation (#1557): wrap the selected lines in

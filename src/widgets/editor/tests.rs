@@ -21458,6 +21458,44 @@ fn editing_reveals_a_fold_the_caret_ended_up_inside() {
     assert!(e.lines[1].contains('Z'), "and the text went to line 1");
 }
 
+/// The edit helper's steps, each in its place: the tab is pinned and the
+/// caret's fold opened before the change, the undo step holds the text from
+/// before it, and the buffer is marked changed (with the caret the change
+/// left) and coloured again after it.
+#[test]
+fn an_undoable_edit_takes_its_steps_in_order() {
+    let mut e = editor_with("fn a() {\n    x\n    y\n}\nafter");
+    e.preview = true;
+    e.toggle_fold(0);
+    e.cursor_row = 1;
+    e.cursor_col = 5;
+    let (seq, requests) = (e.edit_seq, e.highlight_requests);
+    e.undoable_edit(EditKind::Replace, |this| {
+        assert!(!this.preview, "the tab is pinned before the change");
+        assert!(!this.is_line_hidden(1), "and the caret's fold is open");
+        assert!(!this.dirty, "the buffer is marked changed only after it");
+        this.lines[1].push('Z');
+        this.cursor_col = 6;
+    });
+    assert!(e.dirty);
+    assert_eq!(e.edit_seq, seq.wrapping_add(1));
+    assert_eq!(
+        e.last_edit_pos,
+        Some((1, 6)),
+        "the change is marked where it left the caret"
+    );
+    assert_eq!(
+        e.highlight_requests,
+        requests.wrapping_add(1),
+        "and coloured again once"
+    );
+    assert!(e.undo());
+    assert_eq!(
+        e.lines[1], "    x",
+        "one undo brings back the text from before the change"
+    );
+}
+
 /// Waiting for an EDIT to reveal the fold is too late for a jump: a caret
 /// on a hidden line has no painted row at all, so `cursor_screen_pos`
 /// returns `None` and no caret is drawn anywhere on screen. Ctrl+G stands
