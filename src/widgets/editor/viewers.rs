@@ -1546,7 +1546,19 @@ impl Editor {
             path.hash(&mut h);
             h.finish()
         };
-        let scratch = gunzip_scratch_dir()?.join(format!("{key:016x}-{inner}"));
+        let dir = gunzip_scratch_dir()?;
+        // Off this thread: an archive restored at launch opens before the
+        // first frame, and the sweep must not hold that frame up.
+        let swept = dir.clone();
+        let _ = std::thread::Builder::new()
+            .name(String::from("gunzip-sweep"))
+            .spawn(move || sweep_gunzip_copies(&swept, false));
+        let scratch = dir.join(gunzip_copy_name(
+            key,
+            std::process::id(),
+            next_gunzip_copy_number(key),
+            &inner,
+        ));
         // Never follow a link planted at the name: unlink whatever is there
         // (a link, not its target) and create the file exclusively.
         match std::fs::remove_file(&scratch) {
@@ -1557,17 +1569,22 @@ impl Editor {
             .write(true)
             .create_new(true)
             .open(&scratch)?;
+        // From here every way out deletes the copy (#2675): a gzip corrupt
+        // partway, one too large, or a view that cannot open it.
+        let copy = crate::log_view::OwnedCopy::new(scratch.clone());
         out.write_all(&head)?;
         let written = head.len() as u64 + std::io::copy(&mut decoder, &mut out)?;
         drop(out);
         if written > MAX_GUNZIP_BYTES {
-            let _ = std::fs::remove_file(&scratch);
             anyhow::bail!(
                 "Decompressed file too large to show (over {} MiB)",
                 MAX_GUNZIP_BYTES / (1024 * 1024)
             );
         }
         self.open_log(&scratch)?;
+        if let Some(log) = self.log.as_mut() {
+            log.own_copy(copy);
+        }
         self.path = Some(path.to_path_buf());
         self.disk_stamp = Self::disk_stamp_of(path);
         self.status = format!("Opened {} decompressed, read-only", path.display());
@@ -2492,6 +2509,21 @@ pub(super) fn log_span_style(s: &crate::ansi_text::AnsiStyle, theme: crate::them
     style
 }
 
+/// Where the private folder for decompressed gzip copies lives, whether or
+/// not it exists yet: one per user.
+fn gunzip_scratch_path() -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        // SAFETY: getuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        std::env::temp_dir().join(format!("croft-gunzip-{uid}"))
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::temp_dir().join("croft-gunzip")
+    }
+}
+
 /// The private folder that holds decompressed gzip copies (#1469): one per
 /// user, mode 0700 on unix, and refused unless it is a real directory this
 /// user owns that no one else can enter, so another local user can neither
@@ -2502,7 +2534,7 @@ pub(super) fn gunzip_scratch_dir() -> std::io::Result<std::path::PathBuf> {
         use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
         // SAFETY: getuid has no preconditions and cannot fail.
         let uid = unsafe { libc::getuid() };
-        let dir = std::env::temp_dir().join(format!("croft-gunzip-{uid}"));
+        let dir = gunzip_scratch_path();
         match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
             Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
             _ => {}
@@ -2518,9 +2550,117 @@ pub(super) fn gunzip_scratch_dir() -> std::io::Result<std::path::PathBuf> {
     }
     #[cfg(not(unix))]
     {
-        let dir = std::env::temp_dir().join("croft-gunzip");
+        let dir = gunzip_scratch_path();
         std::fs::create_dir_all(&dir)?;
         Ok(dir)
+    }
+}
+
+/// The file name of the `n`th copy this process makes of the archive whose
+/// path hashes to `key` (#2675). Every opening gets its own file, so a tab
+/// closing never deletes a copy another tab still reads, and the process id
+/// tells a later croft whose copy it is. The archive's own name ends it,
+/// cut from the front to its last [`GUNZIP_NAME_KEEP`] bytes, so the whole
+/// stays within the 255 bytes most file systems allow a name and a long
+/// one still opens.
+pub(super) fn gunzip_copy_name(key: u64, pid: u32, n: u64, inner: &str) -> String {
+    let mut cut = inner.len().saturating_sub(GUNZIP_NAME_KEEP);
+    while !inner.is_char_boundary(cut) {
+        cut += 1;
+    }
+    format!("{key:016x}-{pid}-{n}-{}", &inner[cut..])
+}
+
+/// How much of an archive's name its copy keeps: 255 bytes less the
+/// longest key, process id and count with their dashes (16, 10 and 20
+/// digits, 3 dashes).
+const GUNZIP_NAME_KEEP: usize = 255 - (16 + 10 + 20 + 3);
+
+/// How many copies of the archive hashing to `key` this process has made
+/// before this one.
+fn next_gunzip_copy_number(key: u64) -> u64 {
+    static MADE: std::sync::Mutex<std::collections::BTreeMap<u64, u64>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    let n = made.entry(key).or_insert(0);
+    *n += 1;
+    *n - 1
+}
+
+/// The process that made the copy named `name`, for a name
+/// [`gunzip_copy_name`] wrote.
+fn gunzip_copy_owner(name: &str) -> Option<u32> {
+    let mut parts = name.splitn(4, '-');
+    let key = parts.next()?;
+    let pid = parts.next()?;
+    let n = parts.next()?;
+    parts.next()?;
+    let named = key.len() == 16
+        && key.bytes().all(|b| b.is_ascii_hexdigit())
+        && !n.is_empty()
+        && n.bytes().all(|b| b.is_ascii_digit());
+    named.then(|| pid.parse().ok()).flatten()
+}
+
+/// Delete the copies in `dir` that no running croft reads (#2675): those
+/// of a process that is gone, such as one killed or cut off with its ssh
+/// session, and, when `own` is set, this process's own. The way out that
+/// skips the tabs' own clean-up sets it: the self-update relaunch keeps
+/// this process id, so its copies would look in use forever.
+pub(super) fn sweep_gunzip_copies(dir: &Path, own: bool) {
+    let me = std::process::id();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(gunzip_copy_owner) else {
+            continue;
+        };
+        let unused = if pid == me {
+            own
+        } else {
+            !process_is_running(pid)
+        };
+        if unused {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Whether a process with this id may be running. Only "no such process"
+/// counts as gone: one this user may not signal, because a security policy
+/// says no or another user took the id, counts as running, so a copy still
+/// in use is never deleted. Where that cannot be asked, every other process
+/// counts as running.
+fn process_is_running(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return true;
+        };
+        if pid <= 0 {
+            return true;
+        }
+        // SAFETY: signal 0 only checks the process exists; nothing is sent.
+        let probe = unsafe { libc::kill(pid, 0) };
+        probe == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+/// Delete this process's decompressed copies before an exit that skips the
+/// tabs' own clean-up (#2675): the self-update relaunch and the drop back
+/// to the local machine.
+pub fn delete_own_gunzip_copies() {
+    let dir = gunzip_scratch_path();
+    if dir.is_dir()
+        && let Ok(dir) = gunzip_scratch_dir()
+    {
+        sweep_gunzip_copies(&dir, true);
     }
 }
 
