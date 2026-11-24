@@ -44,12 +44,52 @@ pub const TAR_LIST_CAP: u64 = 100 * 1024 * 1024;
 /// is expected to fall through to the hex viewer with the reason shown.
 pub const ZIP_LIST_CAP: u64 = 8 * 1024 * 1024;
 
-/// Whether a listing error is a deliberate SIZE refusal rather than a
-/// parse failure (#493). Owned here, beside the messages it matches, so a
-/// reworded message cannot silently turn a caller's policy branch into its
-/// ignore branch — which would restore the silent hex dump this exists to
-/// explain. Covers every cap in this module: both listing gates and the
-/// decoded-size cap a `.tar.gz` can trip while streaming.
+/// A listing refused at a deliberate SIZE cap rather than a parse failure
+/// (#493). It travels inside the `io::Error` a listing fails with, so a
+/// caller tells the two apart by type, never by the message: a reworded
+/// message cannot turn a caller's policy branch into its ignore branch,
+/// which would restore the silent hex dump this exists to explain. Every
+/// cap in this module makes one: both listing gates and the decoded-size
+/// cap a `.tar.gz` can trip while streaming.
+#[derive(Debug)]
+pub struct PastListingCap(String);
+
+impl std::fmt::Display for PastListingCap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PastListingCap {}
+
+/// A [`PastListingCap`] refusal saying `message`.
+fn past_listing_cap(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::other(PastListingCap(message.into()))
+}
+
+/// Whether a listing failed at a size cap ([`PastListingCap`]), however
+/// deep the refusal sits: the tar reader can wrap the error its source
+/// returned in one of its own.
+pub fn is_list_cap_error(e: &std::io::Error) -> bool {
+    fn holds_cap(e: &(dyn std::error::Error + 'static)) -> bool {
+        if e.is::<PastListingCap>() {
+            return true;
+        }
+        // An io::Error hides its payload from `source`; look inside it.
+        if let Some(io) = e.downcast_ref::<std::io::Error>()
+            && let Some(inner) = io.get_ref()
+            && holds_cap(inner)
+        {
+            return true;
+        }
+        e.source().is_some_and(holds_cap)
+    }
+    holds_cap(e)
+}
+
+/// Whether a rendered status or message names a listing cap: for tests that
+/// check what the user is told.
+#[cfg(test)]
 pub fn is_list_cap_refusal(rendered: &str) -> bool {
     rendered.contains("too large to list") || rendered.contains("past the listing cap")
 }
@@ -65,9 +105,7 @@ struct CappedRead<R> {
 impl<R: std::io::Read> std::io::Read for CappedRead<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.remaining == 0 {
-            return Err(std::io::Error::other(
-                "archive expands past the listing cap",
-            ));
+            return Err(past_listing_cap("archive expands past the listing cap"));
         }
         let take = buf
             .len()
@@ -115,9 +153,8 @@ impl ArchiveKind {
 /// is an error (here or in the header walk), so the file falls through to
 /// the hex viewer.
 fn xz_tar_bytes(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
-    let past_cap = |size: String| {
-        std::io::Error::other(format!("archive expands past the listing cap ({size})"))
-    };
+    let past_cap =
+        |size: String| past_listing_cap(format!("archive expands past the listing cap ({size})"));
     let bytes = std::fs::read(path)?;
     let declared = crate::lsp::install::xz_declared_size(&bytes)
         .ok_or_else(|| std::io::Error::other("the xz index cannot be read"))?;
@@ -277,7 +314,7 @@ pub fn list(path: &Path, kind: ArchiveKind) -> std::io::Result<ArchiveView> {
             // Before the open, not after: the constructor below is where
             // the per-member cost is paid.
             if meta.len() > ZIP_LIST_CAP {
-                return Err(std::io::Error::other(format!(
+                return Err(past_listing_cap(format!(
                     "zip too large to list ({} bytes)",
                     meta.len()
                 )));
@@ -299,7 +336,7 @@ pub fn list(path: &Path, kind: ArchiveKind) -> std::io::Result<ArchiveView> {
         | ArchiveKind::TarBz2
         | ArchiveKind::TarZst => {
             if meta.len() > TAR_LIST_CAP {
-                return Err(std::io::Error::other(format!(
+                return Err(past_listing_cap(format!(
                     "tar archive too large to list ({} bytes)",
                     meta.len()
                 )));
@@ -1157,6 +1194,7 @@ mod tests {
         make_tar_xz(&p);
         let err = xz_tar_bytes(&p, 1024).unwrap_err();
         assert!(is_list_cap_refusal(&err.to_string()), "{err}");
+        assert!(is_list_cap_error(&err), "the refusal keeps its type");
         assert!(xz_tar_bytes(&p, TAR_LIST_CAP).is_ok());
     }
 
@@ -1270,6 +1308,10 @@ mod tests {
             };
             let err = walk(1024).unwrap_err();
             assert!(is_list_cap_refusal(&err.to_string()), "{kind:?}: {err}");
+            assert!(
+                is_list_cap_error(&err),
+                "{kind:?}: the refusal keeps its type"
+            );
             assert_eq!(walk(TAR_LIST_CAP).unwrap(), 3, "{kind:?}");
         }
     }
