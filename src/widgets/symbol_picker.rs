@@ -18,6 +18,7 @@ use ratatui::{
 use crate::icons::for_outline_kind;
 use crate::lsp::manager::OutlineSymbol;
 use crate::widgets::file_finder::fuzzy_score;
+use crate::widgets::picker_query;
 
 pub struct SymbolPicker {
     pub query: String,
@@ -81,56 +82,37 @@ impl SymbolPicker {
         Some((sym.line, sym.character))
     }
 
-    fn char_count(&self) -> usize {
-        self.query.chars().count()
-    }
-
-    fn byte_offset(&self, char_idx: usize) -> usize {
-        self.query
-            .char_indices()
-            .nth(char_idx)
-            .map(|(b, _)| b)
-            .unwrap_or(self.query.len())
-    }
-
     pub fn push_char(&mut self, c: char) {
-        let at = self.byte_offset(self.cursor);
-        self.query.insert(at, c);
-        self.cursor += 1;
+        picker_query::insert(&mut self.query, &mut self.cursor, c);
         self.refresh_results();
         self.selected = 0;
         self.scroll = 0;
     }
 
     pub fn pop_char(&mut self) {
-        if self.cursor == 0 {
+        if !picker_query::backspace(&mut self.query, &mut self.cursor) {
             return;
         }
-        let at = self.byte_offset(self.cursor - 1);
-        self.query.remove(at);
-        self.cursor -= 1;
         self.refresh_results();
         self.selected = 0;
         self.scroll = 0;
     }
 
     pub fn delete_char(&mut self) {
-        if self.cursor >= self.char_count() {
+        if !picker_query::delete(&mut self.query, self.cursor) {
             return;
         }
-        let at = self.byte_offset(self.cursor);
-        self.query.remove(at);
         self.refresh_results();
         self.selected = 0;
         self.scroll = 0;
     }
 
     pub fn move_cursor_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
+        picker_query::left(&mut self.cursor);
     }
 
     pub fn move_cursor_right(&mut self) {
-        self.cursor = (self.cursor + 1).min(self.char_count());
+        picker_query::right(&self.query, &mut self.cursor);
     }
 
     pub fn move_cursor_home(&mut self) {
@@ -138,7 +120,7 @@ impl SymbolPicker {
     }
 
     pub fn move_cursor_end(&mut self) {
-        self.cursor = self.char_count();
+        picker_query::end(&self.query, &mut self.cursor);
     }
 
     pub fn select_next(&mut self) {
