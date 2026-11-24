@@ -1191,6 +1191,10 @@ impl App {
                 self.sync_open_file_poll_mtime();
                 self.status = if crate::rebase_todo::is_todo(path) {
                     String::from(crate::rebase_todo::HINT)
+                } else if self.editor.hex.is_some() {
+                    // Hex is where a file lands when its own viewer declined
+                    // it: the editor's status says so, and why (#2711).
+                    self.editor.status.clone()
                 } else {
                     format!("Opened {}", path.display())
                 };

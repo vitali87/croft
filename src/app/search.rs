@@ -952,6 +952,10 @@ impl App {
                                 hint.line.min(last_line)
                             ),
                         },
+                        // Hex is where a file lands when its own viewer
+                        // declined it: the editor's status says so, and why
+                        // (#2711).
+                        None if self.editor.hex.is_some() => self.editor.status.clone(),
                         None => format!("Opened {}", self.status_path(&path)),
                     };
                 }
