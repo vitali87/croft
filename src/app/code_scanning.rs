@@ -162,15 +162,7 @@ impl App {
             touched.insert(target);
         }
         for path in touched {
-            let merged = self.merged_diagnostics(&path);
-            if self.editor.path.as_deref() == Some(path.as_path()) {
-                self.editor.apply_diagnostics(path.clone(), merged.clone());
-            }
-            for group in self.editor_layout.inactive_groups_mut() {
-                if group.path.as_deref() == Some(path.as_path()) {
-                    group.apply_diagnostics(path.clone(), merged.clone());
-                }
-            }
+            self.show_merged_diagnostics(&path);
         }
         self.rebuild_problems();
         self.refresh_problems_badge();
