@@ -874,12 +874,20 @@ fn a_click_behind_a_popup_never_reaches_what_it_covers() {
         let close_b = app.editor.close_screen_x(1).expect("b.txt's close button");
         let _hook = open(&mut app, p);
         draw(&mut app, 160, 40);
-        let before = (app.editor.tab_count(), app.editor.cursor_row, app.editor.cursor_col);
+        let before = (
+            app.editor.tab_count(),
+            app.editor.cursor_row,
+            app.editor.cursor_col,
+        );
         // The other tab's close button, then the last line of the file.
         left_click(&mut app, close_b, tab_row);
         let text_row = tab_row + 4;
         left_click(&mut app, 30, text_row);
-        let after = (app.editor.tab_count(), app.editor.cursor_row, app.editor.cursor_col);
+        let after = (
+            app.editor.tab_count(),
+            app.editor.cursor_row,
+            app.editor.cursor_col,
+        );
         if before != after {
             reached.push(format!("{p:?} (tabs, row, col {before:?} -> {after:?})"));
         }
