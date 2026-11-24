@@ -638,24 +638,20 @@ impl App {
     pub(super) fn open_shortcuts_modal(&mut self) {
         if self.shortcuts_modal.is_none() {
             self.shortcuts_modal = Some(crate::widgets::shortcuts::ShortcutsModal::default());
-            self.overlays.shortcuts_clear.request();
+            self.overlays.popup_clear.request();
             self.status = String::from("Shortcuts: Esc to close");
         }
     }
 
     pub(super) fn close_shortcuts_modal(&mut self) {
         if self.shortcuts_modal.take().is_some() {
-            self.overlays.shortcuts_clear.request();
+            self.overlays.popup_clear.request();
             self.overlays.activity.mark_dirty();
             self.overlays.welcome.mark_dirty();
             self.overlays.hero.mark_dirty();
             self.invalidate_editor_image_layouts();
             self.status.clear();
         }
-    }
-
-    pub fn consume_shortcuts_image_clear(&mut self) -> bool {
-        self.overlays.shortcuts_clear.consume()
     }
 
     /// Open one of the JSON config files in the editor, creating it seeded with

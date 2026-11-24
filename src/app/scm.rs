@@ -3683,10 +3683,6 @@ impl App {
         self.status = format!("Commit failed: {why}");
     }
 
-    pub fn consume_branch_picker_image_clear(&mut self) -> bool {
-        self.overlays.branch_picker_clear.consume()
-    }
-
     /// Open the Checkout / Create Branch picker, seeded with the repo's
     /// branches (most-recently-committed first). A one-shot `git
     /// for-each-ref` runs here, off the render path — same discipline as
@@ -3702,7 +3698,7 @@ impl App {
                 let n = branches.len();
                 self.branch_picker =
                     Some(crate::widgets::branch_picker::BranchPicker::new(branches));
-                self.overlays.branch_picker_clear.request();
+                self.overlays.popup_clear.request();
                 self.status =
                     format!("Branches: {n} — type to filter or name a new branch, Esc to close");
             }
@@ -3716,7 +3712,7 @@ impl App {
 
     pub(super) fn close_branch_picker(&mut self) {
         if self.branch_picker.take().is_some() {
-            self.overlays.branch_picker_clear.request();
+            self.overlays.popup_clear.request();
             self.overlays.activity.mark_dirty();
             self.overlays.welcome.mark_dirty();
             self.overlays.hero.mark_dirty();
