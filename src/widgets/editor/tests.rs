@@ -22597,6 +22597,10 @@ fn every_route_opens_the_view_it_opens_today() {
             "r.sarif",
             Box::new(|p| std::fs::write(p, "{not json").unwrap()),
         ),
+        (
+            "damaged.xlsx",
+            Box::new(crate::sheet::tests::overflowing_zip),
+        ),
     ];
     let shown = |p: &Path| p.display().to_string();
     let outcomes: Vec<String> = rows
@@ -22630,6 +22634,7 @@ fn every_route_opens_the_view_it_opens_today() {
         r#"app.log.gz: ["log"] Opened <dir>/app.log.gz decompressed, read-only"#,
         r#"bomb.log.gz: ["hex"] Opened <dir>/bomb.log.gz in the hex viewer: Decompressed file too large to show (over 256 MiB)"#,
         r#"r.sarif: [] Opened <dir>/r.sarif as text: invalid JSON at 1:2: key must be a string at line 1 column 2"#,
+        r#"damaged.xlsx: ["hex"] Opened <dir>/damaged.xlsx in the hex viewer"#,
     ];
     pretty_assertions::assert_eq!(outcomes, expected);
 }
