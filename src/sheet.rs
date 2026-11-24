@@ -7,6 +7,38 @@ use std::path::Path;
 pub type SheetCellEdit = (String, usize, usize, String);
 
 pub(crate) const CSV_BYTES_CAP: u64 = 25 * 1024 * 1024;
+
+/// A sheet refused at a deliberate size cap (the file's bytes, or the cells
+/// its grid would hold), not one that failed to parse: the open reports it
+/// instead of falling through to the text editor, which would get around the
+/// cap. It travels inside the `io::Error`, so callers tell the two apart by
+/// type ([`is_size_refusal`]).
+#[derive(Debug)]
+pub struct PastSheetCap(String);
+
+impl std::fmt::Display for PastSheetCap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PastSheetCap {}
+
+/// A [`PastSheetCap`] refusal saying `message`.
+fn past_sheet_cap(message: String) -> std::io::Error {
+    std::io::Error::other(PastSheetCap(message))
+}
+
+/// Whether a sheet open was refused for its size rather than failing to
+/// parse: one of this module's caps ([`PastSheetCap`]), or an error from the
+/// workbook readers that says "too large", such as the zip reader's "Archive
+/// header is too large". The second was always read as a size refusal, by
+/// its wording, and still is; a workbook that fails that way should fall
+/// through to the hex viewer like other unreadable ones (#2709).
+pub fn is_size_refusal(e: &std::io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<PastSheetCap>())
+        || e.to_string().contains("too large")
+}
 const XLSX_BYTES_CAP: u64 = 50 * 1024 * 1024;
 /// The most cells one sheet's grid is built from, counting the dense
 /// rectangle between its outermost values. The compressed-size cap above
@@ -229,7 +261,7 @@ pub fn open_sheet_with_kind(path: &Path, kind: SheetKind) -> std::io::Result<She
     match kind {
         SheetKind::Csv | SheetKind::Tsv => {
             if meta.len() > CSV_BYTES_CAP {
-                return Err(std::io::Error::other(format!(
+                return Err(past_sheet_cap(format!(
                     "CSV/TSV too large ({} bytes)",
                     meta.len()
                 )));
@@ -259,7 +291,7 @@ pub fn open_sheet_with_kind(path: &Path, kind: SheetKind) -> std::io::Result<She
         )),
         SheetKind::Xlsx | SheetKind::Xls | SheetKind::Ods | SheetKind::Xlsb => {
             if meta.len() > XLSX_BYTES_CAP {
-                return Err(std::io::Error::other(format!(
+                return Err(past_sheet_cap(format!(
                     "Spreadsheet too large ({} bytes)",
                     meta.len()
                 )));
@@ -894,11 +926,11 @@ pub(crate) fn text_width(s: &str) -> usize {
     s.graphemes(true).map(grapheme_width).sum()
 }
 
-/// Refuse a sheet whose dense extent is over [`MAX_SHEET_CELLS`]. The
-/// message says "too large" so the open is not rerouted to the text editor.
+/// Refuse a sheet whose dense extent is over [`MAX_SHEET_CELLS`], as a
+/// [`PastSheetCap`] so the open is not rerouted to the text editor.
 fn check_sheet_extent(name: &str, rows: u64, cols: u64) -> std::io::Result<()> {
     if rows.saturating_mul(cols) > MAX_SHEET_CELLS {
-        return Err(std::io::Error::other(format!(
+        return Err(past_sheet_cap(format!(
             "Sheet too large: {name} is {rows}x{cols} cells (max {}M)",
             MAX_SHEET_CELLS / 1_000_000
         )));
