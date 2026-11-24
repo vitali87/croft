@@ -339,6 +339,24 @@ pub(super) fn build_line_spans<'a>(
     out
 }
 
+/// What every row's gutter shares in one frame of [`Editor::render`]: the
+/// text area, the gutter's and the text's widths, and the frame-wide facts
+/// the gutter's painting reads.
+struct GutterFrame {
+    /// The editor's text area: the gutter starts at its left edge.
+    inner: Rect,
+    /// The line-number column with its sign margin, before the change lane.
+    gutter_width: u16,
+    /// The text's width right of the gutter.
+    text_width: u16,
+    /// A selection is active, which hides the current-line wash.
+    selecting: bool,
+    /// The theme draws `surfaces`: a quieter gutter.
+    surfaces: bool,
+    /// The pointer is over the gutter, which shows every fold chevron.
+    gutter_hovered: bool,
+}
+
 impl Widget for &mut Editor {
     fn render(self, area: Rect, buf: &mut Buffer) {
         self.clamp_to_symbol_view();
@@ -864,6 +882,15 @@ impl Widget for &mut Editor {
                 && py >= inner.y
                 && py < inner.y + inner.height
         });
+        // What every row's gutter shares this frame.
+        let gutter = GutterFrame {
+            inner,
+            gutter_width,
+            text_width,
+            selecting: sel_norm.is_some(),
+            surfaces,
+            gutter_hovered,
+        };
         // Each text row's geometry, refilled per row (#873).
         let mut row_cells = RowCells::default();
 
@@ -898,187 +925,7 @@ impl Widget for &mut Editor {
                 }
                 VisRow::Text { line, start, end } => (line, start, end),
             };
-            // Current-line highlight (VS Code `editor.lineHighlightBackground`,
-            // #248): a whisper of the accent behind every visual row of the
-            // cursor's line, gutter through code. Focused editor only, and
-            // hidden while a selection is active so the two washes never stack
-            // — VS Code's `renderLineHighlight` behaves the same. Painted
-            // first: spans that carry their own background (selection, search,
-            // occurrences) patch over it, spans that don't inherit it.
-            if self.focused && line_idx == self.cursor_row && sel_norm.is_none() {
-                buf.set_style(
-                    Rect::new(inner.x, y, gutter_width + 1 + text_width, 1),
-                    Style::default().bg(self.theme.current_line_bg()),
-                );
-            }
-            // The line number shows once per logical line - on its first visual
-            // row; wrapped continuation rows get a blank gutter, like VS Code.
-            if !wrap || row_start == 0 {
-                let line_no = format!(
-                    "{:>width$} ",
-                    self.gutter_number(line_idx)
-                        .map(|n| n.to_string())
-                        .unwrap_or_default(),
-                    width = gutter_width as usize - 1
-                );
-                // Live Run coverage tints the number: green for a statement
-                // that ran, a muted red for one that never did. Otherwise a
-                // caret's line is brighter than the rest (VS Code's
-                // `editorLineNumber.activeForeground`, #1576).
-                let number_fg = match self
-                    .live_run
-                    .as_ref()
-                    .and_then(|v| v.coverage(line_idx, &self.lines[line_idx]))
-                {
-                    Some(crate::live_run::Coverage::Ran) => self.theme.git_added(),
-                    Some(crate::live_run::Coverage::NeverRan) => {
-                        self.theme.ui(Color::Rgb(0xa0, 0x55, 0x55))
-                    }
-                    None if self.is_caret_line(line_idx) => self.theme.line_number_active(),
-                    None => self.theme.line_number_fg(),
-                };
-                let gutter = Line::from(Span::styled(line_no, Style::default().fg(number_fg)));
-                buf.set_line(inner.x, y, &gutter, gutter_width);
-            } else {
-                buf.set_line(
-                    inner.x,
-                    y,
-                    &Line::from(" ".repeat(gutter_width as usize)),
-                    gutter_width,
-                );
-            }
-
-            // The sign cell: the dedicated glyph margin at the far left
-            // (`inner.x`), VS Code-style, so a glyph never crowds the line
-            // number or the code. One glyph, on a logical line's first visual
-            // row, chosen by `sign_glyph`, the rule a click answers by too.
-            let sign_x = inner.x;
-            if let Some(glyph) = (!wrap || row_start == 0)
-                .then(|| self.sign_glyph(line_idx))
-                .flatten()
-            {
-                let (symbol, color) = match glyph {
-                    // The debugger's yellow stop arrow.
-                    SignGlyph::Stop => ("▶", Color::Rgb(0xff, 0xcc, 0x00)),
-                    // Hollow dimmed ring when the adapter could not bind it;
-                    // a red diamond for a conditional breakpoint; an amber
-                    // one for a logpoint; a solid red dot for a plain one.
-                    SignGlyph::Breakpoint(BreakpointMark::Unverified) => {
-                        ("○", Color::Rgb(0x99, 0x99, 0x99))
-                    }
-                    SignGlyph::Breakpoint(BreakpointMark::Conditional) => {
-                        ("◆", Color::Rgb(0xe5, 0x1c, 0x23))
-                    }
-                    SignGlyph::Breakpoint(BreakpointMark::Logpoint) => {
-                        ("◆", Color::Rgb(0xe5, 0xc0, 0x7b))
-                    }
-                    SignGlyph::Breakpoint(BreakpointMark::Plain) => {
-                        ("●", Color::Rgb(0xe5, 0x1c, 0x23))
-                    }
-                    // AI-stream stop button (croft pair): while a pilot
-                    // streams into this file, the row under its caret wears
-                    // a stop square in the badge's orange; clicking it (or
-                    // Cmd+K X) cancels and reverts the stream.
-                    SignGlyph::StreamStop => ("■", Color::Rgb(0xff, 0x9d, 0x2f)),
-                    // ⚑, a plain-Unicode flag: no Nerd Font needed.
-                    SignGlyph::Bookmark => ("\u{2691}", Color::Rgb(0x4f, 0xc1, 0xff)),
-                    // The play button beside a test fn's definition, VS
-                    // Code's run bead in its testing green: cod-play, the
-                    // Testing panel's run glyph.
-                    SignGlyph::TestPlay(_) => ("\u{eb2c}", Color::Rgb(0x73, 0xc9, 0x91)),
-                };
-                buf.set_string(sign_x, y, symbol, Style::default().fg(self.theme.ui(color)));
-            }
-
-            // Fold chevron: on a foldable header's first visual row, in the
-            // second sign-margin column (`sign_x + 1`) so it never collides with
-            // a breakpoint dot at `sign_x`. ▾ = expanded, ▸ = collapsed; the
-            // collapsed one is brighter so hidden content is noticeable. Matches
-            // the gutter's own line numbers. On a `surfaces` theme the
-            // expanded one waits for the caret or the pointer, and the
-            // collapsed one, always shown, wears the muted ink.
-            if (!wrap || row_start == 0) && self.is_foldable(line_idx) {
-                let collapsed = self.folded.contains(&line_idx);
-                let glyph = if collapsed {
-                    let ink = crate::widgets::surface::tones(self.theme)
-                        .map_or_else(|| self.theme.ui(Color::Gray), |t| t.muted());
-                    Some(("▸", ink))
-                } else if !surfaces || gutter_hovered || self.is_caret_line(line_idx) {
-                    Some(("▾", self.theme.line_number_fg()))
-                } else {
-                    None
-                };
-                if let Some((glyph, color)) = glyph {
-                    buf.set_string(sign_x + 1, y, glyph, Style::default().fg(color));
-                }
-            }
-
-            // Git gutter: a thin coloured bar in the spacer cell between the
-            // line number and the code (VS Code's dirty-diff lane), on a
-            // logical line's first visual row only. Colour carries add/mod/del.
-            // ponytail: one heavy bar in three colours; the bar's column also
-            // shows deletions, which VS Code renders as a small triangle — fine
-            // as a first cut, the colour already disambiguates.
-            if (!wrap || row_start == 0)
-                && let Some(mark) = self.git_marks.get(&line_idx)
-            {
-                let color = match mark {
-                    GitMark::Added => self.theme.git_added(),
-                    GitMark::Modified => self.theme.git_modified(),
-                    GitMark::Deleted => self.theme.git_deleted(),
-                };
-                // ┃ heavy vertical; ▎ left quarter block on a `surfaces`
-                // theme, a crisp stripe on the cell edge rather than a line
-                // through its middle.
-                let bar = if surfaces { "\u{258e}" } else { "\u{2503}" };
-                buf.set_string(inner.x + gutter_width, y, bar, Style::default().fg(color));
-            }
-            // Coverage lens (#263): the same lane, painted over the git bar
-            // while a coverage report is shown. Green run, red never run,
-            // amber run with a branch missed; dimmed once the file changed
-            // after the run. `Coverage: Clear` gives the lane back to git.
-            if (!wrap || row_start == 0)
-                && let Some(lens) = self.coverage.as_ref()
-                && let Some(cov) = lens.lines.get(&line_idx)
-            {
-                use crate::testing::coverage::LineCov;
-                let (rgb, glyph) = match cov {
-                    LineCov::Covered => ((0x4e, 0xc9, 0x7a), "\u{258c}"),
-                    LineCov::Uncovered => ((0xe0, 0x55, 0x55), "\u{258c}"),
-                    LineCov::Partial => ((0xe0, 0xb0, 0x40), "\u{2596}"),
-                };
-                let (r, g, b) = if lens.stale {
-                    (rgb.0 / 2, rgb.1 / 2, rgb.2 / 2)
-                } else {
-                    rgb
-                };
-                buf.set_string(
-                    inner.x + gutter_width,
-                    y,
-                    glyph,
-                    Style::default().fg(self.theme.ui(Color::Rgb(r, g, b))),
-                );
-            }
-            // Provenance overlay (#349): the same lane, a thinner bar in the
-            // seat's hue, painted over the git bar while the lens is on
-            // because the user asked who typed the line, not whether it
-            // differs from HEAD. A line with no record paints nothing: an
-            // unknown line is never guessed at.
-            if self.provenance_overlay
-                && (!wrap || row_start == 0)
-                && let Some(seat) = self.provenance.seat(line_idx)
-            {
-                let (r, g, b) = seat.hue();
-                // ▎ left one-quarter block; ▏ one-eighth on a `surfaces`
-                // theme, whose change bar already takes the quarter block.
-                let bar = if surfaces { "\u{258f}" } else { "\u{258e}" };
-                buf.set_string(
-                    inner.x + gutter_width,
-                    y,
-                    bar,
-                    Style::default().fg(self.theme.ui(Color::Rgb(r, g, b))),
-                );
-            }
+            self.paint_row_gutter(buf, &gutter, y, line_idx, !wrap || row_start == 0);
 
             // Per-row window: the segment [row_start, row_end). For non-wrap
             // this is exactly the horizontally-scrolled view; for wrap it is
@@ -1914,6 +1761,213 @@ impl Widget for &mut Editor {
 }
 
 impl Editor {
+    /// Paint the gutter of one visual row at screen row `y` showing
+    /// `line_idx`: the current-line wash, the line number, the sign cell, the
+    /// fold chevron and the change lane. `first_row` is whether this is the
+    /// line's first visual row, the only one that carries its number and
+    /// glyphs when the line wraps.
+    fn paint_row_gutter(
+        &self,
+        buf: &mut Buffer,
+        frame: &GutterFrame,
+        y: u16,
+        line_idx: usize,
+        first_row: bool,
+    ) {
+        // Current-line highlight (VS Code `editor.lineHighlightBackground`,
+        // #248): a whisper of the accent behind every visual row of the
+        // cursor's line, gutter through code. Focused editor only, and
+        // hidden while a selection is active so the two washes never stack
+        // — VS Code's `renderLineHighlight` behaves the same. Painted
+        // first: spans that carry their own background (selection, search,
+        // occurrences) patch over it, spans that don't inherit it.
+        if self.focused && line_idx == self.cursor_row && !frame.selecting {
+            buf.set_style(
+                Rect::new(
+                    frame.inner.x,
+                    y,
+                    frame.gutter_width + 1 + frame.text_width,
+                    1,
+                ),
+                Style::default().bg(self.theme.current_line_bg()),
+            );
+        }
+        // The line number shows once per logical line - on its first visual
+        // row; wrapped continuation rows get a blank gutter, like VS Code.
+        if first_row {
+            let line_no = format!(
+                "{:>width$} ",
+                self.gutter_number(line_idx)
+                    .map(|n| n.to_string())
+                    .unwrap_or_default(),
+                width = frame.gutter_width as usize - 1
+            );
+            // Live Run coverage tints the number: green for a statement
+            // that ran, a muted red for one that never did. Otherwise a
+            // caret's line is brighter than the rest (VS Code's
+            // `editorLineNumber.activeForeground`, #1576).
+            let number_fg = match self
+                .live_run
+                .as_ref()
+                .and_then(|v| v.coverage(line_idx, &self.lines[line_idx]))
+            {
+                Some(crate::live_run::Coverage::Ran) => self.theme.git_added(),
+                Some(crate::live_run::Coverage::NeverRan) => {
+                    self.theme.ui(Color::Rgb(0xa0, 0x55, 0x55))
+                }
+                None if self.is_caret_line(line_idx) => self.theme.line_number_active(),
+                None => self.theme.line_number_fg(),
+            };
+            let gutter = Line::from(Span::styled(line_no, Style::default().fg(number_fg)));
+            buf.set_line(frame.inner.x, y, &gutter, frame.gutter_width);
+        } else {
+            buf.set_line(
+                frame.inner.x,
+                y,
+                &Line::from(" ".repeat(frame.gutter_width as usize)),
+                frame.gutter_width,
+            );
+        }
+
+        // The sign cell: the dedicated glyph margin at the far left
+        // (`inner.x`), VS Code-style, so a glyph never crowds the line
+        // number or the code. One glyph, on a logical line's first visual
+        // row, chosen by `sign_glyph`, the rule a click answers by too.
+        let sign_x = frame.inner.x;
+        if let Some(glyph) = first_row.then(|| self.sign_glyph(line_idx)).flatten() {
+            let (symbol, color) = match glyph {
+                // The debugger's yellow stop arrow.
+                SignGlyph::Stop => ("▶", Color::Rgb(0xff, 0xcc, 0x00)),
+                // Hollow dimmed ring when the adapter could not bind it;
+                // a red diamond for a conditional breakpoint; an amber
+                // one for a logpoint; a solid red dot for a plain one.
+                SignGlyph::Breakpoint(BreakpointMark::Unverified) => {
+                    ("○", Color::Rgb(0x99, 0x99, 0x99))
+                }
+                SignGlyph::Breakpoint(BreakpointMark::Conditional) => {
+                    ("◆", Color::Rgb(0xe5, 0x1c, 0x23))
+                }
+                SignGlyph::Breakpoint(BreakpointMark::Logpoint) => {
+                    ("◆", Color::Rgb(0xe5, 0xc0, 0x7b))
+                }
+                SignGlyph::Breakpoint(BreakpointMark::Plain) => ("●", Color::Rgb(0xe5, 0x1c, 0x23)),
+                // AI-stream stop button (croft pair): while a pilot
+                // streams into this file, the row under its caret wears
+                // a stop square in the badge's orange; clicking it (or
+                // Cmd+K X) cancels and reverts the stream.
+                SignGlyph::StreamStop => ("■", Color::Rgb(0xff, 0x9d, 0x2f)),
+                // ⚑, a plain-Unicode flag: no Nerd Font needed.
+                SignGlyph::Bookmark => ("\u{2691}", Color::Rgb(0x4f, 0xc1, 0xff)),
+                // The play button beside a test fn's definition, VS
+                // Code's run bead in its testing green: cod-play, the
+                // Testing panel's run glyph.
+                SignGlyph::TestPlay(_) => ("\u{eb2c}", Color::Rgb(0x73, 0xc9, 0x91)),
+            };
+            buf.set_string(sign_x, y, symbol, Style::default().fg(self.theme.ui(color)));
+        }
+
+        // Fold chevron: on a foldable header's first visual row, in the
+        // second sign-margin column (`sign_x + 1`) so it never collides with
+        // a breakpoint dot at `sign_x`. ▾ = expanded, ▸ = collapsed; the
+        // collapsed one is brighter so hidden content is noticeable. Matches
+        // the gutter's own line numbers. On a `surfaces` theme the
+        // expanded one waits for the caret or the pointer, and the
+        // collapsed one, always shown, wears the muted ink.
+        if first_row && self.is_foldable(line_idx) {
+            let collapsed = self.folded.contains(&line_idx);
+            let glyph = if collapsed {
+                let ink = crate::widgets::surface::tones(self.theme)
+                    .map_or_else(|| self.theme.ui(Color::Gray), |t| t.muted());
+                Some(("▸", ink))
+            } else if !frame.surfaces || frame.gutter_hovered || self.is_caret_line(line_idx) {
+                Some(("▾", self.theme.line_number_fg()))
+            } else {
+                None
+            };
+            if let Some((glyph, color)) = glyph {
+                buf.set_string(sign_x + 1, y, glyph, Style::default().fg(color));
+            }
+        }
+
+        // Git gutter: a thin coloured bar in the spacer cell between the
+        // line number and the code (VS Code's dirty-diff lane), on a
+        // logical line's first visual row only. Colour carries add/mod/del.
+        // ponytail: one heavy bar in three colours; the bar's column also
+        // shows deletions, which VS Code renders as a small triangle — fine
+        // as a first cut, the colour already disambiguates.
+        if first_row && let Some(mark) = self.git_marks.get(&line_idx) {
+            let color = match mark {
+                GitMark::Added => self.theme.git_added(),
+                GitMark::Modified => self.theme.git_modified(),
+                GitMark::Deleted => self.theme.git_deleted(),
+            };
+            // ┃ heavy vertical; ▎ left quarter block on a `surfaces`
+            // theme, a crisp stripe on the cell edge rather than a line
+            // through its middle.
+            let bar = if frame.surfaces {
+                "\u{258e}"
+            } else {
+                "\u{2503}"
+            };
+            buf.set_string(
+                frame.inner.x + frame.gutter_width,
+                y,
+                bar,
+                Style::default().fg(color),
+            );
+        }
+        // Coverage lens (#263): the same lane, painted over the git bar
+        // while a coverage report is shown. Green run, red never run,
+        // amber run with a branch missed; dimmed once the file changed
+        // after the run. `Coverage: Clear` gives the lane back to git.
+        if first_row
+            && let Some(lens) = self.coverage.as_ref()
+            && let Some(cov) = lens.lines.get(&line_idx)
+        {
+            use crate::testing::coverage::LineCov;
+            let (rgb, glyph) = match cov {
+                LineCov::Covered => ((0x4e, 0xc9, 0x7a), "\u{258c}"),
+                LineCov::Uncovered => ((0xe0, 0x55, 0x55), "\u{258c}"),
+                LineCov::Partial => ((0xe0, 0xb0, 0x40), "\u{2596}"),
+            };
+            let (r, g, b) = if lens.stale {
+                (rgb.0 / 2, rgb.1 / 2, rgb.2 / 2)
+            } else {
+                rgb
+            };
+            buf.set_string(
+                frame.inner.x + frame.gutter_width,
+                y,
+                glyph,
+                Style::default().fg(self.theme.ui(Color::Rgb(r, g, b))),
+            );
+        }
+        // Provenance overlay (#349): the same lane, a thinner bar in the
+        // seat's hue, painted over the git bar while the lens is on
+        // because the user asked who typed the line, not whether it
+        // differs from HEAD. A line with no record paints nothing: an
+        // unknown line is never guessed at.
+        if self.provenance_overlay
+            && first_row
+            && let Some(seat) = self.provenance.seat(line_idx)
+        {
+            let (r, g, b) = seat.hue();
+            // ▎ left one-quarter block; ▏ one-eighth on a `surfaces`
+            // theme, whose change bar already takes the quarter block.
+            let bar = if frame.surfaces {
+                "\u{258f}"
+            } else {
+                "\u{258e}"
+            };
+            buf.set_string(
+                frame.inner.x + frame.gutter_width,
+                y,
+                bar,
+                Style::default().fg(self.theme.ui(Color::Rgb(r, g, b))),
+            );
+        }
+    }
+
     /// Paint logical line `line_idx`'s syntax/semantic-highlighted text at row
     /// `y` from column 0 (no horizontal scroll), clipped to `width`. Used by
     /// the sticky-scroll bar to render pinned scope headers. Assumes the row
