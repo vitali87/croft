@@ -6329,6 +6329,7 @@ pub fn run(
     }
     result?;
     if app.drop_to_local {
+        crate::widgets::editor::delete_own_gunzip_copies();
         std::process::exit(crate::remote::DROP_TO_LOCAL_EXIT_CODE);
     }
     // A background self-update landed: serialize the session and replace
@@ -6363,6 +6364,8 @@ pub fn run(
         cmd.arg(app.workspace_root())
             .arg("--restore-session")
             .arg(&session_path);
+        // The relaunched croft reopens each archive from the saved session.
+        crate::widgets::editor::delete_own_gunzip_copies();
         let err = CommandExt::exec(&mut cmd);
         eprintln!("croft self-relaunch failed: {err}");
         return Ok(());
