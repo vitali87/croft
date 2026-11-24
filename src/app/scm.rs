@@ -255,9 +255,7 @@ impl App {
                 if is_active {
                     self.refresh_commit_graph();
                 }
-                for group in std::iter::once(&mut self.editor)
-                    .chain(self.editor_layout.inactive_groups_mut())
-                {
+                for group in self.editor_layout.all_groups_mut(&mut self.editor) {
                     for ed in &mut group.editors {
                         let owned = ed
                             .path
@@ -511,8 +509,7 @@ impl App {
             (PathBuf, &str),
             Option<crate::packed_lines::PackedLines>,
         > = std::collections::HashMap::new();
-        let groups =
-            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut());
+        let groups = self.editor_layout.all_groups_mut(&mut self.editor);
         for ed in groups.flat_map(|g| g.editors.iter_mut()) {
             let Some(path) = ed.path.clone() else {
                 continue;
@@ -2218,7 +2215,7 @@ impl App {
     pub(super) fn unsaved_repo_files(&self) -> Vec<PathBuf> {
         let root = self.scm_root();
         let mut files: Vec<PathBuf> = Vec::new();
-        let groups = std::iter::once(&self.editor).chain(self.editor_layout.inactive_groups());
+        let groups = self.editor_layout.all_groups(&self.editor);
         let unsaved = |e: &&crate::widgets::editor::Editor| {
             // A scratch tab (#951) is no file of the repository's, though
             // a Git Output tab's label sits under its root.
@@ -2307,9 +2304,7 @@ impl App {
         }
         // A cell still being typed into is part of the save, as Cmd+S
         // treats it (#1140): commit it so Save All writes it.
-        for group in
-            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut())
-        {
+        for group in self.editor_layout.all_groups_mut(&mut self.editor) {
             for ed in &mut group.editors {
                 if let Some(view) = ed.sheet.as_mut()
                     && view.editable()
@@ -4040,8 +4035,8 @@ impl App {
     /// wins in `decode_blob`, and bytes that are not UTF-8 get the plain
     /// open rather than an editable diff of replacement characters.
     pub(super) fn open_tab_encoding(&self, path: &Path) -> &'static encoding_rs::Encoding {
-        std::iter::once(&self.editor)
-            .chain(self.editor_layout.inactive_groups())
+        self.editor_layout
+            .all_groups(&self.editor)
             .flat_map(|g| g.editors.iter())
             .find(|e| e.diff.is_none() && e.path.as_deref() == Some(path))
             .map_or(encoding_rs::UTF_8, |e| e.encoding)

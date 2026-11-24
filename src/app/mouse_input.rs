@@ -705,9 +705,7 @@ impl App {
             && self.context_menu.is_none()
         {
             let mut scrolled = false;
-            for g in
-                std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut())
-            {
+            for g in self.editor_layout.all_groups_mut(&mut self.editor) {
                 if g.tab_strip_contains(m.column, m.row) {
                     g.scroll_tabs_wheel(delta);
                     scrolled = true;

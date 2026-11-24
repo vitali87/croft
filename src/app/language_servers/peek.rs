@@ -25,14 +25,9 @@ impl App {
         // every inactive split leaf's — so unsaved edits show wherever the
         // target file happens to be open.
         let open_buffer = self
-            .editor
-            .editors
-            .iter()
-            .chain(
-                self.editor_layout
-                    .inactive_groups()
-                    .flat_map(|tabs| tabs.editors.iter()),
-            )
+            .editor_layout
+            .all_groups(&self.editor)
+            .flat_map(|g| g.editors.iter())
             .find(|e| e.path.as_deref() == Some(path.as_path()))
             .map(|e| e.lines.clone());
         let lines: Vec<String> = match open_buffer {

@@ -312,6 +312,25 @@ impl EditorLayout {
         activate_first(&mut self.root).expect("a surviving leaf must remain to promote")
     }
 
+    /// Every group: `active` (the focused group, whose tabs live hoisted in
+    /// `App::editor`) first, then the rest as [`Self::inactive_groups`] walks
+    /// them. Pass `&app.editor`; work that must reach every open tab, in any
+    /// group, starts here.
+    pub fn all_groups<'a>(
+        &'a self,
+        active: &'a EditorTabs,
+    ) -> impl Iterator<Item = &'a EditorTabs> {
+        std::iter::once(active).chain(self.inactive_groups())
+    }
+
+    /// [`Self::all_groups`], mutably: pass `&mut app.editor`.
+    pub fn all_groups_mut<'a>(
+        &'a mut self,
+        active: &'a mut EditorTabs,
+    ) -> impl Iterator<Item = &'a mut EditorTabs> {
+        std::iter::once(active).chain(self.inactive_groups_mut())
+    }
+
     /// Every non-active group, mutably, for fan-out work the app must apply
     /// to all groups (LSP tokens, diagnostics, theme, focus flags). The same
     /// groups in the same order as [`Self::inactive_groups`].

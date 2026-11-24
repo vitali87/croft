@@ -115,7 +115,7 @@ impl App {
         let mut paths: std::collections::HashSet<&std::path::Path> =
             std::collections::HashSet::new();
         let mut pathless = 0usize;
-        let groups = std::iter::once(&self.editor).chain(self.editor_layout.inactive_groups());
+        let groups = self.editor_layout.all_groups(&self.editor);
         // A scratch tab's edits are nothing a save writes (#951).
         for ed in groups
             .flat_map(|g| g.editors.iter())
@@ -1377,14 +1377,9 @@ impl App {
     pub(super) fn write_tab_to_disk(&mut self, path: &std::path::Path) {
         use crate::widgets::editor::SaveOutcome;
         let found = self
-            .editor
-            .editors
-            .iter_mut()
-            .chain(
-                self.editor_layout
-                    .inactive_groups_mut()
-                    .flat_map(|g| g.editors.iter_mut()),
-            )
+            .editor_layout
+            .all_groups_mut(&mut self.editor)
+            .flat_map(|g| g.editors.iter_mut())
             .find(|e| e.path.as_deref() == Some(path));
         let Some(editor) = found else {
             // The tab was closed while the formatter was thinking; there is no
@@ -1632,8 +1627,9 @@ impl App {
         for (path, bytes, pane) in std::mem::take(&mut self.pending_sudo_saves) {
             let mut open = false;
             let mut settled = None;
-            for e in std::iter::once(&mut self.editor)
-                .chain(self.editor_layout.inactive_groups_mut())
+            for e in self
+                .editor_layout
+                .all_groups_mut(&mut self.editor)
                 .flat_map(|g| g.editors.iter_mut())
                 .filter(|e| e.path.as_ref() == Some(&path))
             {
@@ -1861,8 +1857,9 @@ impl App {
         let Some(ed) = self.editor.editors.get(idx).filter(|e| holds_unsaved(e)) else {
             return false;
         };
-        !std::iter::once(&self.editor)
-            .chain(self.editor_layout.inactive_groups())
+        !self
+            .editor_layout
+            .all_groups(&self.editor)
             .flat_map(|g| g.editors.iter())
             .any(|other| {
                 !std::ptr::eq(other, ed)
@@ -1879,8 +1876,9 @@ impl App {
     pub(super) fn unsaved_files(&self) -> Vec<String> {
         let mut seen: Vec<&Path> = Vec::new();
         let mut labels = Vec::new();
-        for ed in std::iter::once(&self.editor)
-            .chain(self.editor_layout.inactive_groups())
+        for ed in self
+            .editor_layout
+            .all_groups(&self.editor)
             .flat_map(|g| g.editors.iter())
             .filter(|e| holds_unsaved(e))
         {
@@ -1907,8 +1905,9 @@ impl App {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         let mut any = false;
-        for ed in std::iter::once(&self.editor)
-            .chain(self.editor_layout.inactive_groups())
+        for ed in self
+            .editor_layout
+            .all_groups(&self.editor)
             .flat_map(|g| g.editors.iter())
             .filter(|e| holds_unsaved(e) || e.sheet_pending_cell().is_some())
         {
@@ -1958,8 +1957,8 @@ impl App {
 
     /// When the most recently edited unsaved buffer last changed.
     pub(super) fn newest_unsaved_edit(&self) -> Option<std::time::Instant> {
-        std::iter::once(&self.editor)
-            .chain(self.editor_layout.inactive_groups())
+        self.editor_layout
+            .all_groups(&self.editor)
             .flat_map(|g| g.editors.iter())
             .filter(|e| holds_unsaved(e))
             .filter_map(|e| e.last_edit_at)
@@ -2036,8 +2035,9 @@ impl App {
     /// matched it. Hex and sheet tabs carry no text and are left out, as
     /// from the relaunch.
     pub(super) fn capture_hot_exit(&self) -> crate::hot_exit::Backup {
-        let editors: Vec<&Editor> = std::iter::once(&self.editor)
-            .chain(self.editor_layout.inactive_groups())
+        let editors: Vec<&Editor> = self
+            .editor_layout
+            .all_groups(&self.editor)
             .flat_map(|g| g.editors.iter())
             .collect();
         let buffers = self
@@ -2367,8 +2367,9 @@ impl App {
         let mut copies: Vec<(PathBuf, usize, bool)> = Vec::new();
         if only.is_none() {
             let mut seen: Vec<(PathBuf, &Editor)> = Vec::new();
-            for ed in std::iter::once(&self.editor)
-                .chain(self.editor_layout.inactive_groups())
+            for ed in self
+                .editor_layout
+                .all_groups(&self.editor)
                 .flat_map(|g| g.editors.iter())
                 .filter(|e| holds_unsaved(e) && e.hex.is_none() && e.sheet.is_none())
             {
@@ -2518,8 +2519,9 @@ impl App {
     pub(super) fn new_untitled_file(&mut self) {
         // The lowest number no tab holds in any split group: each group
         // numbering its own would give two tabs the same name.
-        let taken: Vec<usize> = std::iter::once(&self.editor)
-            .chain(self.editor_layout.inactive_groups())
+        let taken: Vec<usize> = self
+            .editor_layout
+            .all_groups(&self.editor)
             .flat_map(|group| group.editors.iter().filter_map(|e| e.untitled))
             .collect();
         let n = (1..).find(|n| !taken.contains(n)).unwrap_or(1);

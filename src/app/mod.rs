@@ -5293,14 +5293,9 @@ impl App {
     /// one. `App::editor` is the hoisted active leaf and `inactive_groups`
     /// walks the rest, so together they cover each leaf exactly once.
     fn open_buffer_paths(&self) -> std::collections::BTreeSet<PathBuf> {
-        self.editor
-            .editors
-            .iter()
-            .chain(
-                self.editor_layout
-                    .inactive_groups()
-                    .flat_map(|g| g.editors.iter()),
-            )
+        self.editor_layout
+            .all_groups(&self.editor)
+            .flat_map(|g| g.editors.iter())
             .filter_map(|e| e.path.clone())
             .collect()
     }
@@ -5390,9 +5385,7 @@ impl App {
     /// every tab of another group, on the old look (#2075).
     pub(super) fn apply_view_prefs(&mut self) {
         let (langs, ws_global) = (&self.language_prefs, self.whitespace_mode);
-        for group in
-            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut())
-        {
+        for group in self.editor_layout.all_groups_mut(&mut self.editor) {
             for ed in &mut group.editors {
                 ed.show_indent_guides = self.indent_guides_enabled;
                 ed.show_bracket_colors = self.bracket_colors_enabled;

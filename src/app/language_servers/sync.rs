@@ -46,8 +46,9 @@ impl App {
         // group's first: a file held only in another group stays open with
         // its unsaved text, so a rename computed for it fits the buffer it
         // lands in, not the disk (#915).
-        let tabs = std::iter::once(&self.editor)
-            .chain(self.editor_layout.inactive_groups())
+        let tabs = self
+            .editor_layout
+            .all_groups(&self.editor)
             .flat_map(|group| {
                 let active = group.active_index();
                 let active_path = group.path.as_ref().filter(|_| !group.has_non_text_view());

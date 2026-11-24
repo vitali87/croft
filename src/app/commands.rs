@@ -337,8 +337,9 @@ impl App {
             })
             .collect();
         let root = self.roots.primary().to_path_buf();
-        let buffers = std::iter::once(&self.editor)
-            .chain(self.editor_layout.inactive_groups())
+        let buffers = self
+            .editor_layout
+            .all_groups(&self.editor)
             .flat_map(|g| g.editors.iter())
             .map(|e| {
                 let (steps, bytes) = e.undo_history_size();

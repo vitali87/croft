@@ -432,14 +432,9 @@ impl App {
     /// Every path open with unsaved edits, across the active group and all
     /// inactive split leaves.
     pub(super) fn dirty_open_paths(&self) -> std::collections::HashSet<PathBuf> {
-        self.editor
-            .editors
-            .iter()
-            .chain(
-                self.editor_layout
-                    .inactive_groups()
-                    .flat_map(|tabs| tabs.editors.iter()),
-            )
+        self.editor_layout
+            .all_groups(&self.editor)
+            .flat_map(|g| g.editors.iter())
             .filter(|e| e.dirty)
             .filter_map(|e| e.path.clone())
             .collect()

@@ -200,8 +200,9 @@ impl App {
     /// tabs has unsaved edits. A closed file was not written, so it is not
     /// saved either.
     pub(in crate::app) fn path_is_saved(&self, path: &Path) -> bool {
-        let mut tabs = std::iter::once(&self.editor)
-            .chain(self.editor_layout.inactive_groups())
+        let mut tabs = self
+            .editor_layout
+            .all_groups(&self.editor)
             .flat_map(|g| g.editors.iter())
             .filter(|e| e.path.as_deref() == Some(path))
             .peekable();

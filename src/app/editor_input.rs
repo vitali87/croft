@@ -1291,9 +1291,7 @@ impl App {
     /// editor group the change was entered on.
     pub(super) fn end_vim_undo_groups(&mut self) {
         self.editor.end_undo_group();
-        for group in
-            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut())
-        {
+        for group in self.editor_layout.all_groups_mut(&mut self.editor) {
             group.end_open_undo_groups();
         }
     }

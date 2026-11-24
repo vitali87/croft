@@ -2553,8 +2553,8 @@ fn line_numbers_reach_every_split_group() {
     let mut app = app_with_open_file(tmp.path(), "a.txt", "a\nb\n");
     app.split_editor_dir(editor_layout::SplitDir::Horizontal, true);
     let modes = |app: &App| -> Vec<LineNumbers> {
-        std::iter::once(&app.editor)
-            .chain(app.editor_layout.inactive_groups())
+        app.editor_layout
+            .all_groups(&app.editor)
             .flat_map(|group| group.editors.iter().map(|e| e.line_numbers))
             .collect()
     };

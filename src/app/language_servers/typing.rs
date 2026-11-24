@@ -20,8 +20,7 @@ impl App {
         // every editor in every group (the active one is already drained by
         // the `take` above) so a trigger can only ever fire from the tab
         // that was active at its tick.
-        let groups =
-            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut());
+        let groups = self.editor_layout.all_groups_mut(&mut self.editor);
         for ed in groups.flat_map(|g| g.editors.iter_mut()) {
             ed.last_typed = None;
         }
