@@ -3018,9 +3018,16 @@ fn the_connect_dialog_keeps_its_own_caret() {
         .as_ref()
         .and_then(|d| d.cursor_screen_pos())
         .expect("the dialog places its caret in its field");
-    assert!(term.backend().caret_shown, "the frame shows the dialog's caret");
+    assert!(
+        term.backend().caret_shown,
+        "the frame shows the dialog's caret"
+    );
     let at = ratatui::backend::Backend::get_cursor_position(term.backend_mut()).unwrap();
-    assert_eq!((at.x, at.y), field, "at the field, not at the editor's caret");
+    assert_eq!(
+        (at.x, at.y),
+        field,
+        "at the field, not at the editor's caret"
+    );
     assert!(
         app.cursor_should_be_visible(),
         "the pictures put the dialog's caret back after drawing"

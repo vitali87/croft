@@ -135,19 +135,22 @@ impl ratatui::backend::Backend for CaretBackend {
 
     fn hide_cursor(&mut self) -> Result<(), Self::Error> {
         self.caret_shown = false;
-        ratatui::backend::Backend::hide_cursor((&mut self.inner)
+        ratatui::backend::Backend::hide_cursor(&mut self.inner)
     }
 
     fn show_cursor(&mut self) -> Result<(), Self::Error> {
         self.caret_shown = true;
-        ratatui::backend::Backend::show_cursor((&mut self.inner)
+        ratatui::backend::Backend::show_cursor(&mut self.inner)
     }
 
     fn get_cursor_position(&mut self) -> Result<ratatui::layout::Position, Self::Error> {
-        ratatui::backend::Backend::get_cursor_position((&mut self.inner)
+        ratatui::backend::Backend::get_cursor_position(&mut self.inner)
     }
 
-    fn set_cursor_position<P: Into<ratatui::layout::Position>>(&mut self, position: P) -> Result<(), Self::Error> {
+    fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+        &mut self,
+        position: P,
+    ) -> Result<(), Self::Error> {
         ratatui::backend::Backend::set_cursor_position(&mut self.inner, position)
     }
 
@@ -160,15 +163,15 @@ impl ratatui::backend::Backend for CaretBackend {
     }
 
     fn size(&self) -> Result<ratatui::layout::Size, Self::Error> {
-        ratatui::backend::Backend::size((&self.inner)
+        ratatui::backend::Backend::size(&self.inner)
     }
 
     fn window_size(&mut self) -> Result<ratatui::backend::WindowSize, Self::Error> {
-        ratatui::backend::Backend::window_size((&mut self.inner)
+        ratatui::backend::Backend::window_size(&mut self.inner)
     }
 
     fn flush(&mut self) -> Result<(), Self::Error> {
-        ratatui::backend::Backend::flush((&mut self.inner)
+        ratatui::backend::Backend::flush(&mut self.inner)
     }
 }
 

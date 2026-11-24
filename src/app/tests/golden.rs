@@ -123,9 +123,9 @@
 //! `sync_caret_style` sends after each frame, are not compared.
 
 use super::*;
-use ratatui::backend::{Backend, ClearType, TestBackend, WindowSize};
+use ratatui::backend::{Backend, TestBackend};
 use ratatui::buffer::{Buffer, Cell};
-use ratatui::layout::{Position, Size};
+use ratatui::layout::Position;
 use unicode_width::UnicodeWidthStr;
 
 /// The fill a masked cell is serialised with.
