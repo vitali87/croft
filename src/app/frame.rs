@@ -3346,12 +3346,11 @@ impl App {
         if self.cursor_should_be_visible() {
             return;
         }
+        // The shell's cursor only while nothing covers it: under a pop-up
+        // the reader belongs on what the pop-up says (#2673 review).
         if self.focus == Pane::Terminal
-            && self.prompt.is_none()
+            && !self.popup_open()
             && self.context_menu.is_none()
-            && self.command_palette.is_none()
-            && self.file_finder.is_none()
-            && self.list_picker.is_none()
             && let Some(pos) = self
                 .terminals
                 .get(self.active_terminal)

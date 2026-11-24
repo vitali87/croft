@@ -2802,6 +2802,55 @@ fn every_popup_is_read_instead_of_the_pane_behind_it() {
     );
 }
 
+/// #2673 review (CodeRabbit): with the terminal focused, screen reader mode
+/// left the real cursor on the shell's cursor under the branch picker,
+/// command history, Jump to Directory, the process list and both symbol
+/// pickers, so a reader that follows the cursor read the shell and never
+/// the pop-up. Under every pop-up the cursor now sits on the announcement,
+/// or on a caret the pop-up places in a field of its own.
+#[cfg(unix)]
+#[test]
+fn the_screen_reader_cursor_leaves_the_shell_for_every_popup() {
+    use crate::app::popups::Popup;
+    let mut stayed = Vec::new();
+    for p in Popup::ALL {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+            "/bin/sh",
+            &[String::from("-c"), String::from("sleep 30")],
+            tmp.path(),
+        )
+        .unwrap();
+        app.active_terminal = 0;
+        app.show_terminal = true;
+        app.focus_pane(Pane::Terminal);
+        app.screen_reader = true;
+        let (_term, before) = draw_and_cursor(&mut app);
+        let shell = app.terminals[0]
+            .screen_cursor()
+            .expect("the shell's cursor shows");
+        assert_eq!(
+            (before.x, before.y),
+            shell,
+            "setup: the cursor is the shell's"
+        );
+        let _hook = super::popups::open(&mut app, p);
+        let (_term, at) = draw_and_cursor(&mut app);
+        let announced = app.announce_pos;
+        assert!(announced.is_some(), "{p:?}: the status bar shows its line");
+        let own_caret = app.cursor_should_be_visible();
+        if (at.x, at.y) == shell || (!own_caret && Some((at.x, at.y)) != announced) {
+            stayed.push(format!("{p:?}"));
+        }
+    }
+    assert!(
+        stayed.is_empty(),
+        "the cursor was not on the announcement under: {}",
+        stayed.join(", ")
+    );
+}
+
 /// #2670: the two questions that had no words say what they ask and which
 /// key does what.
 #[test]
