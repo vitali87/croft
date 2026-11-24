@@ -132,6 +132,12 @@ impl App {
     /// the frame would wipe the part of a pop-up it overlaps (#2659); Kitty
     /// keeps pictures below the text and loses nothing by the wait.
     pub(super) fn pictures_held_back(&self) -> bool {
+        self.popup_open()
+    }
+
+    /// Whether one of the pop-ups drawn over the middle of the screen is
+    /// open. It has the keys, so no pane's caret shows through it (#2669).
+    pub(super) fn popup_open(&self) -> bool {
         Popup::ALL.iter().any(|p| p.is_open(self))
     }
 
