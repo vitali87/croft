@@ -848,3 +848,45 @@ fn a_paste_with_a_right_click_menu_open_goes_nowhere() {
         assert!(app.context_menu.is_some(), "the menu stays open");
     }
 }
+
+/// The bug (#2674): only an agent's proposal, the two unsaved-changes
+/// prompts and the terminal paste question took the mouse. Under the other
+/// confirms, Settings and the startup warning, a click went to what they
+/// cover: it closed a tab, moved the editor's cursor or opened a status bar
+/// pop-up. A pop-up either handles the mouse itself (a picker closes on a
+/// click outside it) or takes every mouse event; none lets one through.
+#[test]
+fn a_click_behind_a_popup_never_reaches_what_it_covers() {
+    let mut reached = Vec::new();
+    for p in Popup::ALL {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.txt");
+        let b = tmp.path().join("b.txt");
+        std::fs::write(&a, "alpha\nbeta\ngamma\n").unwrap();
+        std::fs::write(&b, "bravo\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open_pinned(&a).unwrap();
+        app.editor.open_pinned(&b).unwrap();
+        app.editor.select(0);
+        app.focus_pane(Pane::Editor);
+        draw(&mut app, 160, 40);
+        let tab_row = app.editor.tab_strip_y_for_test();
+        let close_b = app.editor.close_screen_x(1).expect("b.txt's close button");
+        let _hook = open(&mut app, p);
+        draw(&mut app, 160, 40);
+        let before = (app.editor.tab_count(), app.editor.cursor_row, app.editor.cursor_col);
+        // The other tab's close button, then the last line of the file.
+        left_click(&mut app, close_b, tab_row);
+        let text_row = tab_row + 4;
+        left_click(&mut app, 30, text_row);
+        let after = (app.editor.tab_count(), app.editor.cursor_row, app.editor.cursor_col);
+        if before != after {
+            reached.push(format!("{p:?} (tabs, row, col {before:?} -> {after:?})"));
+        }
+    }
+    assert!(
+        reached.is_empty(),
+        "a click went through these pop-ups to the editor behind: {}",
+        reached.join(", ")
+    );
+}

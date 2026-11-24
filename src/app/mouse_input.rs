@@ -621,7 +621,7 @@ impl App {
         // A click on a find bar (in the editor or over a terminal) puts the
         // caret of the row it lands on, before the pane under it sees it.
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
-            && !self.modal_overlay_open()
+            && !self.popup_open()
             && self.context_menu.is_none()
         {
             if self
@@ -652,7 +652,7 @@ impl App {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollLeft => Some(-1),
             MouseEventKind::ScrollDown | MouseEventKind::ScrollRight => Some(1),
             _ => None,
-        } && !self.modal_overlay_open()
+        } && !self.popup_open()
             && self.context_menu.is_none()
         {
             let mut scrolled = false;
@@ -678,17 +678,12 @@ impl App {
         {
             return;
         }
-        // The approval popup takes no clicks, and none reach what it covers.
-        if self.approval_ui.is_some() {
-            return;
-        }
-        // Nor does the unsaved-changes prompt (#862): a click behind it must
-        // not close or move the tabs it is asking about.
-        if self.pending_unsaved.is_some() {
-            return;
-        }
-        // Nor the lossy-save prompt (#1053), for the tab it asks about.
-        if self.pending_lossy_save.is_some() {
+        // A pop-up that handles no mouse of its own (an agent's proposal,
+        // every confirm, Settings, the startup warning) takes every mouse
+        // event: a click behind the unsaved-changes prompt must not close or
+        // move the tabs it is asking about (#862), and the same holds for
+        // what each of the others asks about (#2674).
+        if self.popup_takes_the_mouse() {
             return;
         }
         // The history scrubber's slider (#371): a press on the track seeks

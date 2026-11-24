@@ -124,6 +124,45 @@ impl Popup {
             Popup::TerminalWarning => app.pending_terminal_warning,
         }
     }
+
+    /// Whether the pop-up handles the mouse itself: a picker's rows and the
+    /// click outside that closes it, a dialog's buttons, or the New File
+    /// box's own rule further down the mouse handler. One that does not
+    /// takes every mouse event while it is open, so a click, the wheel or
+    /// the pointer never reaches what it covers (#862, #2674). The match
+    /// has no catch-all: a new pop-up must say which it is.
+    pub(super) fn handles_mouse(self) -> bool {
+        match self {
+            Popup::Prompt
+            | Popup::FileFinder
+            | Popup::CommandPalette
+            | Popup::GoToSymbol
+            | Popup::WorkspaceSymbols
+            | Popup::ProcessPicker
+            | Popup::ZoxideJump
+            | Popup::CommandHistory
+            | Popup::BranchPicker
+            | Popup::InputPrompt
+            | Popup::ListPicker
+            | Popup::ShortcutsModal
+            | Popup::ConnectDialog => true,
+            Popup::LocalOpenConfirm
+            | Popup::DiscardConfirm
+            | Popup::RevertHunkConfirm
+            | Popup::DiscardAllConfirm
+            | Popup::StashDropConfirm
+            | Popup::UnsavedScmConfirm
+            | Popup::ReplaceAllConfirm
+            | Popup::BroadcastConfirm
+            | Popup::TerminalPasteConfirm
+            | Popup::RunBlockConfirm
+            | Popup::UnsavedConfirm
+            | Popup::LossySaveConfirm
+            | Popup::SettingsEditor
+            | Popup::Approval
+            | Popup::TerminalWarning => false,
+        }
+    }
 }
 
 impl App {
@@ -137,6 +176,14 @@ impl App {
 
     /// Whether one of the pop-ups drawn over the middle of the screen is
     /// open. It has the keys, so no pane's caret shows through it (#2669).
+    /// Whether an open pop-up takes every mouse event, as one that handles
+    /// no mouse of its own does (#2674).
+    pub(super) fn popup_takes_the_mouse(&self) -> bool {
+        Popup::ALL
+            .iter()
+            .any(|p| !p.handles_mouse() && p.is_open(self))
+    }
+
     pub(super) fn popup_open(&self) -> bool {
         Popup::ALL.iter().any(|p| p.is_open(self))
     }
