@@ -6,7 +6,7 @@ use std::path::Path;
 /// value on another worksheet.
 pub type SheetCellEdit = (String, usize, usize, String);
 
-const CSV_BYTES_CAP: u64 = 25 * 1024 * 1024;
+pub(crate) const CSV_BYTES_CAP: u64 = 25 * 1024 * 1024;
 const XLSX_BYTES_CAP: u64 = 50 * 1024 * 1024;
 /// The most cells one sheet's grid is built from, counting the dense
 /// rectangle between its outermost values. The compressed-size cap above

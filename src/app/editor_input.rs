@@ -2359,6 +2359,8 @@ impl App {
         let capture =
             self.macro_recording.is_some() && !self.macro_replaying && self.focus == Pane::Editor;
         let into_editor = self.handle_paste_inner(s);
+        #[cfg(test)]
+        self.assert_one_view_per_tab();
         if self.macro_recording.is_none() || self.macro_replaying {
             return;
         }

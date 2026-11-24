@@ -1057,6 +1057,32 @@ impl Editor {
         self.sarif = None;
     }
 
+    /// The view slots this tab has filled, by name: the viewers that stand
+    /// in for its text and the two layers drawn over it (a merge, a Markdown
+    /// preview). A tab shows one at most; two is the state #2069 was, where
+    /// keys went to a document preview hidden under the image opened after
+    /// it. Test builds check every tab after every key, click and paste
+    /// (`App::assert_one_view_per_tab`).
+    #[cfg(test)]
+    pub(crate) fn views_filled(&self) -> Vec<&'static str> {
+        [
+            ("diff", self.diff.is_some()),
+            ("merge", self.merge.is_some()),
+            ("image", self.image.is_some()),
+            ("sheet", self.sheet.is_some()),
+            ("hex", self.hex.is_some()),
+            ("log", self.log.is_some()),
+            ("archive", self.archive.is_some()),
+            ("markdown preview", self.markdown_preview.is_some()),
+            ("PR review", self.pr_review.is_some()),
+            ("fleet", self.fleet.is_some()),
+            ("SARIF", self.sarif.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(name, filled)| filled.then_some(name))
+        .collect()
+    }
+
     pub(super) fn open_image(&mut self, path: &Path) -> Result<()> {
         let meta = std::fs::metadata(path)?;
         if meta.len() > MAX_IMAGE_BYTES {

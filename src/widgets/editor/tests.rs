@@ -22467,3 +22467,169 @@ fn the_toggle_disables_every_pair_behavior() {
     e.backspace();
     assert_eq!(e.lines[0], ")", "off means plain backspace");
 }
+
+/// A file `bytes` long whose head is `head`: the rest reads as zeros and
+/// costs no disk, which is all a size check looks at.
+fn sized_file(p: &Path, head: &[u8], bytes: u64) {
+    std::fs::write(p, head).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(p)
+        .unwrap()
+        .set_len(bytes)
+        .unwrap();
+}
+
+/// A zip of one member `name` holding `body`, stored uncompressed.
+fn zip_of(p: &Path, name: &str, body: &[u8]) {
+    use std::io::Write as _;
+    let mut z = zip::ZipWriter::new(std::fs::File::create(p).unwrap());
+    let o =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    z.start_file(name, o).unwrap();
+    z.write_all(body).unwrap();
+    z.finish().unwrap();
+}
+
+/// Where each kind of file opens (#2062): the view it fills and the status
+/// line it leaves, or the error it fails with, for every route whose choice
+/// turns on why an earlier viewer refused (an image that does not decode, a
+/// sheet past its size cap, an archive past its listing cap, a gzip past
+/// its decompressed cap) and the routes around them. The table pins today's
+/// routing, message text included, before the refusals become typed.
+#[test]
+fn every_route_opens_the_view_it_opens_today() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let png = png_of(2, 2, |_, _| RED);
+    type Build = Box<dyn Fn(&Path)>;
+    let rows: Vec<(&str, Build)> = vec![
+        (
+            "pic.png",
+            Box::new(move |p| std::fs::write(p, &png).unwrap()),
+        ),
+        (
+            "notes.png",
+            Box::new(|p| std::fs::write(p, "just words\n").unwrap()),
+        ),
+        (
+            "junk.png",
+            Box::new(|p| std::fs::write(p, (0..=255u8).collect::<Vec<_>>()).unwrap()),
+        ),
+        (
+            "logo",
+            Box::new(|p| std::fs::write(p, png_of(2, 2, |_, _| BLUE)).unwrap()),
+        ),
+        (
+            "pic.svg",
+            Box::new(|p| std::fs::write(p, "this is not xml").unwrap()),
+        ),
+        (
+            "data.csv",
+            Box::new(|p| std::fs::write(p, "a,b\n1,2\n").unwrap()),
+        ),
+        (
+            "data.xlsx",
+            Box::new(|p| std::fs::write(p, "a,b\n").unwrap()),
+        ),
+        (
+            "big.csv",
+            Box::new(|p| sized_file(p, b"a,b\n", crate::sheet::CSV_BYTES_CAP + 1)),
+        ),
+        ("book", Box::new(write_minimal_xlsx)),
+        (
+            "big.zip",
+            Box::new(|p| sized_file(p, b"", crate::archive::ZIP_LIST_CAP + 1)),
+        ),
+        (
+            "bundle",
+            Box::new(|p| {
+                zip_of(p, "readme.txt", b"inside");
+                let len = crate::archive::ZIP_LIST_CAP + 1;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(p)
+                    .unwrap()
+                    .set_len(len)
+                    .unwrap();
+            }),
+        ),
+        (
+            "big.tar",
+            Box::new(|p| sized_file(p, b"", crate::archive::TAR_LIST_CAP + 1)),
+        ),
+        (
+            "doc.docx",
+            Box::new(|p| std::fs::write(p, "not a zip\n").unwrap()),
+        ),
+        (
+            "huge.docx",
+            Box::new(|p| {
+                zip_of(p, "word/document.xml", b"<w:document/>");
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(p)
+                    .unwrap()
+                    .set_len(crate::docx::MAX_DOC_LISTING_BYTES + 1)
+                    .unwrap();
+            }),
+        ),
+        (
+            "app.log.gz",
+            Box::new(|p| gzip_to(p, b"started\nstopped\n")),
+        ),
+        (
+            "bomb.log.gz",
+            Box::new(|p| {
+                use std::io::Write as _;
+                let mut gz = flate2::write::GzEncoder::new(
+                    std::fs::File::create(p).unwrap(),
+                    flate2::Compression::fast(),
+                );
+                let chunk = vec![b'a'; 1024 * 1024];
+                for _ in 0..=(MAX_GUNZIP_BYTES / chunk.len() as u64) {
+                    gz.write_all(&chunk).unwrap();
+                }
+                gz.finish().unwrap();
+            }),
+        ),
+        (
+            "r.sarif",
+            Box::new(|p| std::fs::write(p, "{not json").unwrap()),
+        ),
+    ];
+    let shown = |p: &Path| p.display().to_string();
+    let outcomes: Vec<String> = rows
+        .iter()
+        .map(|(name, build)| {
+            let p = dir.join(name);
+            build(&p);
+            let mut e = Editor::new();
+            let what = match e.open(&p) {
+                Ok(()) => format!("{:?} {}", e.views_filled(), e.status),
+                Err(err) => format!("error: {err}"),
+            };
+            format!("{name}: {}", what.replace(&shown(dir), "<dir>"))
+        })
+        .collect();
+    let expected = [
+        r#"pic.png: ["image"] Opened image <dir>/pic.png"#,
+        r#"notes.png: [] Opened <dir>/notes.png"#,
+        r#"junk.png: ["hex"] Opened <dir>/junk.png in the hex viewer"#,
+        r#"logo: ["image"] Opened image <dir>/logo"#,
+        r#"pic.svg: [] Opened <dir>/pic.svg"#,
+        r#"data.csv: ["sheet"] Opened <dir>/data.csv (CSV)"#,
+        r#"data.xlsx: [] Opened <dir>/data.xlsx"#,
+        r#"big.csv: error: Spreadsheet open failed: CSV/TSV too large (26214401 bytes)"#,
+        r#"book: ["sheet"] Opened <dir>/book (XLSX)"#,
+        r#"big.zip: ["hex"] Opened <dir>/big.zip in the hex viewer: Archive open failed: zip too large to list (8388609 bytes)"#,
+        r#"bundle: ["hex"] Opened <dir>/bundle in the hex viewer: Archive open failed: zip too large to list (8388609 bytes)"#,
+        r#"big.tar: ["hex"] Opened <dir>/big.tar in the hex viewer: Archive open failed: tar archive too large to list (104857601 bytes)"#,
+        r#"doc.docx: [] Opened <dir>/doc.docx"#,
+        r#"huge.docx: ["hex"] Opened <dir>/huge.docx in the hex viewer: Archive open failed: zip too large to list (8388609 bytes)"#,
+        r#"app.log.gz: ["log"] Opened <dir>/app.log.gz decompressed, read-only"#,
+        r#"bomb.log.gz: ["hex"] Opened <dir>/bomb.log.gz in the hex viewer: Decompressed file too large to show (over 256 MiB)"#,
+        r#"r.sarif: [] Opened <dir>/r.sarif as text: invalid JSON at 1:2: key must be a string at line 1 column 2"#,
+    ];
+    pretty_assertions::assert_eq!(outcomes, expected);
+}

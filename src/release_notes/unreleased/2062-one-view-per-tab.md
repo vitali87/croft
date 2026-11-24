@@ -1,0 +1,1 @@
+refactor: The tests now fail if any editor tab, in any group, shows two views at once, and a table pins which viewer each kind of file opens in, refusal messages included (#2062). Nothing changes in use.
