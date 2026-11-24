@@ -53,7 +53,7 @@ pub fn file_history(root: &Path, rel_path: &str, limit: usize) -> Vec<FileHistor
     let Some(path_str) = dir.to_str() else {
         return Vec::new();
     };
-    let output = Command::new("git")
+    let output = crate::proc::command("git")
         .args([
             "-C",
             path_str,
@@ -247,7 +247,7 @@ pub fn commit_graph(root: &Path, limit: usize) -> Vec<GraphCommit> {
     let Some(path_str) = root.to_str() else {
         return Vec::new();
     };
-    let output = Command::new("git")
+    let output = crate::proc::command("git")
         .args([
             "-C",
             path_str,
@@ -307,7 +307,7 @@ pub fn branch_history_range(root: &Path, revspec: &str, limit: usize) -> Vec<Gra
     let Some(path_str) = root.to_str() else {
         return Vec::new();
     };
-    let output = Command::new("git")
+    let output = crate::proc::command("git")
         .args([
             "-C",
             path_str,
@@ -364,7 +364,7 @@ impl CommitTree {
 /// `None` on any failure (no repo, unknown revision), so a caller dims
 /// nothing rather than everything.
 pub fn tree_paths(root: &Path, rev: &str) -> Option<CommitTree> {
-    let output = Command::new("git")
+    let output = crate::proc::command("git")
         .arg("-C")
         .arg(root)
         .env("GIT_OPTIONAL_LOCKS", "0")

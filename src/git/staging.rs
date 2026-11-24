@@ -18,7 +18,7 @@ pub fn remove_path(root: &Path, rel_path: &str) -> Result<(), String> {
     let path_str = root
         .to_str()
         .ok_or_else(|| "non-utf8 workspace path".to_string())?;
-    let out = Command::new("git")
+    let out = crate::proc::command("git")
         .args([
             "-C",
             path_str,
@@ -50,7 +50,7 @@ pub fn stage_paths(root: &Path, rel_paths: &[String]) -> Result<(), String> {
     let path_str = root
         .to_str()
         .ok_or_else(|| "non-utf8 workspace path".to_string())?;
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::proc::command("git");
     // Literal: git reads a pathspec as a glob, so staging Next.js's
     // `pages/[id].tsx` also staged `pages/i.tsx` and untracked `pages/d.tsx`.
     cmd.args(["-C", path_str, "--literal-pathspecs", "add", "--"]);
@@ -136,7 +136,7 @@ pub fn discard_path(
         let path_str = root
             .to_str()
             .ok_or_else(|| "non-utf8 workspace path".to_string())?;
-        let mut cmd = Command::new("git");
+        let mut cmd = crate::proc::command("git");
         cmd.args(["-C", path_str, "--literal-pathspecs", "checkout"]);
         if staged {
             cmd.arg("HEAD");

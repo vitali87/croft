@@ -27,7 +27,7 @@ pub fn commit(root: &Path, message: &str) -> Result<String, String> {
         .ok_or_else(|| "non-utf8 workspace path".to_string())?;
     // A hook or signing helper that wants a terminal fails fast with its
     // own message instead of fighting croft for the screen (#1153).
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::proc::command("git");
     cmd.args(["-C", path_str, "commit", flags, message]);
     never_prompt(&mut cmd);
     let output = cmd
@@ -53,7 +53,7 @@ pub fn commit(root: &Path, message: &str) -> Result<String, String> {
 /// Paths git still holds as unmerged (`UU`, `AA`, `DU`, …): the MERGE
 /// CONFLICTS group, read straight from the index.
 pub fn unmerged_paths(root: &Path) -> Vec<String> {
-    let Ok(out) = Command::new("git")
+    let Ok(out) = crate::proc::command("git")
         .arg("-C")
         .arg(root)
         // `--no-relative`: with `diff.relative` set, a subdirectory root
@@ -95,7 +95,7 @@ pub fn refuse_unmerged(root: &Path) -> Result<(), String> {
 /// Whether the index holds anything a plain `git commit` would record: a
 /// change against HEAD, or on an unborn branch any staged file.
 pub(super) fn has_staged_changes(root: &Path) -> Result<bool, String> {
-    let output = Command::new("git")
+    let output = crate::proc::command("git")
         .arg("-C")
         .arg(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -189,7 +189,7 @@ pub(super) fn refuse_conflict_markers(root: &Path, scope: Option<&[String]>) -> 
 /// attribute, and marker lines both sides already had, such as a doc
 /// showing what a conflict looks like, which would block staging forever.
 pub(super) fn leftover_conflict_markers(top: &Path, rel: &str) -> bool {
-    Command::new("git")
+    crate::proc::command("git")
         .arg("-C")
         .arg(top)
         .args(["--literal-pathspecs", "diff", "--check", "--no-color", "--"])
@@ -272,7 +272,7 @@ pub fn undo_last_commit(root: &Path) -> Result<String, String> {
 /// configured but cannot be checked (its tracking ref missing) counts as
 /// pushed, so the warning errs on the side of showing.
 pub fn head_is_on_upstream(root: &Path) -> bool {
-    let code = Command::new("git")
+    let code = crate::proc::command("git")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .arg("-C")
         .arg(root)
@@ -349,7 +349,7 @@ pub fn worktree_fingerprint(root: &Path) -> String {
     let index = run_git(root, &["ls-files", "-s", "-z"]).unwrap_or_default();
     // Not `run_git`: its trim would eat the first entry's leading status
     // space (" M path"), and with it where that path starts.
-    let status = Command::new("git")
+    let status = crate::proc::command("git")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .arg("-C")
         .arg(root)

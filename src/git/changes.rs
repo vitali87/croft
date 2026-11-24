@@ -365,7 +365,7 @@ pub fn query_changes(root: &Path) -> Vec<ChangeEntry> {
         Some(s) => s,
         None => return Vec::new(),
     };
-    let output = match Command::new("git")
+    let output = match crate::proc::command("git")
         // Poll without taking index.lock; see run_git.
         .env("GIT_OPTIONAL_LOCKS", "0")
         .args(["-C", path_str, "status", "--porcelain", "--untracked-files=all"])
@@ -435,7 +435,7 @@ pub(super) fn numstat_map(
     workdir: &str,
     args: &[&str],
 ) -> std::collections::HashMap<String, (usize, usize)> {
-    let output = match Command::new("git")
+    let output = match crate::proc::command("git")
         // Poll without taking index.lock; see run_git. `git diff` does not
         // honour GIT_OPTIONAL_LOCKS: a file whose timestamp changed but
         // whose bytes did not has it write the refreshed index back, so its

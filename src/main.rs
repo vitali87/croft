@@ -97,6 +97,7 @@ mod pr_review;
 mod prefs;
 mod prettier;
 mod problem_matchers;
+mod proc;
 mod profiles;
 mod program_status;
 mod provenance;

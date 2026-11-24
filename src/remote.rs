@@ -85,13 +85,6 @@ pub struct SshControl {
     socket_path: PathBuf,
 }
 
-#[cfg(test)]
-thread_local! {
-    /// A stand-in for `ssh` in this test thread, so the commands built here
-    /// can run against a local shim.
-    static TEST_SSH: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
-}
-
 /// The user's config-sync exclusions (#603) as a live re-push reads them.
 ///
 /// Read again whenever a file changes, so an edited exclusion applies

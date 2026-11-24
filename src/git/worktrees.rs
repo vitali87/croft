@@ -105,7 +105,7 @@ pub fn lane_removal_block(lane: &Path) -> Option<String> {
     let Some(path_str) = lane.to_str() else {
         return Some(format!("{} is not a readable path", lane.display()));
     };
-    let output = Command::new("git")
+    let output = crate::proc::command("git")
         .args(["-C", path_str, "status", "--porcelain", "--ignored"])
         .output();
     let Ok(output) = output else {
@@ -252,7 +252,7 @@ pub fn checkout_pr_worktree(
     // No prompt: this runs off the UI thread, where a credential prompt,
     // or ssh's own passphrase or host-key question on /dev/tty, would wait
     // forever on a terminal nobody sees, or draw over the UI.
-    let mut fetch = Command::new("git");
+    let mut fetch = crate::proc::command("git");
     fetch
         .args(["-C", repo_s, "fetch", "--quiet", remote])
         .arg(format!("refs/pull/{number}/head"));

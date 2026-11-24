@@ -400,7 +400,7 @@ pub(super) fn try_local_cross_install(
         shell_quote_for_e_arg(&ssh.socket_path),
     );
     let dest = format!("{}:.cargo/bin/croft.new", ssh.host);
-    let rsync_status = Command::new("rsync")
+    let rsync_status = crate::proc::command("rsync")
         .args(["-az", "--checksum", "-e"])
         .arg(&ssh_e)
         .arg(&binary)
