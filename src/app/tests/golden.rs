@@ -622,8 +622,8 @@ fn golden_scenes_are_skipped_only_in_a_published_crate_without_goldens() {
 /// How many frames a scene may take to settle.
 const MAX_FRAMES: usize = 4;
 
-/// The snapshots record whether the caret is shown, which `TestBackend`
-/// keeps private.
+// The snapshots record whether the caret is shown, which `TestBackend`
+// keeps private.
 use super::CaretBackend as GoldenBackend;
 
 /// Pin every App field that startup reads from the terminal's environment,
