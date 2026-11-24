@@ -1015,3 +1015,158 @@ fn a_click_behind_a_popup_never_reaches_what_it_covers() {
         reached.join(", ")
     );
 }
+
+/// #2679: in Zen Mode, an Esc that closed one of the pop-ups the old short
+/// list left out (a confirm, Settings, the connect dialog, an agent's
+/// proposal, the startup warning) counted as an Esc that did nothing, so one
+/// more Esc left Zen Mode. Closing a pop-up is never half of Esc Esc.
+#[test]
+fn closing_a_popup_with_esc_is_not_half_of_zen_esc_esc() {
+    let mut left = Vec::new();
+    for p in Popup::ALL {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("a.txt");
+        std::fs::write(&file, "one\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open(&file).unwrap();
+        app.focus_pane(Pane::Editor);
+        app.toggle_zen_mode();
+        assert!(app.zen_mode, "setup: Zen Mode is on");
+        let _hook = open(&mut app, p);
+        app.focus = Pane::Editor;
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        if p.is_open(&app) {
+            // Esc does not close this one; nothing to count.
+            continue;
+        }
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        if !app.zen_mode {
+            left.push(format!("{p:?}"));
+        }
+    }
+    assert!(
+        left.is_empty(),
+        "Esc closing these pop-ups counted toward Esc Esc and left Zen: {}",
+        left.join(", ")
+    );
+}
+
+/// #2679: Screencast Mode hides what is typed while the terminal has focus,
+/// since a shell may be reading a password. Typing goes to a pop-up open
+/// over the terminal instead, and it was hidden for the pop-ups the old
+/// short list left out. Only a field that is secret stays hidden.
+#[test]
+fn screencast_shows_typing_into_a_popup_over_the_terminal() {
+    let mut hidden = Vec::new();
+    for p in Popup::ALL {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.show_terminal = true;
+        app.focus_pane(Pane::Terminal);
+        assert!(
+            app.screencast_hides_typing(),
+            "setup: the shell's typing hides"
+        );
+        let _hook = open(&mut app, p);
+        app.focus = Pane::Terminal;
+        let secret = app
+            .connect_dialog
+            .as_ref()
+            .is_some_and(|d| d.input_is_secret());
+        if app.screencast_hides_typing() != secret {
+            hidden.push(format!("{p:?}"));
+        }
+    }
+    assert!(
+        hidden.is_empty(),
+        "typing into these pop-ups was hidden as if it went to the shell: {}",
+        hidden.join(", ")
+    );
+}
+
+/// #2679: auto-hide may collapse the sidebar only while no pop-up is open:
+/// many pop-ups are anchored over it or ask about something in it, such as
+/// Source Control's Discard Changes. It checked the old short list and the
+/// file and connect boxes, and collapsed under the rest.
+#[test]
+fn the_sidebar_never_auto_hides_under_a_popup() {
+    let mut collapsed = Vec::new();
+    for p in Popup::ALL {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.sidebar_auto_hide = true;
+        app.show_tree = true;
+        assert!(app.sidebar_auto_hide_allowed(), "setup: it would collapse");
+        let _hook = open(&mut app, p);
+        if app.sidebar_auto_hide_allowed() {
+            collapsed.push(format!("{p:?}"));
+        }
+    }
+    assert!(
+        collapsed.is_empty(),
+        "auto-hide could collapse the sidebar under these pop-ups: {}",
+        collapsed.join(", ")
+    );
+}
+
+/// #2679: while a pop-up has the keys, the editor drops the marks that say
+/// it has them (its tab's accent). It learned that from the old short list,
+/// so under a confirm, Settings or an agent's proposal it still looked as if
+/// typing would land in it.
+#[test]
+fn the_editor_never_looks_focused_under_a_popup() {
+    let mut focused = Vec::new();
+    for p in Popup::ALL {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("a.txt");
+        std::fs::write(&file, "one\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open(&file).unwrap();
+        app.focus_pane(Pane::Editor);
+        draw(&mut app, 120, 40);
+        assert!(
+            !app.editor.overlay_has_keyboard,
+            "setup: the editor has the keys"
+        );
+        let _hook = open(&mut app, p);
+        draw(&mut app, 120, 40);
+        if !app.editor.overlay_has_keyboard {
+            focused.push(format!("{p:?}"));
+        }
+    }
+    assert!(
+        focused.is_empty(),
+        "the editor kept its focused look under these pop-ups: {}",
+        focused.join(", ")
+    );
+}
+
+/// #2679: the history scrubber's slider took a click under the file prompt
+/// and the connect dialog, which handle the mouse further down: a click
+/// there moved the file to another commit behind the pop-up.
+#[test]
+fn the_scrubber_never_seeks_under_a_popup() {
+    let mut sought = Vec::new();
+    for p in Popup::ALL {
+        let repo = super::scrub_repo();
+        let mut app = App::new(repo.path().to_path_buf()).unwrap();
+        app.editor.open(&repo.path().join("a.txt")).unwrap();
+        app.scrub_history();
+        draw(&mut app, 120, 30);
+        let track = app.scrub_slider;
+        assert!(track.width > 10, "setup: the slider lays out");
+        let before = app.scrub_view.as_ref().map(|v| v.lines.clone());
+        let _hook = open(&mut app, p);
+        left_click(&mut app, track.x, track.y);
+        if app.scrub_view.as_ref().map(|v| v.lines.clone()) != before {
+            sought.push(format!("{p:?}"));
+        }
+    }
+    assert!(
+        sought.is_empty(),
+        "a click on the slider moved the scrubber under these pop-ups: {}",
+        sought.join(", ")
+    );
+}
