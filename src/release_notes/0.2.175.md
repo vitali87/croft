@@ -1,0 +1,1 @@
+fix: A paste with a pop-up open now goes into that pop-up, as typing does: into the SSH password box, the branch picker, the Settings search and the other pickers' filters, and nowhere under an agent's edit proposal, F1 or a confirm. Before, it went into the file or the shell the pop-up was hiding.
