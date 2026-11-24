@@ -5038,6 +5038,53 @@ fn gutter_stream_stop_glyph_renders_maps_clicks_and_outranks_the_play_glyph() {
     assert!(!e.stream_stop_at(sign_x, 2));
 }
 
+/// The sign cell answers a click with the glyph it shows (#2694): on the line an
+/// AI stream writes into, a breakpoint or the debugger's stop arrow
+/// outranks the stop square, so a click on it is the breakpoint lane's,
+/// never a cancel that reverts the stream.
+#[test]
+fn a_click_on_a_glyph_over_the_stream_line_does_not_stop_the_stream() {
+    let mut e = editor_with("fn a() {}\nfn b() {}\nfn c() {}");
+    let path = PathBuf::from("/x/a.rs");
+    e.path = Some(path.clone());
+    e.stream_stop_line = Some(1); // 0-based; the gutter's line 2
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 60,
+        height: 6,
+    };
+    let paint = |e: &mut Editor| {
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (e as &mut Editor).render(area, &mut buf);
+        buf
+    };
+    // Buffer line 1 paints on content row y = 2 (breadcrumb row above).
+    let buf = paint(&mut e);
+    let sign_x = e.last_inner.x;
+    assert_eq!(buf[(sign_x, 2)].symbol(), "■", "fixture: the stop square");
+    assert!(e.stream_stop_at(sign_x, 2), "the square is the button");
+
+    e.breakpoints
+        .insert(path.clone(), std::collections::BTreeSet::from([2]));
+    let buf = paint(&mut e);
+    assert_eq!(buf[(sign_x, 2)].symbol(), "●", "the breakpoint outranks it");
+    assert!(
+        !e.stream_stop_at(sign_x, 2),
+        "a click on the breakpoint dot must not stop the stream"
+    );
+    assert_eq!(e.breakpoint_lane_line_at(sign_x, 2), Some(1));
+
+    e.breakpoints.clear();
+    e.stop_line = Some((path, 2));
+    let buf = paint(&mut e);
+    assert_eq!(buf[(sign_x, 2)].symbol(), "▶", "the stop arrow outranks it");
+    assert!(
+        !e.stream_stop_at(sign_x, 2),
+        "a click on the stop arrow must not stop the stream"
+    );
+}
+
 /// A comment box anchored to line 0 renders as an unnumbered block
 /// between line 0 and line 1: title row naming the author, body, and a
 /// footer with the reply field and Ignore button. The gutter's number
