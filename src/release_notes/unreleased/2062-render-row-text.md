@@ -1,1 +1,0 @@
-refactor: The editor's row drawing paints each row's text (colours, inlay hints, bracket colours, colour swatches, indentation guides, whitespace marks) in a function of its own (#2062). The editor looks exactly as before.

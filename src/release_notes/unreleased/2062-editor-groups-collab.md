@@ -1,1 +1,0 @@
-refactor: Live Share passes that reach every open copy of a file (sharing it, sending local edits, attaching, applying a peer's or an AI's edits, finishing a guest's first sync, reading the text an agent sees) run one loop over all editor groups instead of one copy for the focused group and another for the rest (#2062). Shared editing behaves exactly as before.

@@ -1,1 +1,0 @@
-refactor: When a viewer declines a file (an image that does not decode, or an archive, sheet or gzip past its size cap), the open now picks the next route by the reason, not by matching the error message's words (#2062). Every file opens where it did, with the same messages.
