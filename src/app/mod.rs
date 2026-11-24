@@ -5493,23 +5493,17 @@ impl App {
         // when disabled, the editor opens those file types as plain text.
         let pdf_on = self.is_extension_enabled("pdf");
         let csv_on = self.is_extension_enabled("csv");
-        for ed in self.editor.editors.iter_mut() {
+        for ed in self
+            .editor_layout
+            .all_groups_mut(&mut self.editor)
+            .flat_map(|g| g.editors.iter_mut())
+        {
             ed.focus_gradient = gradient;
             ed.theme = self.theme;
             ed.pdf_viewer_enabled = pdf_on;
             ed.csv_viewer_enabled = csv_on;
             ed.provenance_overlay = self.provenance_overlay;
             ed.diff_ws_default = self.diff_ws_default;
-        }
-        for group in self.editor_layout.inactive_groups_mut() {
-            for ed in group.editors.iter_mut() {
-                ed.focus_gradient = gradient;
-                ed.theme = self.theme;
-                ed.pdf_viewer_enabled = pdf_on;
-                ed.csv_viewer_enabled = csv_on;
-                ed.provenance_overlay = self.provenance_overlay;
-                ed.diff_ws_default = self.diff_ws_default;
-            }
         }
         self.apply_view_prefs();
         self.tree.focus_gradient = gradient;

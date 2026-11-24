@@ -2464,10 +2464,10 @@ impl App {
                 }
             }
             None => {
-                self.editor.editors.iter_mut().for_each(&mut save);
-                for group in self.editor_layout.inactive_groups_mut() {
-                    group.editors.iter_mut().for_each(&mut save);
-                }
+                self.editor_layout
+                    .all_groups_mut(&mut self.editor)
+                    .flat_map(|g| g.editors.iter_mut())
+                    .for_each(&mut save);
             }
         }
         if only.is_none() && !saved.is_empty() {

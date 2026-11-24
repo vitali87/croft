@@ -1378,10 +1378,11 @@ impl App {
     /// to the tabs that show it again. Run every tick, before anything
     /// reads the marks. Returns whether a tab took marks back.
     pub(crate) fn settle_bookmarks(&mut self) -> bool {
-        let mut released = self.editor.take_released_bookmarks();
-        for group in self.editor_layout.inactive_groups_mut() {
-            released.extend(group.take_released_bookmarks());
-        }
+        let released: Vec<_> = self
+            .editor_layout
+            .all_groups_mut(&mut self.editor)
+            .flat_map(|g| g.take_released_bookmarks())
+            .collect();
         for marks in released {
             for (path, set) in marks {
                 if !self
@@ -1426,13 +1427,12 @@ impl App {
         }
         self.closed_bookmarks
             .retain(|path, _| !marks.contains_key(path));
-        for ed in self.editor.editors.iter_mut() {
+        for ed in self
+            .editor_layout
+            .all_groups_mut(&mut self.editor)
+            .flat_map(|g| g.editors.iter_mut())
+        {
             ed.restore_bookmarks(marks);
-        }
-        for group in self.editor_layout.inactive_groups_mut() {
-            for ed in group.editors.iter_mut() {
-                ed.restore_bookmarks(marks);
-            }
         }
     }
 

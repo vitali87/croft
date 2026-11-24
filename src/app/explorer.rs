@@ -2569,8 +2569,7 @@ impl App {
     /// not just the focused one: a tab in the other split kept the old path,
     /// raised a disk conflict, and a save brought the old file back.
     pub(super) fn rename_open_path_everywhere(&mut self, old: &Path, new: &Path) {
-        self.editor.rename_open_path(old, new);
-        for group in self.editor_layout.inactive_groups_mut() {
+        for group in self.editor_layout.all_groups_mut(&mut self.editor) {
             group.rename_open_path(old, new);
         }
     }
@@ -2605,8 +2604,7 @@ impl App {
                 // edits away while the trash only held the saved copy.
                 let mut kept = 0;
                 for path in &paths {
-                    kept += self.editor.close_clean_tabs_under(path);
-                    for group in self.editor_layout.inactive_groups_mut() {
+                    for group in self.editor_layout.all_groups_mut(&mut self.editor) {
                         kept += group.close_clean_tabs_under(path);
                     }
                 }
