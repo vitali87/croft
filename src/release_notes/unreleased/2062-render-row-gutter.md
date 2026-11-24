@@ -1,0 +1,1 @@
+refactor: The editor's row drawing paints each row's gutter (line number, breakpoint and bookmark marks, fold arrow, change bar) in a function of its own instead of inline in the 1,600-line drawing code (#2062). The editor looks exactly as before.
