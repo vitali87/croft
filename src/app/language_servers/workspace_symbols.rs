@@ -18,7 +18,7 @@ impl App {
                 initial,
             ),
         );
-        self.overlays.command_palette_clear.request();
+        self.overlays.popup_clear.request();
         self.workspace_symbols_requery();
         self.status = String::from("Go to Symbol in Workspace: type to search — Esc to close");
     }
@@ -27,7 +27,7 @@ impl App {
         if self.workspace_symbols.take().is_some() {
             self.ws_symbols_request_id = None;
             self.ws_symbols_pending = None;
-            self.overlays.command_palette_clear.request();
+            self.overlays.popup_clear.request();
             self.overlays.activity.mark_dirty();
             self.overlays.welcome.mark_dirty();
             self.overlays.hero.mark_dirty();

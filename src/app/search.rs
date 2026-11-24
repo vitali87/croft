@@ -633,10 +633,6 @@ impl App {
         true
     }
 
-    pub fn consume_file_finder_image_clear(&mut self) -> bool {
-        self.overlays.file_finder_clear.consume()
-    }
-
     /// Take the background build's index into `file_finder_index`
     /// without blocking. Called from `open_file_finder` and from the
     /// main loop tick. Accepts REPLACEMENT results too: when the FS
@@ -782,13 +778,13 @@ impl App {
         let mut finder = crate::widgets::file_finder::FileFinder::new(entries);
         finder.set_open_lines(self.open_text_line_counts());
         self.file_finder = Some(finder);
-        self.overlays.file_finder_clear.request();
+        self.overlays.popup_clear.request();
         self.status = format!("Go to File: {count} files indexed — Esc to close");
     }
 
     pub(super) fn close_file_finder(&mut self) {
         if self.file_finder.take().is_some() {
-            self.overlays.file_finder_clear.request();
+            self.overlays.popup_clear.request();
             self.overlays.activity.mark_dirty();
             self.overlays.welcome.mark_dirty();
             self.overlays.hero.mark_dirty();

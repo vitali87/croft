@@ -1614,10 +1614,6 @@ impl App {
         };
     }
 
-    pub fn consume_zoxide_jump_image_clear(&mut self) -> bool {
-        self.overlays.zoxide_jump_clear.consume()
-    }
-
     /// Open the zoxide jump popup and seed it with the full frecency list
     /// (`zoxide query -l`), so it shows the user's top directories before
     /// they type anything — like pressing `j<Tab>` in the shell.
@@ -1655,14 +1651,14 @@ impl App {
             zoxide_jump_status(&jump)
         };
         self.zoxide_jump = Some(jump);
-        self.overlays.zoxide_jump_clear.request();
+        self.overlays.popup_clear.request();
         self.status = status;
     }
 
     pub(super) fn close_zoxide_jump(&mut self) {
         self.zoxide_add_folder = false;
         if self.zoxide_jump.take().is_some() {
-            self.overlays.zoxide_jump_clear.request();
+            self.overlays.popup_clear.request();
             self.overlays.activity.mark_dirty();
             self.overlays.welcome.mark_dirty();
             self.overlays.hero.mark_dirty();

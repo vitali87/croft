@@ -23,13 +23,13 @@ impl App {
         self.go_to_symbol = Some(crate::widgets::symbol_picker::SymbolPicker::new(
             path, symbols,
         ));
-        self.overlays.command_palette_clear.request();
+        self.overlays.popup_clear.request();
         self.status = format!("Go to Symbol: {count} symbols — Esc to close");
     }
 
     pub(in crate::app) fn close_go_to_symbol(&mut self) {
         if self.go_to_symbol.take().is_some() {
-            self.overlays.command_palette_clear.request();
+            self.overlays.popup_clear.request();
             self.overlays.activity.mark_dirty();
             self.overlays.welcome.mark_dirty();
             self.overlays.hero.mark_dirty();

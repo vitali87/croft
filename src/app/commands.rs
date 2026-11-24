@@ -446,10 +446,6 @@ impl App {
         }
     }
 
-    pub fn consume_command_palette_image_clear(&mut self) -> bool {
-        self.overlays.command_palette_clear.consume()
-    }
-
     /// Open the Command Palette (Cmd/Ctrl+Shift+P). The palette is built from
     /// the static command registry, so there is nothing to index — it opens
     /// instantly regardless of workspace size.
@@ -520,13 +516,13 @@ impl App {
             .collect();
         let count = palette.results.len();
         self.command_palette = Some(palette);
-        self.overlays.command_palette_clear.request();
+        self.overlays.popup_clear.request();
         self.status = format!("Command Palette: {count} commands — Esc to close");
     }
 
     pub(super) fn close_command_palette(&mut self) {
         if self.command_palette.take().is_some() {
-            self.overlays.command_palette_clear.request();
+            self.overlays.popup_clear.request();
             self.overlays.activity.mark_dirty();
             self.overlays.welcome.mark_dirty();
             self.overlays.hero.mark_dirty();

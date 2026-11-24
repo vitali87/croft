@@ -925,6 +925,12 @@ impl App {
         self.overlays.ssh.mark_displayed();
     }
 
+    /// Whether a pop-up that pictures make way for opened or closed since
+    /// the last check (see [`super::overlay::OverlayManager::popup_clear`]).
+    pub fn consume_popup_image_clear(&mut self) -> bool {
+        self.overlays.popup_clear.consume()
+    }
+
     /// One-shot consumer paired with `flush_ssh_empty_state_overlay`. The
     /// main loop ORs the result into its `terminal.clear()` chain so
     /// iTerm2's cached image cells are evicted on view change.
