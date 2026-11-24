@@ -12,6 +12,7 @@
 //! and the one subprocess call stays off the render path.
 
 use crate::git::BranchInfo;
+use crate::widgets::picker_query;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -70,18 +71,6 @@ impl BranchPicker {
             last_rect: Rect::default(),
             last_inner_height: 0,
         }
-    }
-
-    fn char_count(&self) -> usize {
-        self.query.chars().count()
-    }
-
-    fn byte_offset(&self, char_idx: usize) -> usize {
-        self.query
-            .char_indices()
-            .nth(char_idx)
-            .map(|(b, _)| b)
-            .unwrap_or(self.query.len())
     }
 
     /// Indices of branches whose display name contains the query
@@ -157,37 +146,30 @@ impl BranchPicker {
     // --- query editing (mirrors ZoxideJump) -------------------------------
 
     pub fn push_char(&mut self, c: char) {
-        let at = self.byte_offset(self.cursor);
-        self.query.insert(at, c);
-        self.cursor += 1;
+        picker_query::insert(&mut self.query, &mut self.cursor, c);
         self.reset_selection();
     }
 
     pub fn pop_char(&mut self) {
-        if self.cursor == 0 {
+        if !picker_query::backspace(&mut self.query, &mut self.cursor) {
             return;
         }
-        let at = self.byte_offset(self.cursor - 1);
-        self.query.remove(at);
-        self.cursor -= 1;
         self.reset_selection();
     }
 
     pub fn delete_char(&mut self) {
-        if self.cursor >= self.char_count() {
+        if !picker_query::delete(&mut self.query, self.cursor) {
             return;
         }
-        let at = self.byte_offset(self.cursor);
-        self.query.remove(at);
         self.reset_selection();
     }
 
     pub fn move_cursor_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
+        picker_query::left(&mut self.cursor);
     }
 
     pub fn move_cursor_right(&mut self) {
-        self.cursor = (self.cursor + 1).min(self.char_count());
+        picker_query::right(&self.query, &mut self.cursor);
     }
 
     pub fn move_cursor_home(&mut self) {
@@ -195,7 +177,7 @@ impl BranchPicker {
     }
 
     pub fn move_cursor_end(&mut self) {
-        self.cursor = self.char_count();
+        picker_query::end(&self.query, &mut self.cursor);
     }
 
     /// A query edit reshapes the row list, so collapse the highlight back
