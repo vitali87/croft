@@ -30,8 +30,7 @@ impl App {
             .iter()
             .chain(
                 self.editor_layout
-                    .inactive_leaf_tabs()
-                    .into_iter()
+                    .inactive_groups()
                     .flat_map(|tabs| tabs.editors.iter()),
             )
             .find(|e| e.path.as_deref() == Some(path.as_path()))

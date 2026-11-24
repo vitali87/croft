@@ -4559,7 +4559,6 @@ fn a_scrollback_dump_leaves_a_blank_group_it_did_not_empty_alone() {
     assert!(
         app.editor_layout
             .inactive_groups()
-            .iter()
             .any(|g| g.is_blank_initial()),
         "fixture: the blank group is inactive"
     );
@@ -4611,7 +4610,7 @@ fn a_scrollback_dump_prunes_only_the_group_it_emptied() {
         "fixture: the dump's group is focused"
     );
     app.split_editor();
-    let inactive = app.editor_layout.inactive_groups();
+    let inactive = app.editor_layout.inactive_groups().collect::<Vec<_>>();
     assert_eq!(inactive.len(), 2, "fixture: two inactive groups");
     assert!(
         inactive.iter().any(|g| g.is_blank_initial())
@@ -4622,7 +4621,7 @@ fn a_scrollback_dump_prunes_only_the_group_it_emptied() {
     );
     app.focus_pane(Pane::Terminal);
     app.open_scrollback_in_editor();
-    let inactive = app.editor_layout.inactive_groups();
+    let inactive = app.editor_layout.inactive_groups().collect::<Vec<_>>();
     assert!(
         app.editor_layout.is_split(),
         "the user's blank group keeps its split"

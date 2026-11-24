@@ -5290,7 +5290,7 @@ impl App {
     }
 
     /// Every open buffer's path, across the active leaf and every inactive
-    /// one. `App::editor` is the hoisted active leaf and `inactive_leaf_tabs`
+    /// one. `App::editor` is the hoisted active leaf and `inactive_groups`
     /// walks the rest, so together they cover each leaf exactly once.
     fn open_buffer_paths(&self) -> std::collections::BTreeSet<PathBuf> {
         self.editor
@@ -5298,8 +5298,7 @@ impl App {
             .iter()
             .chain(
                 self.editor_layout
-                    .inactive_leaf_tabs()
-                    .into_iter()
+                    .inactive_groups()
                     .flat_map(|g| g.editors.iter()),
             )
             .filter_map(|e| e.path.clone())

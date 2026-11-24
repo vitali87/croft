@@ -54,7 +54,6 @@ impl App {
         }
         self.editor_layout
             .inactive_groups_mut()
-            .into_iter()
             .find_map(|group| group.apply_rename_to_open_tab(path, edits))
     }
 

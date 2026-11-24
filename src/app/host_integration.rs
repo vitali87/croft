@@ -1275,7 +1275,6 @@ impl App {
             .chain(
                 self.editor_layout
                     .inactive_groups()
-                    .into_iter()
                     .flat_map(|g| g.editors.iter()),
             )
             .any(|t| t.path.as_deref().is_some_and(is_it));

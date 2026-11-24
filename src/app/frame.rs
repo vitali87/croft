@@ -1037,12 +1037,7 @@ impl App {
                     .filter(|(i, _)| *i != active_idx)
                     .map(|(_, r)| *r)
                     .collect();
-                for (group, rect) in self
-                    .editor_layout
-                    .inactive_groups_mut()
-                    .into_iter()
-                    .zip(inactive_rects)
-                {
+                for (group, rect) in self.editor_layout.inactive_groups_mut().zip(inactive_rects) {
                     group.hover_pointer = pointer;
                     group.set_tab_reserved_right(reserve(rect));
                     frame.render_widget(group, rect);

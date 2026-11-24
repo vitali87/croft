@@ -73,7 +73,6 @@ impl App {
                     clean_text = self
                         .editor_layout
                         .inactive_groups_mut()
-                        .into_iter()
                         .find(|g| g.path.as_deref() == Some(u.path.as_path()))
                         .and_then(|g| g.clean_cache_text());
                 }

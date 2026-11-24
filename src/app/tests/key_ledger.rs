@@ -544,7 +544,7 @@ fn groups(app: &App) -> String {
         return String::from("1");
     }
     let active = app.editor_layout.active_dfs_index();
-    let mut inactive = app.editor_layout.inactive_groups().into_iter();
+    let mut inactive = app.editor_layout.inactive_groups();
     rects
         .iter()
         .enumerate()

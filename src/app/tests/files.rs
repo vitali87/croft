@@ -850,7 +850,6 @@ fn an_external_write_reloads_a_tab_in_an_inactive_split_group() {
     let stale: Vec<String> = app
         .editor_layout
         .inactive_groups()
-        .into_iter()
         .flat_map(|g| g.editors.iter())
         .filter(|e| e.path.as_deref() == Some(side.as_path()))
         .map(|e| e.lines.join("\n"))
@@ -4722,7 +4721,6 @@ fn save_all_counts_a_file_dirty_in_two_splits_once() {
         .chain(
             app.editor_layout
                 .inactive_groups()
-                .into_iter()
                 .flat_map(|g| g.editors.iter()),
         )
         .filter(|e| e.dirty && e.path.as_deref() == Some(a.as_path()))

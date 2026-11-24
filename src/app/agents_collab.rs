@@ -457,10 +457,11 @@ impl App {
             let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
             let want = canon(&target);
             let lines: Vec<String> = text.lines().map(str::to_string).collect();
-            let mut groups = self.editor_layout.inactive_groups_mut();
-            groups.push(&mut self.editor);
+            let groups = self
+                .editor_layout
+                .inactive_groups_mut()
+                .chain(std::iter::once(&mut self.editor));
             for tab in groups
-                .into_iter()
                 .flat_map(|g| g.editors.iter_mut())
                 .filter(|e| e.path.as_deref().is_some_and(|p| canon(p) == want))
             {
@@ -1747,13 +1748,11 @@ impl App {
         let Some(path) = crate::collab::contained_path(root, file) else {
             return;
         };
-        let groups = self.editor_layout.inactive_groups_mut();
-        for ed in self
-            .editor
-            .editors
-            .iter_mut()
-            .chain(groups.into_iter().flat_map(|g| g.editors.iter_mut()))
-        {
+        for ed in self.editor.editors.iter_mut().chain(
+            self.editor_layout
+                .inactive_groups_mut()
+                .flat_map(|g| g.editors.iter_mut()),
+        ) {
             if ed.path.as_deref() == Some(path.as_path()) && !ed.has_non_text_view() {
                 ed.end_remote_undo_group(group);
             }

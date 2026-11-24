@@ -2180,7 +2180,11 @@ fn saved_bookmarks_reach_the_tabs_of_every_split() {
     let mut marks = std::collections::HashMap::new();
     marks.insert(a.clone(), std::collections::BTreeSet::from([2]));
     app.restore_bookmarks_everywhere(&marks);
-    let split = app.editor_layout.inactive_groups()[0]
+    let split = app
+        .editor_layout
+        .inactive_groups()
+        .next()
+        .unwrap()
         .editors
         .iter()
         .find(|e| e.path.as_deref() == Some(a.as_path()))

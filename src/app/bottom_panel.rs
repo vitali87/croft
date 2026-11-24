@@ -80,7 +80,6 @@ impl App {
         let inactive_tabs: Vec<&crate::widgets::editor::Editor> = self
             .editor_layout
             .inactive_groups()
-            .into_iter()
             .flat_map(|g| g.editors.iter())
             .collect();
         for tab in self.editor.iter_tabs().chain(inactive_tabs) {
@@ -915,7 +914,6 @@ impl App {
         let mut split_targets: Vec<PathBuf> = self
             .editor_layout
             .inactive_groups_mut()
-            .into_iter()
             .filter_map(|s| {
                 let p = s.path.clone()?;
                 let stale = s.diagnostics_path() != Some(p.as_path());

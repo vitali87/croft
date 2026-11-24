@@ -611,7 +611,6 @@ impl App {
         let in_splits = self
             .editor_layout
             .inactive_groups_mut()
-            .into_iter()
             .flat_map(|g| g.editors.iter_mut());
         for ed in self.editor.editors.iter_mut().chain(in_splits) {
             let Some(path) = ed.path.clone().filter(|_| ed.dirty) else {
@@ -1384,7 +1383,6 @@ impl App {
             .chain(
                 self.editor_layout
                     .inactive_groups_mut()
-                    .into_iter()
                     .flat_map(|g| g.editors.iter_mut()),
             )
             .find(|e| e.path.as_deref() == Some(path));

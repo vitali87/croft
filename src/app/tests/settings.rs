@@ -1459,7 +1459,6 @@ fn a_workspace_layer_setting_disable_log_highlight_applies_on_remerge() {
     fn parked_log_flags(app: &mut App) -> Vec<bool> {
         app.editor_layout
             .inactive_groups_mut()
-            .into_iter()
             .flat_map(|g| g.editors.iter())
             .filter_map(|e| e.log.as_ref().map(|l| l.highlight()))
             .collect()
