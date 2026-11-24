@@ -979,9 +979,7 @@ fn owned_goldens() -> Vec<String> {
         "source-control",
     ];
     let confirms = CONFIRM_SCENES.iter().map(|s| s.name.to_string());
-    let confirms_themed = CONFIRM_THEMES
-        .into_iter()
-        .flat_map(|theme| CONFIRMS_PER_THEME.map(|name| format!("{name}-{theme}")));
+    let confirms_themed = confirm_goldens_in_other_themes();
     let themed = crate::theme::Theme::all()
         .iter()
         .filter(|&&theme| theme != crate::theme::Theme::default())
@@ -1440,12 +1438,13 @@ fn terminal_name_row(_: &App, shot: &Shot) -> Vec<Mask> {
 }
 
 /// [`CONFIRM_SCENES`] drawn as scenes in `theme`, at 80x24, the size a
-/// confirm dialog is narrowest at short of the frame's 50-column floor.
-/// Every scene is drawn before the test fails, so one run names them all.
-fn confirm_scenes(theme: crate::theme::Theme, wanted: &[&str], suffix: &str) -> Vec<String> {
+/// confirm dialog is narrowest at short of the frame's 50-column floor:
+/// those named in `only`, or every one. Every scene is drawn before the
+/// test fails, so one run names them all.
+fn confirm_scenes(theme: crate::theme::Theme, only: Option<&[&str]>, suffix: &str) -> Vec<String> {
     CONFIRM_SCENES
         .iter()
-        .filter(|s| wanted.is_empty() || wanted.contains(&s.name))
+        .filter(|s| only.is_none_or(|names| names.contains(&s.name)))
         .filter_map(|s| {
             let (_fixture, mut app) = workbench(theme);
             let root = app.workspace_root().to_path_buf();
@@ -1469,29 +1468,50 @@ fn confirm_scenes(theme: crate::theme::Theme, wanted: &[&str], suffix: &str) -> 
 
 #[test]
 fn every_confirm_dialog() {
-    let failures = confirm_scenes(crate::theme::Theme::default(), &[], "");
+    let failures = confirm_scenes(crate::theme::Theme::default(), None, "");
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
 
-/// The themes [`confirm_dialogs_in_a_light_and_a_high_contrast_theme`]
-/// draws [`CONFIRMS_PER_THEME`] in: a light and a high-contrast one, whose
-/// interface colours each take another path through `Theme::ui` than the
-/// default theme's.
-const CONFIRM_THEMES: [&str; 2] = ["light", "hc-black"];
+/// The themes [`every_confirm_dialog_in_other_themes`] draws the dialogs
+/// in, each with the dialogs it draws (`None`: every one). The default
+/// theme lays the warning card's tones over a dialog, which redraw its
+/// title and keys at normal weight, so Dark Blue, a boxed theme, draws
+/// every dialog with its own colours and weights as given. Light and High
+/// Contrast Black take colours through other paths of `Theme::ui`: one red
+/// dialog and one amber one, with the frame's narrow padding, cover the
+/// frame there.
+const CONFIRM_THEMES: [(&str, Option<&[&str]>); 3] = [
+    ("dark-blue", None),
+    ("light", Some(&["confirm-discard", "confirm-replace-all"])),
+    (
+        "hc-black",
+        Some(&["confirm-discard", "confirm-replace-all"]),
+    ),
+];
 
-/// One red dialog and one amber one, the amber one with the frame's narrow
-/// padding.
-const CONFIRMS_PER_THEME: [&str; 2] = ["confirm-discard", "confirm-replace-all"];
+/// The name of every golden [`every_confirm_dialog_in_other_themes`]
+/// owns.
+fn confirm_goldens_in_other_themes() -> Vec<String> {
+    CONFIRM_THEMES
+        .into_iter()
+        .flat_map(|(id, only)| {
+            CONFIRM_SCENES
+                .iter()
+                .filter(move |s| only.is_none_or(|names| names.contains(&s.name)))
+                .map(move |s| format!("{}-{id}", s.name))
+        })
+        .collect()
+}
 
 #[test]
-fn confirm_dialogs_in_a_light_and_a_high_contrast_theme() {
+fn every_confirm_dialog_in_other_themes() {
     let failures: Vec<String> = CONFIRM_THEMES
         .into_iter()
-        .flat_map(|id| {
+        .flat_map(|(id, only)| {
             let theme = crate::theme::Theme::from_id(id);
             // `from_id` falls back to the default theme on a name it lacks.
             assert_eq!(theme.id(), id, "no bundled theme {id:?}");
-            confirm_scenes(theme, &CONFIRMS_PER_THEME, &format!("-{id}"))
+            confirm_scenes(theme, only, &format!("-{id}"))
         })
         .collect();
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
