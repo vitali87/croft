@@ -174,8 +174,6 @@ impl App {
         self.popup_open()
     }
 
-    /// Whether one of the pop-ups drawn over the middle of the screen is
-    /// open. It has the keys, so no pane's caret shows through it (#2669).
     /// Whether an open pop-up takes every mouse event, as one that handles
     /// no mouse of its own does (#2674).
     pub(super) fn popup_takes_the_mouse(&self) -> bool {
@@ -184,6 +182,8 @@ impl App {
             .any(|p| !p.handles_mouse() && p.is_open(self))
     }
 
+    /// Whether one of the pop-ups drawn over the middle of the screen is
+    /// open. It has the keys, so no pane's caret shows through it (#2669).
     pub(super) fn popup_open(&self) -> bool {
         Popup::ALL.iter().any(|p| p.is_open(self))
     }
