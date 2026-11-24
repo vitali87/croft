@@ -43,7 +43,7 @@ pub(crate) fn stand_in(name: &str, path: std::path::PathBuf) {
 /// file busy" while another test thread's forked child still holds its write
 /// descriptor, so a dry run waits that out before any code under test starts
 /// it, including code that starts a program without retrying.
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, unix))]
 pub(crate) fn stand_in_script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
     use std::process::Stdio;
