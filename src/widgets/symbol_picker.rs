@@ -68,6 +68,12 @@ impl SymbolPicker {
             .filter(|&n| n >= 1)
     }
 
+    /// The selected symbol's name, as screen reader mode reads it.
+    pub fn selected_name(&self) -> Option<&str> {
+        let idx = *self.results.get(self.selected)?;
+        self.symbols.get(idx).map(|s| s.name.as_str())
+    }
+
     /// The selected symbol's 0-based (line, character) jump target.
     pub fn selected_target(&self) -> Option<(u32, u32)> {
         let idx = *self.results.get(self.selected)?;
