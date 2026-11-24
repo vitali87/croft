@@ -22682,3 +22682,29 @@ fn a_tab_turned_viewer_keeps_nothing_of_its_text() {
         assert_eq!(e.path.as_deref(), Some(target), "{view}");
     }
 }
+
+/// Every viewer clears what a tab expected of a file not yet created
+/// (#2062): five of the ten (document, media, archive, log, SARIF) kept the
+/// flag from a new-file tab they replaced. Nothing read it while a viewer
+/// showed, but the reset is one now and none keeps it.
+#[test]
+fn a_viewer_forgets_the_new_file_it_replaced() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let zip = dir.join("bundle.zip");
+    zip_of(&zip, "readme.txt", b"inside");
+    let log = dir.join("run.log");
+    std::fs::write(&log, "\x1b[31mred\x1b[0m\n").unwrap();
+    for (target, view) in [(&zip, "archive"), (&log, "log")] {
+        let mut e = Editor::new();
+        e.open_new_file(&dir.join("draft.md")).unwrap();
+        assert!(
+            e.disk_expect_absent,
+            "staging: a new file is expected absent"
+        );
+
+        e.open(target).unwrap();
+        assert_eq!(e.views_filled(), [view]);
+        assert!(!e.disk_expect_absent, "{view} must forget the new file");
+    }
+}
