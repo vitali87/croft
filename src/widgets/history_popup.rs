@@ -66,9 +66,7 @@ impl HistoryPopup {
     }
 
     pub fn pop_char(&mut self) {
-        if !picker_query::backspace(&mut self.query, &mut self.cursor) {
-            return;
-        }
+        picker_query::backspace(&mut self.query, &mut self.cursor);
     }
 
     pub fn move_cursor_left(&mut self) {
