@@ -1212,9 +1212,8 @@ impl App {
             (
                 self.focus,
                 self.zen_mode,
-                self.modal_overlay_open(),
+                self.open_popups(),
                 self.context_menu.is_some(),
-                self.prompt.is_some(),
                 self.peek_popup.is_some(),
                 self.hover_popup.is_some(),
                 self.completion_popup.is_some(),
@@ -1269,7 +1268,7 @@ impl App {
                 .connect_dialog
                 .as_ref()
                 .is_some_and(|d| d.input_is_secret())
-            || (self.focus == Pane::Terminal && !self.modal_overlay_open())
+            || (self.focus == Pane::Terminal && !self.popup_open())
     }
 
     /// Screencast Mode's keys, over everything else, in the workspace above
@@ -1765,15 +1764,10 @@ impl App {
         if self.splitter_drag.is_some() {
             return false;
         }
-        // Anything modal may be anchored over sidebar space, and several are
-        // sidebar-targeting flows (branch picker, connect dialog) that are
-        // their own fields rather than `Prompt`s — checking only `prompt`
-        // would have missed exactly those.
-        if self.prompt.is_some()
-            || self.context_menu.is_some()
-            || self.connect_dialog.is_some()
-            || self.modal_overlay_open()
-        {
+        // Any pop-up may be anchored over sidebar space, and many ask about
+        // something in it (the branch picker, Source Control's Discard
+        // Changes): the one list of pop-ups names them all (#2679).
+        if self.popup_open() || self.context_menu.is_some() {
             return false;
         }
         // An Explorer drag is a drag over the sidebar the user is dragging

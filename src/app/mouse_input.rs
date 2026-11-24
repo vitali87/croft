@@ -749,7 +749,7 @@ impl App {
         // The history scrubber's slider (#371): a press on the track seeks
         // there, and a drag that started on it keeps seeking wherever the
         // pointer goes, so the handle can be dragged off the row and back.
-        if self.scrubber.is_some() && !self.modal_overlay_open() {
+        if self.scrubber.is_some() && !self.popup_open() {
             let on_track = rect_contains(self.scrub_slider, m.column, m.row);
             match m.kind {
                 MouseEventKind::Down(MouseButton::Left) if on_track => {

@@ -188,6 +188,12 @@ impl App {
         })
     }
 
+    /// The pop-ups open now, in the list's order. An Esc that closed one
+    /// changes this, so Zen Mode's Esc Esc does not count it (#2679).
+    pub(super) fn open_popups(&self) -> Vec<Popup> {
+        Popup::ALL.into_iter().filter(|p| p.is_open(self)).collect()
+    }
+
     /// Whether one of the pop-ups drawn over the middle of the screen is
     /// open. It has the keys, so no pane's caret shows through it (#2669).
     pub(super) fn popup_open(&self) -> bool {

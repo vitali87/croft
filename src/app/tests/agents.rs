@@ -3475,7 +3475,7 @@ fn an_agent_edit_proposal_opens_the_popup_and_enter_answers_the_hook() {
     };
     writeln!(hook, "{}", serde_json::to_string(&req).unwrap()).unwrap();
     assert!(app.drain_hook_requests());
-    assert!(app.modal_overlay_open());
+    assert!(app.popup_open());
     // A proposal the hook has stopped waiting for leaves with the popup.
     app.approvals[0].arrived -= crate::agent_hook::ANSWER_WINDOW;
     assert!(app.drain_hook_requests());

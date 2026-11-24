@@ -5341,26 +5341,6 @@ impl App {
         &mut self.terminals[self.active_terminal]
     }
 
-    /// Whether one of twelve pop-ups is open: the pickers, the input prompt,
-    /// F1 and an agent's edit proposal. Mouse handling, auto-hide (#260) and
-    /// the editor's accent marks ask this. Pictures ask
-    /// [`Self::pictures_held_back`] instead, which counts every pop-up
-    /// (#2659).
-    fn modal_overlay_open(&self) -> bool {
-        self.approval_ui.is_some()
-            || self.shortcuts_modal.is_some()
-            || self.file_finder.is_some()
-            || self.command_palette.is_some()
-            || self.go_to_symbol.is_some()
-            || self.workspace_symbols.is_some()
-            || self.process_picker.is_some()
-            || self.zoxide_jump.is_some()
-            || self.command_history_popup.is_some()
-            || self.branch_picker.is_some()
-            || self.input_prompt.is_some()
-            || self.list_picker.is_some()
-    }
-
     fn focus_pane(&mut self, p: Pane) {
         // Leaving the terminal closes its find bar so a stale match highlight
         // never lingers on the grid once input goes elsewhere. Quick-select

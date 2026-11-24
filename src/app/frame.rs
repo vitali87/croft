@@ -806,10 +806,10 @@ impl App {
             // mirroring the terminal pane buttons' hover affordance.
             let pointer = self.pointer_cell;
             self.editor.hover_pointer = pointer;
-            // A modal quick input takes the keyboard without moving focus
-            // (no focus sync runs when one opens), so the editor learns each
-            // frame to drop its accent marks while one is up.
-            self.editor.overlay_has_keyboard = self.modal_overlay_open();
+            // A pop-up takes the keyboard without moving focus (no focus
+            // sync runs when one opens), so the editor learns each frame to
+            // drop its accent marks while one is up (#2679).
+            self.editor.overlay_has_keyboard = self.popup_open();
             // Without an inline-image protocol an image tab draws itself in
             // half blocks (#1591).
             let cell_images = !self.inline_images_enabled();
