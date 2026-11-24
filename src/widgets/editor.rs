@@ -89,6 +89,7 @@ use transforms::*;
 use typing::*;
 use undo::*;
 pub(crate) use viewers::ansi_color_to_tui;
+pub use viewers::delete_own_gunzip_copies;
 pub(crate) use viewers::format_bytes_human;
 pub use viewers::sqlite_wal_path;
 use viewers::*;
