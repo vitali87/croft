@@ -2568,6 +2568,92 @@ impl App {
                 ..Default::default()
             };
         }
+        // The pickers read like the palette: their title and the selected
+        // row (#2670). Without these a reader heard the pane behind.
+        let picker = |focus: &str, item: Option<String>| Snapshot {
+            focus: tr(focus),
+            item,
+            status: status.clone(),
+            ..Default::default()
+        };
+        // Named for what Enter does with it (#2670 review): the same picker
+        // checks out, deletes, merges, rebases onto or branches from.
+        if let Some(p) = &self.branch_picker {
+            use super::scm::BranchPurpose;
+            use crate::widgets::branch_picker::BranchAction;
+            let title = match self.branch_purpose {
+                BranchPurpose::Checkout => "Checkout / Create Branch",
+                BranchPurpose::CreateFrom => "Create Branch from",
+                BranchPurpose::Delete => "Delete Branch",
+                BranchPurpose::Merge => "Merge Branch",
+                BranchPurpose::Rebase => "Rebase onto Branch",
+            };
+            let item = if self.branch_purpose == BranchPurpose::Checkout {
+                p.selected_action().map(|a| match a {
+                    BranchAction::Checkout(name) | BranchAction::Track { name, .. } => name,
+                    BranchAction::Create(name) => format!("{} {name}", tr("Create branch")),
+                })
+            } else {
+                // The others act on an existing branch only.
+                Some(
+                    p.selected_existing_branch()
+                        .unwrap_or_else(|| tr("Choose an existing branch")),
+                )
+            };
+            return picker(title, item);
+        }
+        if let Some(p) = &self.command_history_popup {
+            return picker("Command History", p.selected_entry().map(|e| e.cmd.clone()));
+        }
+        if let Some(j) = &self.zoxide_jump {
+            // Asking whether to install zoxide or add its hook: the question,
+            // whose last line holds the keys.
+            let item = if j.asks_yes_no() {
+                let asked = if j.available {
+                    crate::widgets::zoxide_jump::hook_offer_message(
+                        j.hook_offer.as_deref().unwrap_or_default(),
+                    )
+                } else {
+                    crate::widgets::zoxide_jump::unavailable_message(j)
+                };
+                Some(asked.split_whitespace().collect::<Vec<_>>().join(" "))
+            } else {
+                j.selected_path().map(|p| p.display().to_string())
+            };
+            return picker("Jump to Directory", item);
+        }
+        if let Some(p) = &self.process_picker {
+            return picker(
+                "Attach to Python Process",
+                p.selected_target().map(|t| t.label.clone()),
+            );
+        }
+        // Where each match is, so two `new`s in two files sound different
+        // (#2670 review).
+        if let Some(p) = &self.workspace_symbols {
+            let item = p.selected_item().map(|i| {
+                let path = i.path.strip_prefix(&p.root).unwrap_or(&i.path);
+                let mut said = i.name.clone();
+                if let Some(c) = &i.container {
+                    said.push_str(&format!(", {} {c}", tr("in")));
+                }
+                format!("{said}, {}:{}", path.display(), i.line + 1)
+            });
+            return picker("Go to Symbol in Workspace", item);
+        }
+        // `:42` jumps to a line: say so, not the symbol last selected
+        // (#2670 review).
+        if let Some(p) = &self.go_to_symbol {
+            let item = if p.is_line_mode() {
+                Some(match p.line_target() {
+                    Some(n) => format!("{} {n}", tr("Go to line")),
+                    None => tr("Type a line number"),
+                })
+            } else {
+                p.selected_name().map(String::from)
+            };
+            return picker("Go to Symbol", item);
+        }
         if let Some(p) = &self.command_palette {
             return Snapshot {
                 focus: tr("Command Palette"),
@@ -2667,7 +2753,8 @@ impl App {
     /// what. Without this a confirmation was silent, so a reader heard
     /// nothing after Ctrl+W and could not know that D throws edits away.
     /// Topmost first, in the order they are drawn; a new dialog that waits
-    /// for a key belongs here too.
+    /// for a key belongs here too, and a test opens every pop-up to check
+    /// one is read (#2670).
     pub(super) fn modal_a11y(&self) -> Option<(String, String)> {
         let tr = |s: &str| crate::i18n::tr(s).into_owned();
         // The title, and its sentences joined for speech: a full stop
@@ -2742,6 +2829,43 @@ impl App {
             };
             return Some((title, tr(actions)));
         }
+        // Connecting to a host (#2670): what it is doing or asking, and the
+        // keys for that step. What is typed, a password among it, is left to
+        // the reader's echo.
+        if let Some(d) = &self.connect_dialog {
+            let title = format!("{} {}", tr("Connect to"), d.host);
+            let mut body = vec![d.status_line.clone()];
+            // What failed, and what a yes to the slow fallback installs: the
+            // dialog draws both (#2670 review).
+            body.extend(d.error.clone());
+            if matches!(
+                d.phase,
+                crate::widgets::connect_dialog::DialogPhase::AwaitingFallbackConfirmation
+            ) {
+                body.extend(d.notes.iter().cloned());
+            }
+            if d.phase.awaits_input() {
+                body.push(d.prompt_text.clone());
+            }
+            let keys = if d.phase.is_terminal() {
+                "Enter or Escape, close"
+            } else if d.phase.awaits_input() {
+                "Type the answer. Enter, send. Escape, cancel"
+            } else {
+                "Escape, cancel. L, show the log"
+            };
+            return Some(said(&title, &body, &[tr(keys)]));
+        }
+        // F1 reads the shortcut at the top of the list, so each scroll is
+        // heard (#2670 review).
+        if let Some(modal) = &self.shortcuts_modal {
+            let row = modal.spoken_row().unwrap_or_default();
+            return Some(said(
+                "Keyboard Shortcuts",
+                &[row],
+                &[tr("Arrows, scroll. Escape or F1, close")],
+            ));
+        }
         // The field's own instruction ("Remote URL") is read with the keys,
         // so a prompt replaced by the next step under the same title is
         // still heard; what is typed is left to the reader's echo.
@@ -2815,6 +2939,33 @@ impl App {
                 &[yes_no("Y, yes, run")],
             ));
         }
+        if let Some(payload) = &self.pending_terminal_paste {
+            let lines = super::terminal_panes::pasted_lines(payload);
+            let n = lines.len();
+            let shown: Vec<String> = lines
+                .iter()
+                .take(3)
+                .map(|l| String::from_utf8_lossy(l).into_owned())
+                .collect();
+            return Some(said(
+                &format!(
+                    "{} {n} {}",
+                    tr("Paste"),
+                    tr(if n == 1 {
+                        "line into the terminal?"
+                    } else {
+                        "lines into the terminal?"
+                    })
+                ),
+                &[
+                    tr("Each line break is an Enter here, so the lines run as they land"),
+                    shown.join("; "),
+                ],
+                &[tr(
+                    "Y or Enter, paste. L, paste as one line. N or Escape, cancel",
+                )],
+            ));
+        }
         if self.pending_broadcast_enable {
             let receiving = self
                 .terminals
@@ -2877,6 +3028,16 @@ impl App {
                     format!("C, {verb} Anyway"),
                     tr("Escape, cancel"),
                 ],
+            ));
+        }
+        if let Some(drop) = &self.pending_stash_drop {
+            return Some(said(
+                "Drop stash?",
+                &[
+                    drop.label.clone(),
+                    tr("This permanently deletes the stash."),
+                ],
+                &[yes_no("Y, yes, drop it")],
             ));
         }
         if self.pending_discard_all {
@@ -3185,12 +3346,11 @@ impl App {
         if self.cursor_should_be_visible() {
             return;
         }
+        // The shell's cursor only while nothing covers it: under a pop-up
+        // the reader belongs on what the pop-up says (#2673 review).
         if self.focus == Pane::Terminal
-            && self.prompt.is_none()
+            && !self.popup_open()
             && self.context_menu.is_none()
-            && self.command_palette.is_none()
-            && self.file_finder.is_none()
-            && self.list_picker.is_none()
             && let Some(pos) = self
                 .terminals
                 .get(self.active_terminal)

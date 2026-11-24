@@ -3664,9 +3664,12 @@ fn a_link_planted_at_the_gunzip_scratch_name_is_not_followed() {
         gz.as_path().hash(&mut h);
         h.finish()
     };
-    let scratch = gunzip_scratch_dir()
-        .unwrap()
-        .join(format!("{key:016x}-planted.log"));
+    let scratch = gunzip_scratch_dir().unwrap().join(gunzip_copy_name(
+        key,
+        std::process::id(),
+        0,
+        "planted.log",
+    ));
     let _ = std::fs::remove_file(&scratch);
     std::os::unix::fs::symlink(&victim, &scratch).unwrap();
     let mut e = Editor::new();
@@ -3675,6 +3678,139 @@ fn a_link_planted_at_the_gunzip_scratch_name_is_not_followed() {
     assert!(!std::fs::symlink_metadata(&scratch).unwrap().is_symlink());
     assert_eq!(log_lines(&mut e, 1), ["decompressed text"]);
     let _ = std::fs::remove_file(&scratch);
+}
+
+/// #2675: the decompressed copy lasts only while a tab shows it. Opening
+/// something else in the tab, or closing it, deletes the copy; it used to
+/// stay in the temp folder until the machine cleared it.
+#[test]
+fn a_gunzipped_copy_is_deleted_once_no_tab_shows_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let gz = tmp.path().join("app.log.1.gz");
+    gzip_to(&gz, b"a rotated line\n");
+    let other = tmp.path().join("notes.txt");
+    std::fs::write(&other, "plain\n").unwrap();
+    let mut e = Editor::new();
+    e.open(&gz).unwrap();
+    let copy = e.log.as_ref().expect("the log view").path.clone();
+    assert!(copy.exists(), "the tab reads its decompressed copy");
+    e.open(&other).unwrap();
+    assert!(e.log.is_none(), "the tab now shows the text file");
+    assert!(!copy.exists(), "opening another file deletes the copy");
+    e.open(&gz).unwrap();
+    let copy = e.log.as_ref().expect("the log view").path.clone();
+    assert!(copy.exists());
+    drop(e);
+    assert!(!copy.exists(), "closing the tab deletes the copy");
+}
+
+/// #2675: a gzip that is cut short fails partway through decompressing
+/// and opens as hex. The part already written used to stay behind.
+#[test]
+fn a_gzip_cut_short_leaves_no_partial_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let gz = tmp.path().join("cut.log.gz");
+    let text: String = (0..20_000)
+        .map(|i| format!("{i:08} a line of a rotated log\n"))
+        .collect();
+    gzip_to(&gz, text.as_bytes());
+    let whole = std::fs::read(&gz).unwrap();
+    std::fs::write(&gz, &whole[..whole.len() / 2]).unwrap();
+    let mut e = Editor::new();
+    e.open(&gz).unwrap();
+    assert!(e.log.is_none(), "a gzip cut short is not shown as text");
+    let key = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        gz.as_path().hash(&mut h);
+        h.finish()
+    };
+    let prefix = format!("{key:016x}-");
+    let left: Vec<_> = std::fs::read_dir(gunzip_scratch_dir().unwrap())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(&prefix))
+        .collect();
+    assert!(left.is_empty(), "partial copies left behind: {left:?}");
+}
+
+/// #2676 review (Codex): a gzip whose name is near the 255 bytes a file
+/// name may have still opens as text. Its copy's name added a prefix to the
+/// whole name, went past the limit, and the gzip fell back to hex.
+#[test]
+fn a_gzip_with_a_long_name_still_opens_as_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let gz = tmp.path().join(format!("{}.log.gz", "a".repeat(244)));
+    gzip_to(&gz, b"a line with a long name\n");
+    let mut e = Editor::new();
+    e.open(&gz).unwrap();
+    assert!(e.hex.is_none(), "not hex");
+    assert_eq!(log_lines(&mut e, 1), ["a line with a long name"]);
+    let copy = e.log.as_ref().expect("the log view").path.clone();
+    let name = copy.file_name().unwrap().to_str().unwrap();
+    assert!(name.len() <= 255 && name.ends_with("aaa.log"), "{name}");
+}
+
+/// #2675: two tabs on one archive read copies of their own, so closing
+/// one never deletes the text the other is showing.
+#[test]
+fn closing_one_of_two_tabs_on_an_archive_keeps_the_others_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let gz = tmp.path().join("shared.log.gz");
+    gzip_to(&gz, b"first line\nsecond line\n");
+    let mut a = Editor::new();
+    a.open(&gz).unwrap();
+    let mut b = Editor::new();
+    b.open(&gz).unwrap();
+    let b_copy = b.log.as_ref().expect("the log view").path.clone();
+    assert_ne!(a.log.as_ref().expect("the log view").path, b_copy);
+    drop(a);
+    assert!(b_copy.exists(), "the other tab's copy stays");
+    assert_eq!(log_lines(&mut b, 2), ["first line", "second line"]);
+}
+
+/// #2675: a copy whose croft is gone, killed or cut off with its ssh
+/// session, is deleted the next time an archive opens. A running croft's
+/// copies stay, even one this user may not signal (#2676 review), and so
+/// do files that are not copies. This process's own go only on the way out
+/// that skips the tabs' clean-up.
+#[cfg(unix)]
+#[test]
+fn copies_of_a_croft_that_is_gone_are_swept() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    let gone = child.id();
+    child.wait().unwrap();
+    let running = std::os::unix::process::parent_id();
+    let me = std::process::id();
+    let copy = |pid| gunzip_copy_name(0xabc, pid, 0, "app.log");
+    let older = format!("{:016x}-app.log", 0xabc);
+    // Process 1 always runs, and a user other than root may not signal it:
+    // a probe that is refused must not read as a process that is gone.
+    let init = copy(1);
+    for name in [
+        copy(gone),
+        copy(running),
+        copy(me),
+        init.clone(),
+        "notes.txt".into(),
+        older.clone(),
+    ] {
+        std::fs::write(dir.path().join(name), b"x").unwrap();
+    }
+    let kept = |name: &str| dir.path().join(name).exists();
+    sweep_gunzip_copies(dir.path(), false);
+    assert!(!kept(&copy(gone)), "the copy of a croft that is gone");
+    assert!(kept(&copy(running)) && kept(&copy(me)));
+    assert!(kept(&init), "a process this user may not signal still runs");
+    assert!(
+        kept("notes.txt") && kept(&older),
+        "files that are not copies"
+    );
+    sweep_gunzip_copies(dir.path(), true);
+    assert!(!kept(&copy(me)), "this process's own, on the way out");
+    assert!(kept(&copy(running)));
 }
 
 #[test]
