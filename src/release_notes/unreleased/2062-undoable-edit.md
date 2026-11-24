@@ -1,0 +1,1 @@
+refactor: Twelve editor commands that took the same four steps around their change (pin the tab and open the caret's fold, record the undo step, then mark the file changed and colour it again) now take them through one helper (#2062). Every command edits, undoes and redoes exactly as before.

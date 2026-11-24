@@ -189,32 +189,30 @@ impl Editor {
         if col_chars.saturating_add(len_chars) > line_len {
             return;
         }
-        self.pin_on_edit();
-        self.push_undo(EditKind::Replace);
-        self.clear_selection();
-        let from = self.byte_index(row, col_chars);
-        let to = self.byte_index(row, col_chars + len_chars);
-        let text = &normalize_newlines(text);
-        let breaks = text.matches('\n').count();
-        if breaks == 0 {
-            self.lines[row].replace_range(from..to, text);
-            self.cursor_row = row;
-            self.cursor_col = col_chars + text.chars().count();
-        } else {
-            // A replacement newline (VS Code's regex `\n`) becomes a real
-            // line break, never an embedded control char in one line.
-            let line = std::mem::take(&mut self.lines[row]);
-            let merged = format!("{}{}{}", &line[..from], text, &line[to..]);
-            self.lines
-                .splice(row..=row, merged.split('\n').map(str::to_string));
-            self.cursor_row = row + breaks;
-            self.cursor_col = text
-                .rsplit('\n')
-                .next()
-                .map_or(0, |tail| tail.chars().count());
-        }
-        self.mark_buffer_changed();
-        self.recompute_highlights();
+        self.undoable_edit(EditKind::Replace, |this| {
+            this.clear_selection();
+            let from = this.byte_index(row, col_chars);
+            let to = this.byte_index(row, col_chars + len_chars);
+            let text = &normalize_newlines(text);
+            let breaks = text.matches('\n').count();
+            if breaks == 0 {
+                this.lines[row].replace_range(from..to, text);
+                this.cursor_row = row;
+                this.cursor_col = col_chars + text.chars().count();
+            } else {
+                // A replacement newline (VS Code's regex `\n`) becomes a real
+                // line break, never an embedded control char in one line.
+                let line = std::mem::take(&mut this.lines[row]);
+                let merged = format!("{}{}{}", &line[..from], text, &line[to..]);
+                this.lines
+                    .splice(row..=row, merged.split('\n').map(str::to_string));
+                this.cursor_row = row + breaks;
+                this.cursor_col = text
+                    .rsplit('\n')
+                    .next()
+                    .map_or(0, |tail| tail.chars().count());
+            }
+        });
     }
 
     /// Swap in a whole new buffer as one undo step: the find bar's Replace
@@ -223,18 +221,16 @@ impl Editor {
     /// extra carets go: they point into the old text, and one left on a row
     /// the new text no longer has crashes the next frame (#2074).
     pub fn replace_all_lines(&mut self, new_lines: Vec<String>) {
-        self.pin_on_edit();
-        self.push_undo(EditKind::Replace);
-        self.clear_selection();
-        self.collapse_carets();
-        self.lines = new_lines;
-        if self.lines.is_empty() {
-            self.lines.push(String::new());
-        }
-        self.cursor_row = self.cursor_row.min(self.lines.len() - 1);
-        self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
-        self.mark_buffer_changed();
-        self.recompute_highlights();
+        self.undoable_edit(EditKind::Replace, |this| {
+            this.clear_selection();
+            this.collapse_carets();
+            this.lines = new_lines;
+            if this.lines.is_empty() {
+                this.lines.push(String::new());
+            }
+            this.cursor_row = this.cursor_row.min(this.lines.len() - 1);
+            this.cursor_col = this.cursor_col.min(this.line_char_len(this.cursor_row));
+        });
     }
 
     pub(super) fn lines_slice_text(&self, start: usize, count: usize) -> String {
@@ -667,29 +663,27 @@ impl Editor {
     /// (both on by default) a Tab at column 2 with a width-4 unit adds 2
     /// spaces to reach column 4, not a flat 4.
     pub fn indent_at_cursor(&mut self) {
-        self.pin_on_edit();
-        self.push_undo(EditKind::Indent);
-        if self.selection.is_some() {
-            self.delete_selection_inner();
-        }
-        if self.lines.is_empty() {
-            self.lines.push(String::new());
-        }
-        let style = self.indent_style();
-        let row = self.cursor_row;
-        let byte = self.byte_index(row, self.cursor_col);
-        let (ins, advance): (String, usize) = if style.use_spaces {
-            let unit_w = (style.width as usize).max(1);
-            let pad = unit_w - (self.cursor_col % unit_w);
-            (" ".repeat(pad), pad)
-        } else {
-            // A tab-indented buffer inserts one literal tab (useTabStops).
-            ("\t".to_string(), 1)
-        };
-        self.lines[row].insert_str(byte, &ins);
-        self.cursor_col += advance;
-        self.mark_buffer_changed();
-        self.recompute_highlights();
+        self.undoable_edit(EditKind::Indent, |this| {
+            if this.selection.is_some() {
+                this.delete_selection_inner();
+            }
+            if this.lines.is_empty() {
+                this.lines.push(String::new());
+            }
+            let style = this.indent_style();
+            let row = this.cursor_row;
+            let byte = this.byte_index(row, this.cursor_col);
+            let (ins, advance): (String, usize) = if style.use_spaces {
+                let unit_w = (style.width as usize).max(1);
+                let pad = unit_w - (this.cursor_col % unit_w);
+                (" ".repeat(pad), pad)
+            } else {
+                // A tab-indented buffer inserts one literal tab (useTabStops).
+                ("\t".to_string(), 1)
+            };
+            this.lines[row].insert_str(byte, &ins);
+            this.cursor_col += advance;
+        });
         self.ensure_cursor_col_visible();
     }
 
@@ -700,34 +694,32 @@ impl Editor {
     /// width on the lines that actually gained indentation so the same text
     /// stays highlighted.
     pub fn indent_lines(&mut self) {
-        self.pin_on_edit();
-        self.push_undo(EditKind::Indent);
-        let unit = self.indent_unit();
-        let unit_w = unit.chars().count();
-        let (start_row, end_row) = self.selected_or_cursor_row_range();
-        for row in start_row..=end_row {
-            if !self.lines[row].is_empty() {
-                self.lines[row].insert_str(0, &unit);
+        self.undoable_edit(EditKind::Indent, |this| {
+            let unit = this.indent_unit();
+            let unit_w = unit.chars().count();
+            let (start_row, end_row) = this.selected_or_cursor_row_range();
+            for row in start_row..=end_row {
+                if !this.lines[row].is_empty() {
+                    this.lines[row].insert_str(0, &unit);
+                }
             }
-        }
-        // A row gained indentation iff it was non-empty (empty lines were
-        // skipped and stay empty), so a row that is non-empty now is exactly
-        // one that shifted right by `unit_w`.
-        let shift = |row: usize, col: usize, lines: &[String]| -> usize {
-            if row >= start_row && row <= end_row && !lines[row].is_empty() {
-                col + unit_w
-            } else {
-                col
+            // A row gained indentation iff it was non-empty (empty lines were
+            // skipped and stay empty), so a row that is non-empty now is exactly
+            // one that shifted right by `unit_w`.
+            let shift = |row: usize, col: usize, lines: &[String]| -> usize {
+                if row >= start_row && row <= end_row && !lines[row].is_empty() {
+                    col + unit_w
+                } else {
+                    col
+                }
+            };
+            this.cursor_col = shift(this.cursor_row, this.cursor_col, &this.lines);
+            if let Some(mut sel) = this.selection {
+                sel.anchor.1 = shift(sel.anchor.0, sel.anchor.1, &this.lines);
+                sel.head.1 = shift(sel.head.0, sel.head.1, &this.lines);
+                this.selection = Some(sel);
             }
-        };
-        self.cursor_col = shift(self.cursor_row, self.cursor_col, &self.lines);
-        if let Some(mut sel) = self.selection {
-            sel.anchor.1 = shift(sel.anchor.0, sel.anchor.1, &self.lines);
-            sel.head.1 = shift(sel.head.0, sel.head.1, &self.lines);
-            self.selection = Some(sel);
-        }
-        self.mark_buffer_changed();
-        self.recompute_highlights();
+        });
         self.ensure_cursor_col_visible();
     }
 
