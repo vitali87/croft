@@ -125,33 +125,31 @@ impl Editor {
     /// like ordinary typing. Auto-closing pairs and tags are bypassed: a
     /// typed bracket replaces, it does not grow a partner.
     pub(super) fn overwrite_char(&mut self, c: char) {
-        self.pin_on_edit();
-        self.push_undo(EditKind::InsertChar);
-        // A click leaves an empty selection behind; drop it, as the insert
-        // path does, or a later Shift+arrow would extend from the click.
-        self.selection = None;
-        let row = self.cursor_row;
-        let from = self.byte_index(row, self.cursor_col);
-        let to = if self.joins_cluster_before_caret(c) {
-            from
-        } else {
-            let next = next_grapheme_col(&self.lines[row], self.cursor_col);
-            self.byte_index(row, next)
-        };
-        let mut buf = [0u8; 4];
-        self.lines[row].replace_range(from..to, c.encode_utf8(&mut buf));
-        // The typed char can join the clusters around it into one (a ZWJ
-        // between two emoji, a regional indicator before a flag); step past
-        // the whole cluster then, so the next keystroke never lands inside it.
-        let col = self.cursor_col + 1;
-        let line = &self.lines[row];
-        self.cursor_col = if floor_grapheme_col(line, col) == col {
-            col
-        } else {
-            next_grapheme_col(line, col)
-        };
-        self.mark_buffer_changed();
-        self.recompute_highlights();
+        self.undoable_edit(EditKind::InsertChar, |this| {
+            // A click leaves an empty selection behind; drop it, as the insert
+            // path does, or a later Shift+arrow would extend from the click.
+            this.selection = None;
+            let row = this.cursor_row;
+            let from = this.byte_index(row, this.cursor_col);
+            let to = if this.joins_cluster_before_caret(c) {
+                from
+            } else {
+                let next = next_grapheme_col(&this.lines[row], this.cursor_col);
+                this.byte_index(row, next)
+            };
+            let mut buf = [0u8; 4];
+            this.lines[row].replace_range(from..to, c.encode_utf8(&mut buf));
+            // The typed char can join the clusters around it into one (a ZWJ
+            // between two emoji, a regional indicator before a flag); step past
+            // the whole cluster then, so the next keystroke never lands inside it.
+            let col = this.cursor_col + 1;
+            let line = &this.lines[row];
+            this.cursor_col = if floor_grapheme_col(line, col) == col {
+                col
+            } else {
+                next_grapheme_col(line, col)
+            };
+        });
         self.last_typed = Some((c, self.edit_seq));
     }
 
@@ -184,15 +182,13 @@ impl Editor {
         let Some(name) = name else {
             return false;
         };
-        self.pin_on_edit();
-        self.push_undo(EditKind::InsertChar);
-        let row = self.cursor_row;
-        self.lines[row].insert_str(byte, &format!("></{name}>"));
-        // The caret lands just past the `>` the user typed, i.e. between the
-        // opening and closing tags, which is where they will type next.
-        self.cursor_col += 1;
-        self.mark_buffer_changed();
-        self.recompute_highlights();
+        self.undoable_edit(EditKind::InsertChar, |this| {
+            let row = this.cursor_row;
+            this.lines[row].insert_str(byte, &format!("></{name}>"));
+            // The caret lands just past the `>` the user typed, i.e. between the
+            // opening and closing tags, which is where they will type next.
+            this.cursor_col += 1;
+        });
         self.ensure_cursor_col_visible();
         true
     }
@@ -609,15 +605,13 @@ impl Editor {
     /// Remove chars `from..to` of the caret's line as one undo step, leaving
     /// the caret at `from`.
     pub(super) fn delete_cols_on_line(&mut self, kind: EditKind, from: usize, to: usize) {
-        self.pin_on_edit();
-        self.push_undo(kind);
-        let row = self.cursor_row;
-        let (a, b) = (self.byte_index(row, from), self.byte_index(row, to));
-        self.lines[row].replace_range(a..b, "");
-        self.cursor_col = from;
-        self.selection = None;
-        self.mark_buffer_changed();
-        self.recompute_highlights();
+        self.undoable_edit(kind, |this| {
+            let row = this.cursor_row;
+            let (a, b) = (this.byte_index(row, from), this.byte_index(row, to));
+            this.lines[row].replace_range(a..b, "");
+            this.cursor_col = from;
+            this.selection = None;
+        });
     }
 }
 
