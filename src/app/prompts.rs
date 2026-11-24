@@ -2,6 +2,7 @@
 //! `submit_input_prompt` and `confirm_list_picker`, and the small inline prompt.
 
 use super::*;
+use crate::widgets::picker_rows::{PickerMouse, answer_mouse};
 
 impl Prompt {
     /// The caret, clamped into `buffer`.
@@ -1400,31 +1401,10 @@ impl App {
         let Some(picker) = self.list_picker.as_mut() else {
             return;
         };
-        let inside = rect_contains(picker.last_rect, m.column, m.row);
-        match m.kind {
-            MouseEventKind::ScrollDown => {
-                for _ in 0..3 {
-                    picker.select_next();
-                }
-            }
-            MouseEventKind::ScrollUp => {
-                for _ in 0..3 {
-                    picker.select_prev();
-                }
-            }
-            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
-                if !inside =>
-            {
-                self.dismiss_list_picker();
-            }
-            // Click a row to select and run it, the way VS Code menus behave.
-            MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(idx) = picker.row_index_at(m.row) {
-                    picker.selected = idx;
-                    self.confirm_list_picker();
-                }
-            }
-            _ => {}
+        match answer_mouse(picker, m) {
+            PickerMouse::Close => self.dismiss_list_picker(),
+            PickerMouse::Accept => self.confirm_list_picker(),
+            PickerMouse::Stay => {}
         }
     }
 
