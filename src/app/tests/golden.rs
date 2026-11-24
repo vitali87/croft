@@ -1007,9 +1007,9 @@ fn every_golden_belongs_to_a_scene() {
         );
         return;
     };
-    // Goldens other test modules save here: the key ledger's and the
-    // command registry's.
-    const SAVED_ELSEWHERE: [&str; 2] = ["key-ledger", "commands"];
+    // Goldens other test modules save here: the key ledger's, the
+    // command registry's and the git module's recorded calls.
+    const SAVED_ELSEWHERE: [&str; 3] = ["key-ledger", "commands", "git-calls"];
     let owned: Vec<String> = owned_goldens()
         .into_iter()
         .chain(SAVED_ELSEWHERE.map(String::from))
