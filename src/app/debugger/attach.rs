@@ -3,6 +3,7 @@
 //! process.
 
 use super::*;
+use crate::widgets::picker_rows::{PickerMouse, answer_mouse};
 
 /// The current user's processes, croft's own excluded, for the attach
 /// picker (#250). Empty when `ps` is unavailable.
@@ -132,31 +133,10 @@ impl App {
         let Some(picker) = self.process_picker.as_mut() else {
             return;
         };
-        let inside = rect_contains(picker.last_rect, m.column, m.row);
-        match m.kind {
-            MouseEventKind::ScrollDown => {
-                for _ in 0..3 {
-                    picker.select_next();
-                }
-            }
-            MouseEventKind::ScrollUp => {
-                for _ in 0..3 {
-                    picker.select_prev();
-                }
-            }
-            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
-                if !inside =>
-            {
-                self.close_process_picker();
-            }
-            // Click a row to attach to it, the way VS Code's quick-pick behaves.
-            MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(idx) = picker.row_index_at(m.row) {
-                    picker.selected = idx;
-                    self.attach_process_picker_selection();
-                }
-            }
-            _ => {}
+        match answer_mouse(picker, m) {
+            PickerMouse::Close => self.close_process_picker(),
+            PickerMouse::Accept => self.attach_process_picker_selection(),
+            PickerMouse::Stay => {}
         }
     }
 

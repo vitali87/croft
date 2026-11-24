@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::widgets::confirm_frame::{ConfirmFrame, Inset, confirm_width, draw_confirm};
+use crate::widgets::picker_rows::{PickerMouse, answer_mouse};
 
 /// A Search Editor tab's label (#615): not a file on disk, so it names the
 /// query rather than a path the save path could clobber.
@@ -971,31 +972,10 @@ impl App {
         let Some(finder) = self.file_finder.as_mut() else {
             return;
         };
-        let inside = rect_contains(finder.last_rect, m.column, m.row);
-        match m.kind {
-            MouseEventKind::ScrollDown => {
-                for _ in 0..3 {
-                    finder.select_next();
-                }
-            }
-            MouseEventKind::ScrollUp => {
-                for _ in 0..3 {
-                    finder.select_prev();
-                }
-            }
-            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
-                if !inside =>
-            {
-                self.close_file_finder();
-            }
-            // Click a row to open it, the way VS Code's quick-pick behaves.
-            MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(idx) = finder.row_index_at(m.row) {
-                    finder.selected = idx;
-                    self.open_file_finder_selection();
-                }
-            }
-            _ => {}
+        match answer_mouse(finder, m) {
+            PickerMouse::Close => self.close_file_finder(),
+            PickerMouse::Accept => self.open_file_finder_selection(),
+            PickerMouse::Stay => {}
         }
     }
 

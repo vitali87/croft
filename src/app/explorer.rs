@@ -3,6 +3,7 @@
 //! .code-workspace files, re-rooting, file watching and outside changes, zoxide jump.
 
 use super::*;
+use crate::widgets::picker_rows::{PickerMouse, answer_mouse};
 
 /// The toggleable sub-views stacked inside the Explorer side panel, mirroring
 /// VS Code's "Views and More Actions" (⋯) menu on the EXPLORER header. Ordered
@@ -1851,31 +1852,10 @@ impl App {
         let Some(jump) = self.zoxide_jump.as_mut() else {
             return;
         };
-        let inside = rect_contains(jump.last_rect, m.column, m.row);
-        match m.kind {
-            MouseEventKind::ScrollDown => {
-                for _ in 0..3 {
-                    jump.select_next();
-                }
-            }
-            MouseEventKind::ScrollUp => {
-                for _ in 0..3 {
-                    jump.select_prev();
-                }
-            }
-            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
-                if !inside =>
-            {
-                self.close_zoxide_jump();
-            }
-            // Click a row to jump to it, the way VS Code's quick-pick behaves.
-            MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(idx) = jump.row_index_at(m.row) {
-                    jump.selected = idx;
-                    self.apply_zoxide_jump_selection();
-                }
-            }
-            _ => {}
+        match answer_mouse(jump, m) {
+            PickerMouse::Close => self.close_zoxide_jump(),
+            PickerMouse::Accept => self.apply_zoxide_jump_selection(),
+            PickerMouse::Stay => {}
         }
     }
 

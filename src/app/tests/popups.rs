@@ -1043,6 +1043,81 @@ fn a_click_behind_a_popup_never_reaches_what_it_covers() {
     );
 }
 
+/// The eight pickers answer the mouse through one rule
+/// (`widgets::picker_rows::answer_mouse`), and each says only how it closes
+/// and what taking a row does. A left or a right press outside closes every
+/// one of them, and a left press on its top border, inside it but on no
+/// row, leaves it open.
+#[test]
+fn every_picker_closes_on_a_press_outside_and_stays_open_on_its_border() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    const PICKERS: [Popup; 8] = [
+        Popup::FileFinder,
+        Popup::CommandPalette,
+        Popup::GoToSymbol,
+        Popup::WorkspaceSymbols,
+        Popup::ProcessPicker,
+        Popup::ZoxideJump,
+        Popup::BranchPicker,
+        Popup::ListPicker,
+    ];
+    fn last_rect(app: &App, p: Popup) -> Rect {
+        match p {
+            Popup::FileFinder => app.file_finder.as_ref().unwrap().last_rect,
+            Popup::CommandPalette => app.command_palette.as_ref().unwrap().last_rect,
+            Popup::GoToSymbol => app.go_to_symbol.as_ref().unwrap().last_rect,
+            Popup::WorkspaceSymbols => app.workspace_symbols.as_ref().unwrap().last_rect,
+            Popup::ProcessPicker => app.process_picker.as_ref().unwrap().last_rect,
+            Popup::ZoxideJump => app.zoxide_jump.as_ref().unwrap().last_rect,
+            Popup::BranchPicker => app.branch_picker.as_ref().unwrap().last_rect,
+            Popup::ListPicker => app.list_picker.as_ref().unwrap().last_rect,
+            _ => unreachable!("{p:?} is no picker"),
+        }
+    }
+    // `p` open over a fresh app, drawn once so it knows where it is.
+    fn opened(root: &Path, p: Popup) -> (App, Rect) {
+        let mut app = App::new(root.to_path_buf()).unwrap();
+        open(&mut app, p);
+        draw(&mut app, 160, 40);
+        assert!(p.is_open(&app), "{p:?} opens");
+        let rect = last_rect(&app, p);
+        assert!(rect.width > 0 && rect.height > 0, "{p:?} was drawn");
+        (app, rect)
+    }
+    fn press(app: &mut App, button: MouseButton, column: u16, row: u16) {
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(button),
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        });
+    }
+    let mut wrong = Vec::new();
+    for p in PICKERS {
+        for button in [MouseButton::Left, MouseButton::Right] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (mut app, rect) = opened(tmp.path(), p);
+            // The bottom-right corner, which no picker reaches.
+            let (x, y) = (159, 39);
+            assert!(
+                !rect.contains(ratatui::layout::Position::new(x, y)),
+                "{p:?} reaches the corner"
+            );
+            press(&mut app, button, x, y);
+            if p.is_open(&app) {
+                wrong.push(format!("{p:?} stayed open on a {button:?} press outside"));
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, rect) = opened(tmp.path(), p);
+        press(&mut app, MouseButton::Left, rect.x + 1, rect.y);
+        if !p.is_open(&app) {
+            wrong.push(format!("{p:?} closed on a press on its own border"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// #2679: in Zen Mode, an Esc that closed one of the pop-ups the old short
 /// list left out (a confirm, Settings, the connect dialog, an agent's
 /// proposal, the startup warning) counted as an Esc that did nothing, so one

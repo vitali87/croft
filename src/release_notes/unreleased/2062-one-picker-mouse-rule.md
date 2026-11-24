@@ -1,0 +1,1 @@
+refactor: The eight pickers (Quick Open, the Command Palette, both symbol pickers, and the process, directory, branch and list pickers) answer the mouse through one shared rule (#2062). Nothing changes in use.

@@ -2,6 +2,7 @@
 //! tools, viewers) and Show Memory Usage.
 
 use super::*;
+use crate::widgets::picker_rows::{PickerMouse, answer_mouse};
 
 impl App {
     /// Pull the one-shot remote-extension-index refresh if it has finished.
@@ -580,31 +581,10 @@ impl App {
         let Some(palette) = self.command_palette.as_mut() else {
             return;
         };
-        let inside = rect_contains(palette.last_rect, m.column, m.row);
-        match m.kind {
-            MouseEventKind::ScrollDown => {
-                for _ in 0..3 {
-                    palette.select_next();
-                }
-            }
-            MouseEventKind::ScrollUp => {
-                for _ in 0..3 {
-                    palette.select_prev();
-                }
-            }
-            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
-                if !inside =>
-            {
-                self.close_command_palette();
-            }
-            // Click a row to run it, the way VS Code's quick-pick behaves.
-            MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(idx) = palette.row_index_at(m.row) {
-                    palette.selected = idx;
-                    self.run_command_palette_selection();
-                }
-            }
-            _ => {}
+        match answer_mouse(palette, m) {
+            PickerMouse::Close => self.close_command_palette(),
+            PickerMouse::Accept => self.run_command_palette_selection(),
+            PickerMouse::Stay => {}
         }
     }
 
