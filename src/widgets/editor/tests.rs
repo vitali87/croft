@@ -22633,3 +22633,49 @@ fn every_route_opens_the_view_it_opens_today() {
     ];
     pretty_assertions::assert_eq!(outcomes, expected);
 }
+
+/// Every viewer starts from the same reset (#2062): a text tab with edits,
+/// an undo history, a selection, a language and a place in the file keeps
+/// none of them once it shows an image, a sheet, an archive, a log or hex.
+#[test]
+fn a_tab_turned_viewer_keeps_nothing_of_its_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let png = dir.join("pic.png");
+    std::fs::write(&png, png_of(2, 2, |_, _| RED)).unwrap();
+    let csv = dir.join("data.csv");
+    std::fs::write(&csv, "a,b\n1,2\n").unwrap();
+    let zip = dir.join("bundle.zip");
+    zip_of(&zip, "readme.txt", b"inside");
+    let log = dir.join("run.log");
+    std::fs::write(&log, "\x1b[31mred\x1b[0m\n").unwrap();
+    let bin = dir.join("blob.bin");
+    std::fs::write(&bin, [0u8, 159, 146, 150, 0, 1]).unwrap();
+    let viewers: [(&Path, &str); 5] = [
+        (&png, "image"),
+        (&csv, "sheet"),
+        (&zip, "archive"),
+        (&log, "log"),
+        (&bin, "hex"),
+    ];
+    for (target, view) in viewers {
+        let src = dir.join("main.rs");
+        std::fs::write(&src, "fn main() {\n    let x = 1;\n}\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&src).unwrap();
+        e.cursor_row = 1;
+        e.cursor_col = 4;
+        e.insert_char('y');
+        e.select_all();
+        e.scroll = 1;
+        assert!(e.lang.is_some() && !e.undo_stack.is_empty(), "staging");
+
+        e.open(target).unwrap();
+        assert_eq!(e.views_filled(), [view], "{view}");
+        assert_eq!(e.lines, [""], "{view}: the text side is a stub");
+        assert!(e.undo_stack.is_empty() && e.redo_stack.is_empty(), "{view}");
+        assert!(!e.dirty && e.selection.is_none() && e.lang.is_none(), "{view}");
+        assert_eq!((e.cursor_row, e.cursor_col, e.scroll), (0, 0, 0), "{view}");
+        assert_eq!(e.path.as_deref(), Some(target), "{view}");
+    }
+}
