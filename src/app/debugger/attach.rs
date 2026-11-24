@@ -59,10 +59,6 @@ impl App {
         Some((rc, slot))
     }
 
-    pub fn consume_process_picker_image_clear(&mut self) -> bool {
-        self.overlays.process_picker_clear.consume()
-    }
-
     /// Open the "Debug: Attach to Python Process" picker. Enumerates running
     /// CPython 3.14+ processes (those with PEP 768 `sys.remote_exec`); shows a
     /// status message and opens nothing when there are none.
@@ -81,13 +77,13 @@ impl App {
         }
         let count = targets.len();
         self.process_picker = Some(crate::widgets::process_picker::ProcessPicker::new(targets));
-        self.overlays.process_picker_clear.request();
+        self.overlays.popup_clear.request();
         self.status = format!("Attach: {count} Python process(es) — Esc to close, Enter to attach");
     }
 
     pub(in crate::app) fn close_process_picker(&mut self) {
         if self.process_picker.take().is_some() {
-            self.overlays.process_picker_clear.request();
+            self.overlays.popup_clear.request();
             self.overlays.activity.mark_dirty();
             self.overlays.welcome.mark_dirty();
             self.overlays.hero.mark_dirty();

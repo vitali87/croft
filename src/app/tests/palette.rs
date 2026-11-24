@@ -993,11 +993,11 @@ fn opening_the_file_finder_arms_one_image_clear_so_iterm_evicts_cached_osc_1337_
     app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER))
         .unwrap();
     assert!(
-        app.consume_file_finder_image_clear(),
+        app.consume_popup_image_clear(),
         "Cmd+P must arm terminal.clear() so iTerm2's image cache (activity bar icons, welcome wordmark, editor preview) is wiped before the modal paints, otherwise those cached image cells bleed through the file list"
     );
     assert!(
-        !app.consume_file_finder_image_clear(),
+        !app.consume_popup_image_clear(),
         "the flag is one-shot — a second consume call must return false so the driver does not re-clear every frame"
     );
 }

@@ -1846,11 +1846,11 @@ fn opening_the_shortcuts_modal_arms_one_image_clear_so_iterm_evicts_cached_osc_1
     app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE))
         .unwrap();
     assert!(
-        app.consume_shortcuts_image_clear(),
+        app.consume_popup_image_clear(),
         "F1 must arm terminal.clear() so iTerm2's image cache (activity bar icons, welcome wordmark, editor preview) is wiped before the modal paints, otherwise those cached image cells bleed through the modal text"
     );
     assert!(
-        !app.consume_shortcuts_image_clear(),
+        !app.consume_popup_image_clear(),
         "the flag is one-shot — a second consume call must return false so the driver does not re-clear every frame"
     );
 }
@@ -1861,11 +1861,11 @@ fn closing_the_shortcuts_modal_arms_image_clear_and_re_dirties_overlays() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE))
         .unwrap();
-    let _ = app.consume_shortcuts_image_clear();
+    let _ = app.consume_popup_image_clear();
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
     assert!(
-        app.consume_shortcuts_image_clear(),
+        app.consume_popup_image_clear(),
         "Esc must also arm terminal.clear() so the modal's text cells get wiped and the activity bar / welcome wordmark / hero icons can be re-emitted cleanly"
     );
     assert!(app.overlays.activity.dirty());

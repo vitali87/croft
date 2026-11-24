@@ -243,12 +243,12 @@ impl App {
     pub(super) fn open_input_prompt(&mut self, prompt: crate::widgets::input_prompt::InputPrompt) {
         self.scm_menu.close();
         self.input_prompt = Some(prompt);
-        self.overlays.input_prompt_clear.request();
+        self.overlays.popup_clear.request();
     }
 
     pub(super) fn close_input_prompt(&mut self) {
         if self.input_prompt.take().is_some() {
-            self.overlays.input_prompt_clear.request();
+            self.overlays.popup_clear.request();
             self.overlays.activity.mark_dirty();
             self.overlays.welcome.mark_dirty();
             self.overlays.hero.mark_dirty();
@@ -270,7 +270,7 @@ impl App {
             return;
         }
         self.list_picker = Some(picker);
-        self.overlays.list_picker_clear.request();
+        self.overlays.popup_clear.request();
     }
 
     /// The list picker closed with no row chosen (Esc, a click outside).
@@ -286,7 +286,7 @@ impl App {
         // A server question closed without a pick is answered "no action".
         self.lsp_question = None;
         if self.list_picker.take().is_some() {
-            self.overlays.list_picker_clear.request();
+            self.overlays.popup_clear.request();
             self.overlays.activity.mark_dirty();
             self.overlays.welcome.mark_dirty();
             self.overlays.hero.mark_dirty();
@@ -1295,14 +1295,6 @@ impl App {
                 self.open_settings_view();
             }
         }
-    }
-
-    pub fn consume_input_prompt_image_clear(&mut self) -> bool {
-        self.overlays.input_prompt_clear.consume()
-    }
-
-    pub fn consume_list_picker_image_clear(&mut self) -> bool {
-        self.overlays.list_picker_clear.consume()
     }
 
     pub(super) fn handle_input_prompt_key(&mut self, key: KeyEvent) {
