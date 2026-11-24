@@ -1,0 +1,1 @@
+fix: A file that opens in the hex viewer because its own viewer declined it (an archive too large to list, a gzip too large to decompress) now says why when opened from Quick Open or with `croft <file>` in croft's terminal, as it already did from the Explorer (#2711).

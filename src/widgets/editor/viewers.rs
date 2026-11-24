@@ -1402,6 +1402,12 @@ impl Editor {
         Ok(())
     }
 
+    /// Why this tab shows its file in the hex viewer rather than the viewer
+    /// its kind gets, when that viewer declined it (#2711).
+    pub fn hex_routed_because(&self) -> Option<&str> {
+        self.hex.as_ref()?.routed_because.as_deref()
+    }
+
     /// True when this tab shows any non-text view: a diff, sheet,
     /// image/PDF, or hex tab. Text-only affordances (save, LSP sync,
     /// vim, merge commands, encoding, markdown preview) refuse on it.
@@ -1636,20 +1642,23 @@ impl Editor {
             self.disk_conflict = false;
             return Ok(());
         }
-        let view =
+        let mut view =
             crate::hex::HexView::open(path).map_err(|e| anyhow::anyhow!("Hex open failed: {e}"))?;
         self.become_viewer(path, Self::disk_stamp_of(path));
-        self.hex = Some(view);
         // Only for the file it was set for: an open can set the note and
         // then fail before reaching a viewer, and this is also reached
         // directly by "Reopen as Hex", so a note that outlived its open
         // would explain the wrong file.
-        self.status = match self.route_note.take() {
-            Some((noted, why)) if noted == path => {
-                format!("Opened {} in the hex viewer: {why}", path.display())
-            }
-            _ => format!("Opened {} in the hex viewer", path.display()),
+        let why = match self.route_note.take() {
+            Some((noted, why)) if noted == path => Some(why),
+            _ => None,
         };
+        self.status = match &why {
+            Some(why) => format!("Opened {} in the hex viewer: {why}", path.display()),
+            None => format!("Opened {} in the hex viewer", path.display()),
+        };
+        view.routed_because = why;
+        self.hex = Some(view);
         Ok(())
     }
 

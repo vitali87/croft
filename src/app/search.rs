@@ -938,21 +938,30 @@ impl App {
                     // file (or one that saturated in the parser) was clamped
                     // above, and the clamped truth is the useful signal.
                     let last_line = self.editor.lines.len().max(1);
-                    self.status = match hint {
-                        Some(hint) => match hint.end {
-                            Some(end) => format!(
-                                "Opened {}:{}-{}",
-                                self.status_path(&path),
-                                hint.line.min(last_line),
-                                end.min(last_line)
-                            ),
-                            None => format!(
-                                "Opened {}:{}",
-                                self.status_path(&path),
-                                hint.line.min(last_line)
-                            ),
-                        },
-                        None => format!("Opened {}", self.status_path(&path)),
+                    self.status = if let Some(why) = self.editor.hex_routed_because() {
+                        // Its own viewer declined the file: say why, as the
+                        // Explorer does, line hint or not (#2711).
+                        format!(
+                            "Opened {} in the hex viewer: {why}",
+                            self.status_path(&path)
+                        )
+                    } else {
+                        match hint {
+                            Some(hint) => match hint.end {
+                                Some(end) => format!(
+                                    "Opened {}:{}-{}",
+                                    self.status_path(&path),
+                                    hint.line.min(last_line),
+                                    end.min(last_line)
+                                ),
+                                None => format!(
+                                    "Opened {}:{}",
+                                    self.status_path(&path),
+                                    hint.line.min(last_line)
+                                ),
+                            },
+                            None => format!("Opened {}", self.status_path(&path)),
+                        }
                     };
                 }
                 Err(e) => {
