@@ -342,9 +342,11 @@ pub(super) fn build_line_spans<'a>(
 /// What every visual row shares in one frame of [`Editor::render`]: the
 /// text area and where the gutter and the text sit in it, and the
 /// frame-wide facts the row painters read.
-struct RowFrame {
+struct RowFrame<'a> {
     /// The editor's text area: the gutter starts at its left edge.
     inner: Rect,
+    /// Every visual row this frame draws, top to bottom.
+    visual_rows: &'a [VisRow],
     /// The line-number column with its sign margin, before the change lane.
     gutter_width: u16,
     /// The screen column the text starts at, right of the gutter.
@@ -355,6 +357,11 @@ struct RowFrame {
     wrap: bool,
     /// The primary selection, start before end, when it covers any text.
     sel_norm: Option<((usize, usize), (usize, usize))>,
+    /// The selected text whose other occurrences are highlighted, when the
+    /// selection asks for that.
+    occ_needle: Option<String>,
+    /// The two brackets matched at the caret, in the focused editor.
+    bracket_pair: Option<(BPos, BPos)>,
     /// Columns between indentation guides.
     guide_step: usize,
     /// The caret block's guide as (column, first line, last line), when
@@ -898,11 +905,14 @@ impl Widget for &mut Editor {
         // What every row shares this frame.
         let frame = RowFrame {
             inner,
+            visual_rows: &visual_rows,
             gutter_width,
             text_x,
             text_width,
             wrap,
             sel_norm,
+            occ_needle,
+            bracket_pair,
             guide_step,
             active_guide,
             guide_fg,
@@ -948,401 +958,10 @@ impl Widget for &mut Editor {
 
             let (line_len, row_width) =
                 self.paint_row_text(buf, &frame, &mut row_cells, y, line_idx, row_start, row_end);
-            let raw = &self.lines[line_idx];
 
-            // Merge-conflict region tints (VS Code's current/incoming
-            // backgrounds), painted right after the text so diagnostics,
-            // search highlights, and the selection all win over them.
-            if let Some(tint) = conflict_row_tint(&self.conflicts, line_idx, self.theme) {
-                paint_full_row_bg(buf, text_x, y, row_width, tint);
-            }
-            // Clickable accept buttons on the conflict header row — VS Code's
-            // merge-conflict CodeLens, drawn after the marker text where the
-            // `<<<<<<<` line is otherwise dead space (#1169). A narrow row
-            // gets the short labels rather than losing buttons. Hit spans are
-            // recorded per frame (cleared at render start) so the rects always
-            // describe the painted frame (#103's invariant).
-            if let Some(block_idx) = self.conflicts.iter().position(|b| b.ours_start == line_idx) {
-                let block = self.conflicts[block_idx];
-                let marker_len = row_cells.text_before(line_len) as u16;
-                // A header that wraps gets them after its last segment only.
-                if marker_len <= row_width {
-                    use crate::merge::Resolution;
-                    let chips = [
-                        AcceptChip::new("Accept Current", "Current", ACCEPT_CURRENT_FILL),
-                        AcceptChip::new("Accept Incoming", "Incoming", ACCEPT_INCOMING_FILL),
-                        AcceptChip::new("Accept Both", "Both", ACCEPT_BOTH_FILL),
-                    ];
-                    let res = [Resolution::Current, Resolution::Incoming, Resolution::Both];
-                    let x0 = text_x + marker_len + 2;
-                    for (i, xs) in
-                        paint_accept_chips(buf, &chips, x0, text_x + row_width, y, self.theme)
-                    {
-                        self.merge_action_spans
-                            .push((y, xs, block.ours_start, res[i]));
-                    }
-                }
-            }
-
-            // LSP diagnostics: underline each problem span in its severity
-            // colour, clipped to the visible row window. VS Code draws a wavy
-            // underline; the crossterm backend exposes only a straight one, so
-            // a coloured straight underline carries the severity instead. The
-            // underline colour is independent of the glyph's foreground, so the
-            // syntax/semantic colour underneath is preserved.
-            let empty_diag: Vec<(usize, usize, crate::lsp::manager::DiagnosticSeverity)> =
-                Vec::new();
-            for &(sc, ec, severity) in self.diagnostic_spans.get(line_idx).unwrap_or(&empty_diag) {
-                let vs = row_cells.cell(sc);
-                // The exclusive end shifts by the hints before its LAST char,
-                // so an underline never swallows a hint anchored right at it.
-                let ve = row_cells.end(ec);
-                if ve > vs {
-                    paint_diagnostic_underline(
-                        buf, text_x, y, row_width, vs, ve, severity, self.theme,
-                    );
-                }
-            }
-            let empty_tags: Vec<(usize, usize, crate::lsp::manager::DiagnosticTags)> = Vec::new();
-            for &(sc, ec, tags) in self
-                .diagnostic_tag_spans
-                .get(line_idx)
-                .unwrap_or(&empty_tags)
-            {
-                let vs = row_cells.cell(sc);
-                let ve = row_cells.end(ec);
-                if ve > vs {
-                    paint_diagnostic_tags(buf, text_x, y, row_width, vs, ve, tags);
-                }
-            }
-
-            // LSP occurrences of the symbol under the caret (word highlight):
-            // painted before the find layer, the selection band, and the
-            // bracket match so all three stay visible on top. The find layer
-            // in particular paints black-on-gold; an occurrence bg over it
-            // left black text on a dark grey (the caret parked on a find
-            // match makes the two layers cover the same cells).
-            for &(occ_row, occ_start, occ_end, occ_write) in &self.occurrences {
-                if occ_row != line_idx {
-                    continue;
-                }
-                let bg = if occ_write {
-                    self.theme.occurrence_write_bg()
-                } else {
-                    self.theme.occurrence_bg()
-                };
-                for c in occ_start.max(row_start)..occ_end {
-                    if !paint_row_cells(buf, text_x, y, row_width, &row_cells, c, |s| s.bg(bg)) {
-                        break;
-                    }
-                }
-            }
-
-            if let Some(term) = self
-                .search_highlight
-                .as_deref()
-                .filter(|_| find_window(self.find_range, line_idx) != Some((0, 0)))
-            {
-                let active_on_line = self
-                    .active_search_match
-                    .filter(|(r, _, _)| *r == line_idx)
-                    .map(|(_, c, l)| (c, l));
-                paint_search_highlight(
-                    buf,
-                    text_x,
-                    y,
-                    row_width,
-                    raw,
-                    term,
-                    self.search_highlight_opts,
-                    &row_cells,
-                    active_on_line,
-                    None,
-                    find_window(self.find_range, line_idx),
-                    self.theme,
-                );
-            }
-
-            if let Some(needle) = occ_needle.as_deref() {
-                paint_selection_occurrences(
-                    buf, text_x, y, row_width, raw, needle, &row_cells, self.theme,
-                );
-            }
-
-            if let Some(((sr, sc), (er, ec))) = sel_norm
-                && line_idx >= sr
-                && line_idx <= er
-            {
-                let sel_start = if line_idx == sr { sc } else { 0 };
-                // For non-final selected rows, paint past the content by one
-                // cell to make the trailing newline visible.
-                let sel_end = if line_idx == er { ec } else { line_len + 1 };
-                let visible_start = row_cells.cell(sel_start);
-                let visible_end = row_cells.end(sel_end);
-                if visible_end > visible_start {
-                    paint_selection_band(
-                        buf,
-                        text_x,
-                        y,
-                        row_width,
-                        visible_start,
-                        visible_end,
-                        self.theme,
-                    );
-                }
-            }
-
-            // Bracket-match highlight: tint the two matched bracket cells that
-            // fall on this visual row, honouring horizontal scroll.
-            if let Some((open, close)) = bracket_pair {
-                for pos in [open, close] {
-                    if pos.0 == line_idx && pos.1 >= row_start {
-                        paint_bracket_match(
-                            buf,
-                            text_x,
-                            y,
-                            row_width,
-                            row_cells.cell(pos.1),
-                            self.theme,
-                        );
-                    }
-                }
-            }
-
-            // Secondary multi-cursor carets ("Change All Occurrences"): paint
-            // each one's selection band and a software block cursor at its
-            // head. The primary cursor is the hardware caret; these blocks
-            // mark the extra cursors so the user sees every edit point.
-            for caret in &self.carets {
-                let ((cr0, cc0), (cr1, cc1)) = caret.normalised();
-                if line_idx >= cr0 && line_idx <= cr1 {
-                    let cs = if line_idx == cr0 { cc0 } else { 0 };
-                    let ce = if line_idx == cr1 { cc1 } else { line_len + 1 };
-                    let vs = row_cells.cell(cs);
-                    let ve = row_cells.end(ce);
-                    if ve > vs {
-                        paint_selection_band(buf, text_x, y, row_width, vs, ve, self.theme);
-                    }
-                }
-                // Only paint the block on the visual row that holds the caret.
-                let c = caret.head.1;
-                let on_row = caret.head.0 == line_idx
-                    && c >= row_start
-                    && (c < row_end || (c == row_end && row_end == line_len));
-                if on_row {
-                    // `caret`, not `cell`: a caret AT a hint's anchor sits
-                    // left of the hint, inside its own band.
-                    paint_block_cursor(buf, text_x, y, row_width, row_cells.caret(c), self.theme);
-                }
-            }
-
-            // Collaborators' ghost carets (multiplayer): the same block shape
-            // as secondary carets, in each participant's color. The local
-            // hardware caret is painted by the terminal after drawing, so it
-            // always sits above these.
-            for &(gr, gc, color) in &self.ghost_carets {
-                let on_row = gr == line_idx
-                    && gc >= row_start
-                    && (gc < row_end || (gc == row_end && row_end == line_len));
-                if on_row {
-                    paint_ghost_caret(buf, text_x, y, row_width, row_cells.caret(gc), color);
-                }
-            }
-
-            // GitLens-style inline blame: a dim italic annotation trailing the
-            // cursor's line, on its last visual segment, in the focused editor
-            // only. Painted last so no overlay covers it, and clipped to the
-            // pane's right edge.
-            if self.focused
-                && line_idx == self.cursor_row
-                && row_end >= line_len
-                && !self.inline_values.contains_key(&line_idx)
-                && self.live_note(line_idx).is_none()
-                && self.lenses_on_line(line_idx).is_empty()
-                && self.live_ghost().is_none()
-                && let Some(note) = self.current_line_blame_annotation()
-            {
-                let text_cols = row_cells.cell(line_len);
-                let start_x = text_x + text_cols as u16 + 2;
-                let right = inner.x + inner.width;
-                if start_x < right {
-                    let avail = (right - start_x) as usize;
-                    let shown: String = note.chars().take(avail).collect();
-                    buf.set_string(
-                        start_x,
-                        y,
-                        &shown,
-                        Style::default()
-                            .fg(self.theme.ignored_fg())
-                            .add_modifier(Modifier::ITALIC),
-                    );
-                    // Hover and click reach the commit it names (#1556);
-                    // `Uncommitted changes` has none to show.
-                    if let Some(LineBlame::Commit(c)) = self.cursor_line_blame() {
-                        let hash = c.hash.clone();
-                        let w = unicode_width::UnicodeWidthStr::width(shown.as_str()) as u16;
-                        self.blame_span = Some((y, start_x..(start_x + w).min(right), hash));
-                    }
-                }
-            }
-
-            // Debugger inline values (#135): the "name = value" trailer for a
-            // stopped session, on the line's last visual segment like the
-            // blame above (which yields to it on the cursor line — while
-            // stepping, state beats history). Clipped to the pane edge.
-            if row_end >= line_len
-                && let Some(note) = self.inline_values.get(&line_idx)
-            {
-                let text_cols = row_cells.cell(line_len);
-                let start_x = text_x + text_cols as u16 + 2;
-                let right = inner.x + inner.width;
-                if start_x < right {
-                    let avail = (right - start_x) as usize;
-                    let shown: String = note.chars().take(avail).collect();
-                    buf.set_string(
-                        start_x,
-                        y,
-                        &shown,
-                        Style::default()
-                            .fg(self.theme.ignored_fg())
-                            .add_modifier(Modifier::ITALIC),
-                    );
-                }
-            }
-
-            // A language server's replacement strikes through the columns it
-            // takes the place of, and its text stands one cell clear of them.
-            let replaces = self
-                .live_ghost_full()
-                .and_then(|g| g.replaces.clone())
-                .filter(|_| self.focused && line_idx == self.cursor_row);
-            if let Some(r) = &replaces {
-                let (vs, ve) = (row_cells.cell(r.start), row_cells.end(r.end));
-                if ve > vs {
-                    let struck = crate::lsp::manager::DiagnosticTags {
-                        unnecessary: true,
-                        deprecated: true,
-                    };
-                    paint_diagnostic_tags(buf, text_x, y, row_width, vs, ve, struck);
-                }
-            }
-
-            // Inline suggestion (#607): the first line as ghost text right at
-            // the caret (suggestions are only asked for at a line's end); the
-            // rest hang below as `VisRow::Ghost` rows (#1625), and only lines
-            // that found no row are counted here. It owns the line's tail, so
-            // the trailers below stand aside.
-            let ghost_here = self.focused
-                && line_idx == self.cursor_row
-                && row_end >= line_len
-                && self.live_ghost().is_some();
-            if ghost_here && let Some(text) = self.live_ghost() {
-                let text_cols = row_cells.cell(line_len) + usize::from(replaces.is_some());
-                let x = text_x + text_cols as u16;
-                let right = inner.x + inner.width;
-                if x < right {
-                    let first = text.split('\n').next().unwrap_or("");
-                    let shown_rows = visual_rows
-                        .iter()
-                        .filter(|r| matches!(r, VisRow::Ghost { .. }))
-                        .count();
-                    let more = text.split('\n').count() - 1 - shown_rows;
-                    let shown = if more > 0 {
-                        format!(
-                            "{first}  (+{more} line{})",
-                            if more == 1 { "" } else { "s" }
-                        )
-                    } else {
-                        first.to_string()
-                    };
-                    let clipped: String = shown.chars().take((right - x) as usize).collect();
-                    buf.set_string(
-                        x,
-                        y,
-                        &clipped,
-                        Style::default()
-                            .fg(self.theme.ignored_fg())
-                            .add_modifier(Modifier::ITALIC),
-                    );
-                }
-            }
-
-            // Code lenses (#608): the server's "3 references | Run" at the end
-            // of the symbol's line, clickable, yielding to the debugger's and
-            // Live Run's trailers, which describe this very run.
-            if row_end >= line_len
-                && !ghost_here
-                && !self.inline_values.contains_key(&line_idx)
-                && self.live_note(line_idx).is_none()
-            {
-                let lenses = self.lenses_on_line(line_idx);
-                if !lenses.is_empty() {
-                    let text_cols = row_cells.cell(line_len);
-                    let mut x = text_x + text_cols as u16 + 2;
-                    let right = inner.x + inner.width;
-                    let style = Style::default()
-                        .fg(self.theme.ignored_fg())
-                        .add_modifier(Modifier::UNDERLINED);
-                    for (n, idx) in lenses.into_iter().enumerate() {
-                        if n > 0 && x + 3 < right {
-                            buf.set_string(
-                                x,
-                                y,
-                                " | ",
-                                Style::default().fg(self.theme.ignored_fg()),
-                            );
-                            x += 3;
-                        }
-                        if x >= right {
-                            break;
-                        }
-                        let title = &self.code_lenses[idx].title;
-                        let shown: String = title.chars().take((right - x) as usize).collect();
-                        let w = unicode_width::UnicodeWidthStr::width(shown.as_str()) as u16;
-                        buf.set_string(x, y, &shown, style);
-                        self.code_lens_spans.push((y, x..x + w, idx));
-                        x += w;
-                    }
-                }
-            }
-
-            // Live Run trailer: what this line did on the last run, painted
-            // where the debugger's values go and yielding to them, since a
-            // paused session is the more specific answer.
-            if row_end >= line_len
-                && !ghost_here
-                && !self.inline_values.contains_key(&line_idx)
-                && let Some(note) = self.live_note(line_idx)
-            {
-                let text_cols = row_cells.cell(line_len);
-                let mut x = text_x + text_cols as u16 + 2;
-                let right = inner.x + inner.width;
-                for (text, kind) in note {
-                    if x >= right {
-                        break;
-                    }
-                    let color = match kind {
-                        crate::live_run::Kind::Value => self.theme.ignored_fg(),
-                        crate::live_run::Kind::Output => {
-                            self.theme.ui(Color::Rgb(0x3b, 0x9e, 0xff))
-                        }
-                        crate::live_run::Kind::Error => self.theme.ui(Color::Rgb(0xf1, 0x4c, 0x4c)),
-                        crate::live_run::Kind::Timeout => {
-                            self.theme.ui(Color::Rgb(0xcc, 0xa7, 0x00))
-                        }
-                    };
-                    let avail = (right - x) as usize;
-                    let shown: String = text.chars().take(avail).collect();
-                    let width = unicode_width::UnicodeWidthStr::width(shown.as_str()) as u16;
-                    buf.set_string(
-                        x,
-                        y,
-                        &shown,
-                        Style::default().fg(color).add_modifier(Modifier::ITALIC),
-                    );
-                    x = x.saturating_add(width + 2);
-                }
-            }
+            self.paint_row_overlays(
+                buf, &frame, &row_cells, y, line_idx, row_start, row_end, line_len, row_width,
+            );
 
             // The cursor itself is drawn by the host terminal as a hardware
             // caret (DECSCUSR `BlinkingBar`); App calls
@@ -1532,7 +1151,7 @@ impl Editor {
     fn paint_row_gutter(
         &self,
         buf: &mut Buffer,
-        frame: &RowFrame,
+        frame: &RowFrame<'_>,
         y: u16,
         line_idx: usize,
         first_row: bool,
@@ -1741,7 +1360,7 @@ impl Editor {
     fn paint_row_text(
         &self,
         buf: &mut Buffer,
-        frame: &RowFrame,
+        frame: &RowFrame<'_>,
         row_cells: &mut RowCells,
         y: u16,
         line_idx: usize,
@@ -2010,6 +1629,436 @@ impl Editor {
             }
         }
         (line_len, row_width)
+    }
+
+    /// Paint everything laid over one visual row's text at screen row `y`:
+    /// merge-conflict tints and accept buttons, diagnostics, occurrence,
+    /// find and selection highlights, the bracket match, extra and
+    /// collaborators' carets, inline blame, debugger inline values, a
+    /// server's replacement, the inline suggestion, code lenses and Live
+    /// Run's trailer. `row_cells` is the row's geometry as
+    /// [`Self::paint_row_text`] filled it, `line_len` the line's length and
+    /// `row_width` the row's width in cells. Records where this frame drew
+    /// the clickable blame and code lens spans.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_row_overlays(
+        &mut self,
+        buf: &mut Buffer,
+        frame: &RowFrame<'_>,
+        row_cells: &RowCells,
+        y: u16,
+        line_idx: usize,
+        row_start: usize,
+        row_end: usize,
+        line_len: usize,
+        row_width: u16,
+    ) {
+        let raw = &self.lines[line_idx];
+        // Merge-conflict region tints (VS Code's current/incoming
+        // backgrounds), painted right after the text so diagnostics,
+        // search highlights, and the selection all win over them.
+        if let Some(tint) = conflict_row_tint(&self.conflicts, line_idx, self.theme) {
+            paint_full_row_bg(buf, frame.text_x, y, row_width, tint);
+        }
+        // Clickable accept buttons on the conflict header row — VS Code's
+        // merge-conflict CodeLens, drawn after the marker text where the
+        // `<<<<<<<` line is otherwise dead space (#1169). A narrow row
+        // gets the short labels rather than losing buttons. Hit spans are
+        // recorded per frame (cleared at render start) so the rects always
+        // describe the painted frame (#103's invariant).
+        if let Some(block_idx) = self.conflicts.iter().position(|b| b.ours_start == line_idx) {
+            let block = self.conflicts[block_idx];
+            let marker_len = row_cells.text_before(line_len) as u16;
+            // A header that wraps gets them after its last segment only.
+            if marker_len <= row_width {
+                use crate::merge::Resolution;
+                let chips = [
+                    AcceptChip::new("Accept Current", "Current", ACCEPT_CURRENT_FILL),
+                    AcceptChip::new("Accept Incoming", "Incoming", ACCEPT_INCOMING_FILL),
+                    AcceptChip::new("Accept Both", "Both", ACCEPT_BOTH_FILL),
+                ];
+                let res = [Resolution::Current, Resolution::Incoming, Resolution::Both];
+                let x0 = frame.text_x + marker_len + 2;
+                for (i, xs) in
+                    paint_accept_chips(buf, &chips, x0, frame.text_x + row_width, y, self.theme)
+                {
+                    self.merge_action_spans
+                        .push((y, xs, block.ours_start, res[i]));
+                }
+            }
+        }
+
+        // LSP diagnostics: underline each problem span in its severity
+        // colour, clipped to the visible row window. VS Code draws a wavy
+        // underline; the crossterm backend exposes only a straight one, so
+        // a coloured straight underline carries the severity instead. The
+        // underline colour is independent of the glyph's foreground, so the
+        // syntax/semantic colour underneath is preserved.
+        let empty_diag: Vec<(usize, usize, crate::lsp::manager::DiagnosticSeverity)> = Vec::new();
+        for &(sc, ec, severity) in self.diagnostic_spans.get(line_idx).unwrap_or(&empty_diag) {
+            let vs = row_cells.cell(sc);
+            // The exclusive end shifts by the hints before its LAST char,
+            // so an underline never swallows a hint anchored right at it.
+            let ve = row_cells.end(ec);
+            if ve > vs {
+                paint_diagnostic_underline(
+                    buf,
+                    frame.text_x,
+                    y,
+                    row_width,
+                    vs,
+                    ve,
+                    severity,
+                    self.theme,
+                );
+            }
+        }
+        let empty_tags: Vec<(usize, usize, crate::lsp::manager::DiagnosticTags)> = Vec::new();
+        for &(sc, ec, tags) in self
+            .diagnostic_tag_spans
+            .get(line_idx)
+            .unwrap_or(&empty_tags)
+        {
+            let vs = row_cells.cell(sc);
+            let ve = row_cells.end(ec);
+            if ve > vs {
+                paint_diagnostic_tags(buf, frame.text_x, y, row_width, vs, ve, tags);
+            }
+        }
+
+        // LSP occurrences of the symbol under the caret (word highlight):
+        // painted before the find layer, the selection band, and the
+        // bracket match so all three stay visible on top. The find layer
+        // in particular paints black-on-gold; an occurrence bg over it
+        // left black text on a dark grey (the caret parked on a find
+        // match makes the two layers cover the same cells).
+        for &(occ_row, occ_start, occ_end, occ_write) in &self.occurrences {
+            if occ_row != line_idx {
+                continue;
+            }
+            let bg = if occ_write {
+                self.theme.occurrence_write_bg()
+            } else {
+                self.theme.occurrence_bg()
+            };
+            for c in occ_start.max(row_start)..occ_end {
+                if !paint_row_cells(buf, frame.text_x, y, row_width, row_cells, c, |s| s.bg(bg)) {
+                    break;
+                }
+            }
+        }
+
+        if let Some(term) = self
+            .search_highlight
+            .as_deref()
+            .filter(|_| find_window(self.find_range, line_idx) != Some((0, 0)))
+        {
+            let active_on_line = self
+                .active_search_match
+                .filter(|(r, _, _)| *r == line_idx)
+                .map(|(_, c, l)| (c, l));
+            paint_search_highlight(
+                buf,
+                frame.text_x,
+                y,
+                row_width,
+                raw,
+                term,
+                self.search_highlight_opts,
+                row_cells,
+                active_on_line,
+                None,
+                find_window(self.find_range, line_idx),
+                self.theme,
+            );
+        }
+
+        if let Some(needle) = frame.occ_needle.as_deref() {
+            paint_selection_occurrences(
+                buf,
+                frame.text_x,
+                y,
+                row_width,
+                raw,
+                needle,
+                row_cells,
+                self.theme,
+            );
+        }
+
+        if let Some(((sr, sc), (er, ec))) = frame.sel_norm
+            && line_idx >= sr
+            && line_idx <= er
+        {
+            let sel_start = if line_idx == sr { sc } else { 0 };
+            // For non-final selected rows, paint past the content by one
+            // cell to make the trailing newline visible.
+            let sel_end = if line_idx == er { ec } else { line_len + 1 };
+            let visible_start = row_cells.cell(sel_start);
+            let visible_end = row_cells.end(sel_end);
+            if visible_end > visible_start {
+                paint_selection_band(
+                    buf,
+                    frame.text_x,
+                    y,
+                    row_width,
+                    visible_start,
+                    visible_end,
+                    self.theme,
+                );
+            }
+        }
+
+        // Bracket-match highlight: tint the two matched bracket cells that
+        // fall on this visual row, honouring horizontal scroll.
+        if let Some((open, close)) = frame.bracket_pair {
+            for pos in [open, close] {
+                if pos.0 == line_idx && pos.1 >= row_start {
+                    paint_bracket_match(
+                        buf,
+                        frame.text_x,
+                        y,
+                        row_width,
+                        row_cells.cell(pos.1),
+                        self.theme,
+                    );
+                }
+            }
+        }
+
+        // Secondary multi-cursor carets ("Change All Occurrences"): paint
+        // each one's selection band and a software block cursor at its
+        // head. The primary cursor is the hardware caret; these blocks
+        // mark the extra cursors so the user sees every edit point.
+        for caret in &self.carets {
+            let ((cr0, cc0), (cr1, cc1)) = caret.normalised();
+            if line_idx >= cr0 && line_idx <= cr1 {
+                let cs = if line_idx == cr0 { cc0 } else { 0 };
+                let ce = if line_idx == cr1 { cc1 } else { line_len + 1 };
+                let vs = row_cells.cell(cs);
+                let ve = row_cells.end(ce);
+                if ve > vs {
+                    paint_selection_band(buf, frame.text_x, y, row_width, vs, ve, self.theme);
+                }
+            }
+            // Only paint the block on the visual row that holds the caret.
+            let c = caret.head.1;
+            let on_row = caret.head.0 == line_idx
+                && c >= row_start
+                && (c < row_end || (c == row_end && row_end == line_len));
+            if on_row {
+                // `caret`, not `cell`: a caret AT a hint's anchor sits
+                // left of the hint, inside its own band.
+                paint_block_cursor(
+                    buf,
+                    frame.text_x,
+                    y,
+                    row_width,
+                    row_cells.caret(c),
+                    self.theme,
+                );
+            }
+        }
+
+        // Collaborators' ghost carets (multiplayer): the same block shape
+        // as secondary carets, in each participant's color. The local
+        // hardware caret is painted by the terminal after drawing, so it
+        // always sits above these.
+        for &(gr, gc, color) in &self.ghost_carets {
+            let on_row = gr == line_idx
+                && gc >= row_start
+                && (gc < row_end || (gc == row_end && row_end == line_len));
+            if on_row {
+                paint_ghost_caret(buf, frame.text_x, y, row_width, row_cells.caret(gc), color);
+            }
+        }
+
+        // GitLens-style inline blame: a dim italic annotation trailing the
+        // cursor's line, on its last visual segment, in the focused editor
+        // only. Painted last so no overlay covers it, and clipped to the
+        // pane's right edge.
+        if self.focused
+            && line_idx == self.cursor_row
+            && row_end >= line_len
+            && !self.inline_values.contains_key(&line_idx)
+            && self.live_note(line_idx).is_none()
+            && self.lenses_on_line(line_idx).is_empty()
+            && self.live_ghost().is_none()
+            && let Some(note) = self.current_line_blame_annotation()
+        {
+            let text_cols = row_cells.cell(line_len);
+            let start_x = frame.text_x + text_cols as u16 + 2;
+            let right = frame.inner.x + frame.inner.width;
+            if start_x < right {
+                let avail = (right - start_x) as usize;
+                let shown: String = note.chars().take(avail).collect();
+                buf.set_string(
+                    start_x,
+                    y,
+                    &shown,
+                    Style::default()
+                        .fg(self.theme.ignored_fg())
+                        .add_modifier(Modifier::ITALIC),
+                );
+                // Hover and click reach the commit it names (#1556);
+                // `Uncommitted changes` has none to show.
+                if let Some(LineBlame::Commit(c)) = self.cursor_line_blame() {
+                    let hash = c.hash.clone();
+                    let w = unicode_width::UnicodeWidthStr::width(shown.as_str()) as u16;
+                    self.blame_span = Some((y, start_x..(start_x + w).min(right), hash));
+                }
+            }
+        }
+
+        // Debugger inline values (#135): the "name = value" trailer for a
+        // stopped session, on the line's last visual segment like the
+        // blame above (which yields to it on the cursor line — while
+        // stepping, state beats history). Clipped to the pane edge.
+        if row_end >= line_len
+            && let Some(note) = self.inline_values.get(&line_idx)
+        {
+            let text_cols = row_cells.cell(line_len);
+            let start_x = frame.text_x + text_cols as u16 + 2;
+            let right = frame.inner.x + frame.inner.width;
+            if start_x < right {
+                let avail = (right - start_x) as usize;
+                let shown: String = note.chars().take(avail).collect();
+                buf.set_string(
+                    start_x,
+                    y,
+                    &shown,
+                    Style::default()
+                        .fg(self.theme.ignored_fg())
+                        .add_modifier(Modifier::ITALIC),
+                );
+            }
+        }
+
+        // A language server's replacement strikes through the columns it
+        // takes the place of, and its text stands one cell clear of them.
+        let replaces = self
+            .live_ghost_full()
+            .and_then(|g| g.replaces.clone())
+            .filter(|_| self.focused && line_idx == self.cursor_row);
+        if let Some(r) = &replaces {
+            let (vs, ve) = (row_cells.cell(r.start), row_cells.end(r.end));
+            if ve > vs {
+                let struck = crate::lsp::manager::DiagnosticTags {
+                    unnecessary: true,
+                    deprecated: true,
+                };
+                paint_diagnostic_tags(buf, frame.text_x, y, row_width, vs, ve, struck);
+            }
+        }
+
+        // Inline suggestion (#607): the first line as ghost text right at
+        // the caret (suggestions are only asked for at a line's end); the
+        // rest hang below as `VisRow::Ghost` rows (#1625), and only lines
+        // that found no row are counted here. It owns the line's tail, so
+        // the trailers below stand aside.
+        let ghost_here = self.focused
+            && line_idx == self.cursor_row
+            && row_end >= line_len
+            && self.live_ghost().is_some();
+        if ghost_here && let Some(text) = self.live_ghost() {
+            let text_cols = row_cells.cell(line_len) + usize::from(replaces.is_some());
+            let x = frame.text_x + text_cols as u16;
+            let right = frame.inner.x + frame.inner.width;
+            if x < right {
+                let first = text.split('\n').next().unwrap_or("");
+                let shown_rows = frame
+                    .visual_rows
+                    .iter()
+                    .filter(|r| matches!(r, VisRow::Ghost { .. }))
+                    .count();
+                let more = text.split('\n').count() - 1 - shown_rows;
+                let shown = if more > 0 {
+                    format!(
+                        "{first}  (+{more} line{})",
+                        if more == 1 { "" } else { "s" }
+                    )
+                } else {
+                    first.to_string()
+                };
+                let clipped: String = shown.chars().take((right - x) as usize).collect();
+                buf.set_string(
+                    x,
+                    y,
+                    &clipped,
+                    Style::default()
+                        .fg(self.theme.ignored_fg())
+                        .add_modifier(Modifier::ITALIC),
+                );
+            }
+        }
+
+        // Code lenses (#608): the server's "3 references | Run" at the end
+        // of the symbol's line, clickable, yielding to the debugger's and
+        // Live Run's trailers, which describe this very run.
+        if row_end >= line_len
+            && !ghost_here
+            && !self.inline_values.contains_key(&line_idx)
+            && self.live_note(line_idx).is_none()
+        {
+            let lenses = self.lenses_on_line(line_idx);
+            if !lenses.is_empty() {
+                let text_cols = row_cells.cell(line_len);
+                let mut x = frame.text_x + text_cols as u16 + 2;
+                let right = frame.inner.x + frame.inner.width;
+                let style = Style::default()
+                    .fg(self.theme.ignored_fg())
+                    .add_modifier(Modifier::UNDERLINED);
+                for (n, idx) in lenses.into_iter().enumerate() {
+                    if n > 0 && x + 3 < right {
+                        buf.set_string(x, y, " | ", Style::default().fg(self.theme.ignored_fg()));
+                        x += 3;
+                    }
+                    if x >= right {
+                        break;
+                    }
+                    let title = &self.code_lenses[idx].title;
+                    let shown: String = title.chars().take((right - x) as usize).collect();
+                    let w = unicode_width::UnicodeWidthStr::width(shown.as_str()) as u16;
+                    buf.set_string(x, y, &shown, style);
+                    self.code_lens_spans.push((y, x..x + w, idx));
+                    x += w;
+                }
+            }
+        }
+
+        // Live Run trailer: what this line did on the last run, painted
+        // where the debugger's values go and yielding to them, since a
+        // paused session is the more specific answer.
+        if row_end >= line_len
+            && !ghost_here
+            && !self.inline_values.contains_key(&line_idx)
+            && let Some(note) = self.live_note(line_idx)
+        {
+            let text_cols = row_cells.cell(line_len);
+            let mut x = frame.text_x + text_cols as u16 + 2;
+            let right = frame.inner.x + frame.inner.width;
+            for (text, kind) in note {
+                if x >= right {
+                    break;
+                }
+                let color = match kind {
+                    crate::live_run::Kind::Value => self.theme.ignored_fg(),
+                    crate::live_run::Kind::Output => self.theme.ui(Color::Rgb(0x3b, 0x9e, 0xff)),
+                    crate::live_run::Kind::Error => self.theme.ui(Color::Rgb(0xf1, 0x4c, 0x4c)),
+                    crate::live_run::Kind::Timeout => self.theme.ui(Color::Rgb(0xcc, 0xa7, 0x00)),
+                };
+                let avail = (right - x) as usize;
+                let shown: String = text.chars().take(avail).collect();
+                let width = unicode_width::UnicodeWidthStr::width(shown.as_str()) as u16;
+                buf.set_string(
+                    x,
+                    y,
+                    &shown,
+                    Style::default().fg(color).add_modifier(Modifier::ITALIC),
+                );
+                x = x.saturating_add(width + 2);
+            }
+        }
     }
 
     /// Paint logical line `line_idx`'s syntax/semantic-highlighted text at row

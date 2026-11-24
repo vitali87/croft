@@ -1,0 +1,1 @@
+refactor: The editor's row drawing paints what lies over each row's text (conflict tints, problem underlines, highlights, the selection, extra carets, inline blame, debugger values, suggestions, CodeLens and Live Run notes) in a function of its own (#2062). The editor looks exactly as before.
