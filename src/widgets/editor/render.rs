@@ -339,18 +339,31 @@ pub(super) fn build_line_spans<'a>(
     out
 }
 
-/// What every row's gutter shares in one frame of [`Editor::render`]: the
-/// text area, the gutter's and the text's widths, and the frame-wide facts
-/// the gutter's painting reads.
-struct GutterFrame {
+/// What every visual row shares in one frame of [`Editor::render`]: the
+/// text area and where the gutter and the text sit in it, and the
+/// frame-wide facts the row painters read.
+struct RowFrame {
     /// The editor's text area: the gutter starts at its left edge.
     inner: Rect,
     /// The line-number column with its sign margin, before the change lane.
     gutter_width: u16,
+    /// The screen column the text starts at, right of the gutter.
+    text_x: u16,
     /// The text's width right of the gutter.
     text_width: u16,
-    /// A selection is active, which hides the current-line wash.
-    selecting: bool,
+    /// Lines wrap: a long line takes several visual rows.
+    wrap: bool,
+    /// The primary selection, start before end, when it covers any text.
+    sel_norm: Option<((usize, usize), (usize, usize))>,
+    /// Columns between indentation guides.
+    guide_step: usize,
+    /// The caret block's guide as (column, first line, last line), when
+    /// the focused editor shows guides.
+    active_guide: Option<(usize, usize, usize)>,
+    /// The guides' colour.
+    guide_fg: Color,
+    /// The active guide's colour.
+    guide_active_fg: Color,
     /// The theme draws `surfaces`: a quieter gutter.
     surfaces: bool,
     /// The pointer is over the gutter, which shows every fold chevron.
@@ -882,12 +895,18 @@ impl Widget for &mut Editor {
                 && py >= inner.y
                 && py < inner.y + inner.height
         });
-        // What every row's gutter shares this frame.
-        let gutter = GutterFrame {
+        // What every row shares this frame.
+        let frame = RowFrame {
             inner,
             gutter_width,
+            text_x,
             text_width,
-            selecting: sel_norm.is_some(),
+            wrap,
+            sel_norm,
+            guide_step,
+            active_guide,
+            guide_fg,
+            guide_active_fg,
             surfaces,
             gutter_hovered,
         };
@@ -925,267 +944,11 @@ impl Widget for &mut Editor {
                 }
                 VisRow::Text { line, start, end } => (line, start, end),
             };
-            self.paint_row_gutter(buf, &gutter, y, line_idx, !wrap || row_start == 0);
+            self.paint_row_gutter(buf, &frame, y, line_idx, !wrap || row_start == 0);
 
-            // Per-row window: the segment [row_start, row_end). For non-wrap
-            // this is exactly the horizontally-scrolled view; for wrap it is
-            // one folded segment. The overlay painters treat `row_start` as
-            // the scroll offset and `row_width` as the text width, so the
-            // same code paints both modes.
+            let (line_len, row_width) =
+                self.paint_row_text(buf, &frame, &mut row_cells, y, line_idx, row_start, row_end);
             let raw = &self.lines[line_idx];
-            let line_len = self.line_char_len(line_idx);
-            let byte_start = byte_index_of_char(raw, row_start);
-            let byte_end = byte_index_of_char(raw, row_end);
-            // A wrapped row's width in CELLS, which is what the painters clip
-            // by: its char count cut a row of wide characters in half.
-            let row_origin = self.row_origin(raw, row_start);
-            let row_width = {
-                let cells: usize = cells_from(&raw[byte_start..byte_end], row_origin);
-                cells.max(row_end - row_start).min(text_width as usize) as u16
-            };
-            let visible_raw = &raw[byte_start..byte_end];
-            let seg_bytes = byte_end - byte_start;
-            let empty: Vec<HiSpan> = Vec::new();
-            let line_spans = self.highlights.get(line_idx).unwrap_or(&empty);
-            // Paint the LSP semantic overlay over the tree-sitter base so
-            // resolved symbols (parameters, etc.) win wherever the server
-            // has an opinion, syntax fills the gaps (the "combined" model).
-            let sem_spans = self.semantic_overlay.get(line_idx).unwrap_or(&empty);
-            let merged = merge_overlay(line_spans, sem_spans);
-            // The row's geometry: its text by display width (#873) and the
-            // inlay hints anchored inside its window, as (anchor col,
-            // display cells) pairs. A hint's label is spliced into the row
-            // BEFORE the character at its anchor; every buffer column at or
-            // past an anchor therefore paints `inlay_cells_before` cells
-            // further right, and each overlay painter below translates its
-            // columns through `row_cells` so highlights, underlines, and
-            // carets stay glued to their glyphs.
-            let hint_cap = row_end.min(line_len);
-            row_cells.fill(
-                visible_raw,
-                row_start,
-                row_origin,
-                self.row_inlay_spans(line_idx)
-                    .iter()
-                    .filter(|(hc, _, _)| *hc >= row_start && *hc <= hint_cap)
-                    .map(|(hc, l, _)| (*hc, l.chars().count())),
-            );
-            if row_cells.hints.is_empty() {
-                // Shift highlight spans to the row origin and clip them to the
-                // segment so build_line_spans never slices past `visible_raw`.
-                let shifted: Vec<HiSpan> = shift_spans_for_view(&merged, byte_start)
-                    .into_iter()
-                    .filter_map(|sp| sp.clipped(seg_bytes))
-                    .collect();
-                let spans = build_line_spans(visible_raw, &shifted, row_origin);
-                buf.set_line(text_x, y, &Line::from(spans), row_width);
-            } else {
-                // Splice each hint label between the text segments it splits.
-                // Style A (Zed's look): dim italic text, one shade quieter
-                // than comments, no chip background.
-                let hint_style = Style::default()
-                    .fg(self.theme.ignored_fg())
-                    .add_modifier(Modifier::ITALIC);
-                let mut out: Vec<Span> = Vec::new();
-                let mut from = row_start;
-                for (hcol, label, swatch) in self
-                    .row_inlay_spans(line_idx)
-                    .iter()
-                    .filter(|(hc, _, _)| *hc >= row_start && *hc <= hint_cap)
-                {
-                    if *hcol > from {
-                        out.extend(inlay_text_segment(
-                            raw,
-                            &merged,
-                            (row_start, row_origin),
-                            from,
-                            *hcol,
-                        ));
-                    }
-                    // A color swatch paints in ITS color (#254); plain
-                    // hints keep the dim italic Zed look.
-                    let style = match swatch {
-                        Some(c) => Style::default().fg(*c),
-                        None => hint_style,
-                    };
-                    out.push(Span::styled(label.clone(), style));
-                    from = from.max(*hcol);
-                }
-                if row_end > from {
-                    out.extend(inlay_text_segment(
-                        raw,
-                        &merged,
-                        (row_start, row_origin),
-                        from,
-                        row_end,
-                    ));
-                }
-                buf.set_line(text_x, y, &Line::from(out), row_width);
-            }
-
-            // Bracket-pair colorization (#131): recolour each bracket cell by
-            // its nesting depth (red for an unmatched closer). A foreground
-            // override on the already-painted glyph, so selection / search /
-            // occurrence layers below still lay their backgrounds over it —
-            // and the find layer, painted later, wins outright like it does
-            // over syntax colours. Columns translate through inlay cells and
-            // the row window like every painter; wrap continuation segments
-            // participate (brackets live anywhere in the line, unlike the
-            // leading-whitespace guides).
-            if self.show_bracket_colors
-                && let Some(cols) = self.bracket_colors.get(line_idx)
-            {
-                for &(c, ci) in cols {
-                    let c = c as usize;
-                    if c < row_start {
-                        continue;
-                    }
-                    let fg = if ci == UNEXPECTED_BRACKET {
-                        self.theme.bracket_unexpected_fg()
-                    } else {
-                        self.theme.bracket_pair_color(usize::from(ci))
-                    };
-                    if !paint_row_cells(buf, text_x, y, row_width, &row_cells, c, |s| s.fg(fg)) {
-                        break;
-                    }
-                }
-            }
-
-            // Inline color-literal decorations (VS Code's
-            // `naumovs.color-highlight`, filling the "no colour-swatch
-            // decorations" gap): tint each recognized `#hex` / `rgb()` /
-            // `hsl()` literal's own cells with its parsed color, choosing a
-            // black or white foreground for legibility. Painted after
-            // bracket colorization so a color literal's own brackets (e.g.
-            // `rgb(...)`) still read against the tint, and before the
-            // overlays below (selection, search) so those still win over it.
-            if self.show_color_swatches
-                && let Some(hits) = self.color_swatches.get(line_idx)
-            {
-                for &(start_c, end_c, bg, fg) in hits {
-                    if end_c <= row_start {
-                        continue;
-                    }
-                    let from = start_c.max(row_start);
-                    for c in from..end_c {
-                        let tint = |s: Style| s.bg(bg).fg(fg);
-                        if !paint_row_cells(buf, text_x, y, row_width, &row_cells, c, tint) {
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // Indentation guides (VS Code `editor.guides.indentation`): a dim
-            // │ at each indent-unit column of the line's leading whitespace,
-            // with the cursor block's guide highlighted. Painted into blank
-            // cells only, right after the text, so text always wins and the
-            // overlays below (selection band, conflict tints) lay their
-            // backgrounds over the glyph. A wrap continuation row carries no
-            // leading whitespace, so only a line's first segment draws guides;
-            // in the flat path `row_start` is the horizontal scroll and
-            // translates the columns like every other painter here.
-            if self.show_indent_guides && (!wrap || row_start == 0) {
-                let (guide_width, guide_src) = self.guide_indent(line_idx);
-                // A blank line's guides sit where its neighbour's indentation
-                // is drawn, tabs and all, not one cell per level.
-                let src_cells;
-                let geometry = if guide_src == line_idx {
-                    &row_cells
-                } else {
-                    src_cells = RowCells::of_line_at(
-                        &self.lines[guide_src],
-                        row_start,
-                        self.row_origin(&self.lines[guide_src], row_start),
-                    );
-                    &src_cells
-                };
-                for c in (0..guide_width).step_by(guide_step) {
-                    if c < row_start {
-                        continue;
-                    }
-                    let col = geometry.cell(c);
-                    if col >= usize::from(row_width) {
-                        break;
-                    }
-                    let cell = &mut buf[(text_x + col as u16, y)];
-                    if cell.symbol() != " " {
-                        continue;
-                    }
-                    let fg = match active_guide {
-                        Some((ac, lo, hi)) if ac == c && (lo..=hi).contains(&line_idx) => {
-                            guide_active_fg
-                        }
-                        _ => guide_fg,
-                    };
-                    cell.set_symbol("\u{2502}");
-                    // Not italic even over a comment: a slanted guide looks
-                    // broken, and the text's modifier is not the guide's.
-                    let style = cell.style().fg(fg).remove_modifier(Modifier::ITALIC);
-                    cell.set_style(style);
-                }
-            }
-
-            // Render whitespace (#133): swap space/tab cells to `·`/`→` in a
-            // dim theme colour — across the whole row in All mode, inside the
-            // primary and secondary-caret selections in Selection mode (the
-            // VS Code default). Painted after the indent guides so the glyph
-            // wins the cell: it reports a real character where the guide only
-            // decorates, and the selection band below touches backgrounds
-            // only, so the glyph rides the band like text does.
-            if self.whitespace_mode != WhitespaceMode::None {
-                let ws_fg = self.theme.whitespace_fg();
-                let mut ws_spans: Vec<(usize, usize)> = Vec::new();
-                match self.whitespace_mode {
-                    WhitespaceMode::All => ws_spans.push((0, line_len)),
-                    WhitespaceMode::Selection => {
-                        if let Some(((sr, sc), (er, ec))) = sel_norm
-                            && line_idx >= sr
-                            && line_idx <= er
-                        {
-                            let s = if line_idx == sr { sc } else { 0 };
-                            let e = if line_idx == er { ec } else { line_len };
-                            if e > s {
-                                ws_spans.push((s, e));
-                            }
-                        }
-                        for caret in &self.carets {
-                            let ((cr0, cc0), (cr1, cc1)) = caret.normalised();
-                            if line_idx >= cr0 && line_idx <= cr1 {
-                                let s = if line_idx == cr0 { cc0 } else { 0 };
-                                let e = if line_idx == cr1 { cc1 } else { line_len };
-                                if e > s {
-                                    ws_spans.push((s, e));
-                                }
-                            }
-                        }
-                    }
-                    WhitespaceMode::None => {}
-                }
-                for (s, e) in ws_spans {
-                    let from = s.max(row_start);
-                    let to = e.min(row_end).min(line_len);
-                    if to <= from {
-                        continue;
-                    }
-                    for (ci, ch) in raw.chars().enumerate().skip(from).take(to - from) {
-                        let glyph = match ch {
-                            ' ' => "\u{b7}",
-                            '\t' => "\u{2192}",
-                            _ => continue,
-                        };
-                        let col = row_cells.cell(ci);
-                        if col >= usize::from(row_width) {
-                            break;
-                        }
-                        let cell = &mut buf[(text_x + col as u16, y)];
-                        cell.set_symbol(glyph);
-                        // The glyph marks whitespace, not comment text.
-                        let style = cell.style().fg(ws_fg).remove_modifier(Modifier::ITALIC);
-                        cell.set_style(style);
-                    }
-                }
-            }
 
             // Merge-conflict region tints (VS Code's current/incoming
             // backgrounds), painted right after the text so diagnostics,
@@ -1769,7 +1532,7 @@ impl Editor {
     fn paint_row_gutter(
         &self,
         buf: &mut Buffer,
-        frame: &GutterFrame,
+        frame: &RowFrame,
         y: u16,
         line_idx: usize,
         first_row: bool,
@@ -1781,7 +1544,7 @@ impl Editor {
         // — VS Code's `renderLineHighlight` behaves the same. Painted
         // first: spans that carry their own background (selection, search,
         // occurrences) patch over it, spans that don't inherit it.
-        if self.focused && line_idx == self.cursor_row && !frame.selecting {
+        if self.focused && line_idx == self.cursor_row && frame.sel_norm.is_none() {
             buf.set_style(
                 Rect::new(
                     frame.inner.x,
@@ -1966,6 +1729,287 @@ impl Editor {
                 Style::default().fg(self.theme.ui(Color::Rgb(r, g, b))),
             );
         }
+    }
+
+    /// Paint the text of one visual row at screen row `y`: the segment
+    /// `[row_start, row_end)` of `line_idx` with its syntax and semantic
+    /// colours and inlay hints, then bracket colours, colour swatches,
+    /// indentation guides and whitespace marks. Fills `row_cells` with the
+    /// row's geometry for the overlays painted after it, and returns the
+    /// line's length in characters and the row's width in cells.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_row_text(
+        &self,
+        buf: &mut Buffer,
+        frame: &RowFrame,
+        row_cells: &mut RowCells,
+        y: u16,
+        line_idx: usize,
+        row_start: usize,
+        row_end: usize,
+    ) -> (usize, u16) {
+        // Per-row window: the segment [row_start, row_end). For non-wrap
+        // this is exactly the horizontally-scrolled view; for wrap it is
+        // one folded segment. The overlay painters treat `row_start` as
+        // the scroll offset and `row_width` as the text width, so the
+        // same code paints both modes.
+        let raw = &self.lines[line_idx];
+        let line_len = self.line_char_len(line_idx);
+        let byte_start = byte_index_of_char(raw, row_start);
+        let byte_end = byte_index_of_char(raw, row_end);
+        // A wrapped row's width in CELLS, which is what the painters clip
+        // by: its char count cut a row of wide characters in half.
+        let row_origin = self.row_origin(raw, row_start);
+        let row_width = {
+            let cells: usize = cells_from(&raw[byte_start..byte_end], row_origin);
+            cells
+                .max(row_end - row_start)
+                .min(frame.text_width as usize) as u16
+        };
+        let visible_raw = &raw[byte_start..byte_end];
+        let seg_bytes = byte_end - byte_start;
+        let empty: Vec<HiSpan> = Vec::new();
+        let line_spans = self.highlights.get(line_idx).unwrap_or(&empty);
+        // Paint the LSP semantic overlay over the tree-sitter base so
+        // resolved symbols (parameters, etc.) win wherever the server
+        // has an opinion, syntax fills the gaps (the "combined" model).
+        let sem_spans = self.semantic_overlay.get(line_idx).unwrap_or(&empty);
+        let merged = merge_overlay(line_spans, sem_spans);
+        // The row's geometry: its text by display width (#873) and the
+        // inlay hints anchored inside its window, as (anchor col,
+        // display cells) pairs. A hint's label is spliced into the row
+        // BEFORE the character at its anchor; every buffer column at or
+        // past an anchor therefore paints `inlay_cells_before` cells
+        // further right, and each overlay painter below translates its
+        // columns through `row_cells` so highlights, underlines, and
+        // carets stay glued to their glyphs.
+        let hint_cap = row_end.min(line_len);
+        row_cells.fill(
+            visible_raw,
+            row_start,
+            row_origin,
+            self.row_inlay_spans(line_idx)
+                .iter()
+                .filter(|(hc, _, _)| *hc >= row_start && *hc <= hint_cap)
+                .map(|(hc, l, _)| (*hc, l.chars().count())),
+        );
+        if row_cells.hints.is_empty() {
+            // Shift highlight spans to the row origin and clip them to the
+            // segment so build_line_spans never slices past `visible_raw`.
+            let shifted: Vec<HiSpan> = shift_spans_for_view(&merged, byte_start)
+                .into_iter()
+                .filter_map(|sp| sp.clipped(seg_bytes))
+                .collect();
+            let spans = build_line_spans(visible_raw, &shifted, row_origin);
+            buf.set_line(frame.text_x, y, &Line::from(spans), row_width);
+        } else {
+            // Splice each hint label between the text segments it splits.
+            // Style A (Zed's look): dim italic text, one shade quieter
+            // than comments, no chip background.
+            let hint_style = Style::default()
+                .fg(self.theme.ignored_fg())
+                .add_modifier(Modifier::ITALIC);
+            let mut out: Vec<Span> = Vec::new();
+            let mut from = row_start;
+            for (hcol, label, swatch) in self
+                .row_inlay_spans(line_idx)
+                .iter()
+                .filter(|(hc, _, _)| *hc >= row_start && *hc <= hint_cap)
+            {
+                if *hcol > from {
+                    out.extend(inlay_text_segment(
+                        raw,
+                        &merged,
+                        (row_start, row_origin),
+                        from,
+                        *hcol,
+                    ));
+                }
+                // A color swatch paints in ITS color (#254); plain
+                // hints keep the dim italic Zed look.
+                let style = match swatch {
+                    Some(c) => Style::default().fg(*c),
+                    None => hint_style,
+                };
+                out.push(Span::styled(label.clone(), style));
+                from = from.max(*hcol);
+            }
+            if row_end > from {
+                out.extend(inlay_text_segment(
+                    raw,
+                    &merged,
+                    (row_start, row_origin),
+                    from,
+                    row_end,
+                ));
+            }
+            buf.set_line(frame.text_x, y, &Line::from(out), row_width);
+        }
+
+        // Bracket-pair colorization (#131): recolour each bracket cell by
+        // its nesting depth (red for an unmatched closer). A foreground
+        // override on the already-painted glyph, so selection / search /
+        // occurrence layers below still lay their backgrounds over it —
+        // and the find layer, painted later, wins outright like it does
+        // over syntax colours. Columns translate through inlay cells and
+        // the row window like every painter; wrap continuation segments
+        // participate (brackets live anywhere in the line, unlike the
+        // leading-whitespace guides).
+        if self.show_bracket_colors
+            && let Some(cols) = self.bracket_colors.get(line_idx)
+        {
+            for &(c, ci) in cols {
+                let c = c as usize;
+                if c < row_start {
+                    continue;
+                }
+                let fg = if ci == UNEXPECTED_BRACKET {
+                    self.theme.bracket_unexpected_fg()
+                } else {
+                    self.theme.bracket_pair_color(usize::from(ci))
+                };
+                if !paint_row_cells(buf, frame.text_x, y, row_width, row_cells, c, |s| s.fg(fg)) {
+                    break;
+                }
+            }
+        }
+
+        // Inline color-literal decorations (VS Code's
+        // `naumovs.color-highlight`, filling the "no colour-swatch
+        // decorations" gap): tint each recognized `#hex` / `rgb()` /
+        // `hsl()` literal's own cells with its parsed color, choosing a
+        // black or white foreground for legibility. Painted after
+        // bracket colorization so a color literal's own brackets (e.g.
+        // `rgb(...)`) still read against the tint, and before the
+        // overlays below (selection, search) so those still win over it.
+        if self.show_color_swatches
+            && let Some(hits) = self.color_swatches.get(line_idx)
+        {
+            for &(start_c, end_c, bg, fg) in hits {
+                if end_c <= row_start {
+                    continue;
+                }
+                let from = start_c.max(row_start);
+                for c in from..end_c {
+                    let tint = |s: Style| s.bg(bg).fg(fg);
+                    if !paint_row_cells(buf, frame.text_x, y, row_width, row_cells, c, tint) {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Indentation guides (VS Code `editor.guides.indentation`): a dim
+        // │ at each indent-unit column of the line's leading whitespace,
+        // with the cursor block's guide highlighted. Painted into blank
+        // cells only, right after the text, so text always wins and the
+        // overlays below (selection band, conflict tints) lay their
+        // backgrounds over the glyph. A wrap continuation row carries no
+        // leading whitespace, so only a line's first segment draws guides;
+        // in the flat path `row_start` is the horizontal scroll and
+        // translates the columns like every other painter here.
+        if self.show_indent_guides && (!frame.wrap || row_start == 0) {
+            let (guide_width, guide_src) = self.guide_indent(line_idx);
+            // A blank line's guides sit where its neighbour's indentation
+            // is drawn, tabs and all, not one cell per level.
+            let src_cells;
+            let geometry = if guide_src == line_idx {
+                &*row_cells
+            } else {
+                src_cells = RowCells::of_line_at(
+                    &self.lines[guide_src],
+                    row_start,
+                    self.row_origin(&self.lines[guide_src], row_start),
+                );
+                &src_cells
+            };
+            for c in (0..guide_width).step_by(frame.guide_step) {
+                if c < row_start {
+                    continue;
+                }
+                let col = geometry.cell(c);
+                if col >= usize::from(row_width) {
+                    break;
+                }
+                let cell = &mut buf[(frame.text_x + col as u16, y)];
+                if cell.symbol() != " " {
+                    continue;
+                }
+                let fg = match frame.active_guide {
+                    Some((ac, lo, hi)) if ac == c && (lo..=hi).contains(&line_idx) => {
+                        frame.guide_active_fg
+                    }
+                    _ => frame.guide_fg,
+                };
+                cell.set_symbol("\u{2502}");
+                // Not italic even over a comment: a slanted guide looks
+                // broken, and the text's modifier is not the guide's.
+                let style = cell.style().fg(fg).remove_modifier(Modifier::ITALIC);
+                cell.set_style(style);
+            }
+        }
+
+        // Render whitespace (#133): swap space/tab cells to `·`/`→` in a
+        // dim theme colour — across the whole row in All mode, inside the
+        // primary and secondary-caret selections in Selection mode (the
+        // VS Code default). Painted after the indent guides so the glyph
+        // wins the cell: it reports a real character where the guide only
+        // decorates, and the selection band below touches backgrounds
+        // only, so the glyph rides the band like text does.
+        if self.whitespace_mode != WhitespaceMode::None {
+            let ws_fg = self.theme.whitespace_fg();
+            let mut ws_spans: Vec<(usize, usize)> = Vec::new();
+            match self.whitespace_mode {
+                WhitespaceMode::All => ws_spans.push((0, line_len)),
+                WhitespaceMode::Selection => {
+                    if let Some(((sr, sc), (er, ec))) = frame.sel_norm
+                        && line_idx >= sr
+                        && line_idx <= er
+                    {
+                        let s = if line_idx == sr { sc } else { 0 };
+                        let e = if line_idx == er { ec } else { line_len };
+                        if e > s {
+                            ws_spans.push((s, e));
+                        }
+                    }
+                    for caret in &self.carets {
+                        let ((cr0, cc0), (cr1, cc1)) = caret.normalised();
+                        if line_idx >= cr0 && line_idx <= cr1 {
+                            let s = if line_idx == cr0 { cc0 } else { 0 };
+                            let e = if line_idx == cr1 { cc1 } else { line_len };
+                            if e > s {
+                                ws_spans.push((s, e));
+                            }
+                        }
+                    }
+                }
+                WhitespaceMode::None => {}
+            }
+            for (s, e) in ws_spans {
+                let from = s.max(row_start);
+                let to = e.min(row_end).min(line_len);
+                if to <= from {
+                    continue;
+                }
+                for (ci, ch) in raw.chars().enumerate().skip(from).take(to - from) {
+                    let glyph = match ch {
+                        ' ' => "\u{b7}",
+                        '\t' => "\u{2192}",
+                        _ => continue,
+                    };
+                    let col = row_cells.cell(ci);
+                    if col >= usize::from(row_width) {
+                        break;
+                    }
+                    let cell = &mut buf[(frame.text_x + col as u16, y)];
+                    cell.set_symbol(glyph);
+                    // The glyph marks whitespace, not comment text.
+                    let style = cell.style().fg(ws_fg).remove_modifier(Modifier::ITALIC);
+                    cell.set_style(style);
+                }
+            }
+        }
+        (line_len, row_width)
     }
 
     /// Paint logical line `line_idx`'s syntax/semantic-highlighted text at row
