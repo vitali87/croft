@@ -951,6 +951,33 @@ fn a_toast_button_under_a_popup_is_not_pressed() {
     );
 }
 
+/// #2678 review (CodeRabbit): the status bar and the layout icons are
+/// handled before the panes, and the New File box's rule to ignore the mouse
+/// came after them: a click on a layout icon under it toggled the panel. No
+/// pop-up lets a click reach them.
+#[test]
+fn a_layout_icon_under_a_popup_is_not_pressed() {
+    let mut pressed = Vec::new();
+    for p in Popup::ALL {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        draw(&mut app, 160, 40);
+        let icon = app.layout_icon_areas.toggle_panel;
+        assert!(icon.width > 0, "setup: the layout icons are drawn");
+        let shown = app.show_terminal;
+        let _hook = open(&mut app, p);
+        left_click(&mut app, icon.x, icon.y);
+        if app.show_terminal != shown {
+            pressed.push(format!("{p:?}"));
+        }
+    }
+    assert!(
+        pressed.is_empty(),
+        "a click toggled the panel under these pop-ups: {}",
+        pressed.join(", ")
+    );
+}
+
 /// The bug (#2674): only an agent's proposal, the two unsaved-changes
 /// prompts and the terminal paste question took the mouse. Under the other
 /// nine confirms, Settings and the startup warning, a click went to what

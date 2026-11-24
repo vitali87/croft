@@ -731,7 +731,8 @@ impl App {
             return;
         }
         // A pop-up that handles no mouse of its own (an agent's proposal,
-        // every confirm, Settings, the startup warning) takes every mouse
+        // every confirm, the New File box, Settings, the startup warning)
+        // takes every mouse
         // event: a click behind the unsaved-changes prompt must not close or
         // move the tabs it is asking about (#862), and the same holds for
         // what each of the others asks about (#2674).
@@ -925,11 +926,6 @@ impl App {
                 self.open_customize_layout_menu();
                 return;
             }
-        }
-
-        // While a prompt is open, mouse events are ignored.
-        if self.prompt.is_some() {
-            return;
         }
 
         // While a context menu is open, route clicks to it.

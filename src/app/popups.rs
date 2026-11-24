@@ -126,15 +126,15 @@ impl Popup {
     }
 
     /// Whether the pop-up handles the mouse itself: a picker's rows and the
-    /// click outside that closes it, a dialog's buttons, or the New File
-    /// box's own rule further down the mouse handler. One that does not
-    /// takes every mouse event while it is open, so a click, the wheel or
-    /// the pointer never reaches what it covers (#862, #2674). The match
-    /// has no catch-all: a new pop-up must say which it is.
+    /// click outside that closes it, or a dialog's buttons. One that does
+    /// not takes every mouse event while it is open, so a click, the wheel
+    /// or the pointer never reaches what it covers (#862, #2674). The New
+    /// File box handles none: a click in the status bar or on a layout icon
+    /// acted behind it (#2678 review). The match has no catch-all: a new
+    /// pop-up must say which it is.
     pub(super) fn handles_mouse(self) -> bool {
         match self {
-            Popup::Prompt
-            | Popup::FileFinder
+            Popup::FileFinder
             | Popup::CommandPalette
             | Popup::GoToSymbol
             | Popup::WorkspaceSymbols
@@ -146,7 +146,8 @@ impl Popup {
             | Popup::ListPicker
             | Popup::ShortcutsModal
             | Popup::ConnectDialog => true,
-            Popup::LocalOpenConfirm
+            Popup::Prompt
+            | Popup::LocalOpenConfirm
             | Popup::DiscardConfirm
             | Popup::RevertHunkConfirm
             | Popup::DiscardAllConfirm
