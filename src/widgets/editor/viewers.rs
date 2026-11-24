@@ -1107,6 +1107,9 @@ impl Editor {
     ) {
         self.path = Some(path.to_path_buf());
         self.disk_stamp = disk_stamp;
+        // A viewer shows a file that exists: whatever the tab expected of a
+        // file not yet created no longer applies.
+        self.disk_expect_absent = false;
         self.disk_conflict = false;
         // A whole-buffer swap: whatever the previous contents could not be
         // encoded as is no longer this tab's problem.
@@ -1175,7 +1178,6 @@ impl Editor {
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let format_label = image_format_label_from_ext(ext);
         self.become_viewer(path, Self::disk_stamp_of(path));
-        self.disk_expect_absent = false;
         self.image = Some(ImageView {
             bytes,
             format_label,
@@ -1331,7 +1333,6 @@ impl Editor {
             natural,
         } = crate::svg::render(&src).map_err(|e| anyhow::anyhow!("SVG render failed: {e}"))?;
         self.become_viewer(path, Self::disk_stamp_of(path));
-        self.disk_expect_absent = false;
         self.image = Some(ImageView {
             bytes: png,
             format_label: String::from("SVG"),
@@ -1357,7 +1358,6 @@ impl Editor {
             path,
             Self::disk_stamp_with_wal(path, view.kind == crate::sheet::SheetKind::Sqlite),
         );
-        self.disk_expect_absent = false;
         self.status = format!("Opened {} ({})", path.display(), view.kind.label());
         self.sheet = Some(view);
     }
@@ -1381,7 +1381,6 @@ impl Editor {
         let (pixel_w, pixel_h) = image_dimensions_of(&bytes)
             .ok_or_else(|| anyhow::anyhow!("Could not decode rasterised PDF"))?;
         self.become_viewer(path, Self::disk_stamp_of(path));
-        self.disk_expect_absent = false;
         self.image = Some(ImageView {
             bytes,
             format_label: String::from("PDF"),
@@ -1646,7 +1645,6 @@ impl Editor {
         let mut view =
             crate::hex::HexView::open(path).map_err(|e| anyhow::anyhow!("Hex open failed: {e}"))?;
         self.become_viewer(path, Self::disk_stamp_of(path));
-        self.disk_expect_absent = false;
         // Only for the file it was set for: an open can set the note and
         // then fail before reaching a viewer, and this is also reached
         // directly by "Reopen as Hex", so a note that outlived its open
