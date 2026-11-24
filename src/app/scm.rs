@@ -925,85 +925,60 @@ impl App {
         let Some(pending) = self.pending_unsaved_scm.as_ref() else {
             return;
         };
-        let area = frame.area();
-        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
-        let height: u16 = 8;
-        let rect = Rect {
-            x: (area.width.saturating_sub(width)) / 2 + area.x,
-            y: (area.height.saturating_sub(height)) / 2 + area.y,
-            width,
-            height,
-        };
-        let rect = rect.intersection(area);
         let accent = self.theme.ui(Color::Rgb(0xe5, 0xc0, 0x7b));
-        let verb = pending.op.verb();
-        let block = ratatui::widgets::Block::default()
-            .borders(ratatui::widgets::Borders::ALL)
-            .border_style(Style::default().fg(accent))
-            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
-            .title(ratatui::text::Span::styled(
-                format!(" {} ", crate::i18n::tr("UNSAVED CHANGES")),
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(accent)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        frame.render_widget(ratatui::widgets::Clear, rect);
-        frame.render_widget(block, rect);
-        let inner = Rect {
-            x: rect.x + 2,
-            y: rect.y + 1,
-            width: rect.width.saturating_sub(4),
-            height: rect.height.saturating_sub(2),
-        };
-        let n = pending.files.len();
-        let names: Vec<String> = pending
-            .files
-            .iter()
-            .map(|p| {
-                p.strip_prefix(&pending.root)
-                    .unwrap_or(p)
-                    .display()
-                    .to_string()
-            })
-            .collect();
-        let white = Style::default().fg(self.theme.ui(Color::White));
-        let dim = Style::default().fg(self.theme.ui(Color::Rgb(0x9a, 0xa4, 0xb8)));
-        let key = Style::default().fg(accent).add_modifier(Modifier::BOLD);
-        let body = ratatui::text::Text::from(vec![
-            ratatui::text::Line::from(ratatui::text::Span::styled(
-                format!(
-                    "{n} file{} {} unsaved changes: {}",
-                    if n == 1 { "" } else { "s" },
-                    if n == 1 { "has" } else { "have" },
-                    names.join(", ")
-                ),
-                white,
-            )),
-            ratatui::text::Line::from(ratatui::text::Span::styled(
-                format!("{verb} records the files on disk, without these edits."),
-                dim,
-            )),
-            ratatui::text::Line::from(""),
-            ratatui::text::Line::from(vec![
-                ratatui::text::Span::styled("[S]", key),
-                ratatui::text::Span::raw(format!(" Save All & {verb}   ")),
-                ratatui::text::Span::styled("[C]", key),
-                ratatui::text::Span::raw(format!(" {verb} Anyway   ")),
-                ratatui::text::Span::styled("[Esc]", key),
-                ratatui::text::Span::raw(" Cancel"),
-            ]),
-        ]);
-        frame.render_widget(
-            ratatui::widgets::Paragraph::new(body).wrap(ratatui::widgets::Wrap { trim: false }),
-            inner,
-        );
-        crate::widgets::approval_popup::paint_warning_card(
-            frame.buffer_mut(),
-            rect,
-            self.theme,
+        let title = format!(" {} ", crate::i18n::tr("UNSAVED CHANGES"));
+        let frame_spec = ConfirmFrame {
+            title: &title,
             accent,
-        );
+            title_fg: Color::Black,
+            height: 8,
+            inset: Inset::Wide,
+        };
+        let verb = pending.op.verb();
+        draw_confirm(frame, self.theme, frame_spec, |frame, inner| {
+            let n = pending.files.len();
+            let names: Vec<String> = pending
+                .files
+                .iter()
+                .map(|p| {
+                    p.strip_prefix(&pending.root)
+                        .unwrap_or(p)
+                        .display()
+                        .to_string()
+                })
+                .collect();
+            let white = Style::default().fg(self.theme.ui(Color::White));
+            let dim = Style::default().fg(self.theme.ui(Color::Rgb(0x9a, 0xa4, 0xb8)));
+            let key = Style::default().fg(accent).add_modifier(Modifier::BOLD);
+            let body = ratatui::text::Text::from(vec![
+                ratatui::text::Line::from(ratatui::text::Span::styled(
+                    format!(
+                        "{n} file{} {} unsaved changes: {}",
+                        if n == 1 { "" } else { "s" },
+                        if n == 1 { "has" } else { "have" },
+                        names.join(", ")
+                    ),
+                    white,
+                )),
+                ratatui::text::Line::from(ratatui::text::Span::styled(
+                    format!("{verb} records the files on disk, without these edits."),
+                    dim,
+                )),
+                ratatui::text::Line::from(""),
+                ratatui::text::Line::from(vec![
+                    ratatui::text::Span::styled("[S]", key),
+                    ratatui::text::Span::raw(format!(" Save All & {verb}   ")),
+                    ratatui::text::Span::styled("[C]", key),
+                    ratatui::text::Span::raw(format!(" {verb} Anyway   ")),
+                    ratatui::text::Span::styled("[Esc]", key),
+                    ratatui::text::Span::raw(" Cancel"),
+                ]),
+            ]);
+            frame.render_widget(
+                ratatui::widgets::Paragraph::new(body).wrap(ratatui::widgets::Wrap { trim: false }),
+                inner,
+            );
+        });
     }
 
     /// Confirmation modal for "Discard All Changes" — reverts every tracked
@@ -1012,64 +987,24 @@ impl App {
         if !self.pending_discard_all {
             return;
         }
-        let area = frame.area();
-        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
-        let height: u16 = 7;
-        let rect = Rect {
-            x: (area.width.saturating_sub(width)) / 2 + area.x,
-            y: (area.height.saturating_sub(height)) / 2 + area.y,
-            width,
-            height,
+        let frame_spec = ConfirmFrame {
+            title: " DISCARD ALL CHANGES? ",
+            accent: self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70)),
+            title_fg: Color::White,
+            height: 7,
+            inset: Inset::Wide,
         };
-        let rect = rect.intersection(area);
-        let warn = self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70));
-        let block = ratatui::widgets::Block::default()
-            .borders(ratatui::widgets::Borders::ALL)
-            .border_style(Style::default().fg(warn))
-            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
-            .title(ratatui::text::Span::styled(
-                " DISCARD ALL CHANGES? ",
-                Style::default()
-                    .fg(Color::White)
-                    .bg(warn)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        frame.render_widget(ratatui::widgets::Clear, rect);
-        frame.render_widget(block, rect);
-        let inner = Rect {
-            x: rect.x + 2,
-            y: rect.y + 1,
-            width: rect.width.saturating_sub(4),
-            height: rect.height.saturating_sub(2),
-        };
-        let body = ratatui::text::Text::from(vec![
-            ratatui::text::Line::from(ratatui::text::Span::styled(
-                "This reverts every tracked file to HEAD. Untracked files are kept.",
-                Style::default().fg(self.theme.ui(Color::White)),
-            )),
-            ratatui::text::Line::from(""),
-            ratatui::text::Line::from(vec![
-                ratatui::text::Span::styled(
-                    "[Y]",
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                ),
-                ratatui::text::Span::raw("es, discard all   "),
-                ratatui::text::Span::styled(
-                    "[N]",
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                ratatui::text::Span::raw("o / Esc"),
-            ]),
-        ]);
-        frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
-        crate::widgets::approval_popup::paint_warning_card(
-            frame.buffer_mut(),
-            rect,
-            self.theme,
-            warn,
-        );
+        draw_confirm(frame, self.theme, frame_spec, |frame, inner| {
+            let body = ratatui::text::Text::from(vec![
+                ratatui::text::Line::from(ratatui::text::Span::styled(
+                    "This reverts every tracked file to HEAD. Untracked files are kept.",
+                    Style::default().fg(self.theme.ui(Color::White)),
+                )),
+                ratatui::text::Line::from(""),
+                yes_no_keys("es, discard all"),
+            ]);
+            frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+        });
     }
 
     /// Confirmation modal for Drop Stash (#1128), in the Discard All style.
@@ -1079,69 +1014,29 @@ impl App {
         let Some(pending) = &self.pending_stash_drop else {
             return;
         };
-        let area = frame.area();
-        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
-        let height: u16 = 8;
-        let rect = Rect {
-            x: (area.width.saturating_sub(width)) / 2 + area.x,
-            y: (area.height.saturating_sub(height)) / 2 + area.y,
-            width,
-            height,
+        let frame_spec = ConfirmFrame {
+            title: " DROP STASH? ",
+            accent: self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70)),
+            title_fg: Color::White,
+            height: 8,
+            inset: Inset::Wide,
         };
-        let rect = rect.intersection(area);
-        let warn = self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70));
-        let block = ratatui::widgets::Block::default()
-            .borders(ratatui::widgets::Borders::ALL)
-            .border_style(Style::default().fg(warn))
-            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
-            .title(ratatui::text::Span::styled(
-                " DROP STASH? ",
-                Style::default()
-                    .fg(Color::White)
-                    .bg(warn)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        frame.render_widget(ratatui::widgets::Clear, rect);
-        frame.render_widget(block, rect);
-        let inner = Rect {
-            x: rect.x + 2,
-            y: rect.y + 1,
-            width: rect.width.saturating_sub(4),
-            height: rect.height.saturating_sub(2),
-        };
-        let white = Style::default().fg(self.theme.ui(Color::White));
-        let body = ratatui::text::Text::from(vec![
-            ratatui::text::Line::from(ratatui::text::Span::styled(
-                pending.label.as_str(),
-                white.add_modifier(Modifier::BOLD),
-            )),
-            ratatui::text::Line::from(ratatui::text::Span::styled(
-                "This permanently deletes the stash.",
-                white,
-            )),
-            ratatui::text::Line::from(""),
-            ratatui::text::Line::from(vec![
-                ratatui::text::Span::styled(
-                    "[Y]",
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                ),
-                ratatui::text::Span::raw("es, drop it   "),
-                ratatui::text::Span::styled(
-                    "[N]",
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                ratatui::text::Span::raw("o / Esc"),
-            ]),
-        ]);
-        frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
-        crate::widgets::approval_popup::paint_warning_card(
-            frame.buffer_mut(),
-            rect,
-            self.theme,
-            warn,
-        );
+        draw_confirm(frame, self.theme, frame_spec, |frame, inner| {
+            let white = Style::default().fg(self.theme.ui(Color::White));
+            let body = ratatui::text::Text::from(vec![
+                ratatui::text::Line::from(ratatui::text::Span::styled(
+                    pending.label.as_str(),
+                    white.add_modifier(Modifier::BOLD),
+                )),
+                ratatui::text::Line::from(ratatui::text::Span::styled(
+                    "This permanently deletes the stash.",
+                    white,
+                )),
+                ratatui::text::Line::from(""),
+                yes_no_keys("es, drop it"),
+            ]);
+            frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+        });
     }
 
     pub(super) fn handle_source_control_key(&mut self, key: KeyEvent) {
