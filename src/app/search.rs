@@ -2,6 +2,7 @@
 //! diffs and logs), Quick Open, and Switch Header/Source.
 
 use super::*;
+use crate::widgets::confirm_frame::{ConfirmFrame, Inset, confirm_width, draw_confirm};
 
 /// A Search Editor tab's label (#615): not a file on disk, so it names the
 /// query rather than a path the save path could clobber.
@@ -168,8 +169,7 @@ impl App {
         let Some((occurrences, files, skipped)) = self.pending_replace_all else {
             return;
         };
-        let area = frame.area();
-        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
+        let width = confirm_width(frame.area());
         let prompt = format!(
             "Replace {occurrences} occurrence(s) across {files} file(s) with \"{}\"?",
             self.search.replace
@@ -180,54 +180,34 @@ impl App {
         let inner_w = width.saturating_sub(2);
         let prompt_rows = wrap_cells_variable_width(&prompt, inner_w, inner_w).len() as u16;
         let skipped_rows = u16::from(skipped > 0);
-        let height: u16 = 6 + prompt_rows + skipped_rows;
-        let rect = Rect {
-            x: (area.width.saturating_sub(width)) / 2 + area.x,
-            y: (area.height.saturating_sub(height)) / 2 + area.y,
-            width,
-            height,
+        let frame_spec = ConfirmFrame {
+            title: " REPLACE ALL? ",
+            accent: self.theme.ui(Color::Rgb(0xe7, 0xa7, 0x3c)),
+            title_fg: Color::Black,
+            height: 6 + prompt_rows + skipped_rows,
+            inset: Inset::Tight,
         };
-        let rect = rect.intersection(area);
-        let warn = self.theme.ui(Color::Rgb(0xe7, 0xa7, 0x3c));
-        let block = ratatui::widgets::Block::default()
-            .borders(ratatui::widgets::Borders::ALL)
-            .border_style(Style::default().fg(warn))
-            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
-            .title(ratatui::text::Span::styled(
-                " REPLACE ALL? ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(warn)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        frame.render_widget(ratatui::widgets::Clear, rect);
-        let inner = block.inner(rect);
-        frame.render_widget(block, rect);
-        let mut lines = vec![
-            Line::from(prompt),
-            Line::from(""),
-            Line::from("Files are rewritten on disk."),
-        ];
-        if skipped > 0 {
-            lines.push(Line::from(format!(
-                "{skipped} open file(s) with unsaved changes will be skipped."
+        draw_confirm(frame, self.theme, frame_spec, |frame, inner| {
+            let mut lines = vec![
+                Line::from(prompt),
+                Line::from(""),
+                Line::from("Files are rewritten on disk."),
+            ];
+            if skipped > 0 {
+                lines.push(Line::from(format!(
+                    "{skipped} open file(s) with unsaved changes will be skipped."
+                )));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Enter / Y replaces \u{00b7} Esc cancels",
+                Style::default().fg(self.theme.ui(Color::Rgb(0x9a, 0xa4, 0xb8))),
             )));
-        }
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "Enter / Y replaces \u{00b7} Esc cancels",
-            Style::default().fg(self.theme.ui(Color::Rgb(0x9a, 0xa4, 0xb8))),
-        )));
-        frame.render_widget(
-            Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
-            inner,
-        );
-        crate::widgets::approval_popup::paint_warning_card(
-            frame.buffer_mut(),
-            rect,
-            self.theme,
-            warn,
-        );
+            frame.render_widget(
+                Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+                inner,
+            );
+        });
     }
 
     pub(super) fn handle_search_key(&mut self, key: KeyEvent) {

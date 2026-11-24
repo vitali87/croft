@@ -3,6 +3,7 @@
 //! graph, its dialogs, change gutters and inline blame.
 
 use super::*;
+use crate::widgets::confirm_frame::{ConfirmFrame, Inset, draw_confirm, yes_no_keys};
 
 /// How many commits the history scrubber loads up front (#371).
 ///
@@ -855,78 +856,35 @@ impl App {
         let Some(pd) = self.pending_discard.as_ref() else {
             return;
         };
-        let area = frame.area();
-        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
-        let height: u16 = 8;
-        let x = (area.width.saturating_sub(width)) / 2 + area.x;
-        let y = (area.height.saturating_sub(height)) / 2 + area.y;
-        let rect = Rect {
-            x,
-            y,
-            width,
-            height,
+        let title = format!(" {} ", crate::i18n::tr("DISCARD CHANGES?"));
+        let frame_spec = ConfirmFrame {
+            title: &title,
+            accent: self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70)),
+            title_fg: Color::White,
+            height: 8,
+            inset: Inset::Wide,
         };
-        // Clipped to the frame: a terminal narrower or shorter than the
-        // dialog's minimum made a rect outside the buffer, which panics.
-        let rect = rect.intersection(area);
-        let warn = self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70));
-        let block = ratatui::widgets::Block::default()
-            .borders(ratatui::widgets::Borders::ALL)
-            .border_style(Style::default().fg(warn))
-            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
-            .title(ratatui::text::Span::styled(
-                format!(" {} ", crate::i18n::tr("DISCARD CHANGES?")),
-                Style::default()
-                    .fg(Color::White)
-                    .bg(warn)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        frame.render_widget(ratatui::widgets::Clear, rect);
-        frame.render_widget(block, rect);
-        let inner = Rect {
-            x: rect.x + 2,
-            y: rect.y + 1,
-            width: rect.width.saturating_sub(4),
-            height: rect.height.saturating_sub(2),
-        };
-        let warn_text = if pd.untracked {
-            crate::i18n::tr("This will permanently delete the file from disk.")
-        } else {
-            crate::i18n::tr("This will overwrite your local changes from HEAD.")
-        };
-        let body = ratatui::text::Text::from(vec![
-            ratatui::text::Line::from(ratatui::text::Span::styled(
-                warn_text,
-                Style::default().fg(self.theme.ui(Color::White)),
-            )),
-            ratatui::text::Line::from(""),
-            ratatui::text::Line::from(ratatui::text::Span::styled(
-                truncate_for_display(&pd.rel_path, inner.width as usize),
-                Style::default().fg(self.theme.ui(Color::Rgb(0xeb, 0xcb, 0x8b))),
-            )),
-            ratatui::text::Line::from(""),
-            ratatui::text::Line::from(vec![
-                ratatui::text::Span::styled(
-                    "[Y]",
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                ),
-                ratatui::text::Span::raw("es, discard   "),
-                ratatui::text::Span::styled(
-                    "[N]",
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                ratatui::text::Span::raw("o / Esc"),
-            ]),
-        ]);
-        frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
-        crate::widgets::approval_popup::paint_warning_card(
-            frame.buffer_mut(),
-            rect,
-            self.theme,
-            warn,
-        );
+        draw_confirm(frame, self.theme, frame_spec, |frame, inner| {
+            let warn_text = if pd.untracked {
+                crate::i18n::tr("This will permanently delete the file from disk.")
+            } else {
+                crate::i18n::tr("This will overwrite your local changes from HEAD.")
+            };
+            let body = ratatui::text::Text::from(vec![
+                ratatui::text::Line::from(ratatui::text::Span::styled(
+                    warn_text,
+                    Style::default().fg(self.theme.ui(Color::White)),
+                )),
+                ratatui::text::Line::from(""),
+                ratatui::text::Line::from(ratatui::text::Span::styled(
+                    truncate_for_display(&pd.rel_path, inner.width as usize),
+                    Style::default().fg(self.theme.ui(Color::Rgb(0xeb, 0xcb, 0x8b))),
+                )),
+                ratatui::text::Line::from(""),
+                yes_no_keys("es, discard"),
+            ]);
+            frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+        });
     }
 
     /// Confirmation modal for Revert Hunk: destroys the uncommitted edit
@@ -935,71 +893,29 @@ impl App {
         let Some(pr) = self.pending_revert_hunk.as_ref() else {
             return;
         };
-        let area = frame.area();
-        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
-        let height: u16 = 8;
-        let x = (area.width.saturating_sub(width)) / 2 + area.x;
-        let y = (area.height.saturating_sub(height)) / 2 + area.y;
-        let rect = Rect {
-            x,
-            y,
-            width,
-            height,
+        let frame_spec = ConfirmFrame {
+            title: " REVERT HUNK? ",
+            accent: self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70)),
+            title_fg: Color::White,
+            height: 8,
+            inset: Inset::Wide,
         };
-        let rect = rect.intersection(area);
-        let warn = self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70));
-        let block = ratatui::widgets::Block::default()
-            .borders(ratatui::widgets::Borders::ALL)
-            .border_style(Style::default().fg(warn))
-            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
-            .title(ratatui::text::Span::styled(
-                " REVERT HUNK? ",
-                Style::default()
-                    .fg(Color::White)
-                    .bg(warn)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        frame.render_widget(ratatui::widgets::Clear, rect);
-        frame.render_widget(block, rect);
-        let inner = Rect {
-            x: rect.x + 2,
-            y: rect.y + 1,
-            width: rect.width.saturating_sub(4),
-            height: rect.height.saturating_sub(2),
-        };
-        let body = ratatui::text::Text::from(vec![
-            ratatui::text::Line::from(ratatui::text::Span::styled(
-                "This will undo the change hunk under the cursor on disk.",
-                Style::default().fg(self.theme.ui(Color::White)),
-            )),
-            ratatui::text::Line::from(""),
-            ratatui::text::Line::from(ratatui::text::Span::styled(
-                truncate_for_display(&pr.rel_path, inner.width as usize),
-                Style::default().fg(self.theme.ui(Color::Rgb(0xeb, 0xcb, 0x8b))),
-            )),
-            ratatui::text::Line::from(""),
-            ratatui::text::Line::from(vec![
-                ratatui::text::Span::styled(
-                    "[Y]",
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                ),
-                ratatui::text::Span::raw("es, revert   "),
-                ratatui::text::Span::styled(
-                    "[N]",
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                ratatui::text::Span::raw("o / Esc"),
-            ]),
-        ]);
-        frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
-        crate::widgets::approval_popup::paint_warning_card(
-            frame.buffer_mut(),
-            rect,
-            self.theme,
-            warn,
-        );
+        draw_confirm(frame, self.theme, frame_spec, |frame, inner| {
+            let body = ratatui::text::Text::from(vec![
+                ratatui::text::Line::from(ratatui::text::Span::styled(
+                    "This will undo the change hunk under the cursor on disk.",
+                    Style::default().fg(self.theme.ui(Color::White)),
+                )),
+                ratatui::text::Line::from(""),
+                ratatui::text::Line::from(ratatui::text::Span::styled(
+                    truncate_for_display(&pr.rel_path, inner.width as usize),
+                    Style::default().fg(self.theme.ui(Color::Rgb(0xeb, 0xcb, 0x8b))),
+                )),
+                ratatui::text::Line::from(""),
+                yes_no_keys("es, revert"),
+            ]);
+            frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+        });
     }
 
     /// The unsaved-changes prompt in front of a commit or stash (#1438):
