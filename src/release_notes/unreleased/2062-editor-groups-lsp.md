@@ -1,0 +1,1 @@
+refactor: Language-server and debugger updates that reach every editor group (semantic colours, inlay hints, CodeLens, folds, inline values, renames) run one loop over all groups instead of one copy for the focused group and another for the rest (#2062). Split editors behave exactly as before.
