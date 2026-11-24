@@ -75,15 +75,11 @@ impl WorkspaceSymbolPicker {
     }
 
     pub fn pop_char(&mut self) {
-        if !picker_query::backspace(&mut self.query, &mut self.cursor) {
-            return;
-        }
+        picker_query::backspace(&mut self.query, &mut self.cursor);
     }
 
     pub fn delete_char(&mut self) {
-        if !picker_query::delete(&mut self.query, self.cursor) {
-            return;
-        }
+        picker_query::delete(&mut self.query, self.cursor);
     }
 
     pub fn move_cursor_left(&mut self) {
