@@ -851,20 +851,29 @@ fn a_paste_with_a_right_click_menu_open_goes_nowhere() {
 
 /// The bug (#2674): only an agent's proposal, the two unsaved-changes
 /// prompts and the terminal paste question took the mouse. Under the other
-/// confirms, Settings and the startup warning, a click went to what they
-/// cover: it closed a tab, moved the editor's cursor or opened a status bar
-/// pop-up. A pop-up either handles the mouse itself (a picker closes on a
-/// click outside it) or takes every mouse event; none lets one through.
+/// nine confirms, Settings and the startup warning, a click went to what
+/// they cover: it moved the editor's cursor and closed a tab. A pop-up
+/// either handles the mouse itself (a picker closes on a click outside it)
+/// or takes every mouse event; none lets one through.
 #[test]
 fn a_click_behind_a_popup_never_reaches_what_it_covers() {
-    let mut reached = Vec::new();
-    for p in Popup::ALL {
-        let tmp = tempfile::tempdir().unwrap();
-        let a = tmp.path().join("a.txt");
-        let b = tmp.path().join("b.txt");
+    // Two files open, the first shown, then `p` opened over them. A picker
+    // closes on a click outside it, so each click gets a fresh setup: both
+    // land while the pop-up is open.
+    fn setup(
+        root: &Path,
+        p: Popup,
+    ) -> (
+        App,
+        Option<std::os::unix::net::UnixStream>,
+        (u16, u16),
+        (u16, u16),
+    ) {
+        let a = root.join("a.txt");
+        let b = root.join("b.txt");
         std::fs::write(&a, "alpha\nbeta\ngamma\n").unwrap();
         std::fs::write(&b, "bravo\n").unwrap();
-        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let mut app = App::new(root.to_path_buf()).unwrap();
         app.editor.open_pinned(&a).unwrap();
         app.editor.open_pinned(&b).unwrap();
         app.editor.select(0);
@@ -872,24 +881,30 @@ fn a_click_behind_a_popup_never_reaches_what_it_covers() {
         draw(&mut app, 160, 40);
         let tab_row = app.editor.tab_strip_y_for_test();
         let close_b = app.editor.close_screen_x(1).expect("b.txt's close button");
-        let _hook = open(&mut app, p);
+        let caret = app.editor.cursor_screen_pos().expect("the editor's caret");
+        let hook = open(&mut app, p);
         draw(&mut app, 160, 40);
-        let before = (
-            app.editor.tab_count(),
-            app.editor.cursor_row,
-            app.editor.cursor_col,
-        );
-        // The other tab's close button, then the last line of the file.
-        left_click(&mut app, close_b, tab_row);
-        let text_row = tab_row + 4;
-        left_click(&mut app, 30, text_row);
-        let after = (
-            app.editor.tab_count(),
-            app.editor.cursor_row,
-            app.editor.cursor_col,
-        );
-        if before != after {
-            reached.push(format!("{p:?} (tabs, row, col {before:?} -> {after:?})"));
+        (app, hook, (close_b, tab_row), caret)
+    }
+    let mut reached = Vec::new();
+    for p in Popup::ALL {
+        let mut what = Vec::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _hook, _, (x, y)) = setup(tmp.path(), p);
+        // Two lines down and three along from the caret: "gamma", column 3.
+        left_click(&mut app, x + 3, y + 2);
+        if (app.editor.cursor_row, app.editor.cursor_col) != (0, 0) {
+            what.push("moved the cursor");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _hook, (x, y), _) = setup(tmp.path(), p);
+        // The other tab's close button.
+        left_click(&mut app, x, y);
+        if app.editor.tab_count() != 2 {
+            what.push("closed a tab");
+        }
+        if !what.is_empty() {
+            reached.push(format!("{p:?} ({})", what.join(", ")));
         }
     }
     assert!(
