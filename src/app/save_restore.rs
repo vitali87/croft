@@ -3,6 +3,7 @@
 //! launch file.
 
 use super::*;
+use crate::widgets::confirm_frame::{ConfirmFrame, Inset, confirm_width, draw_confirm};
 
 /// What an unsaved-changes prompt (#862) goes on to do once it is answered.
 /// Everything that would drop a dirty buffer asks first: a quit that goes
@@ -169,66 +170,40 @@ impl App {
             return;
         };
         let (headline, names, save, discard) = self.unsaved_confirm_text(exit);
-        let area = frame.area();
-        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
-        let height: u16 = 8;
-        let rect = Rect {
-            x: (area.width.saturating_sub(width)) / 2 + area.x,
-            y: (area.height.saturating_sub(height)) / 2 + area.y,
-            width,
-            height,
+        let title = format!(" {} ", crate::i18n::tr("UNSAVED CHANGES"));
+        let frame_spec = ConfirmFrame {
+            title: &title,
+            accent: self.theme.ui(Color::Rgb(0xe7, 0xa7, 0x3c)),
+            title_fg: Color::Black,
+            height: 8,
+            inset: Inset::Wide,
         };
-        let rect = rect.intersection(area);
-        let warn = self.theme.ui(Color::Rgb(0xe7, 0xa7, 0x3c));
-        let block = ratatui::widgets::Block::default()
-            .borders(ratatui::widgets::Borders::ALL)
-            .border_style(Style::default().fg(warn))
-            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
-            .title(ratatui::text::Span::styled(
-                format!(" {} ", crate::i18n::tr("UNSAVED CHANGES")),
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(warn)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        frame.render_widget(ratatui::widgets::Clear, rect);
-        frame.render_widget(block, rect);
-        let inner = Rect {
-            x: rect.x + 2,
-            y: rect.y + 1,
-            width: rect.width.saturating_sub(4),
-            height: rect.height.saturating_sub(2),
-        };
-        let key = |k: &'static str, color: Color| {
-            Span::styled(k, Style::default().fg(color).add_modifier(Modifier::BOLD))
-        };
-        let body = ratatui::text::Text::from(vec![
-            Line::from(Span::styled(
-                headline,
-                Style::default().fg(self.theme.ui(Color::White)),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                truncate_for_display(&names, inner.width as usize),
-                Style::default().fg(self.theme.ui(Color::Rgb(0xeb, 0xcb, 0x8b))),
-            )),
-            Line::from(""),
-            Line::from(vec![
-                key("[S]", Color::Green),
-                Span::raw(format!("{save}   ")),
-                key("[D]", Color::Red),
-                Span::raw(format!("{discard}   ")),
-                key("[Esc]", self.theme.ui(Color::White)),
-                Span::raw(" cancel"),
-            ]),
-        ]);
-        frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
-        crate::widgets::approval_popup::paint_warning_card(
-            frame.buffer_mut(),
-            rect,
-            self.theme,
-            warn,
-        );
+        draw_confirm(frame, self.theme, frame_spec, |frame, inner| {
+            let key = |k: &'static str, color: Color| {
+                Span::styled(k, Style::default().fg(color).add_modifier(Modifier::BOLD))
+            };
+            let body = ratatui::text::Text::from(vec![
+                Line::from(Span::styled(
+                    headline,
+                    Style::default().fg(self.theme.ui(Color::White)),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    truncate_for_display(&names, inner.width as usize),
+                    Style::default().fg(self.theme.ui(Color::Rgb(0xeb, 0xcb, 0x8b))),
+                )),
+                Line::from(""),
+                Line::from(vec![
+                    key("[S]", Color::Green),
+                    Span::raw(format!("{save}   ")),
+                    key("[D]", Color::Red),
+                    Span::raw(format!("{discard}   ")),
+                    key("[Esc]", self.theme.ui(Color::White)),
+                    Span::raw(" cancel"),
+                ]),
+            ]);
+            frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+        });
     }
 
     /// The lossy-save prompt (#1053): what the file's encoding would destroy,
@@ -240,71 +215,45 @@ impl App {
             return;
         };
         let [what, consequence, keep] = asked.text();
-        let area = frame.area();
-        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
-        let inner_w = width.saturating_sub(4);
+        let inner_w = confirm_width(frame.area()).saturating_sub(4);
         let rows = |s: &str| wrap_cells_variable_width(s, inner_w, inner_w).len() as u16;
-        // Three texts, a blank line after each, and the keys.
-        let height = 2 + rows(&what) + rows(&consequence) + rows(&keep) + 4;
-        let rect = Rect {
-            x: (area.width.saturating_sub(width)) / 2 + area.x,
-            y: (area.height.saturating_sub(height)) / 2 + area.y,
-            width,
-            height,
-        };
-        let rect = rect.intersection(area);
         let danger = self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70));
-        let block = ratatui::widgets::Block::default()
-            .borders(ratatui::widgets::Borders::ALL)
-            .border_style(Style::default().fg(danger))
-            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
-            .title(ratatui::text::Span::styled(
-                " SAVE WOULD LOSE DATA ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(danger)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        frame.render_widget(ratatui::widgets::Clear, rect);
-        frame.render_widget(block, rect);
-        let inner = Rect {
-            x: rect.x + 2,
-            y: rect.y + 1,
-            width: rect.width.saturating_sub(4),
-            height: rect.height.saturating_sub(2),
+        let frame_spec = ConfirmFrame {
+            title: " SAVE WOULD LOSE DATA ",
+            accent: danger,
+            title_fg: Color::Black,
+            // Three texts, a blank line after each, and the keys.
+            height: 2 + rows(&what) + rows(&consequence) + rows(&keep) + 4,
+            inset: Inset::Wide,
         };
-        let key = |k: &'static str, color: Color| {
-            Span::styled(k, Style::default().fg(color).add_modifier(Modifier::BOLD))
-        };
-        let text = self.theme.ui(Color::White);
-        let dim = self.theme.ui(Color::Rgb(0x9a, 0xa4, 0xb8));
-        let body = ratatui::text::Text::from(vec![
-            Line::from(Span::styled(what, Style::default().fg(text))),
-            Line::from(""),
-            Line::from(Span::styled(
-                consequence,
-                Style::default().fg(danger).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(keep, Style::default().fg(dim))),
-            Line::from(""),
-            Line::from(vec![
-                key("[S]", Color::Red),
-                Span::raw(" save anyway   "),
-                key("[Esc]", text),
-                Span::raw(" keep the file as it is"),
-            ]),
-        ]);
-        frame.render_widget(
-            Paragraph::new(body).wrap(ratatui::widgets::Wrap { trim: false }),
-            inner,
-        );
-        crate::widgets::approval_popup::paint_warning_card(
-            frame.buffer_mut(),
-            rect,
-            self.theme,
-            danger,
-        );
+        draw_confirm(frame, self.theme, frame_spec, |frame, inner| {
+            let key = |k: &'static str, color: Color| {
+                Span::styled(k, Style::default().fg(color).add_modifier(Modifier::BOLD))
+            };
+            let text = self.theme.ui(Color::White);
+            let dim = self.theme.ui(Color::Rgb(0x9a, 0xa4, 0xb8));
+            let body = ratatui::text::Text::from(vec![
+                Line::from(Span::styled(what, Style::default().fg(text))),
+                Line::from(""),
+                Line::from(Span::styled(
+                    consequence,
+                    Style::default().fg(danger).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(keep, Style::default().fg(dim))),
+                Line::from(""),
+                Line::from(vec![
+                    key("[S]", Color::Red),
+                    Span::raw(" save anyway   "),
+                    key("[Esc]", text),
+                    Span::raw(" keep the file as it is"),
+                ]),
+            ]);
+            frame.render_widget(
+                Paragraph::new(body).wrap(ratatui::widgets::Wrap { trim: false }),
+                inner,
+            );
+        });
     }
 
     /// Open `path` as a pinned editor tab and focus the editor. Used at launch

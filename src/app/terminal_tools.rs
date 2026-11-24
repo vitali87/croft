@@ -3,6 +3,9 @@
 //! CAPTURES, links and inline suggestions.
 
 use super::*;
+use crate::widgets::confirm_frame::{
+    ConfirmFrame, Inset, confirm_width, draw_confirm, yes_no_keys,
+};
 
 impl App {
     /// Settings / palette "Terminal: Toggle Secret Redaction" (#360): the
@@ -282,75 +285,35 @@ impl App {
         if !self.pending_broadcast_enable {
             return;
         }
-        let area = frame.area();
-        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
-        let height: u16 = 7;
-        let rect = Rect {
-            x: (area.width.saturating_sub(width)) / 2 + area.x,
-            y: (area.height.saturating_sub(height)) / 2 + area.y,
-            width,
-            height,
+        let frame_spec = ConfirmFrame {
+            title: " BROADCAST INPUT TO ALL PANES? ",
+            accent: self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70)),
+            title_fg: Color::White,
+            height: 7,
+            inset: Inset::Wide,
         };
-        let rect = rect.intersection(area);
-        let warn = self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70));
-        let block = ratatui::widgets::Block::default()
-            .borders(ratatui::widgets::Borders::ALL)
-            .border_style(Style::default().fg(warn))
-            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
-            .title(ratatui::text::Span::styled(
-                " BROADCAST INPUT TO ALL PANES? ",
-                Style::default()
-                    .fg(Color::White)
-                    .bg(warn)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        frame.render_widget(ratatui::widgets::Clear, rect);
-        frame.render_widget(block, rect);
-        let inner = Rect {
-            x: rect.x + 2,
-            y: rect.y + 1,
-            width: rect.width.saturating_sub(4),
-            height: rect.height.saturating_sub(2),
-        };
-        let receiving = self
-            .terminals
-            .iter()
-            .filter(|t| !t.broadcast_excluded)
-            .count()
-            .max(1);
-        let body = ratatui::text::Text::from(vec![
-            ratatui::text::Line::from(ratatui::text::Span::styled(
-                format!(
-                    "Every keystroke and paste will go to {receiving} terminal panes at once (red \u{21f6} pills mark them). Cmd+K I stops it; Cmd+K Shift+I excludes a pane."
-                ),
-                Style::default().fg(self.theme.ui(Color::White)),
-            )),
-            ratatui::text::Line::from(""),
-            ratatui::text::Line::from(vec![
-                ratatui::text::Span::styled(
-                    "[Y]",
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                ),
-                ratatui::text::Span::raw("es, broadcast   "),
-                ratatui::text::Span::styled(
-                    "[N]",
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                ratatui::text::Span::raw("o / Esc"),
-            ]),
-        ]);
-        frame.render_widget(
-            ratatui::widgets::Paragraph::new(body).wrap(ratatui::widgets::Wrap { trim: true }),
-            inner,
-        );
-        crate::widgets::approval_popup::paint_warning_card(
-            frame.buffer_mut(),
-            rect,
-            self.theme,
-            warn,
-        );
+        draw_confirm(frame, self.theme, frame_spec, |frame, inner| {
+            let receiving = self
+                .terminals
+                .iter()
+                .filter(|t| !t.broadcast_excluded)
+                .count()
+                .max(1);
+            let body = ratatui::text::Text::from(vec![
+                ratatui::text::Line::from(ratatui::text::Span::styled(
+                    format!(
+                        "Every keystroke and paste will go to {receiving} terminal panes at once (red \u{21f6} pills mark them). Cmd+K I stops it; Cmd+K Shift+I excludes a pane."
+                    ),
+                    Style::default().fg(self.theme.ui(Color::White)),
+                )),
+                ratatui::text::Line::from(""),
+                yes_no_keys("es, broadcast"),
+            ]);
+            frame.render_widget(
+                ratatui::widgets::Paragraph::new(body).wrap(ratatui::widgets::Wrap { trim: true }),
+                inner,
+            );
+        });
     }
 
     /// The confirm popup for a multi-line terminal paste (#1274): how many
@@ -364,80 +327,54 @@ impl App {
         const PREVIEW: usize = 3;
         let preview = lines.len().min(PREVIEW);
         let more = lines.len() > PREVIEW;
-        let area = frame.area();
-        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
-        let height = 7 + preview as u16 + u16::from(more);
-        let rect = Rect {
-            x: (area.width.saturating_sub(width)) / 2 + area.x,
-            y: (area.height.saturating_sub(height)) / 2 + area.y,
-            width,
-            height,
-        }
-        .intersection(area);
-        let warn = self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70));
         let n = lines.len();
-        let block = ratatui::widgets::Block::default()
-            .borders(ratatui::widgets::Borders::ALL)
-            .border_style(Style::default().fg(warn))
-            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
-            .title(Span::styled(
-                format!(
-                    " PASTE {n} LINE{} INTO THE TERMINAL? ",
-                    if n == 1 { "" } else { "S" }
-                ),
-                Style::default()
-                    .fg(Color::White)
-                    .bg(warn)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        frame.render_widget(ratatui::widgets::Clear, rect);
-        frame.render_widget(block, rect);
-        let inner = Rect {
-            x: rect.x + 2,
-            y: rect.y + 1,
-            width: rect.width.saturating_sub(4),
-            height: rect.height.saturating_sub(2),
-        };
-        let white = Style::default().fg(self.theme.ui(Color::White));
-        let dim = Style::default().fg(self.theme.ui(Color::Rgb(0x8b, 0x93, 0xa5)));
-        let mut body = vec![
-            Line::from(Span::styled(
-                "Each line break is an Enter here, so the lines run as they land:",
-                white,
-            )),
-            Line::from(""),
-        ];
-        for line in &lines[..preview] {
-            body.push(Line::from(Span::styled(
-                format!("  {}", String::from_utf8_lossy(line)),
-                dim,
-            )));
-        }
-        if more {
-            body.push(Line::from(Span::styled(
-                format!("  … and {} more", lines.len() - PREVIEW),
-                dim,
-            )));
-        }
-        let key = |k: &'static str, color: Color| {
-            Span::styled(k, Style::default().fg(color).add_modifier(Modifier::BOLD))
-        };
-        body.push(Line::from(""));
-        body.push(Line::from(vec![
-            key("[Y]", Color::Red),
-            Span::raw(" / Enter paste   "),
-            key("[L]", Color::Yellow),
-            Span::raw(" paste as one line   "),
-            key("[N]", Color::Green),
-            Span::raw(" / Esc cancel"),
-        ]));
-        frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
-        crate::widgets::approval_popup::paint_warning_card(
-            frame.buffer_mut(),
-            rect,
-            self.theme,
-            warn,
+        let title = format!(
+            " PASTE {n} LINE{} INTO THE TERMINAL? ",
+            if n == 1 { "" } else { "S" }
         );
+        let frame_spec = ConfirmFrame {
+            title: &title,
+            accent: self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70)),
+            title_fg: Color::White,
+            height: 7 + preview as u16 + u16::from(more),
+            inset: Inset::Wide,
+        };
+        draw_confirm(frame, self.theme, frame_spec, |frame, inner| {
+            let white = Style::default().fg(self.theme.ui(Color::White));
+            let dim = Style::default().fg(self.theme.ui(Color::Rgb(0x8b, 0x93, 0xa5)));
+            let mut body = vec![
+                Line::from(Span::styled(
+                    "Each line break is an Enter here, so the lines run as they land:",
+                    white,
+                )),
+                Line::from(""),
+            ];
+            for line in &lines[..preview] {
+                body.push(Line::from(Span::styled(
+                    format!("  {}", String::from_utf8_lossy(line)),
+                    dim,
+                )));
+            }
+            if more {
+                body.push(Line::from(Span::styled(
+                    format!("  … and {} more", lines.len() - PREVIEW),
+                    dim,
+                )));
+            }
+            let key = |k: &'static str, color: Color| {
+                Span::styled(k, Style::default().fg(color).add_modifier(Modifier::BOLD))
+            };
+            body.push(Line::from(""));
+            body.push(Line::from(vec![
+                key("[Y]", Color::Red),
+                Span::raw(" / Enter paste   "),
+                key("[L]", Color::Yellow),
+                Span::raw(" paste as one line   "),
+                key("[N]", Color::Green),
+                Span::raw(" / Esc cancel"),
+            ]));
+            frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+        });
     }
 
     /// The confirm popup for a runnable fence (#353): the whole block, the
@@ -447,8 +384,7 @@ impl App {
             return;
         };
         let area = frame.area();
-        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
-        let inner_w = width.saturating_sub(4) as usize;
+        let inner_w = confirm_width(area).saturating_sub(4) as usize;
         let shown: Vec<String> = block
             .code
             .lines()
@@ -466,15 +402,6 @@ impl App {
             })
             .collect();
         let more = block.code.lines().count().saturating_sub(shown.len());
-        let height =
-            (shown.len() as u16 + 6 + u16::from(more > 0)).min(area.height.saturating_sub(2));
-        let rect = Rect {
-            x: (area.width.saturating_sub(width)) / 2 + area.x,
-            y: (area.height.saturating_sub(height)) / 2 + area.y,
-            width,
-            height,
-        };
-        let rect = rect.intersection(area);
         let (title, accent) = if block.destructive {
             (
                 " RUN THIS BLOCK? IT LOOKS DESTRUCTIVE ",
@@ -483,67 +410,39 @@ impl App {
         } else {
             (" RUN THIS BLOCK? ", self.theme.accent())
         };
-        let popup = ratatui::widgets::Block::default()
-            .borders(ratatui::widgets::Borders::ALL)
-            .border_style(Style::default().fg(accent))
-            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
-            .title(ratatui::text::Span::styled(
-                title,
-                Style::default()
-                    .fg(Color::White)
-                    .bg(accent)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        frame.render_widget(ratatui::widgets::Clear, rect);
-        frame.render_widget(popup, rect);
-        let inner = Rect {
-            x: rect.x + 2,
-            y: rect.y + 1,
-            width: rect.width.saturating_sub(4),
-            height: rect.height.saturating_sub(2),
-        };
-        let mut lines: Vec<ratatui::text::Line> =
-            vec![ratatui::text::Line::from(ratatui::text::Span::styled(
-                format!("in pane {} at {}", block.pane_name, block.cwd.display()),
-                Style::default().fg(self.theme.ui(Color::Rgb(0xCC, 0xCC, 0xCC))),
-            ))];
-        for l in &shown {
-            lines.push(ratatui::text::Line::from(ratatui::text::Span::styled(
-                l.clone(),
-                Style::default().fg(self.theme.ui(Color::White)),
-            )));
-        }
-        if more > 0 {
-            lines.push(ratatui::text::Line::from(ratatui::text::Span::styled(
-                format!("… {more} more line(s)"),
-                Style::default().fg(self.theme.ui(Color::Rgb(0x88, 0x88, 0x88))),
-            )));
-        }
-        lines.push(ratatui::text::Line::from(""));
-        lines.push(ratatui::text::Line::from(vec![
-            ratatui::text::Span::styled(
-                "[Y]",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            ratatui::text::Span::raw("es, run   "),
-            ratatui::text::Span::styled(
-                "[N]",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            ratatui::text::Span::raw("o / Esc"),
-        ]));
-        frame.render_widget(
-            ratatui::widgets::Paragraph::new(ratatui::text::Text::from(lines)),
-            inner,
-        );
-        crate::widgets::approval_popup::paint_warning_card(
-            frame.buffer_mut(),
-            rect,
-            self.theme,
+        let frame_spec = ConfirmFrame {
+            title,
             accent,
-        );
+            title_fg: Color::White,
+            height: (shown.len() as u16 + 6 + u16::from(more > 0))
+                .min(area.height.saturating_sub(2)),
+            inset: Inset::Wide,
+        };
+        draw_confirm(frame, self.theme, frame_spec, |frame, inner| {
+            let mut lines: Vec<ratatui::text::Line> =
+                vec![ratatui::text::Line::from(ratatui::text::Span::styled(
+                    format!("in pane {} at {}", block.pane_name, block.cwd.display()),
+                    Style::default().fg(self.theme.ui(Color::Rgb(0xCC, 0xCC, 0xCC))),
+                ))];
+            for l in &shown {
+                lines.push(ratatui::text::Line::from(ratatui::text::Span::styled(
+                    l.clone(),
+                    Style::default().fg(self.theme.ui(Color::White)),
+                )));
+            }
+            if more > 0 {
+                lines.push(ratatui::text::Line::from(ratatui::text::Span::styled(
+                    format!("… {more} more line(s)"),
+                    Style::default().fg(self.theme.ui(Color::Rgb(0x88, 0x88, 0x88))),
+                )));
+            }
+            lines.push(ratatui::text::Line::from(""));
+            lines.push(yes_no_keys("es, run"));
+            frame.render_widget(
+                ratatui::widgets::Paragraph::new(ratatui::text::Text::from(lines)),
+                inner,
+            );
+        });
     }
 
     pub(super) fn handle_captures_key(&mut self, key: KeyEvent) {

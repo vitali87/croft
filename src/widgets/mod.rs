@@ -6,6 +6,7 @@ pub mod codeql;
 pub mod command_palette;
 pub mod commit_graph;
 pub mod completion_popup;
+pub mod confirm_frame;
 pub mod connect_dialog;
 pub mod dependencies;
 pub mod diff;
