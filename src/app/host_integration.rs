@@ -1269,14 +1269,9 @@ impl App {
         let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let is_it = |p: &Path| p == path || p.canonicalize().is_ok_and(|c| c == canon);
         let open = self
-            .editor
-            .editors
-            .iter()
-            .chain(
-                self.editor_layout
-                    .inactive_groups()
-                    .flat_map(|g| g.editors.iter()),
-            )
+            .editor_layout
+            .all_groups(&self.editor)
+            .flat_map(|g| g.editors.iter())
             .any(|t| t.path.as_deref().is_some_and(is_it));
         if open {
             crate::view_ipc::ViewReply::Err {

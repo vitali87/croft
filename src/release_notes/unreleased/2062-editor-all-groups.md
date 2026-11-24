@@ -1,0 +1,1 @@
+refactor: Code that reaches every editor group, the focused one included, asks the layout for all of them in one call instead of joining the focused group to the others by hand (#2062). Split editors behave exactly as before.

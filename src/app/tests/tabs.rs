@@ -339,8 +339,9 @@ fn close_all_closes_every_split_group() {
     app.split_editor(); // right group (focused) duplicates a.rs
     app.editor.open_pinned(&b).unwrap();
     assert!(app.editor_layout.is_split(), "two groups before Close All");
-    let total: usize = std::iter::once(&app.editor)
-        .chain(app.editor_layout.inactive_groups())
+    let total: usize = app
+        .editor_layout
+        .all_groups(&app.editor)
         .map(|g| g.editors.len())
         .sum();
     assert!(total >= 2, "tabs are spread over both groups");

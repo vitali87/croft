@@ -385,8 +385,9 @@ impl App {
     /// exist yet; its appearing is a change like any other.
     pub(super) fn polled_open_file_paths(&self) -> Vec<PathBuf> {
         let mut paths = self.open_tab_paths();
-        let wal = std::iter::once(&self.editor)
-            .chain(self.editor_layout.inactive_groups())
+        let wal = self
+            .editor_layout
+            .all_groups(&self.editor)
             .flat_map(|g| g.editors.iter())
             .filter(|e| {
                 e.sheet
@@ -406,8 +407,8 @@ impl App {
     /// stats these, so a background tab in a dir that carries no watch still
     /// sees an external write.
     pub(super) fn open_tab_paths(&self) -> Vec<PathBuf> {
-        std::iter::once(&self.editor)
-            .chain(self.editor_layout.inactive_groups())
+        self.editor_layout
+            .all_groups(&self.editor)
             .flat_map(|g| g.editors.iter())
             .filter_map(|e| e.path.clone())
             .collect()

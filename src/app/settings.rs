@@ -1177,8 +1177,9 @@ impl App {
                 && e.language() == crate::highlight::lang_for_path(path))
             .then(|| path.clone())
         };
-        let following: Vec<PathBuf> = std::iter::once(&self.editor)
-            .chain(self.editor_layout.inactive_groups())
+        let following: Vec<PathBuf> = self
+            .editor_layout
+            .all_groups(&self.editor)
             .flat_map(|g| g.editors.iter())
             .filter_map(picked)
             .collect();
@@ -1216,8 +1217,9 @@ impl App {
             self.rebuild_problems();
             self.refresh_problems_badge();
         }
-        for e in std::iter::once(&mut self.editor)
-            .chain(self.editor_layout.inactive_groups_mut())
+        for e in self
+            .editor_layout
+            .all_groups_mut(&mut self.editor)
             .flat_map(|g| g.editors.iter_mut())
         {
             let Some(path) = e.path.clone().filter(|p| following.contains(p)) else {

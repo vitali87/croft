@@ -123,8 +123,7 @@ impl App {
     /// last tick (#850), in every editor group. True when any landed, so the
     /// frame repaints in the new colors.
     pub fn poll_highlights(&mut self) -> bool {
-        let groups =
-            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut());
+        let groups = self.editor_layout.all_groups_mut(&mut self.editor);
         let mut landed = false;
         for ed in groups.flat_map(|g| g.editors.iter_mut()) {
             landed |= ed.poll_highlights();

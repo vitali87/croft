@@ -142,7 +142,7 @@ impl App {
     pub(super) fn dirty_tab_lines(&self, path: &Path) -> Option<Vec<String>> {
         let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
         let want = canon(path);
-        let groups = std::iter::once(&self.editor).chain(self.editor_layout.inactive_groups());
+        let groups = self.editor_layout.all_groups(&self.editor);
         groups
             .flat_map(|g| g.editors.iter())
             .find(|e| e.dirty && e.path.as_deref().is_some_and(|p| canon(p) == want))
@@ -378,7 +378,7 @@ impl App {
             );
             return true;
         }
-        let groups = std::iter::once(&self.editor).chain(self.editor_layout.inactive_groups());
+        let groups = self.editor_layout.all_groups(&self.editor);
         let open = groups
             .flat_map(|g| g.editors.iter())
             .any(|e| e.path.as_deref() == Some(file.as_path()));
@@ -1748,11 +1748,11 @@ impl App {
         let Some(path) = crate::collab::contained_path(root, file) else {
             return;
         };
-        for ed in self.editor.editors.iter_mut().chain(
-            self.editor_layout
-                .inactive_groups_mut()
-                .flat_map(|g| g.editors.iter_mut()),
-        ) {
+        for ed in self
+            .editor_layout
+            .all_groups_mut(&mut self.editor)
+            .flat_map(|g| g.editors.iter_mut())
+        {
             if ed.path.as_deref() == Some(path.as_path()) && !ed.has_non_text_view() {
                 ed.end_remote_undo_group(group);
             }
@@ -2208,8 +2208,8 @@ impl App {
     /// sees only what is on disk, and the tab's edits are not there yet.
     /// A sheet cell still being typed into is an unsaved edit too.
     pub(super) fn unsaved_file_under(&self, dir: &Path) -> Option<String> {
-        std::iter::once(&self.editor)
-            .chain(self.editor_layout.inactive_groups())
+        self.editor_layout
+            .all_groups(&self.editor)
             .flat_map(|g| g.editors.iter())
             .filter(|e| e.dirty || e.sheet_pending_cell().is_some())
             .find_map(|e| e.path.as_deref().filter(|p| p.starts_with(dir)))
