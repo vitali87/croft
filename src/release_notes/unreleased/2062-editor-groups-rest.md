@@ -1,0 +1,1 @@
+refactor: Renaming or trashing a file, bookmarks, Save All, the per-frame editor settings, the theme switch, per-language inlay hints and the test-run decorations reach every editor group in one loop instead of one copy for the focused group and another for the rest (#2062). Split editors behave exactly as before.
