@@ -124,6 +124,46 @@ impl Popup {
             Popup::TerminalWarning => app.pending_terminal_warning,
         }
     }
+
+    /// Whether the pop-up handles the mouse itself: a picker's rows and the
+    /// click outside that closes it, or a dialog's buttons. One that does
+    /// not takes every mouse event while it is open, so a click, the wheel
+    /// or the pointer never reaches what it covers (#862, #2674). The New
+    /// File box handles none: a click in the status bar or on a layout icon
+    /// acted behind it (#2678 review). The match has no catch-all: a new
+    /// pop-up must say which it is.
+    pub(super) fn handles_mouse(self) -> bool {
+        match self {
+            Popup::FileFinder
+            | Popup::CommandPalette
+            | Popup::GoToSymbol
+            | Popup::WorkspaceSymbols
+            | Popup::ProcessPicker
+            | Popup::ZoxideJump
+            | Popup::CommandHistory
+            | Popup::BranchPicker
+            | Popup::InputPrompt
+            | Popup::ListPicker
+            | Popup::ShortcutsModal
+            | Popup::ConnectDialog => true,
+            Popup::Prompt
+            | Popup::LocalOpenConfirm
+            | Popup::DiscardConfirm
+            | Popup::RevertHunkConfirm
+            | Popup::DiscardAllConfirm
+            | Popup::StashDropConfirm
+            | Popup::UnsavedScmConfirm
+            | Popup::ReplaceAllConfirm
+            | Popup::BroadcastConfirm
+            | Popup::TerminalPasteConfirm
+            | Popup::RunBlockConfirm
+            | Popup::UnsavedConfirm
+            | Popup::LossySaveConfirm
+            | Popup::SettingsEditor
+            | Popup::Approval
+            | Popup::TerminalWarning => false,
+        }
+    }
 }
 
 impl App {
@@ -133,6 +173,19 @@ impl App {
     /// keeps pictures below the text and loses nothing by the wait.
     pub(super) fn pictures_held_back(&self) -> bool {
         self.popup_open()
+    }
+
+    /// Whether an open pop-up takes every mouse event, as one that handles
+    /// no mouse of its own does (#2674). Settings opens an input prompt over
+    /// itself to edit a value, and gives it the keys while it is up (see
+    /// `handle_key_inner`); it gives it the mouse too, so a click outside the
+    /// prompt closes it as anywhere else (#2678 review).
+    pub(super) fn popup_takes_the_mouse(&self) -> bool {
+        Popup::ALL.iter().any(|&p| {
+            !p.handles_mouse()
+                && p.is_open(self)
+                && !(p == Popup::SettingsEditor && self.input_prompt.is_some())
+        })
     }
 
     /// Whether one of the pop-ups drawn over the middle of the screen is
