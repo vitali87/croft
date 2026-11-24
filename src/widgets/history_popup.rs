@@ -18,6 +18,7 @@ use ratatui::{
 };
 
 use crate::command_history::{HistoryEntry, HistoryScope};
+use crate::widgets::picker_query;
 
 pub struct HistoryPopup {
     pub query: String,
@@ -54,18 +55,6 @@ impl HistoryPopup {
         Self::default()
     }
 
-    fn char_count(&self) -> usize {
-        self.query.chars().count()
-    }
-
-    fn byte_offset(&self, char_idx: usize) -> usize {
-        self.query
-            .char_indices()
-            .nth(char_idx)
-            .map(|(b, _)| b)
-            .unwrap_or(self.query.len())
-    }
-
     /// Replace the result list after the app re-ran the store search.
     pub fn set_results(&mut self, results: Vec<HistoryEntry>) {
         self.results = results;
@@ -73,26 +62,21 @@ impl HistoryPopup {
     }
 
     pub fn push_char(&mut self, c: char) {
-        let at = self.byte_offset(self.cursor);
-        self.query.insert(at, c);
-        self.cursor += 1;
+        picker_query::insert(&mut self.query, &mut self.cursor, c);
     }
 
     pub fn pop_char(&mut self) {
-        if self.cursor == 0 {
+        if !picker_query::backspace(&mut self.query, &mut self.cursor) {
             return;
         }
-        let at = self.byte_offset(self.cursor - 1);
-        self.query.remove(at);
-        self.cursor -= 1;
     }
 
     pub fn move_cursor_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
+        picker_query::left(&mut self.cursor);
     }
 
     pub fn move_cursor_right(&mut self) {
-        self.cursor = (self.cursor + 1).min(self.char_count());
+        picker_query::right(&self.query, &mut self.cursor);
     }
 
     pub fn select_next(&mut self) {
@@ -167,7 +151,7 @@ pub fn render_history_popup(
     let caret_style = Style::default()
         .fg(theme.ui(Color::Rgb(0x16, 0x18, 0x1f)))
         .bg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)));
-    let cursor = pop.cursor.min(pop.char_count());
+    let cursor = pop.cursor.min(picker_query::char_count(&pop.query));
     let before: String = pop.query.chars().take(cursor).collect();
     let at: String = pop.query.chars().skip(cursor).take(1).collect();
     let after: String = pop.query.chars().skip(cursor + 1).collect();
