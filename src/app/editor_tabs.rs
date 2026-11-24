@@ -405,7 +405,32 @@ impl App {
         {
             self.nav.record(left);
         }
+        #[cfg(test)]
+        self.assert_one_view_per_tab();
         result
+    }
+
+    /// Fail when any tab, in any group, has more than one view slot filled
+    /// ([`Editor::views_filled`]). Test builds run it after every key, click,
+    /// paste and background pass, so every test that drives the app checks
+    /// it, not only the tests written about viewers.
+    #[cfg(test)]
+    pub(super) fn assert_one_view_per_tab(&self) {
+        for group in self.editor_layout.all_groups(&self.editor) {
+            for tab in &group.editors {
+                let views = tab.views_filled();
+                assert!(
+                    views.len() <= 1,
+                    "{} shows {} views at once: {}",
+                    tab.path.as_deref().map_or_else(
+                        || String::from("an untitled tab"),
+                        |p| p.display().to_string()
+                    ),
+                    views.len(),
+                    views.join(", ")
+                );
+            }
+        }
     }
 
     /// Which editor group has focus, as the split's leaf count and the
