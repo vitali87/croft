@@ -78,15 +78,7 @@ impl Editor {
         };
         self.push_undo(kind);
         self.delete_selection_inner();
-        if self.lines.is_empty() {
-            self.lines.push(String::new());
-        }
-        let row = self.cursor_row;
-        let col = self.cursor_col;
-        let byte = self.byte_index(row, col);
-        self.lines[row].insert(byte, c);
-        self.cursor_col += 1;
-        self.mark_buffer_changed();
+        self.insert_char_raw(c);
         self.recompute_highlights();
         // On-type formatting (#254) reads this to know the last edit was
         // this keystroke (seq must still match at the tick). Set here, not
