@@ -3004,7 +3004,7 @@ fn tabs_snapshot_852(app: &App) -> TabsSnapshot852 {
             .collect::<Vec<_>>()
     };
     let mut groups = vec![group(&app.editor)];
-    groups.extend(app.editor_layout.inactive_groups().into_iter().map(group));
+    groups.extend(app.editor_layout.inactive_groups().map(group));
     (
         groups,
         app.editor.active_index(),

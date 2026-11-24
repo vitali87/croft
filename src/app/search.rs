@@ -437,8 +437,7 @@ impl App {
             .iter()
             .chain(
                 self.editor_layout
-                    .inactive_leaf_tabs()
-                    .into_iter()
+                    .inactive_groups()
                     .flat_map(|tabs| tabs.editors.iter()),
             )
             .filter(|e| e.dirty)

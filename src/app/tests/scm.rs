@@ -48,7 +48,6 @@ fn git_gutter_baselines_are_fetched_for_inactive_split_groups() {
     let inactive_baselines: Vec<Option<std::path::PathBuf>> = app
         .editor_layout
         .inactive_groups()
-        .into_iter()
         .flat_map(|g| g.editors.iter())
         .filter(|e| e.path.as_deref() == Some(f.as_path()))
         .map(|e| e.git_baseline_for.clone())

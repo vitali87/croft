@@ -782,15 +782,11 @@ impl App {
         let Some(dfs) = target else {
             return false;
         };
-        // Same depth-first order as inactive_groups_mut, minus the active
-        // leaf — see collect_inactive_mut.
+        // inactive_groups_mut walks the leaves in depth-first order, minus
+        // the active one.
         let active = self.editor_layout.active_dfs_index();
         let inactive_idx = if dfs > active { dfs - 1 } else { dfs };
-        if let Some(group) = self
-            .editor_layout
-            .inactive_groups_mut()
-            .get_mut(inactive_idx)
-        {
+        if let Some(group) = self.editor_layout.inactive_groups_mut().nth(inactive_idx) {
             // A PDF page step is a synchronous rasterise, so a background
             // split's PDF coalesces a wheel burst exactly like the focused one
             // (see wheel_pdf_page), stamped after the render.
@@ -1030,7 +1026,6 @@ impl App {
             .chain(
                 self.editor_layout
                     .inactive_groups_mut()
-                    .into_iter()
                     .flat_map(|g| g.editors.iter_mut().map(|ed| (false, ed))),
             )
             .filter(|(_, ed)| ed.path.as_deref() == Some(path) && !ed.has_non_text_view())
@@ -1185,12 +1180,7 @@ impl App {
             .into_iter()
             .filter(|&i| !keep(&mut self.editor.editors[i], &whole_file_open))
             .collect();
-        for (g, group) in self
-            .editor_layout
-            .inactive_groups_mut()
-            .into_iter()
-            .enumerate()
-        {
+        for (g, group) in self.editor_layout.inactive_groups_mut().enumerate() {
             gone_inactive[g].retain(|&i| !keep(&mut group.editors[i], &whole_file_open));
         }
         notes.extend(kept_notes);
@@ -1202,16 +1192,10 @@ impl App {
         let pre_blank: Vec<bool> = self
             .editor_layout
             .inactive_groups()
-            .iter()
             .map(|g| g.is_blank_initial())
             .collect();
         let mut doomed = Vec::new();
-        for (g, group) in self
-            .editor_layout
-            .inactive_groups_mut()
-            .into_iter()
-            .enumerate()
-        {
+        for (g, group) in self.editor_layout.inactive_groups_mut().enumerate() {
             for &i in gone_inactive[g].iter().rev() {
                 group.close_tab(i);
             }
@@ -1523,7 +1507,6 @@ impl App {
         let in_splits = self
             .editor_layout
             .inactive_groups_mut()
-            .into_iter()
             .flat_map(|g| g.editors.iter_mut());
         for ed in before.iter_mut().chain(after.iter_mut()).chain(in_splits) {
             if ed.path.as_deref() == Some(path) {
@@ -1703,16 +1686,10 @@ impl App {
         let pre_blank: Vec<bool> = self
             .editor_layout
             .inactive_groups()
-            .iter()
             .map(|g| g.is_blank_initial())
             .collect();
         let mut doomed = Vec::new();
-        for (i, group) in self
-            .editor_layout
-            .inactive_groups_mut()
-            .into_iter()
-            .enumerate()
-        {
+        for (i, group) in self.editor_layout.inactive_groups_mut().enumerate() {
             let mut closed_here = false;
             while let Some(idx) = group.find_any_tab_with_path(path) {
                 group.close_tab(idx);
@@ -1734,12 +1711,7 @@ impl App {
     pub(super) fn close_clean_tabs_under_everywhere(&mut self, dir: &Path) {
         self.editor.close_clean_tabs_under(dir);
         let mut doomed = Vec::new();
-        for (i, group) in self
-            .editor_layout
-            .inactive_groups_mut()
-            .into_iter()
-            .enumerate()
-        {
+        for (i, group) in self.editor_layout.inactive_groups_mut().enumerate() {
             let touched = group
                 .editors
                 .iter()
@@ -1853,7 +1825,7 @@ impl App {
     /// away then. The closed tabs are recorded for Reopen Closed Editor, the
     /// focused group's last so they are the first to come back.
     pub(super) fn close_all_tabs(&mut self) {
-        let groups = self.editor_layout.inactive_groups().into_iter();
+        let groups = self.editor_layout.inactive_groups();
         let (records, unsaved) =
             bulk_close_records(groups.flat_map(|g| &g.editors).chain(&self.editor.editors));
         self.push_closed_tabs(records);
@@ -1861,12 +1833,7 @@ impl App {
         if self.editor_layout.is_split() {
             let mut emptied = Vec::new();
             let mut any_kept = !self.editor.is_blank_initial();
-            for (g, group) in self
-                .editor_layout
-                .inactive_groups_mut()
-                .into_iter()
-                .enumerate()
-            {
+            for (g, group) in self.editor_layout.inactive_groups_mut().enumerate() {
                 removed += group.close_all();
                 if group.is_blank_initial() {
                     emptied.push(g);

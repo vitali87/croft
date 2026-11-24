@@ -211,25 +211,6 @@ impl EditorLayout {
         }
     }
 
-    /// Every INACTIVE leaf's tabs (the active leaf's live hoisted in
-    /// `App::editor` and are not visited). Depth-first, stable order.
-    pub fn inactive_leaf_tabs(&self) -> Vec<&EditorTabs> {
-        fn walk<'a>(node: &'a LayoutNode, out: &mut Vec<&'a EditorTabs>) {
-            match node {
-                LayoutNode::Leaf(Some(tabs)) => out.push(tabs),
-                LayoutNode::Leaf(None) => {}
-                LayoutNode::Split { children, .. } => {
-                    for c in children {
-                        walk(&c.node, out);
-                    }
-                }
-            }
-        }
-        let mut out = Vec::new();
-        walk(&self.root, &mut out);
-        out
-    }
-
     /// True when more than one group exists (the editor pane is split).
     pub fn is_split(&self) -> bool {
         self.leaf_count() > 1
@@ -331,20 +312,20 @@ impl EditorLayout {
         activate_first(&mut self.root).expect("a surviving leaf must remain to promote")
     }
 
-    /// Mutable references to every non-active group, for fan-out work the app
-    /// must apply to all groups (LSP tokens, diagnostics, theme, focus flags).
-    pub fn inactive_groups_mut(&mut self) -> Vec<&mut EditorTabs> {
-        let mut out = Vec::new();
-        collect_inactive_mut(&mut self.root, &mut out);
-        out
+    /// Every non-active group, mutably, for fan-out work the app must apply
+    /// to all groups (LSP tokens, diagnostics, theme, focus flags). The same
+    /// groups in the same order as [`Self::inactive_groups`].
+    pub fn inactive_groups_mut(&mut self) -> impl Iterator<Item = &mut EditorTabs> {
+        InactiveGroupsMut::new(&mut self.root)
     }
 
-    /// Shared references to every non-active group, for read-only fan-out
-    /// (e.g. collecting the set of open paths across all groups).
-    pub fn inactive_groups(&self) -> Vec<&EditorTabs> {
-        let mut out = Vec::new();
-        collect_inactive(&self.root, &mut out);
-        out
+    /// Every non-active group (the active one's tabs live hoisted in
+    /// `App::editor` and are not visited), depth first: left to right and
+    /// top to bottom, the order [`Self::leaf_rects`] lays the groups out in,
+    /// with the active leaf left out. For read-only fan-out, such as
+    /// collecting the set of open paths across all groups.
+    pub fn inactive_groups(&self) -> impl Iterator<Item = &EditorTabs> {
+        InactiveGroups::new(&self.root)
     }
 
     /// Reference to the group at depth-first index `dfs`, if that leaf is an
@@ -446,9 +427,9 @@ fn prune_blank_rec<F: Fn(&EditorTabs) -> bool>(node: &mut LayoutNode, is_blank: 
     }
 }
 
-/// Inactive leaves are numbered in the order `collect_inactive` visits them:
+/// Inactive leaves are numbered in the order `inactive_groups()` visits them:
 /// children in order, depth first, so `next` advances exactly as that walk
-/// would and a position from `inactive_groups()` names the same leaf here.
+/// does and a position from `inactive_groups()` names the same leaf here.
 fn prune_at_rec(node: &mut LayoutNode, doomed: &[usize], next: &mut usize) {
     if let LayoutNode::Split { children, .. } = node {
         let mut kept = Vec::with_capacity(children.len());
@@ -760,25 +741,105 @@ fn activate_first(node: &mut LayoutNode) -> Option<EditorTabs> {
     }
 }
 
-fn collect_inactive<'a>(node: &'a LayoutNode, out: &mut Vec<&'a EditorTabs>) {
-    match node {
-        LayoutNode::Leaf(Some(tabs)) => out.push(tabs),
-        LayoutNode::Leaf(None) => {}
-        LayoutNode::Split { children, .. } => {
-            for c in children {
-                collect_inactive(&c.node, out);
+/// The walk behind [`EditorLayout::inactive_groups`]: the tree is visited as
+/// the caller asks for the next group, so no list of groups is built. Each
+/// split being walked keeps its place in its children; the root split's
+/// place is held apart from the others, so a layout with no split inside a
+/// split (groups side by side, or stacked) is walked without allocating.
+struct InactiveGroups<'a> {
+    /// A root leaf that owns its tabs. The layout keeps the root leaf
+    /// active, so this is only here to visit every leaf the tree can hold.
+    root_leaf: Option<&'a EditorTabs>,
+    /// The root split's children not visited yet.
+    root_children: std::slice::Iter<'a, LayoutChild>,
+    /// The children not visited yet of each split below the root on the
+    /// way to the current leaf, outermost first.
+    nested: Vec<std::slice::Iter<'a, LayoutChild>>,
+}
+
+impl<'a> InactiveGroups<'a> {
+    fn new(root: &'a LayoutNode) -> Self {
+        let (root_leaf, root_children) = match root {
+            LayoutNode::Leaf(tabs) => (tabs.as_ref(), Default::default()),
+            LayoutNode::Split { children, .. } => (None, children.iter()),
+        };
+        Self {
+            root_leaf,
+            root_children,
+            nested: Vec::new(),
+        }
+    }
+}
+
+impl<'a> Iterator for InactiveGroups<'a> {
+    type Item = &'a EditorTabs;
+
+    fn next(&mut self) -> Option<&'a EditorTabs> {
+        if let Some(tabs) = self.root_leaf.take() {
+            return Some(tabs);
+        }
+        loop {
+            let children = match self.nested.last_mut() {
+                Some(children) => children,
+                None => &mut self.root_children,
+            };
+            match children.next() {
+                Some(child) => match &child.node {
+                    LayoutNode::Leaf(Some(tabs)) => return Some(tabs),
+                    LayoutNode::Leaf(None) => {}
+                    LayoutNode::Split { children, .. } => self.nested.push(children.iter()),
+                },
+                // This split is done: carry on in the one holding it, or stop
+                // once the root split is done too.
+                None if self.nested.pop().is_some() => {}
+                None => return None,
             }
         }
     }
 }
 
-fn collect_inactive_mut<'a>(node: &'a mut LayoutNode, out: &mut Vec<&'a mut EditorTabs>) {
-    match node {
-        LayoutNode::Leaf(Some(tabs)) => out.push(tabs),
-        LayoutNode::Leaf(None) => {}
-        LayoutNode::Split { children, .. } => {
-            for c in children {
-                collect_inactive_mut(&mut c.node, out);
+/// [`InactiveGroups`] for [`EditorLayout::inactive_groups_mut`]: the same
+/// walk over mutable references.
+struct InactiveGroupsMut<'a> {
+    root_leaf: Option<&'a mut EditorTabs>,
+    root_children: std::slice::IterMut<'a, LayoutChild>,
+    nested: Vec<std::slice::IterMut<'a, LayoutChild>>,
+}
+
+impl<'a> InactiveGroupsMut<'a> {
+    fn new(root: &'a mut LayoutNode) -> Self {
+        let (root_leaf, root_children) = match root {
+            LayoutNode::Leaf(tabs) => (tabs.as_mut(), Default::default()),
+            LayoutNode::Split { children, .. } => (None, children.iter_mut()),
+        };
+        Self {
+            root_leaf,
+            root_children,
+            nested: Vec::new(),
+        }
+    }
+}
+
+impl<'a> Iterator for InactiveGroupsMut<'a> {
+    type Item = &'a mut EditorTabs;
+
+    fn next(&mut self) -> Option<&'a mut EditorTabs> {
+        if let Some(tabs) = self.root_leaf.take() {
+            return Some(tabs);
+        }
+        loop {
+            let children = match self.nested.last_mut() {
+                Some(children) => children,
+                None => &mut self.root_children,
+            };
+            match children.next() {
+                Some(child) => match &mut child.node {
+                    LayoutNode::Leaf(Some(tabs)) => return Some(tabs),
+                    LayoutNode::Leaf(None) => {}
+                    LayoutNode::Split { children, .. } => self.nested.push(children.iter_mut()),
+                },
+                None if self.nested.pop().is_some() => {}
+                None => return None,
             }
         }
     }
@@ -1237,6 +1298,114 @@ mod tests {
         assert!(!Dir::Left.places_new_after() && !Dir::Up.places_new_after());
     }
 
+    /// How many splits deep the tree goes: 0 for a single group.
+    fn depth(node: &LayoutNode) -> usize {
+        match node {
+            LayoutNode::Leaf(_) => 0,
+            LayoutNode::Split { children, .. } => {
+                1 + children.iter().map(|c| depth(&c.node)).max().unwrap_or(0)
+            }
+        }
+    }
+
+    /// Assert both walks visit exactly the owned leaves, in the depth-first
+    /// order `group_ref_at_dfs` numbers them in (a separate recursive walk),
+    /// with the active leaf left out.
+    fn assert_walks_match_dfs(layout: &mut EditorLayout) {
+        let expected: Vec<*const EditorTabs> = (0..layout.leaf_count())
+            .filter_map(|i| layout.group_ref_at_dfs(i))
+            .map(|g| g as *const EditorTabs)
+            .collect();
+        assert_eq!(expected.len(), layout.leaf_count() - 1, "one active leaf");
+        let shared: Vec<*const EditorTabs> = layout
+            .inactive_groups()
+            .map(|g| g as *const EditorTabs)
+            .collect();
+        assert_eq!(shared, expected, "inactive_groups in depth-first order");
+        let unique: Vec<*const EditorTabs> = layout
+            .inactive_groups_mut()
+            .map(|g| g as *const EditorTabs)
+            .collect();
+        assert_eq!(unique, expected, "inactive_groups_mut walks the same");
+    }
+
+    /// The walk visits every group but the active one, depth first, for
+    /// layouts built the way the user builds them: splits on both axes, a
+    /// split inside a split inside a split, and focus moved around between
+    /// splits so the active leaf sits first, last and in between.
+    #[test]
+    fn inactive_groups_walk_every_owned_leaf_depth_first() {
+        let mut layout = EditorLayout::single();
+        let mut active = EditorTabs::default();
+        assert_walks_match_dfs(&mut layout);
+        let dirs = [
+            Dir::Right,
+            Dir::Down,
+            Dir::Left,
+            Dir::Up,
+            Dir::Right,
+            Dir::Down,
+        ];
+        for step in 0..18 {
+            let dir = dirs[step % dirs.len()];
+            layout.split_active(
+                std::mem::take(&mut active),
+                dir.split_dir(),
+                dir.places_new_after(),
+            );
+            assert_walks_match_dfs(&mut layout);
+            let target = (step * 7) % layout.leaf_count();
+            active = layout.refocus_to_dfs(active, target);
+            assert_eq!(layout.active_dfs_index(), target);
+            assert_walks_match_dfs(&mut layout);
+        }
+        assert!(
+            depth(&layout.root) >= 4,
+            "fixture: splits nest {} deep",
+            depth(&layout.root)
+        );
+        while layout.is_split() {
+            active = layout.collapse_active();
+            assert_walks_match_dfs(&mut layout);
+        }
+        drop(active);
+    }
+
+    /// A root leaf yields its tabs when it owns them and nothing when it is
+    /// the active placeholder.
+    #[test]
+    fn inactive_groups_walk_a_root_leaf() {
+        let mut layout = EditorLayout::single();
+        assert_eq!(layout.inactive_groups().count(), 0);
+        assert_eq!(layout.inactive_groups_mut().count(), 0);
+        let mut owned = EditorLayout {
+            root: LayoutNode::Leaf(Some(EditorTabs::default())),
+        };
+        assert_eq!(owned.inactive_groups().count(), 1);
+        assert_eq!(owned.inactive_groups_mut().count(), 1);
+    }
+
+    /// Walking a single split, groups side by side or stacked, allocates
+    /// nothing: only a split inside a split needs the walk's stack.
+    #[test]
+    fn inactive_groups_walk_a_single_split_without_allocating() {
+        let mut layout = EditorLayout::single();
+        let mut active = EditorTabs::default();
+        for _ in 0..3 {
+            layout.split_active(std::mem::take(&mut active), SplitDir::Horizontal, true);
+        }
+        assert_eq!(depth(&layout.root), 1, "fixture: one split, four groups");
+        let mut walk = InactiveGroups::new(&layout.root);
+        assert_eq!(walk.by_ref().count(), 3);
+        assert_eq!(walk.nested.capacity(), 0, "shared walk allocated");
+        let mut walk = InactiveGroupsMut::new(&mut layout.root);
+        assert_eq!(walk.by_ref().count(), 3);
+        assert_eq!(walk.nested.capacity(), 0, "mutable walk allocated");
+        layout.split_active(std::mem::take(&mut active), SplitDir::Vertical, true);
+        assert_eq!(depth(&layout.root), 2, "fixture: a split inside the split");
+        assert_eq!(layout.inactive_groups().count(), 4);
+    }
+
     /// `prune_inactive_at` drops the named inactive groups and no other: with
     /// two inactive leaves, dooming the first leaves the second in place.
     #[test]
@@ -1245,16 +1414,20 @@ mod tests {
         layout.split_active(EditorTabs::default(), SplitDir::Horizontal, true);
         layout.split_active(EditorTabs::default(), SplitDir::Horizontal, true);
         assert_eq!(
-            layout.inactive_groups().len(),
+            layout.inactive_groups().count(),
             2,
             "fixture: two inactive leaves"
         );
         layout.prune_inactive_at(&[0]);
-        assert_eq!(layout.inactive_groups().len(), 1, "one named group is gone");
+        assert_eq!(
+            layout.inactive_groups().count(),
+            1,
+            "one named group is gone"
+        );
         assert!(layout.is_split(), "the other keeps its split");
         layout.prune_inactive_at(&[5]);
         assert_eq!(
-            layout.inactive_groups().len(),
+            layout.inactive_groups().count(),
             1,
             "a position past the end drops nothing"
         );

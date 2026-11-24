@@ -1685,7 +1685,10 @@ fn a_file_open_in_two_splits_keeps_one_set_of_bookmarks() {
         "the new split starts from the file's marks"
     );
     let other = |app: &App| {
-        app.editor_layout.inactive_groups()[0]
+        app.editor_layout
+            .inactive_groups()
+            .next()
+            .unwrap()
             .editors
             .iter()
             .find(|e| e.path.as_deref() == Some(a.as_path()))
@@ -1743,7 +1746,11 @@ fn a_mark_shared_between_two_splits_lands_on_its_line_in_each() {
     app.editor.cursor_row = 2;
     app.toggle_bookmark();
     assert_eq!(app.editor.bookmarked_lines(), vec![2, 3]);
-    let first = app.editor_layout.inactive_groups()[0]
+    let first = app
+        .editor_layout
+        .inactive_groups()
+        .next()
+        .unwrap()
         .editors
         .iter()
         .find(|e| e.path.as_deref() == Some(a.as_path()))
@@ -3035,18 +3042,26 @@ fn one_symbols_tabs_in_two_groups_keep_a_single_file_tab() {
     };
     let i = file_tab(&app.editor);
     app.editor.close_tab(i);
-    let other = &mut app.editor_layout.inactive_groups_mut()[0];
+    let other = &mut app.editor_layout.inactive_groups_mut().next().unwrap();
     let i = file_tab(other);
     other.close_tab(i);
     assert_eq!(app.editor.editors.len(), 1);
-    assert_eq!(app.editor_layout.inactive_groups()[0].editors.len(), 1);
+    assert_eq!(
+        app.editor_layout
+            .inactive_groups()
+            .next()
+            .unwrap()
+            .editors
+            .len(),
+        1
+    );
     app.focus_pane(Pane::Editor);
     app.handle_key(key(KeyCode::Char('a'), KeyModifiers::SUPER))
         .unwrap();
     app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
         .unwrap();
     assert!(
-        app.editor_layout.inactive_groups().is_empty(),
+        app.editor_layout.inactive_groups().next().is_none(),
         "the other copy closed and its group folded away"
     );
     assert_eq!(app.editor.editors.len(), 1);

@@ -57,7 +57,6 @@ impl App {
         let inactive: Vec<&crate::widgets::editor::Editor> = self
             .editor_layout
             .inactive_groups()
-            .into_iter()
             .flat_map(|g| g.editors.iter())
             .collect();
         let mut signature: Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)> = self
@@ -108,7 +107,6 @@ impl App {
             .chain(
                 self.editor_layout
                     .inactive_groups()
-                    .into_iter()
                     .flat_map(|g| g.editors.iter()),
             )
             .filter_map(|t| t.sarif.as_ref())
