@@ -49,11 +49,8 @@ impl App {
         path: &Path,
         edits: &[crate::widgets::editor::TextSpanEdit],
     ) -> Option<usize> {
-        if let Some(n) = self.editor.apply_rename_to_open_tab(path, edits) {
-            return Some(n);
-        }
         self.editor_layout
-            .inactive_groups_mut()
+            .all_groups_mut(&mut self.editor)
             .find_map(|group| group.apply_rename_to_open_tab(path, edits))
     }
 

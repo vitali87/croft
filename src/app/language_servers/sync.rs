@@ -204,11 +204,7 @@ impl App {
         // server `range` reply can't blank the off-screen colours, and the
         // identical `full` reply repaints to the same pixels (no snap).
         for (path, legend, data) in cache_hits {
-            if self.editor.path.as_deref() == Some(path.as_path()) {
-                self.editor
-                    .apply_semantic_tokens(path.clone(), data.clone(), legend.clone(), true);
-            }
-            for group in self.editor_layout.inactive_groups_mut() {
+            for group in self.editor_layout.all_groups_mut(&mut self.editor) {
                 if group.path.as_deref() == Some(path.as_path()) {
                     group.apply_semantic_tokens(path.clone(), data.clone(), legend.clone(), true);
                 }

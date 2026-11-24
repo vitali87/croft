@@ -146,13 +146,12 @@ impl App {
         self.code_lens_enabled = !self.code_lens_enabled;
         self.code_lens_requested.clear();
         if !self.code_lens_enabled {
-            for tab in self.editor.editors.iter_mut() {
+            for tab in self
+                .editor_layout
+                .all_groups_mut(&mut self.editor)
+                .flat_map(|g| g.editors.iter_mut())
+            {
                 tab.code_lenses.clear();
-            }
-            for group in self.editor_layout.inactive_groups_mut() {
-                for tab in group.editors.iter_mut() {
-                    tab.code_lenses.clear();
-                }
             }
         }
         self.status = format!(

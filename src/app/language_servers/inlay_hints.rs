@@ -42,11 +42,7 @@ impl App {
             return false;
         }
         let mut applied = false;
-        if self.editor.path.as_deref() == Some(path) {
-            apply(&mut self.editor);
-            applied = true;
-        }
-        for group in self.editor_layout.inactive_groups_mut() {
+        for group in self.editor_layout.all_groups_mut(&mut self.editor) {
             if group.path.as_deref() == Some(path) {
                 apply(group);
                 applied = true;
@@ -89,16 +85,10 @@ impl App {
     /// Every visible editor's file with where its buffer ends: the range an
     /// inlay-hint request covers (#1490).
     pub(in crate::app) fn inlay_hint_targets(&self) -> Vec<(PathBuf, lsp_types::Position)> {
-        let mut targets = Vec::new();
-        if let Some(p) = self.editor.path.clone() {
-            targets.push((p, self.editor.document_end()));
-        }
-        for group in self.editor_layout.inactive_groups() {
-            if let Some(p) = group.path.clone() {
-                targets.push((p, group.document_end()));
-            }
-        }
-        targets
+        self.editor_layout
+            .all_groups(&self.editor)
+            .filter_map(|g| Some((g.path.clone()?, g.document_end())))
+            .collect()
     }
 
     /// Editor: Toggle Inlay Hints — flips the hint display live and persists
@@ -110,8 +100,7 @@ impl App {
             self.request_inlay_hints_for_open_editors();
             self.status = String::from("Inlay Hints: on");
         } else {
-            self.editor.clear_inlay_hints();
-            for group in self.editor_layout.inactive_groups_mut() {
+            for group in self.editor_layout.all_groups_mut(&mut self.editor) {
                 group.clear_inlay_hints();
             }
             self.status = String::from("Inlay Hints: off");

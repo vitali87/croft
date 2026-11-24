@@ -33,19 +33,7 @@ impl App {
                 continue;
             }
             let mut applied_anywhere = false;
-            if self.editor.path.as_deref() == Some(u.path.as_path())
-                && self.editor.edit_seq == u.seq
-            {
-                self.editor.apply_semantic_tokens(
-                    u.path.clone(),
-                    u.data.clone(),
-                    u.legend.clone(),
-                    u.is_full,
-                );
-                changed = true;
-                applied_anywhere = true;
-            }
-            for group in self.editor_layout.inactive_groups_mut() {
+            for group in self.editor_layout.all_groups_mut(&mut self.editor) {
                 if group.path.as_deref() == Some(u.path.as_path()) && group.edit_seq == u.seq {
                     group.apply_semantic_tokens(
                         u.path.clone(),
@@ -99,15 +87,11 @@ impl App {
         if !lsp.take_semantic_refresh() {
             return;
         }
-        let mut paths: Vec<PathBuf> = Vec::new();
-        if let Some(p) = self.editor.path.clone() {
-            paths.push(p);
-        }
-        for group in self.editor_layout.inactive_groups() {
-            if let Some(p) = group.path.clone() {
-                paths.push(p);
-            }
-        }
+        let paths: Vec<PathBuf> = self
+            .editor_layout
+            .all_groups(&self.editor)
+            .filter_map(|g| g.path.clone())
+            .collect();
         for p in paths {
             // Re-request at the seq the doc was last synced at, so a reply
             // arriving after an external reload is recognised as stale.
