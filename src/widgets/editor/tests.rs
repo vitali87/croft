@@ -22536,7 +22536,7 @@ fn every_route_opens_the_view_it_opens_today() {
             "big.csv",
             Box::new(|p| sized_file(p, b"a,b\n", crate::sheet::CSV_BYTES_CAP + 1)),
         ),
-        ("book", Box::new(|p| write_minimal_xlsx(p))),
+        ("book", Box::new(write_minimal_xlsx)),
         (
             "big.zip",
             Box::new(|p| sized_file(p, b"", crate::archive::ZIP_LIST_CAP + 1)),
