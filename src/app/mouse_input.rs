@@ -586,6 +586,51 @@ impl App {
         }
     }
 
+    /// End every press and drag under way without doing what its release
+    /// would (#2678 review): no drop, no reorder, no copy-on-select. A press
+    /// a program in a terminal pane asked for still gets its release there,
+    /// so the program never sees the button held down.
+    pub(super) fn abandon_mouse_gestures(&mut self, m: &MouseEvent) {
+        self.editor_tab_drag_from = None;
+        self.editor_line_drag = None;
+        if let Some(fp) = self.terminal_pointer_forwarded.take()
+            && let Some(idx) = self.forwarded_pane_index(fp)
+        {
+            let (col, row) = self.terminals[idx].clamp_to_grid(m.column, m.row);
+            self.terminals[idx].report_mouse(
+                MouseButtonKind::Left,
+                MouseAction::Release,
+                col,
+                row,
+                mouse_mods(m),
+            );
+            if fp.selecting {
+                self.terminals[idx].end_drag();
+            }
+        }
+        self.terminal_select_autoscroll = None;
+        self.terminal_drag_from = None;
+        if self.editor.box_selecting() {
+            self.editor.end_box_select();
+        }
+        self.splitter_drag = None;
+        self.minimap_drag = false;
+        self.scrollbar_drag = None;
+        self.editor_hscrollbar_drag = false;
+        self.breakpoint_lane_press = false;
+        self.outline_scrollbar_drag = false;
+        self.secondary_outline_scrollbar_drag = false;
+        self.open_editors_scrollbar_drag = false;
+        self.timeline_scrollbar_drag = false;
+        self.deps_scrollbar_drag = false;
+        self.testing_scrollbar_drag = false;
+        self.graph_scrollbar_drag = false;
+        self.scrub_dragging = false;
+        if self.tree_drag.take().is_some() {
+            self.tree.drag_target = None;
+        }
+    }
+
     pub(super) fn handle_mouse_inner(&mut self, m: MouseEvent) {
         // So does a click (#1609), except on the message itself, which opens
         // its full text below.
@@ -614,8 +659,12 @@ impl App {
         }
         // The pending paste was checked against the active pane and the
         // broadcast set; a click that switched panes would send it to one
-        // that was never checked. Only the popup's keys answer it.
+        // that was never checked. Only the popup's keys answer it. A drag
+        // it cut short ends without its drop, as under the others below.
         if self.pending_terminal_paste.is_some() {
+            if matches!(m.kind, MouseEventKind::Up(_)) {
+                self.abandon_mouse_gestures(&m);
+            }
             return;
         }
         // A click on a find bar (in the editor or over a terminal) puts the
@@ -671,8 +720,11 @@ impl App {
         }
         // A click on the port-detection toast's action buttons is consumed
         // before anything else; clicks elsewhere fall through to normal
-        // handling, so the toast never blocks the rest of the UI.
+        // handling, so the toast never blocks the rest of the UI. The pop-ups
+        // are drawn over the toasts, so while one is open a click on a
+        // button it hides must not press it (#2678 review).
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+            && !self.popup_open()
             && (self.handle_port_toast_click(m.column, m.row)
                 || self.handle_update_toast_click(m.column, m.row))
         {
@@ -684,6 +736,13 @@ impl App {
         // move the tabs it is asking about (#862), and the same holds for
         // what each of the others asks about (#2674).
         if self.popup_takes_the_mouse() {
+            // A drag under way when the pop-up opened ends with the release
+            // the pop-up takes, without its drop: left live, the next release
+            // after the pop-up closed finished it, moving a file into the
+            // folder it was over (#2678 review).
+            if matches!(m.kind, MouseEventKind::Up(_)) {
+                self.abandon_mouse_gestures(&m);
+            }
             return;
         }
         // The history scrubber's slider (#371): a press on the track seeks

@@ -175,11 +175,16 @@ impl App {
     }
 
     /// Whether an open pop-up takes every mouse event, as one that handles
-    /// no mouse of its own does (#2674).
+    /// no mouse of its own does (#2674). Settings opens an input prompt over
+    /// itself to edit a value, and gives it the keys while it is up (see
+    /// `handle_key_inner`); it gives it the mouse too, so a click outside the
+    /// prompt closes it as anywhere else (#2678 review).
     pub(super) fn popup_takes_the_mouse(&self) -> bool {
-        Popup::ALL
-            .iter()
-            .any(|p| !p.handles_mouse() && p.is_open(self))
+        Popup::ALL.iter().any(|&p| {
+            !p.handles_mouse()
+                && p.is_open(self)
+                && !(p == Popup::SettingsEditor && self.input_prompt.is_some())
+        })
     }
 
     /// Whether one of the pop-ups drawn over the middle of the screen is

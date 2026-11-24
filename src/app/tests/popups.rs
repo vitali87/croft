@@ -849,6 +849,108 @@ fn a_paste_with_a_right_click_menu_open_goes_nowhere() {
     }
 }
 
+/// #2678 review (Codex): Settings opens an input prompt over itself to edit
+/// a value, and the prompt has the keys while it is up. It has the mouse
+/// too: a click outside it closes it, as anywhere else, and Settings stays.
+#[test]
+fn a_click_outside_a_setting_value_prompt_closes_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let _hook = open(&mut app, Popup::SettingsEditor);
+    app.input_prompt = Some(crate::widgets::input_prompt::InputPrompt::new(
+        crate::widgets::input_prompt::InputPurpose::SettingValue {
+            key: String::from("tab_size"),
+        },
+        "tab size",
+        "new value",
+    ));
+    draw(&mut app, 160, 40);
+    left_click(&mut app, 0, 0);
+    assert!(
+        app.input_prompt.is_none(),
+        "the click outside closed the prompt"
+    );
+    assert!(app.settings_editor.is_some(), "Settings stays under it");
+}
+
+/// #2678 review (Greptile): a pop-up that opens mid-drag takes the release.
+/// The drag ends there without its drop. Left live, the next release after
+/// the pop-up closed finished it and moved the file into the folder.
+#[test]
+fn a_drag_a_popup_cuts_short_drops_nothing_later() {
+    let mut dropped = Vec::new();
+    for p in Popup::ALL.into_iter().filter(|p| !p.handles_mouse()) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("src.txt"), "x").unwrap();
+        std::fs::create_dir(tmp.path().join("dest")).unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.tree.last_area = Rect::new(0, 0, 40, 8);
+        app.tree.last_inner = Rect::new(1, 1, 38, 6);
+        let row_of = |app: &App, name: &str| {
+            let i = app.tree.nodes.iter().position(|n| n.path.ends_with(name));
+            app.tree.last_inner.y + i.expect("the tree lists it") as u16
+        };
+        let (src_row, dest_row) = (row_of(&app, "src.txt"), row_of(&app, "dest"));
+        let mouse = |app: &mut App, kind, row| {
+            app.handle_mouse(crossterm::event::MouseEvent {
+                kind,
+                column: 6,
+                row,
+                modifiers: KeyModifiers::NONE,
+            });
+        };
+        use crossterm::event::{MouseButton::Left, MouseEventKind::*};
+        mouse(&mut app, Down(Left), src_row);
+        mouse(&mut app, Drag(Left), dest_row);
+        let hook = open(&mut app, p);
+        mouse(&mut app, Up(Left), dest_row);
+        close(&mut app, p);
+        drop(hook);
+        mouse(&mut app, Up(Left), dest_row);
+        if tmp.path().join("dest/src.txt").exists() {
+            dropped.push(format!("{p:?}"));
+        }
+    }
+    assert!(
+        dropped.is_empty(),
+        "a drag cut short by these pop-ups dropped the file later: {}",
+        dropped.join(", ")
+    );
+}
+
+/// #2678 review (Greptile): the port toast is drawn under the pop-ups, so a
+/// click on one of its buttons while a pop-up is open lands on a button the
+/// pop-up may hide. It must not press it.
+#[test]
+fn a_toast_button_under_a_popup_is_not_pressed() {
+    let mut pressed = Vec::new();
+    for p in Popup::ALL {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.show_port_toast(3000, Some("node".into()));
+        draw(&mut app, 140, 50);
+        let dismiss = app
+            .port_toast
+            .as_ref()
+            .expect("the toast shows")
+            .buttons
+            .iter()
+            .find(|(_, a)| matches!(a, super::PortToastAction::Dismiss))
+            .map(|(r, _)| *r)
+            .expect("the toast has a dismiss button");
+        let _hook = open(&mut app, p);
+        left_click(&mut app, dismiss.x, dismiss.y);
+        if app.port_toast.is_none() {
+            pressed.push(format!("{p:?}"));
+        }
+    }
+    assert!(
+        pressed.is_empty(),
+        "a click pressed the toast's button under these pop-ups: {}",
+        pressed.join(", ")
+    );
+}
+
 /// The bug (#2674): only an agent's proposal, the two unsaved-changes
 /// prompts and the terminal paste question took the mouse. Under the other
 /// nine confirms, Settings and the startup warning, a click went to what
