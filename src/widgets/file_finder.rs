@@ -1,3 +1,4 @@
+use crate::widgets::picker_colours;
 use crate::widgets::picker_query;
 use ignore::{WalkBuilder, WalkState};
 use ratatui::{
@@ -1461,9 +1462,9 @@ pub fn render_file_finder(
     );
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))))
+        .border_style(Style::default().fg(theme.ui(picker_colours::BORDER)))
         .title(title.clone())
-        .style(Style::default().bg(theme.ui(Color::Rgb(0x16, 0x18, 0x1f))));
+        .style(Style::default().bg(theme.ui(picker_colours::BODY)));
     let inner = Rect {
         x: rect.x + 1,
         y: rect.y + 1,
@@ -1480,7 +1481,7 @@ pub fn render_file_finder(
         let (r, g, b) = crate::gradient::POPUP_SEL_BG;
         Color::Rgb(r, g, b)
     } else {
-        theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e))
+        theme.ui(picker_colours::SELECTION)
     };
 
     if inner.height == 0 || inner.width == 0 {
@@ -1488,11 +1489,11 @@ pub fn render_file_finder(
     }
 
     let query_style = Style::default()
-        .fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
+        .fg(theme.ui(picker_colours::TEXT))
         .add_modifier(Modifier::BOLD);
     let caret_style = Style::default()
-        .fg(theme.ui(Color::Rgb(0x16, 0x18, 0x1f)))
-        .bg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
+        .fg(theme.ui(picker_colours::BODY))
+        .bg(theme.ui(picker_colours::TEXT))
         .add_modifier(Modifier::SLOW_BLINK);
     let cursor = finder.cursor.min(finder.query.chars().count());
     let before: String = finder.query.chars().take(cursor).collect();
@@ -1500,10 +1501,7 @@ pub fn render_file_finder(
     let after: String = finder.query.chars().skip(cursor + 1).collect();
     let caret_glyph = if at.is_empty() { String::from(" ") } else { at };
     let prompt_line = Line::from(vec![
-        Span::styled(
-            "> ",
-            Style::default().fg(theme.ui(Color::Rgb(0x88, 0xc0, 0xd0))),
-        ),
+        Span::styled("> ", Style::default().fg(theme.ui(picker_colours::PROMPT))),
         Span::styled(before, query_style),
         Span::styled(caret_glyph, caret_style),
         Span::styled(after, query_style),
@@ -1569,12 +1567,12 @@ pub fn render_file_finder(
         let empty = if finder.query.trim().is_empty() {
             Line::from(Span::styled(
                 "  (no files indexed)",
-                Style::default().fg(theme.ui(Color::Rgb(0x7a, 0x82, 0x90))),
+                Style::default().fg(theme.ui(picker_colours::DIM)),
             ))
         } else {
             Line::from(Span::styled(
                 format!("  No matches for '{}'", finder.query),
-                Style::default().fg(theme.ui(Color::Rgb(0x7a, 0x82, 0x90))),
+                Style::default().fg(theme.ui(picker_colours::DIM)),
             ))
         };
         Widget::render(Paragraph::new(empty), list_rect, buf);
@@ -1588,14 +1586,14 @@ pub fn render_file_finder(
         let row_style = if is_selected {
             Style::default().bg(sel_bg).fg(theme.ui(Color::White))
         } else {
-            Style::default().fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
+            Style::default().fg(theme.ui(picker_colours::TEXT))
         };
         let dir_style = if is_selected {
             Style::default()
                 .bg(sel_bg)
-                .fg(theme.ui(Color::Rgb(0xa0, 0xb4, 0xd8)))
+                .fg(theme.ui(picker_colours::DETAIL_BRIGHT))
         } else {
-            Style::default().fg(theme.ui(Color::Rgb(0x8e, 0x95, 0xa4)))
+            Style::default().fg(theme.ui(picker_colours::DETAIL))
         };
         let (dir_part, file_part) = split_dir_file(&result.entry.rel, result.entry.filename_start);
         let prefix = if is_selected { "> " } else { "  " };

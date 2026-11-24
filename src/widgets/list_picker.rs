@@ -8,6 +8,7 @@
 //! existing row, so it stays a thin list. The App tags it with a
 //! [`ListPurpose`] and reads back the chosen row's `id`.
 
+use crate::widgets::picker_colours;
 use crate::widgets::picker_query;
 use ratatui::{
     buffer::Buffer,
@@ -315,9 +316,9 @@ pub fn render_list_picker(
     );
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))))
+        .border_style(Style::default().fg(theme.ui(picker_colours::BORDER)))
         .title(title.clone())
-        .style(Style::default().bg(theme.ui(Color::Rgb(0x16, 0x18, 0x1f))));
+        .style(Style::default().bg(theme.ui(picker_colours::BODY)));
     let inner = Rect {
         x: rect.x + 1,
         y: rect.y + 1,
@@ -333,7 +334,7 @@ pub fn render_list_picker(
         let (r, g, b) = crate::gradient::POPUP_SEL_BG;
         Color::Rgb(r, g, b)
     } else {
-        theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e))
+        theme.ui(picker_colours::SELECTION)
     };
     if inner.width == 0 || inner.height == 0 {
         return;
@@ -345,17 +346,14 @@ pub fn render_list_picker(
     let at: String = picker.query.chars().skip(cursor).take(1).collect();
     let after: String = picker.query.chars().skip(cursor + 1).collect();
     let caret = if at.is_empty() { " ".to_string() } else { at };
-    let qstyle = Style::default().fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)));
+    let qstyle = Style::default().fg(theme.ui(picker_colours::TEXT));
     let caret_style = Style::default()
-        .fg(theme.ui(Color::Rgb(0x16, 0x18, 0x1f)))
-        .bg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
+        .fg(theme.ui(picker_colours::BODY))
+        .bg(theme.ui(picker_colours::TEXT))
         .add_modifier(Modifier::SLOW_BLINK);
     Widget::render(
         Paragraph::new(Line::from(vec![
-            Span::styled(
-                "> ",
-                Style::default().fg(theme.ui(Color::Rgb(0x88, 0xc0, 0xd0))),
-            ),
+            Span::styled("> ", Style::default().fg(theme.ui(picker_colours::PROMPT))),
             Span::styled(before, qstyle),
             Span::styled(caret, caret_style),
             Span::styled(after, qstyle),
@@ -383,7 +381,7 @@ pub fn render_list_picker(
         Widget::render(
             Paragraph::new(Line::from(Span::styled(
                 "  (nothing to choose)",
-                Style::default().fg(theme.ui(Color::Rgb(0x7a, 0x82, 0x90))),
+                Style::default().fg(theme.ui(picker_colours::DIM)),
             ))),
             list,
             buf,
@@ -405,7 +403,7 @@ pub fn render_list_picker(
         let style = if is_sel {
             Style::default().bg(sel_bg).fg(theme.ui(Color::White))
         } else {
-            Style::default().fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
+            Style::default().fg(theme.ui(picker_colours::TEXT))
         };
         let prefix = if is_sel { "> " } else { "  " };
         lines.push(Line::from(vec![

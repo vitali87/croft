@@ -18,6 +18,7 @@ use ratatui::{
 };
 
 use crate::command_history::{HistoryEntry, HistoryScope};
+use crate::widgets::picker_colours;
 use crate::widgets::picker_query;
 
 pub struct HistoryPopup {
@@ -117,9 +118,9 @@ pub fn render_history_popup(
     );
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))))
+        .border_style(Style::default().fg(theme.ui(picker_colours::BORDER)))
         .title(title.clone())
-        .style(Style::default().bg(theme.ui(Color::Rgb(0x16, 0x18, 0x1f))));
+        .style(Style::default().bg(theme.ui(picker_colours::BODY)));
     let inner = Rect {
         x: rect.x + 1,
         y: rect.y + 1,
@@ -138,17 +139,17 @@ pub fn render_history_popup(
         let (r, g, b) = crate::gradient::POPUP_SEL_BG;
         Color::Rgb(r, g, b)
     } else {
-        theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e))
+        theme.ui(picker_colours::SELECTION)
     };
     let tones = crate::widgets::surface::tones(theme);
 
     // Query line with a block caret, the zoxide-jump idiom.
     let query_style = Style::default()
-        .fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
+        .fg(theme.ui(picker_colours::TEXT))
         .add_modifier(Modifier::BOLD);
     let caret_style = Style::default()
-        .fg(theme.ui(Color::Rgb(0x16, 0x18, 0x1f)))
-        .bg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)));
+        .fg(theme.ui(picker_colours::BODY))
+        .bg(theme.ui(picker_colours::TEXT));
     let cursor = pop.cursor.min(picker_query::char_count(&pop.query));
     let before: String = pop.query.chars().take(cursor).collect();
     let at: String = pop.query.chars().skip(cursor).take(1).collect();
@@ -160,10 +161,7 @@ pub fn render_history_popup(
         HistoryScope::Failed => String::from("  [failed only]"),
     };
     let prompt_line = Line::from(vec![
-        Span::styled(
-            "> ",
-            Style::default().fg(theme.ui(Color::Rgb(0x88, 0xc0, 0xd0))),
-        ),
+        Span::styled("> ", Style::default().fg(theme.ui(picker_colours::PROMPT))),
         Span::styled(before, query_style),
         Span::styled(caret_glyph, caret_style),
         Span::styled(after, query_style),
@@ -232,7 +230,7 @@ pub fn render_history_popup(
             None => (
                 theme.ui(Color::Rgb(0x4f, 0xb1, 0xa6)),
                 Style::default()
-                    .fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
+                    .fg(theme.ui(picker_colours::TEXT))
                     .add_modifier(Modifier::BOLD),
                 theme.ui(Color::Rgb(0x80, 0x88, 0x98)),
             ),
