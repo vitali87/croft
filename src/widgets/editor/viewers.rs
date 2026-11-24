@@ -1547,7 +1547,12 @@ impl Editor {
             h.finish()
         };
         let dir = gunzip_scratch_dir()?;
-        sweep_gunzip_copies(&dir, false);
+        // Off this thread: an archive restored at launch opens before the
+        // first frame, and the sweep must not hold that frame up.
+        let swept = dir.clone();
+        let _ = std::thread::Builder::new()
+            .name(String::from("gunzip-sweep"))
+            .spawn(move || sweep_gunzip_copies(&swept, false));
         let scratch = dir.join(gunzip_copy_name(
             key,
             std::process::id(),
@@ -2554,10 +2559,22 @@ pub(super) fn gunzip_scratch_dir() -> std::io::Result<std::path::PathBuf> {
 /// The file name of the `n`th copy this process makes of the archive whose
 /// path hashes to `key` (#2675). Every opening gets its own file, so a tab
 /// closing never deletes a copy another tab still reads, and the process id
-/// tells a later croft whose copy it is.
+/// tells a later croft whose copy it is. The archive's own name ends it,
+/// cut from the front to its last [`GUNZIP_NAME_KEEP`] bytes, so the whole
+/// stays within the 255 bytes most file systems allow a name and a long
+/// one still opens.
 pub(super) fn gunzip_copy_name(key: u64, pid: u32, n: u64, inner: &str) -> String {
-    format!("{key:016x}-{pid}-{n}-{inner}")
+    let mut cut = inner.len().saturating_sub(GUNZIP_NAME_KEEP);
+    while !inner.is_char_boundary(cut) {
+        cut += 1;
+    }
+    format!("{key:016x}-{pid}-{n}-{}", &inner[cut..])
 }
+
+/// How much of an archive's name its copy keeps: 255 bytes less the
+/// longest key, process id and count with their dashes (16, 10 and 20
+/// digits, 3 dashes).
+const GUNZIP_NAME_KEEP: usize = 255 - (16 + 10 + 20 + 3);
 
 /// How many copies of the archive hashing to `key` this process has made
 /// before this one.
@@ -2610,17 +2627,23 @@ pub(super) fn sweep_gunzip_copies(dir: &Path, own: bool) {
     }
 }
 
-/// Whether a process with this id is running. The folder is one user's,
-/// so a process that user cannot signal is someone else's that took the id.
-/// Where that cannot be asked, every other process counts as running.
+/// Whether a process with this id may be running. Only "no such process"
+/// counts as gone: one this user may not signal, because a security policy
+/// says no or another user took the id, counts as running, so a copy still
+/// in use is never deleted. Where that cannot be asked, every other process
+/// counts as running.
 fn process_is_running(pid: u32) -> bool {
     #[cfg(unix)]
     {
         let Ok(pid) = libc::pid_t::try_from(pid) else {
             return true;
         };
+        if pid <= 0 {
+            return true;
+        }
         // SAFETY: signal 0 only checks the process exists; nothing is sent.
-        pid > 0 && unsafe { libc::kill(pid, 0) } == 0
+        let probe = unsafe { libc::kill(pid, 0) };
+        probe == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
     #[cfg(not(unix))]
     {

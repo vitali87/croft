@@ -3735,6 +3735,23 @@ fn a_gzip_cut_short_leaves_no_partial_copy() {
     assert!(left.is_empty(), "partial copies left behind: {left:?}");
 }
 
+/// #2676 review (Codex): a gzip whose name is near the 255 bytes a file
+/// name may have still opens as text. Its copy's name added a prefix to the
+/// whole name, went past the limit, and the gzip fell back to hex.
+#[test]
+fn a_gzip_with_a_long_name_still_opens_as_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let gz = tmp.path().join(format!("{}.log.gz", "a".repeat(244)));
+    gzip_to(&gz, b"a line with a long name\n");
+    let mut e = Editor::new();
+    e.open(&gz).unwrap();
+    assert!(e.hex.is_none(), "not hex");
+    assert_eq!(log_lines(&mut e, 1), ["a line with a long name"]);
+    let copy = e.log.as_ref().expect("the log view").path.clone();
+    let name = copy.file_name().unwrap().to_str().unwrap();
+    assert!(name.len() <= 255 && name.ends_with("aaa.log"), "{name}");
+}
+
 /// #2675: two tabs on one archive read copies of their own, so closing
 /// one never deletes the text the other is showing.
 #[test]
@@ -3755,8 +3772,9 @@ fn closing_one_of_two_tabs_on_an_archive_keeps_the_others_text() {
 
 /// #2675: a copy whose croft is gone, killed or cut off with its ssh
 /// session, is deleted the next time an archive opens. A running croft's
-/// copies stay, and so do files that are not copies. This process's own
-/// go only on the way out that skips the tabs' clean-up.
+/// copies stay, even one this user may not signal (#2676 review), and so
+/// do files that are not copies. This process's own go only on the way out
+/// that skips the tabs' clean-up.
 #[cfg(unix)]
 #[test]
 fn copies_of_a_croft_that_is_gone_are_swept() {
@@ -3768,10 +3786,14 @@ fn copies_of_a_croft_that_is_gone_are_swept() {
     let me = std::process::id();
     let copy = |pid| gunzip_copy_name(0xabc, pid, 0, "app.log");
     let older = format!("{:016x}-app.log", 0xabc);
+    // Process 1 always runs, and a user other than root may not signal it:
+    // a probe that is refused must not read as a process that is gone.
+    let init = copy(1);
     for name in [
         copy(gone),
         copy(running),
         copy(me),
+        init.clone(),
         "notes.txt".into(),
         older.clone(),
     ] {
@@ -3781,6 +3803,7 @@ fn copies_of_a_croft_that_is_gone_are_swept() {
     sweep_gunzip_copies(dir.path(), false);
     assert!(!kept(&copy(gone)), "the copy of a croft that is gone");
     assert!(kept(&copy(running)) && kept(&copy(me)));
+    assert!(kept(&init), "a process this user may not signal still runs");
     assert!(
         kept("notes.txt") && kept(&older),
         "files that are not copies"
