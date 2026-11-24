@@ -4241,6 +4241,15 @@ fn every_open_route_says_why_a_file_landed_in_hex() {
     let _ = app.apply_view_request(&big);
     assert!(app.editor.hex.is_some(), "staging: the zip opens as hex");
     assert!(app.status.contains(why), "croft <file>: {:?}", app.status);
+    // Asking again only switches to the tab, whose status line has moved on
+    // since (a hex save or undo writes there): the reason still comes back.
+    app.editor.status = String::from("No pending byte edits");
+    let _ = app.apply_view_request(&big);
+    assert!(
+        app.status.contains(why),
+        "croft <file> again: {:?}",
+        app.status
+    );
 
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER))
@@ -4250,4 +4259,18 @@ fn every_open_route_says_why_a_file_landed_in_hex() {
         .unwrap();
     assert!(app.editor.hex.is_some(), "staging: the zip opens as hex");
     assert!(app.status.contains(why), "Quick Open: {:?}", app.status);
+
+    // A line hint is for text: the reason wins over it too.
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER))
+        .unwrap();
+    type_keys(&mut app, "big.zip:1");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.editor.hex.is_some(), "staging: the zip opens as hex");
+    assert!(
+        app.status.contains(why),
+        "Quick Open big.zip:1: {:?}",
+        app.status
+    );
 }
