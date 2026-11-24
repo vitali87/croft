@@ -1,1 +1,0 @@
-refactor: The broadcast, multi-line paste and run-block confirms draw their frame through the shared confirm painter, so every confirm dialog now shares one frame (#2062). They look exactly as before.

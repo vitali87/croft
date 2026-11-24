@@ -1,1 +1,0 @@
-fix: A click on a breakpoint or the debugger's stop arrow on the line an AI pilot is streaming into no longer stops the stream and reverts its text: the gutter's first column now answers a click with the glyph it shows, so the click removes the breakpoint, as in VS Code (#2694).
