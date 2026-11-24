@@ -4195,3 +4195,27 @@ fn every_activity_icon_bakes_as_it_did_before_the_table() {
         );
     }
 }
+
+/// A tab with two views filled fails the test-only check (#2062), even in a
+/// group without focus, and the check runs on every key: the hex view and
+/// the rendered log here sit on one tab of the group the split left behind.
+#[test]
+#[should_panic(expected = "shows 2 views at once: hex, log")]
+fn two_views_on_one_tab_fail_the_check_in_any_group() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("notes.txt");
+    std::fs::write(&f, "one\ntwo\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.split_editor();
+    let left = app
+        .editor_layout
+        .inactive_groups_mut()
+        .next()
+        .expect("staging: the split leaves one group without focus");
+    left.hex = Some(crate::hex::HexView::open(&f).unwrap());
+    left.log = Some(crate::log_view::LogView::open(&f).unwrap());
+
+    let _ = app.handle_key(key(KeyCode::Down, KeyModifiers::NONE));
+}

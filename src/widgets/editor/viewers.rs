@@ -1061,7 +1061,7 @@ impl Editor {
     /// in for its text and the two layers drawn over it (a merge, a Markdown
     /// preview). A tab shows one at most; two is the state #2069 was, where
     /// keys went to a document preview hidden under the image opened after
-    /// it. Test builds check every tab after every gesture
+    /// it. Test builds check every tab after every key, click and paste
     /// (`App::assert_one_view_per_tab`).
     #[cfg(test)]
     pub(crate) fn views_filled(&self) -> Vec<&'static str> {

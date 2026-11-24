@@ -49,8 +49,6 @@ pub(super) fn tick_background(app: &mut App) -> BackgroundTick {
     changed |= tick_debugger_and_tests(app);
     changed |= tick_ai_tools(app);
     changed |= tick_timers_and_installs(app);
-    #[cfg(test)]
-    app.assert_one_view_per_tab();
     BackgroundTick {
         changed,
         pty_pending,

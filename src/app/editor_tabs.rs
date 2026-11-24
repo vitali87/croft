@@ -411,9 +411,9 @@ impl App {
     }
 
     /// Fail when any tab, in any group, has more than one view slot filled
-    /// ([`Editor::views_filled`]). Test builds run it after every key, click,
-    /// paste and background pass, so every test that drives the app checks
-    /// it, not only the tests written about viewers.
+    /// ([`Editor::views_filled`]). Test builds run it after every key, click
+    /// and paste, so every test that drives the app through them checks it,
+    /// not only the tests written about viewers.
     #[cfg(test)]
     pub(super) fn assert_one_view_per_tab(&self) {
         for group in self.editor_layout.all_groups(&self.editor) {
