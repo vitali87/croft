@@ -1,0 +1,1 @@
+refactor: The ten ways a tab becomes a viewer (image, SVG, PDF, sheet, document, media, archive, log, SARIF and hex) share one reset instead of ten copies of it (#2062). Every file opens exactly as before.
