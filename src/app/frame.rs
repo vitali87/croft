@@ -2574,15 +2574,31 @@ impl App {
             status: status.clone(),
             ..Default::default()
         };
+        // Named for what Enter does with it (#2670 review): the same picker
+        // checks out, deletes, merges, rebases onto or branches from.
         if let Some(p) = &self.branch_picker {
-            let item = p.selected_action().map(|a| match a {
-                crate::widgets::branch_picker::BranchAction::Checkout(name)
-                | crate::widgets::branch_picker::BranchAction::Track { name, .. } => name,
-                crate::widgets::branch_picker::BranchAction::Create(name) => {
-                    format!("{} {name}", tr("Create branch"))
-                }
-            });
-            return picker("Checkout / Create Branch", item);
+            use super::scm::BranchPurpose;
+            use crate::widgets::branch_picker::BranchAction;
+            let title = match self.branch_purpose {
+                BranchPurpose::Checkout => "Checkout / Create Branch",
+                BranchPurpose::CreateFrom => "Create Branch from",
+                BranchPurpose::Delete => "Delete Branch",
+                BranchPurpose::Merge => "Merge Branch",
+                BranchPurpose::Rebase => "Rebase onto Branch",
+            };
+            let item = if self.branch_purpose == BranchPurpose::Checkout {
+                p.selected_action().map(|a| match a {
+                    BranchAction::Checkout(name) | BranchAction::Track { name, .. } => name,
+                    BranchAction::Create(name) => format!("{} {name}", tr("Create branch")),
+                })
+            } else {
+                // The others act on an existing branch only.
+                Some(
+                    p.selected_existing_branch()
+                        .unwrap_or_else(|| tr("Choose an existing branch")),
+                )
+            };
+            return picker(title, item);
         }
         if let Some(p) = &self.command_history_popup {
             return picker("Command History", p.selected_entry().map(|e| e.cmd.clone()));
@@ -2610,14 +2626,31 @@ impl App {
                 p.selected_target().map(|t| t.label.clone()),
             );
         }
+        // Where each match is, so two `new`s in two files sound different
+        // (#2670 review).
         if let Some(p) = &self.workspace_symbols {
-            return picker(
-                "Go to Symbol in Workspace",
-                p.selected_item().map(|i| i.name.clone()),
-            );
+            let item = p.selected_item().map(|i| {
+                let path = i.path.strip_prefix(&p.root).unwrap_or(&i.path);
+                let mut said = i.name.clone();
+                if let Some(c) = &i.container {
+                    said.push_str(&format!(", {} {c}", tr("in")));
+                }
+                format!("{said}, {}:{}", path.display(), i.line + 1)
+            });
+            return picker("Go to Symbol in Workspace", item);
         }
+        // `:42` jumps to a line: say so, not the symbol last selected
+        // (#2670 review).
         if let Some(p) = &self.go_to_symbol {
-            return picker("Go to Symbol", p.selected_name().map(String::from));
+            let item = if p.is_line_mode() {
+                Some(match p.line_target() {
+                    Some(n) => format!("{} {n}", tr("Go to line")),
+                    None => tr("Type a line number"),
+                })
+            } else {
+                p.selected_name().map(String::from)
+            };
+            return picker("Go to Symbol", item);
         }
         if let Some(p) = &self.command_palette {
             return Snapshot {
@@ -2800,6 +2833,15 @@ impl App {
         if let Some(d) = &self.connect_dialog {
             let title = format!("{} {}", tr("Connect to"), d.host);
             let mut body = vec![d.status_line.clone()];
+            // What failed, and what a yes to the slow fallback installs: the
+            // dialog draws both (#2670 review).
+            body.extend(d.error.clone());
+            if matches!(
+                d.phase,
+                crate::widgets::connect_dialog::DialogPhase::AwaitingFallbackConfirmation
+            ) {
+                body.extend(d.notes.iter().cloned());
+            }
             if d.phase.awaits_input() {
                 body.push(d.prompt_text.clone());
             }
@@ -2812,10 +2854,13 @@ impl App {
             };
             return Some(said(&title, &body, &[tr(keys)]));
         }
-        if self.shortcuts_modal.is_some() {
+        // F1 reads the shortcut at the top of the list, so each scroll is
+        // heard (#2670 review).
+        if let Some(modal) = &self.shortcuts_modal {
+            let row = modal.spoken_row().unwrap_or_default();
             return Some(said(
                 "Keyboard Shortcuts",
-                &[],
+                &[row],
                 &[tr("Arrows, scroll. Escape or F1, close")],
             ));
         }

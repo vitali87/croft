@@ -2864,3 +2864,73 @@ fn the_connect_dialog_reads_its_question_but_not_the_password() {
         "the password is never read: {item}"
     );
 }
+
+/// #2670 review: what the pickers read tells their rows apart and says what
+/// Enter does. F1 reads the shortcut at the top, so each scroll is heard; a
+/// workspace symbol carries its file and line; `:42` in Go to Symbol reads
+/// the line; the branch picker says Delete when Enter deletes; a failed
+/// connection reads its error.
+#[test]
+fn the_pickers_read_what_tells_their_rows_apart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    app.shortcuts_modal = Some(crate::widgets::shortcuts::ShortcutsModal::default());
+    let first = app.a11y_snapshot().item.unwrap_or_default();
+    assert!(first.contains(": "), "a shortcut is read: {first}");
+    let modal = app.shortcuts_modal.as_mut().unwrap();
+    modal.last_content_height = 400;
+    modal.last_inner_height = 10;
+    modal.scroll_down(10);
+    let later = app.a11y_snapshot().item.unwrap_or_default();
+    assert_ne!(first, later, "scrolling reads the next shortcut");
+    app.shortcuts_modal = None;
+
+    let mut ws = crate::widgets::workspace_symbols::WorkspaceSymbolPicker::new(
+        tmp.path().to_path_buf(),
+        "new",
+    );
+    ws.set_results(vec![crate::lsp::manager::WorkspaceSymbolItem {
+        name: String::from("new"),
+        kind: crate::lsp::manager::OutlineKind::Function,
+        path: tmp.path().join("src/b.rs"),
+        line: 41,
+        character: 4,
+        container: Some(String::from("Parser")),
+    }]);
+    app.workspace_symbols = Some(ws);
+    assert_eq!(
+        app.a11y_snapshot().item.as_deref(),
+        Some("new, in Parser, src/b.rs:42")
+    );
+    app.workspace_symbols = None;
+
+    let mut sym =
+        crate::widgets::symbol_picker::SymbolPicker::new(PathBuf::from("a.rs"), Vec::new());
+    sym.query = String::from(":42");
+    app.go_to_symbol = Some(sym);
+    assert_eq!(app.a11y_snapshot().item.as_deref(), Some("Go to line 42"));
+    app.go_to_symbol = None;
+
+    let branch = |name: &str| crate::git::BranchInfo {
+        display: name.to_string(),
+        checkout_name: name.to_string(),
+        is_current: false,
+        is_remote: false,
+        track: None,
+    };
+    app.branch_picker = Some(crate::widgets::branch_picker::BranchPicker::new(vec![
+        branch("feature"),
+    ]));
+    app.branch_purpose = crate::app::BranchPurpose::Delete;
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Delete Branch", "named for what Enter does");
+    assert_eq!(snap.item.as_deref(), Some("feature"));
+    app.branch_picker = None;
+
+    let mut dialog = crate::widgets::connect_dialog::ConnectDialog::new(String::from("devbox"));
+    dialog.set_failed(String::from("Permission denied (publickey)"));
+    app.connect_dialog = Some(dialog);
+    let item = app.a11y_snapshot().item.unwrap_or_default();
+    assert!(item.contains("Permission denied (publickey)"), "{item}");
+}
