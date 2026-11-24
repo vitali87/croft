@@ -53,7 +53,10 @@
 //!   `iterm2_inline::detect_inline_image_protocol`, which a picture open in
 //!   an editor reads for its canvas. `set_var` would race every other test
 //!   in the process, so [`draw`] answers both for its own thread through
-//!   the `cfg(test)`-only `PLAIN_HOST_FRAMES` ([`PlainHost`]).
+//!   the `cfg(test)`-only `PLAIN_HOST_FRAMES` ([`PlainHost`]). A third,
+//!   the unsupported-terminal warning naming the terminal from
+//!   `TERM_PROGRAM` or `TERM`, is left to the machine: its scene masks
+//!   that row (`terminal` under Masks).
 //! * The status line starts from a process-wide latch other tests may set
 //!   (`VIEW_BIND_ERROR`); scenes pin it to the "Ready" a clean start shows.
 //! * The caret blinks on the wall clock. [`draw`] resets the blink and
@@ -104,7 +107,8 @@
 //!
 //! # Masks
 //!
-//! Only things a build changes on purpose are masked, each with a fixed
+//! Only things a build changes on purpose, or the one row a scene reads
+//! from the machine's terminal, are masked, each with a fixed
 //! fill (`MASK_SYMBOL`, reset colours) over whole rows of a named region
 //! so a longer or shorter value cannot shift what is compared:
 //!
@@ -114,6 +118,9 @@
 //!   release card's heading row, which also says whether the build carries
 //!   unreleased notes. The card's notes are pinned with `set_test_notes`,
 //!   so they are compared, not masked.
+//! * `terminal`: the unsupported-terminal warning's row that names the
+//!   terminal croft runs in, which it reads from `TERM_PROGRAM` or `TERM`
+//!   as it draws.
 //!
 //! # Not covered
 //!
@@ -971,11 +978,21 @@ fn owned_goldens() -> Vec<String> {
         "search-results",
         "source-control",
     ];
+    let confirms = CONFIRM_SCENES.iter().map(|s| s.name.to_string());
+    let confirms_themed = CONFIRM_THEMES
+        .into_iter()
+        .flat_map(|theme| CONFIRMS_PER_THEME.map(|name| format!("{name}-{theme}")));
     let themed = crate::theme::Theme::all()
         .iter()
         .filter(|&&theme| theme != crate::theme::Theme::default())
         .map(|theme| format!("workbench-theme-{}", theme.id()));
-    fixed.into_iter().map(String::from).chain(themed).collect()
+    fixed
+        .into_iter()
+        .map(String::from)
+        .chain(confirms)
+        .chain(confirms_themed)
+        .chain(themed)
+        .collect()
 }
 
 /// A golden no scene owns, left by a renamed scene or a theme that left the
@@ -1278,4 +1295,204 @@ fn source_control_with_a_staged_and_an_unstaged_change() {
         },
     );
     workbench_scene("source-control", &mut app);
+}
+
+/// A confirm dialog over the workbench, raised by setting the state its
+/// command would set: what the dialog draws reads only that state.
+struct ConfirmScene {
+    name: &'static str,
+    raise: fn(&mut App, &Path),
+}
+
+/// Every dialog drawn in the centred frame 50 to 96 columns wide but the
+/// unsaved-changes prompt, which `unsaved_changes_prompt_on_closing_a_tab`
+/// draws: eleven confirms, the run-block one in both its colours, and the
+/// unsupported-terminal warning.
+const CONFIRM_SCENES: [ConfirmScene; 13] = [
+    ConfirmScene {
+        name: "confirm-local-open",
+        raise: |app, _| app.pending_local_open = Some(String::from("http://localhost:5173/")),
+    },
+    ConfirmScene {
+        name: "confirm-discard",
+        raise: |app, _| {
+            app.pending_discard = Some(PendingDiscard {
+                rel_path: String::from("src/main.rs"),
+                untracked: false,
+                staged: false,
+            });
+        },
+    },
+    ConfirmScene {
+        name: "confirm-revert-hunk",
+        raise: |app, _| {
+            app.pending_revert_hunk = Some(PendingRevertHunk {
+                rel_path: String::from("src/main.rs"),
+                patch: String::new(),
+            });
+        },
+    },
+    ConfirmScene {
+        name: "confirm-discard-all",
+        raise: |app, _| app.pending_discard_all = true,
+    },
+    ConfirmScene {
+        name: "confirm-stash-drop",
+        raise: |app, root| {
+            app.pending_stash_drop = Some(PendingStashDrop {
+                root: root.to_path_buf(),
+                oid: String::from("0123456789abcdef0123456789abcdef01234567"),
+                label: String::from("stash@{0}: On main: try the greeter"),
+            });
+        },
+    },
+    ConfirmScene {
+        name: "confirm-unsaved-scm",
+        raise: |app, root| {
+            app.pending_unsaved_scm = Some(PendingUnsavedScm {
+                op: ScmWrite::Commit,
+                root: root.to_path_buf(),
+                files: vec![root.join("src/main.rs"), root.join("notes.txt")],
+            });
+        },
+    },
+    ConfirmScene {
+        name: "confirm-replace-all",
+        raise: |app, _| {
+            app.search.replace = String::from("farewell");
+            app.pending_replace_all = Some((12, 3, 1));
+        },
+    },
+    ConfirmScene {
+        name: "confirm-broadcast",
+        raise: |app, _| app.pending_broadcast_enable = true,
+    },
+    ConfirmScene {
+        name: "confirm-terminal-paste",
+        raise: |app, _| {
+            app.pending_terminal_paste =
+                Some(b"cargo fmt\ncargo clippy\ncargo test\ncargo build\n".to_vec());
+        },
+    },
+    ConfirmScene {
+        name: "confirm-run-block",
+        raise: |app, _| app.pending_run_block = Some(run_block(false)),
+    },
+    ConfirmScene {
+        name: "confirm-run-block-destructive",
+        raise: |app, _| app.pending_run_block = Some(run_block(true)),
+    },
+    ConfirmScene {
+        name: "confirm-lossy-save",
+        raise: |app, root| {
+            app.pending_lossy_save = Some(LossySave {
+                path: Some(root.join("notes.txt")),
+                encoding: "windows-1252",
+                chars: vec!['\u{30a2}'],
+            });
+        },
+    },
+    ConfirmScene {
+        name: "terminal-warning",
+        raise: |app, _| app.pending_terminal_warning = true,
+    },
+];
+
+/// The fenced block the run-block scenes ask about. The directory is
+/// relative, so no scene draws the temp dir's absolute path.
+fn run_block(destructive: bool) -> PendingRunBlock {
+    PendingRunBlock {
+        pane_name: String::from("Terminal 1"),
+        cwd: PathBuf::from("golden"),
+        command: String::from("cargo build && cargo test"),
+        code: String::from("cargo build\ncargo test"),
+        destructive,
+        doc: None,
+        block_line: 0,
+        persist: false,
+        capture_timeout: None,
+    }
+}
+
+/// The unsupported-terminal warning names the terminal croft runs in, read
+/// from `TERM_PROGRAM` or `TERM` as it is drawn; that row is masked.
+fn terminal_name_row(_: &App, shot: &Shot) -> Vec<Mask> {
+    let (_, above) = find_on_screen(shot, "Croft draws its icons").unwrap_or_else(|| {
+        panic!("the unsupported-terminal warning is not on screen");
+    });
+    let area = shot.buffer.area;
+    let row = above + 1;
+    // A long terminal name runs the rest of the line off the dialog, so
+    // only the word before the name is sure to be on the row.
+    assert!(
+        row_text(&shot.buffer, row, 0, area.width).contains(" that "),
+        "the row under the warning's first line no longer names the terminal"
+    );
+    vec![Mask {
+        name: "terminal",
+        area: Rect {
+            x: 0,
+            y: row,
+            width: area.width,
+            height: 1,
+        },
+    }]
+}
+
+/// [`CONFIRM_SCENES`] drawn as scenes in `theme`, at 80x24, the size a
+/// confirm dialog is narrowest at short of the frame's 50-column floor.
+/// Every scene is drawn before the test fails, so one run names them all.
+fn confirm_scenes(theme: crate::theme::Theme, wanted: &[&str], suffix: &str) -> Vec<String> {
+    CONFIRM_SCENES
+        .iter()
+        .filter(|s| wanted.is_empty() || wanted.contains(&s.name))
+        .filter_map(|s| {
+            let (_fixture, mut app) = workbench(theme);
+            let root = app.workspace_root().to_path_buf();
+            (s.raise)(&mut app, &root);
+            let masks = if s.name == "terminal-warning" {
+                terminal_name_row
+            } else {
+                no_masks
+            };
+            scene(
+                &format!("{}{suffix}", s.name),
+                &mut app,
+                (80, 24),
+                crate::color_depth::ColorDepth::TrueColor,
+                masks,
+            )
+            .err()
+        })
+        .collect()
+}
+
+#[test]
+fn every_confirm_dialog() {
+    let failures = confirm_scenes(crate::theme::Theme::default(), &[], "");
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+/// The themes [`confirm_dialogs_in_a_light_and_a_high_contrast_theme`]
+/// draws [`CONFIRMS_PER_THEME`] in: a light and a high-contrast one, whose
+/// interface colours each take another path through `Theme::ui` than the
+/// default theme's.
+const CONFIRM_THEMES: [&str; 2] = ["light", "hc-black"];
+
+/// One red dialog and one amber one, the amber one with the frame's narrow
+/// padding.
+const CONFIRMS_PER_THEME: [&str; 2] = ["confirm-discard", "confirm-replace-all"];
+
+#[test]
+fn confirm_dialogs_in_a_light_and_a_high_contrast_theme() {
+    let failures: Vec<String> = CONFIRM_THEMES
+        .into_iter()
+        .flat_map(|id| {
+            let theme = crate::theme::Theme::from_id(id);
+            // `from_id` falls back to the default theme on a name it lacks.
+            assert_eq!(theme.id(), id, "no bundled theme {id:?}");
+            confirm_scenes(theme, &CONFIRMS_PER_THEME, &format!("-{id}"))
+        })
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
