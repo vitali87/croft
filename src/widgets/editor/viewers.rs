@@ -10,6 +10,43 @@ pub(super) const MAX_GUNZIP_BYTES: u64 = 256 * 1024 * 1024;
 
 pub(super) const MAX_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
 
+/// Why a viewer declined a file (#2062), carried in its error so the open
+/// picks the next route by the reason, never by the wording of the message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Refusal {
+    /// The bytes are not the format the viewer reads, such as an image
+    /// that does not decode: the next route may read them.
+    NotItsFormat,
+    /// A deliberate size cap, on the file or on what it expands to: the
+    /// open says so instead of quietly taking another route around it.
+    PastCap,
+}
+
+/// A viewer's refusal: its [`Refusal`] and the message the user sees.
+#[derive(Debug)]
+struct Refused {
+    reason: Refusal,
+    message: String,
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// An error that says `message` and carries `reason` for the router.
+pub(super) fn refused(reason: Refusal, message: String) -> anyhow::Error {
+    anyhow::Error::new(Refused { reason, message })
+}
+
+/// Why a viewer declined, when the error is a refusal made by [`refused`].
+pub(super) fn refusal(e: &anyhow::Error) -> Option<Refusal> {
+    e.downcast_ref::<Refused>().map(|r| r.reason)
+}
+
 /// An image's pixel size from its header alone. Opening a tab decoded the
 /// whole picture on the render thread just to read these two numbers: a
 /// 48-megapixel photo meant a ~190 MB decode per open, and one past the
@@ -1129,8 +1166,12 @@ impl Editor {
             anyhow::bail!("Image too large ({} bytes)", meta.len());
         }
         let bytes = std::fs::read(path)?;
-        let (pixel_w, pixel_h) =
-            image_dimensions_of(&bytes).ok_or_else(|| anyhow::anyhow!("Could not decode image"))?;
+        let (pixel_w, pixel_h) = image_dimensions_of(&bytes).ok_or_else(|| {
+            refused(
+                Refusal::NotItsFormat,
+                String::from("Could not decode image"),
+            )
+        })?;
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let format_label = image_format_label_from_ext(ext);
         self.become_viewer(path, Self::disk_stamp_of(path));
@@ -1150,8 +1191,14 @@ impl Editor {
     }
 
     pub(super) fn open_sheet(&mut self, path: &Path) -> Result<()> {
-        let view = crate::sheet::open_sheet(path)
-            .map_err(|e| anyhow::anyhow!("Spreadsheet open failed: {e}"))?;
+        let view = crate::sheet::open_sheet(path).map_err(|e| {
+            let reason = if crate::sheet::is_size_refusal(&e) {
+                Refusal::PastCap
+            } else {
+                Refusal::NotItsFormat
+            };
+            refused(reason, format!("Spreadsheet open failed: {e}"))
+        })?;
         self.install_sheet_view(path, view);
         Ok(())
     }
@@ -1252,8 +1299,14 @@ impl Editor {
         path: &Path,
         kind: crate::archive::ArchiveKind,
     ) -> Result<()> {
-        let view = crate::archive::list(path, kind)
-            .map_err(|e| anyhow::anyhow!("Archive open failed: {e}"))?;
+        let view = crate::archive::list(path, kind).map_err(|e| {
+            let reason = if crate::archive::is_list_cap_error(&e) {
+                Refusal::PastCap
+            } else {
+                Refusal::NotItsFormat
+            };
+            refused(reason, format!("Archive open failed: {e}"))
+        })?;
         // A listing that succeeds positively disproves any refusal armed
         // for this path, so it cannot be left to explain a later view.
         self.route_note = None;
@@ -1383,7 +1436,7 @@ impl Editor {
     pub(super) fn route_gzip(&mut self, path: &Path) -> bool {
         match self.open_archive(path, crate::archive::ArchiveKind::TarGz) {
             Ok(()) => return true,
-            Err(e) if crate::archive::is_list_cap_refusal(&e.to_string()) => {
+            Err(e) if refusal(&e) == Some(Refusal::PastCap) => {
                 self.route_note = Some((path.to_path_buf(), e.to_string()));
                 return false;
             }
@@ -1394,7 +1447,7 @@ impl Editor {
         match self.open_gunzipped(path) {
             Ok(()) => true,
             Err(e) => {
-                if e.to_string().contains("too large") {
+                if refusal(&e) == Some(Refusal::PastCap) {
                     self.route_note = Some((path.to_path_buf(), e.to_string()));
                 }
                 false
@@ -1474,10 +1527,13 @@ impl Editor {
         let written = head.len() as u64 + std::io::copy(&mut decoder, &mut out)?;
         drop(out);
         if written > MAX_GUNZIP_BYTES {
-            anyhow::bail!(
-                "Decompressed file too large to show (over {} MiB)",
-                MAX_GUNZIP_BYTES / (1024 * 1024)
-            );
+            return Err(refused(
+                Refusal::PastCap,
+                format!(
+                    "Decompressed file too large to show (over {} MiB)",
+                    MAX_GUNZIP_BYTES / (1024 * 1024)
+                ),
+            ));
         }
         self.open_log(&scratch)?;
         if let Some(log) = self.log.as_mut() {
