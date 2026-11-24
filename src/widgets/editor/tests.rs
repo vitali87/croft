@@ -22674,7 +22674,10 @@ fn a_tab_turned_viewer_keeps_nothing_of_its_text() {
         assert_eq!(e.views_filled(), [view], "{view}");
         assert_eq!(e.lines, [""], "{view}: the text side is a stub");
         assert!(e.undo_stack.is_empty() && e.redo_stack.is_empty(), "{view}");
-        assert!(!e.dirty && e.selection.is_none() && e.lang.is_none(), "{view}");
+        assert!(
+            !e.dirty && e.selection.is_none() && e.lang.is_none(),
+            "{view}"
+        );
         assert_eq!((e.cursor_row, e.cursor_col, e.scroll), (0, 0, 0), "{view}");
         assert_eq!(e.path.as_deref(), Some(target), "{view}");
     }
