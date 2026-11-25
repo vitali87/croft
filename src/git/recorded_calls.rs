@@ -76,8 +76,31 @@ impl Script {
 /// its record; the test does nothing without it.
 const RECORD_TO: &str = "CROFT_RECORD_GIT_CALLS_TO";
 
+/// Variables croft might set for git or take away from it, each given
+/// [`SEEDED_VALUE`] in the scenario's environment: a call that removes one
+/// shows the removal, and one that sets it shows its own value. With the
+/// variable absent, taking it away would leave no trace in the record.
+const SEEDED: [&str; 12] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_TERMINAL_PROMPT",
+    "GIT_OPTIONAL_LOCKS",
+    "GIT_EDITOR",
+    "GIT_SEQUENCE_EDITOR",
+    "GIT_PAGER",
+    "GIT_ASKPASS",
+    "LANGUAGE",
+];
+
+/// The value every [`SEEDED`] variable starts with. The stand-in takes it
+/// away again before the real git runs, keeping any value croft set.
+const SEEDED_VALUE: &str = "croft-recorded-seed";
+
 /// The scenario runs in a fresh copy of this test binary with an empty
-/// environment but `PATH` and a scratch `HOME`. Run here, a variable the
+/// environment but `PATH`, a scratch `HOME` and the [`SEEDED`] variables. Run here, a variable the
 /// machine already sets, as a CI runner or a sandbox does
 /// (`GIT_TERMINAL_PROMPT`, `GIT_EDITOR`, `LANGUAGE`), hides croft setting the
 /// same value, so the record would differ from machine to machine.
@@ -95,6 +118,7 @@ fn every_git_call_is_made_as_recorded() {
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home.path())
+        .envs(SEEDED.map(|name| (name, SEEDED_VALUE)))
         .env(RECORD_TO, &record)
         .output()
         .unwrap();
@@ -153,10 +177,12 @@ fn child_records_every_git_call() {
 
     let real = crate::proc::record::real_program("git");
     let then = format!(
-        "exec env -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT \
+        "for v in {}; do eval \"[ \\\"\\${{$v-}}\\\" = {SEEDED_VALUE} ] && unset $v\"; done\n\
+         exec env -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT \
          GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 XDG_CONFIG_HOME=/dev/null \
          GIT_AUTHOR_NAME=a GIT_AUTHOR_EMAIL=a@b GIT_COMMITTER_NAME=a GIT_COMMITTER_EMAIL=a@b \
          GIT_AUTHOR_DATE={DATE} GIT_COMMITTER_DATE={DATE} '{}' \"$@\"",
+        SEEDED.join(" "),
         real.display()
     );
     let mut s = Script {
