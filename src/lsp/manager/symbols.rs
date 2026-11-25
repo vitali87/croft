@@ -136,7 +136,7 @@ impl LspManager {
     }
 
     pub fn drain_document_symbols(&self) -> Option<DocumentSymbolsResult> {
-        self.doc_symbols_rx.try_recv().ok()
+        self.replies.document_symbols.try_recv().ok()
     }
 
     /// Fire a `workspace/symbol` query at every running server that
@@ -147,7 +147,7 @@ impl LspManager {
     }
 
     pub fn drain_workspace_symbols(&self) -> Option<WorkspaceSymbolsResult> {
-        self.ws_symbols_rx.try_recv().ok()
+        self.replies.workspace_symbols.try_recv().ok()
     }
 }
 

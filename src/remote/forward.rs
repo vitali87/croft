@@ -140,7 +140,7 @@ pub(super) fn handle_forward_request(
     }
     let local_port = pick_local_port(remote_port);
     let spec = format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}");
-    let forwarded = Command::new("ssh")
+    let forwarded = crate::proc::command("ssh")
         .arg("-S")
         .arg(socket)
         .arg("-O")
@@ -176,7 +176,7 @@ pub(super) fn handle_unforward_request(host: &str, socket: &Path, local: &str, r
         return;
     };
     let spec = format!("127.0.0.1:{local}:127.0.0.1:{remote}");
-    let _ = Command::new("ssh")
+    let _ = crate::proc::command("ssh")
         .arg("-S")
         .arg(socket)
         .arg("-O")

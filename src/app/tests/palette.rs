@@ -993,11 +993,11 @@ fn opening_the_file_finder_arms_one_image_clear_so_iterm_evicts_cached_osc_1337_
     app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER))
         .unwrap();
     assert!(
-        app.consume_file_finder_image_clear(),
+        app.consume_popup_image_clear(),
         "Cmd+P must arm terminal.clear() so iTerm2's image cache (activity bar icons, welcome wordmark, editor preview) is wiped before the modal paints, otherwise those cached image cells bleed through the file list"
     );
     assert!(
-        !app.consume_file_finder_image_clear(),
+        !app.consume_popup_image_clear(),
         "the flag is one-shot — a second consume call must return false so the driver does not re-clear every frame"
     );
 }
@@ -2884,5 +2884,152 @@ fn quick_open_line_hint_counts_the_buffer_a_pick_opens_as_it_is_now() {
         listed(&mut app),
         ["api/a.ts"],
         "a pick opens the active group's short copy"
+    );
+}
+
+/// #2062 (card 8): every palette command as the palette knows it, saved in
+/// `golden/commands.txt`. Each row is one command in palette order: its
+/// place there, its variant, id, title and extra search words, its hint as
+/// macOS and Linux show it, and the groups it is in. The Customize Layout
+/// rows follow in the popup's order. The command-table refactor must leave
+/// the file byte-identical; rewrite it with `CROFT_BLESS=1` only after a
+/// change meant to move a command. Like the screen goldens and the key
+/// ledger, it runs on Linux, where the goldens module is built; it spells
+/// both platforms' hints itself, so the macOS spelling is checked there too.
+#[cfg(target_os = "linux")]
+#[test]
+fn every_command_matches_the_saved_registry() {
+    use crate::command_registry::{ALL_COMMANDS, LAYOUT_COMMANDS, hint_for_platform};
+    use std::fmt::Write as _;
+    let mut text = String::from(
+        "# Every palette command: src/app/tests/palette.rs. Rewrite with CROFT_BLESS=1 after a change meant to move one.\n\
+         # palette place | variant | id | title | keyword | macOS hint | Linux hint | groups\n",
+    );
+    for (place, cmd) in ALL_COMMANDS.iter().enumerate() {
+        let hint = cmd.keybinding_hint();
+        let groups: Vec<&str> = [
+            (LAYOUT_COMMANDS.contains(cmd), "layout"),
+            (cmd.skips_the_shell(), "skips-the-shell"),
+            (cmd.is_codeql(), "codeql"),
+        ]
+        .into_iter()
+        .filter_map(|(member, group)| member.then_some(group))
+        .collect();
+        let row = format!(
+            "{place} | {cmd:?} | {} | {} | {} | {} | {} | {}",
+            cmd.id(),
+            cmd.title(),
+            cmd.keyword(),
+            hint_for_platform(hint, true),
+            hint_for_platform(hint, false),
+            groups.join(" "),
+        );
+        writeln!(text, "{}", row.trim_end()).unwrap();
+    }
+    text.push_str("# Customize Layout, in the popup's order\n");
+    for cmd in LAYOUT_COMMANDS {
+        writeln!(text, "layout | {cmd:?}").unwrap();
+    }
+    super::golden::check_text("commands", &text);
+}
+
+/// The bug (#2669): the editor's caret was placed under every pop-up but
+/// the right-click menu, the New File box and the list picker, so on a
+/// boxed theme it blinked inside Settings, Quick Open, every confirm and the
+/// rest, and on Croft Loch inside every pop-up that is not a quick input.
+/// An open pop-up has the keys: only its own caret may show. The rule the
+/// pictures use to put the caret back agrees with the frame's.
+#[test]
+fn no_pane_caret_blinks_through_a_popup() {
+    use crate::app::popups::Popup;
+    let draw = |app: &mut App| {
+        let backend = super::CaretBackend {
+            inner: ratatui::backend::TestBackend::new(120, 40),
+            caret_shown: false,
+        };
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        app.cursor_blink.poke();
+        term.draw(|f| app.render(f)).unwrap();
+        let shown = term.backend().caret_shown;
+        let at = ratatui::backend::Backend::get_cursor_position(term.backend_mut()).unwrap();
+        (shown, (at.x, at.y))
+    };
+    let mut wrong = Vec::new();
+    for theme in [
+        crate::theme::Theme::BLACK,
+        crate::theme::Theme::from_id("loch"),
+    ] {
+        for p in Popup::ALL {
+            let tmp = tempfile::tempdir().unwrap();
+            let file = tmp.path().join("a.txt");
+            std::fs::write(&file, "one\ntwo\n").unwrap();
+            let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+            app.apply_theme(theme);
+            app.editor.open_in_new_tab(&file).unwrap();
+            app.focus_pane(Pane::Editor);
+            let (shown, editor_caret) = draw(&mut app);
+            assert!(shown, "the editor's caret shows with no pop-up open");
+            let _hook = super::popups::open(&mut app, p);
+            let (shown, at) = draw(&mut app);
+            if shown && at == editor_caret {
+                wrong.push(format!("{p:?} on {}", theme.id()));
+            }
+            assert_eq!(
+                app.cursor_should_be_visible(),
+                shown,
+                "{p:?} on {}: the pictures' caret rule must agree with the frame's",
+                theme.id()
+            );
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "the editor's caret blinked through these pop-ups: {}",
+        wrong.join(", ")
+    );
+}
+
+/// #2669 review (Codex): the connect dialog places its own caret in its
+/// password field. The rule the pictures use to put the caret back after
+/// drawing must keep that one, not hide it with the panes' carets.
+#[test]
+fn the_connect_dialog_keeps_its_own_caret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.txt");
+    std::fs::write(&file, "one\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_in_new_tab(&file).unwrap();
+    app.focus_pane(Pane::Editor);
+    let mut dialog = crate::widgets::connect_dialog::ConnectDialog::new(String::from("devbox"));
+    dialog.set_prompt(
+        crate::remote_connect::PromptKind::Password,
+        String::from("devbox's password:"),
+    );
+    app.connect_dialog = Some(dialog);
+    let backend = super::CaretBackend {
+        inner: ratatui::backend::TestBackend::new(120, 40),
+        caret_shown: false,
+    };
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    app.cursor_blink.poke();
+    term.draw(|f| app.render(f)).unwrap();
+    let field = app
+        .connect_dialog
+        .as_ref()
+        .and_then(|d| d.cursor_screen_pos())
+        .expect("the dialog places its caret in its field");
+    assert!(
+        term.backend().caret_shown,
+        "the frame shows the dialog's caret"
+    );
+    let at = ratatui::backend::Backend::get_cursor_position(term.backend_mut()).unwrap();
+    assert_eq!(
+        (at.x, at.y),
+        field,
+        "at the field, not at the editor's caret"
+    );
+    assert!(
+        app.cursor_should_be_visible(),
+        "the pictures put the dialog's caret back after drawing"
     );
 }

@@ -61,26 +61,17 @@ impl App {
     }
 
     pub fn drain_lsp_code_actions(&mut self) -> bool {
-        let mut arrived = false;
-        let mut items: Option<Vec<crate::lsp::manager::CodeActionItem>> = None;
-        let mut unsupported = false;
-        {
-            let Some(lsp) = self.lsp.as_ref() else {
-                return false;
-            };
-            while let Some(result) = lsp.drain_code_action() {
-                if Some(result.request_id) != self.code_action_request_id {
-                    continue;
-                }
-                arrived = true;
-                items = result.items;
-                unsupported = result.unsupported;
-            }
-        }
-        if !arrived {
+        let Some(lsp) = self.lsp.as_ref() else {
             return false;
-        }
-        self.code_action_request_id = None;
+        };
+        let Some(reply) = take_reply(
+            &mut self.code_action_request_id,
+            || lsp.drain_code_action(),
+            |r| r.request_id,
+        ) else {
+            return false;
+        };
+        let (items, unsupported) = (reply.items, reply.unsupported);
         let was_resolve = std::mem::take(&mut self.code_action_pending_resolve);
         if unsupported {
             // No code-action server, but a seated navigator can still take

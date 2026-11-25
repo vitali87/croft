@@ -50,7 +50,7 @@ fn tooltip_repaints_over_the_hero_without_hiding_it() {
         (hero.x, hero.y),
     ));
     app.ui_tooltip_area = Some(hero);
-    app.flush_no_repo_hero_overlay();
+    app.flush_no_repo_hero_overlay(&ratatui::buffer::Buffer::empty(app.last_frame_area));
     app.flush_tooltip_over_image();
     assert!(
         !app.consume_no_repo_hero_image_clear(),
@@ -494,4 +494,24 @@ fn the_editor_menu_without_a_selection_offers_only_paste() {
         !labels.contains(&"Cut") && !labels.contains(&"Copy"),
         "{labels:?}"
     );
+}
+
+/// #2643: the status bar's indentation menu shows the chords that run its
+/// Convert Indentation rows, spelled as the palette spells them: the Mac's
+/// glyphs there, `Ctrl+Alt+Shift` elsewhere. The rows showed none.
+#[test]
+fn the_convert_indentation_rows_show_the_chords_that_run_them() {
+    use crate::command_registry::{Command, hint_for_platform};
+    for (to_spaces, command, glyphs) in [
+        (true, Command::IndentationToSpaces, "⌥⇧⌘S"),
+        (false, Command::IndentationToTabs, "⌥⇧⌘T"),
+    ] {
+        let row = MenuAction::ConvertIndentation(to_spaces);
+        assert_eq!(platform_shortcut_for(&row, true).as_deref(), Some(glyphs));
+        assert_eq!(
+            platform_shortcut_for(&row, false).as_deref(),
+            Some(hint_for_platform(command.keybinding_hint(), false).as_ref()),
+            "{command:?}"
+        );
+    }
 }

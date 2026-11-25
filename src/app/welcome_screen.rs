@@ -1313,19 +1313,8 @@ impl App {
     }
 
     pub fn welcome_image_emit_payload(&self) -> Option<(&str, &WelcomeLayout)> {
-        if self.shortcuts_modal.is_some()
-            || self.file_finder.is_some()
-            || self.command_palette.is_some()
-            || self.go_to_symbol.is_some()
-            || self.workspace_symbols.is_some()
-            || self.process_picker.is_some()
-            || self.zoxide_jump.is_some()
-            || self.command_history_popup.is_some()
-            || self.branch_picker.is_some()
-            || self.input_prompt.is_some()
-            || self.list_picker.is_some()
+        if self.picture_waits(super::popups::PictureSpot::Welcome)
             || self.context_menu.is_some()
-            || self.connect_dialog.is_some()
             || !self.editor.is_blank_initial()
             || self.terminal_maximized
         {

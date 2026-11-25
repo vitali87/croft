@@ -20,6 +20,15 @@
 //! source leaves the ledger out, as it does the screen goldens, and there
 //! the comparison is skipped with a note.
 //!
+//! The ledger also proves that each palette command's chord runs that
+//! command. `every_listed_chord_runs_its_command` runs every command with a
+//! chord from the palette in the same contexts and compares what it did with
+//! what its chord did there, read from the saved ledger. A chord that works
+//! only in a given state (a Markdown file, a pinned tab, two terminals) is
+//! pressed in a place set up for it, in `PROOF_PLACES`. `UNPROVEN` names the
+//! commands no place reaches, with why (a language server, a debug session,
+//! this machine), and can only shrink.
+//!
 //! One chord reaches outside the test: re-rooting the Explorer
 //! (`ctrl+shift+/`) writes the window title straight to the terminal, so the
 //! test's output shows an `ESC]0;` sequence.
@@ -28,6 +37,7 @@
 //! be another file.
 
 use super::*;
+use crate::command_registry::Command;
 use crate::keymap::Chord;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -200,7 +210,7 @@ const COUNTED: &[&str] = &[
 /// The keys Linux presses for each key sequence `hint` names, or why one
 /// names none.
 fn linux_keys(hint: &str) -> Vec<Result<Vec<KeyEvent>, String>> {
-    use crate::widgets::command_palette::hint_for_platform;
+    use crate::command_registry::hint_for_platform;
     alternatives(hint)
         .iter()
         .map(|one| keys_of(&hint_for_platform(one, false)))
@@ -322,6 +332,41 @@ fn shortcut_table_hints() -> BTreeSet<String> {
         .skip(1)
         .map(|s| s[..s.find("\")").unwrap()].replace("\\\\", "\\"))
         .collect()
+}
+
+/// #2648: the palette listed Cmd+Opt+Shift+C for Transform to Title Case,
+/// though that chord copies the relative path. Whatever chord it lists must
+/// title-case the selection when pressed.
+#[test]
+fn the_chord_listed_for_title_case_title_cases_the_selection() {
+    let copy_relative = KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT;
+    assert!(is_copy_relative_path_key(KeyEvent::new(
+        KeyCode::Char('C'),
+        copy_relative
+    )));
+    let hint = crate::command_registry::Command::TransformTitle.keybinding_hint();
+    let listed = if hint.is_empty() {
+        Vec::new()
+    } else {
+        linux_keys(hint)
+    };
+    for keys in listed {
+        let keys = keys.unwrap_or_else(|why| panic!("{hint}: {why}"));
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("notes.txt");
+        std::fs::write(&file, "hello world\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open_pinned(&file).unwrap();
+        app.focus_pane(Pane::Editor);
+        select(&mut app, (0, 0), (0, 11));
+        for key in keys {
+            app.handle_key(key).unwrap();
+        }
+        assert_eq!(
+            app.editor.lines[0], "Hello World",
+            "the palette lists {hint} for Transform to Title Case"
+        );
+    }
 }
 
 /// Menu shortcuts no walked menu row reaches, with why. None today: a new
@@ -499,7 +544,7 @@ fn groups(app: &App) -> String {
         return String::from("1");
     }
     let active = app.editor_layout.active_dfs_index();
-    let mut inactive = app.editor_layout.inactive_groups().into_iter();
+    let mut inactive = app.editor_layout.inactive_groups();
     rects
         .iter()
         .enumerate()
@@ -1703,4 +1748,688 @@ fn every_advertised_chord_does_what_the_ledger_says_in_the_command_palette() {
 #[test]
 fn every_advertised_chord_does_what_the_ledger_says_in_a_confirm_dialog() {
     check_context("confirm");
+}
+
+/// What each key sequence did in each context, read from the saved ledger,
+/// which the tests above keep true: `(context, chord)` to its effects. None
+/// where a published crate's source has no saved ledger.
+fn saved_presses() -> Option<BTreeMap<(String, String), String>> {
+    let saved = match std::fs::read_to_string(LEDGER) {
+        Ok(saved) => saved,
+        Err(_) if super::golden::packaged_source() => return None,
+        Err(err) => panic!("no saved ledger at {LEDGER} ({err}): write it with CROFT_BLESS=1"),
+    };
+    let presses = saved
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .map(|line| {
+            let mut parts = line.splitn(3, " | ");
+            let mut next = || parts.next().unwrap().to_string();
+            let (context, chord, effects) = (next(), next(), next());
+            ((context, chord), effects)
+        })
+        .collect();
+    Some(presses)
+}
+
+/// `effects` without its status line, which a command run from the palette
+/// may set where its chord does not (Toggle Word Wrap says "Word wrap: on").
+fn without_status(effects: &str) -> String {
+    let Some(at) = effects.find("status=\"") else {
+        return effects.to_string();
+    };
+    // The value is written with `{:?}`, so a quote inside it is escaped.
+    let value = &effects[at + "status=\"".len()..];
+    let mut end = None;
+    let mut escaped = false;
+    for (i, c) in value.char_indices() {
+        match c {
+            '\\' if !escaped => escaped = true,
+            '"' if !escaped => {
+                end = Some(i);
+                break;
+            }
+            _ => escaped = false,
+        }
+    }
+    let end = at + "status=\"".len() + end.expect("a closed status value") + 1;
+    let rest = format!("{}{}", &effects[..at], &effects[end..]);
+    rest.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Whether pressing a command's chord did what running the command did: the
+/// same effects, something happened, and at most the status line differs.
+fn same_work(pressed: &str, ran: &str) -> bool {
+    if ran == "-" {
+        return false;
+    }
+    if pressed == ran {
+        return true;
+    }
+    let (pressed, ran) = (without_status(pressed), without_status(ran));
+    !ran.is_empty() && pressed == ran
+}
+
+/// What running each palette command with a chord did in `ctx`, on an app
+/// set up as the ledger sets it up there. An app is kept for the next
+/// command while the last one changed nothing it shows, as the ledger keeps
+/// its apps, and `CROFT_LEDGER_FRESH=1` builds a new one for every command.
+fn command_runs(ctx: &Context) -> Vec<(Command, String)> {
+    let fresh = std::env::var("CROFT_LEDGER_FRESH").is_ok_and(|v| v == "1");
+    let mut enders = Enders::default();
+    let mut kept: Option<Built> = None;
+    let mut runs = Vec::new();
+    for cmd in crate::command_registry::ALL_COMMANDS {
+        if cmd.keybinding_hint().is_empty() {
+            continue;
+        }
+        let b = kept.get_or_insert_with(|| build(ctx));
+        b.app.run_command(*cmd);
+        if b.app.git_net_job.is_some() {
+            wait_for_git_net(&mut b.app);
+        }
+        if ctx.repo {
+            settle_source_control(&mut b.app, &b.root);
+        }
+        let fx = effects(&b.seen, &fingerprint(&b.app, &b.root));
+        if fresh || fx != "-" {
+            kept.take().unwrap().retire(&mut enders);
+        }
+        runs.push((*cmd, fx));
+    }
+    if let Some(done) = kept {
+        done.retire(&mut enders);
+    }
+    runs
+}
+
+/// Writes `text` to `name` in the app's workspace and opens it, the caret at
+/// `caret`.
+fn open_new(app: &mut App, name: &str, text: &str, caret: (usize, usize)) {
+    let path = app.workspace_root().join(name);
+    std::fs::write(&path, text).unwrap();
+    app.editor.open_pinned(&path).unwrap();
+    (app.editor.cursor_row, app.editor.cursor_col) = caret;
+    app.focus_pane(Pane::Editor);
+}
+
+/// A file eight blocks deep, so every fold level up to seven has a block.
+const DEEP_RS: &str = concat!(
+    "fn deep() {\n",
+    "    if a {\n",
+    "        if b {\n",
+    "            if c {\n",
+    "                if d {\n",
+    "                    if e {\n",
+    "                        if f {\n",
+    "                            if g {\n",
+    "                                done();\n",
+    "                            }\n",
+    "                        }\n",
+    "                    }\n",
+    "                }\n",
+    "            }\n",
+    "        }\n",
+    "    }\n",
+    "}\n",
+);
+
+/// A file with two merge conflicts.
+const CONFLICTED: &str = concat!(
+    "a\n",
+    "<<<<<<< HEAD\n",
+    "ours\n",
+    "=======\n",
+    "theirs\n",
+    ">>>>>>> topic\n",
+    "b\n",
+    "<<<<<<< HEAD\n",
+    "ours too\n",
+    "=======\n",
+    "theirs too\n",
+    ">>>>>>> topic\n",
+    "c\n",
+);
+
+/// A place the ledger's contexts do not set up, where some commands' chords
+/// do their work, and the commands it proves.
+struct ProofPlace {
+    context: Context,
+    commands: &'static [Command],
+}
+
+/// The places beyond the ledger's own contexts.
+const PROOF_PLACES: &[ProofPlace] = &[
+    ProofPlace {
+        context: Context {
+            name: "trailing whitespace and blank lines",
+            repo: false,
+            setup: |app| open_new(app, "trim.rs", "fn a() {   \n}  \n\n\n\n", (0, 0)),
+        },
+        commands: &[Command::TrimTrailingWhitespace, Command::TrimFinalNewlines],
+    },
+    ProofPlace {
+        context: Context {
+            name: "a selection grown twice",
+            repo: false,
+            setup: |app| {
+                app.focus_pane(Pane::Editor);
+                app.run_command(Command::ExpandSelection);
+                app.run_command(Command::ExpandSelection);
+            },
+        },
+        commands: &[Command::ShrinkSelection],
+    },
+    ProofPlace {
+        context: Context {
+            name: "Find open over a selection",
+            repo: false,
+            setup: |app| {
+                app.focus_pane(Pane::Editor);
+                select(app, ON_TOTAL, TOTAL_END);
+                app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL))
+                    .unwrap();
+            },
+        },
+        commands: &[Command::ToggleFindInSelection],
+    },
+    ProofPlace {
+        context: Context {
+            name: "a file eight blocks deep",
+            repo: false,
+            setup: |app| open_new(app, "deep.rs", DEEP_RS, (0, 0)),
+        },
+        commands: &[
+            Command::FoldLevel3,
+            Command::FoldLevel4,
+            Command::FoldLevel5,
+            Command::FoldLevel6,
+            Command::FoldLevel7,
+        ],
+    },
+    ProofPlace {
+        context: Context {
+            name: "everything folded",
+            repo: false,
+            setup: |app| {
+                app.focus_pane(Pane::Editor);
+                app.run_command(Command::FoldAll);
+            },
+        },
+        commands: &[Command::UnfoldAll],
+    },
+    ProofPlace {
+        context: Context {
+            name: "every region folded",
+            repo: false,
+            setup: |app| {
+                app.focus_pane(Pane::Editor);
+                app.run_command(Command::FoldAllRegions);
+            },
+        },
+        commands: &[Command::UnfoldAllRegions],
+    },
+    ProofPlace {
+        context: Context {
+            name: "a Markdown file, the caret in a shell fence",
+            repo: false,
+            setup: |app| open_new(app, "run.md", "# Run\n\n```sh\necho hi\n```\n", (3, 0)),
+        },
+        commands: &[
+            Command::OpenMarkdownPreviewToSide,
+            Command::RunCodeBlockAtCursor,
+        ],
+    },
+    ProofPlace {
+        context: Context {
+            name: "a pinned tab",
+            repo: false,
+            setup: |app| {
+                app.focus_pane(Pane::Editor);
+                app.run_command(Command::PinEditor);
+            },
+        },
+        commands: &[Command::UnpinEditor],
+    },
+    ProofPlace {
+        context: Context {
+            name: "two editor groups, the right one focused",
+            repo: false,
+            setup: |app| {
+                app.focus_pane(Pane::Editor);
+                app.split_editor();
+            },
+        },
+        commands: &[Command::FocusLeftEditorGroup],
+    },
+    ProofPlace {
+        context: Context {
+            name: "two editor groups, the left one focused",
+            repo: false,
+            setup: |app| {
+                app.focus_pane(Pane::Editor);
+                app.split_editor();
+                app.focus_editor_group(true);
+            },
+        },
+        commands: &[Command::FocusRightEditorGroup],
+    },
+    ProofPlace {
+        context: Context {
+            name: "two terminals, the panel focused",
+            repo: false,
+            setup: |app| {
+                app.show_terminal = true;
+                app.bottom_panel_tab = BottomPanelTab::Terminal;
+                app.focus_pane(Pane::Terminal);
+                app.split_terminal().unwrap();
+            },
+        },
+        commands: &[Command::FocusNextTerminal, Command::FocusPreviousTerminal],
+    },
+    ProofPlace {
+        context: Context {
+            name: "a terminal that reports Shift with Ctrl (kitty keyboard protocol)",
+            repo: false,
+            setup: |app| {
+                app.focus_pane(Pane::Editor);
+                app.kitty_keys = true;
+            },
+        },
+        commands: &[Command::ShowSourceControl],
+    },
+    ProofPlace {
+        context: Context {
+            name: "a C file beside its header",
+            repo: false,
+            setup: |app| {
+                let header = app.workspace_root().join("pair.h");
+                std::fs::write(header, "int pair(void);\n").unwrap();
+                open_new(app, "pair.c", "int pair(void) { return 2; }\n", (0, 0));
+            },
+        },
+        commands: &[Command::SwitchHeaderSource],
+    },
+    ProofPlace {
+        context: Context {
+            name: "a file with two merge conflicts",
+            repo: false,
+            setup: |app| open_new(app, "conflicted.txt", CONFLICTED, (0, 0)),
+        },
+        commands: &[Command::MergeNextConflict, Command::MergePrevConflict],
+    },
+    ProofPlace {
+        context: Context {
+            name: "Search with its query selected",
+            repo: false,
+            setup: |app| {
+                app.set_sidebar_view(SidebarView::Search);
+                app.search.query = String::from("total");
+                app.search.run_query();
+                app.set_sidebar_view(SidebarView::Search);
+            },
+        },
+        commands: &[
+            Command::SearchToggleMatchCase,
+            Command::SearchToggleWholeWord,
+            Command::SearchToggleRegex,
+            Command::SearchTogglePreserveCase,
+            Command::SearchToggleDetails,
+        ],
+    },
+];
+
+/// What `run` did on an app freshly set up as `ctx`.
+fn effects_in(ctx: &Context, enders: &mut Enders, run: impl FnOnce(&mut App)) -> String {
+    let mut b = build(ctx);
+    run(&mut b.app);
+    if b.app.git_net_job.is_some() {
+        wait_for_git_net(&mut b.app);
+    }
+    if ctx.repo {
+        settle_source_control(&mut b.app, &b.root);
+    }
+    let fx = effects(&b.seen, &fingerprint(&b.app, &b.root));
+    b.retire(enders);
+    fx
+}
+
+/// What each [`PROOF_PLACES`] entry showed for each chord of each command
+/// it names: the command, the chord, and `None` where pressing the chord did
+/// what running the command did there, else the line saying what each did.
+fn proved_in_places() -> Vec<(Command, String, Option<String>)> {
+    let mut enders = Enders::default();
+    let mut out = Vec::new();
+    for place in PROOF_PLACES {
+        for cmd in place.commands {
+            let ran = effects_in(&place.context, &mut enders, |app| app.run_command(*cmd));
+            for keys in linux_keys(cmd.keybinding_hint()) {
+                let Ok(keys) = keys else { continue };
+                let pressed = effects_in(&place.context, &mut enders, |app| {
+                    for key in &keys {
+                        let _ = app.handle_key(*key);
+                    }
+                });
+                let chord = spell(&keys);
+                let miss = (!same_work(&pressed, &ran)).then(|| {
+                    format!(
+                        "{} | {chord} | ran: {ran} | pressed: {pressed}",
+                        place.context.name
+                    )
+                });
+                out.push((*cmd, chord, miss));
+            }
+        }
+    }
+    out
+}
+
+/// Why a command's chord needs a language server to do anything.
+const NEEDS_A_LANGUAGE_SERVER: &str = "works through a language server; the tests start none";
+/// Why a command's chord needs a debug session.
+const NEEDS_A_DEBUG_SESSION: &str = "steers a debug session; the tests start no debugger";
+/// Why a merge-conflict command's chord is not the command itself.
+const OPENS_THE_MERGE_PICKER: &str = "Cmd+. in a merge conflict opens the Accept Current / \
+     Incoming / Both picker, whose rows run these; the chord is the way there";
+/// Why a Source Control diff command's chord is not proven.
+const A_KEY_IN_THE_DIFF_VIEW: &str =
+    "a single key in Source Control's diff view, which no proof place opens";
+
+/// Palette commands whose chord [`every_listed_chord_runs_its_command`]
+/// cannot press where it does its work, by id, with why. One that becomes
+/// proven fails the test until it is taken off, so the list only shrinks.
+const UNPROVEN: &[(&str, &str)] = &[
+    ("merge_accept_current", OPENS_THE_MERGE_PICKER),
+    ("merge_accept_incoming", OPENS_THE_MERGE_PICKER),
+    ("merge_accept_both", OPENS_THE_MERGE_PICKER),
+    ("peek_references", NEEDS_A_LANGUAGE_SERVER),
+    ("go_to_definition", NEEDS_A_LANGUAGE_SERVER),
+    ("go_to_references", NEEDS_A_LANGUAGE_SERVER),
+    ("go_to_declaration", NEEDS_A_LANGUAGE_SERVER),
+    ("go_to_type_definition", NEEDS_A_LANGUAGE_SERVER),
+    ("go_to_implementations", NEEDS_A_LANGUAGE_SERVER),
+    ("stage_hunk", A_KEY_IN_THE_DIFF_VIEW),
+    ("unstage_hunk", A_KEY_IN_THE_DIFF_VIEW),
+    ("revert_hunk", A_KEY_IN_THE_DIFF_VIEW),
+    ("pause_debugging", NEEDS_A_DEBUG_SESSION),
+    ("continue", NEEDS_A_DEBUG_SESSION),
+    ("step_over", NEEDS_A_DEBUG_SESSION),
+    ("step_into", NEEDS_A_DEBUG_SESSION),
+    ("step_out", NEEDS_A_DEBUG_SESSION),
+    ("switch_debug_session", NEEDS_A_DEBUG_SESSION),
+    (
+        "toggle_inline_suggestions",
+        "asks a model when ANTHROPIC_API_KEY is set (machine-bound, see MACHINE_BOUND)",
+    ),
+    (
+        "attach_python_process",
+        "lists this machine's running Python processes (machine-bound)",
+    ),
+    (
+        "update_croft",
+        "checks for a croft update over the network (machine-bound)",
+    ),
+    (
+        "zoxide_jump",
+        "jumps with zoxide, installed or not (machine-bound)",
+    ),
+    ("http_send_request", "sends a real HTTP request"),
+    (
+        "hex_find_next",
+        "F3 in the hex view with its find open, which no proof place opens",
+    ),
+];
+
+/// Every chord croft lists for a palette command runs that command: pressed
+/// where the command does its work, it does what the palette's run of the
+/// command does there (the status line may differ), and something happens.
+/// The places are the key ledger's contexts, whose saved presses this reads,
+/// and [`PROOF_PLACES`]. The palette and confirm contexts are left out: there
+/// a chord goes to the open palette or dialog. [`UNPROVEN`] names the
+/// commands no place reaches, with why.
+#[test]
+fn every_listed_chord_runs_its_command() {
+    use crate::command_registry::ALL_COMMANDS;
+    // Blessing rewrites the saved ledger while this reads it: check after.
+    if std::env::var("CROFT_BLESS").is_ok_and(|v| v == "1") {
+        eprintln!("skipped while CROFT_BLESS=1 rewrites the ledger: run again without it");
+        return;
+    }
+    let Some(saved) = saved_presses() else {
+        eprintln!("skipped, a published crate's source has no saved ledger");
+        return;
+    };
+    let contexts: Vec<&Context> = CONTEXTS
+        .iter()
+        .filter(|c| !matches!(c.name, "palette" | "confirm"))
+        .collect();
+    // One context after another, as the ledger's own tests build one app at
+    // a time: apps built side by side here are load the suite's wait budgets
+    // do not count, and under CI's load Source Control's git status outran
+    // its budget.
+    let runs: Vec<(&str, Vec<(Command, String)>)> = contexts
+        .iter()
+        .map(|ctx| (ctx.name, command_runs(ctx)))
+        .collect();
+    let places = proved_in_places();
+    let mut unproven: Vec<String> = Vec::new();
+    let mut proven: Vec<&str> = Vec::new();
+    for cmd in ALL_COMMANDS {
+        let hint = cmd.keybinding_hint();
+        if hint.is_empty() {
+            continue;
+        }
+        // Every chord the hint lists must run the command somewhere.
+        let mut lines = Vec::new();
+        let mut done = true;
+        let mut pressed_any = false;
+        for keys in linux_keys(hint) {
+            let Ok(keys) = keys else { continue };
+            pressed_any = true;
+            let chord = spell(&keys);
+            let mut this_one = false;
+            for (context, list) in &runs {
+                let ran = &list.iter().find(|(c, _)| c == cmd).unwrap().1;
+                let pressed = saved.get(&(context.to_string(), chord.clone()));
+                let pressed = pressed.map_or("(not pressed there)", String::as_str);
+                this_one |= same_work(pressed, ran);
+                lines.push(format!(
+                    "  {context} | {chord} | ran: {ran} | pressed: {pressed}"
+                ));
+            }
+            for (_, _, miss) in places.iter().filter(|(c, k, _)| c == cmd && *k == chord) {
+                match miss {
+                    None => this_one = true,
+                    Some(line) => lines.push(format!("  {line}")),
+                }
+            }
+            done &= this_one;
+        }
+        if done && pressed_any {
+            proven.push(cmd.id());
+        } else if !UNPROVEN.iter().any(|(id, _)| *id == cmd.id()) {
+            unproven.push(format!("{} [{hint}]\n{}", cmd.id(), lines.join("\n")));
+        }
+    }
+    let stale: Vec<&str> = UNPROVEN
+        .iter()
+        .map(|(id, _)| *id)
+        .filter(|id| {
+            proven.contains(id)
+                || !ALL_COMMANDS
+                    .iter()
+                    .any(|c| c.id() == *id && !c.keybinding_hint().is_empty())
+        })
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "UNPROVEN lists commands that are proven now or list no chord; take them off: {stale:?}"
+    );
+    assert!(
+        unproven.is_empty(),
+        "{} palette command(s) list a chord that does not run them where they work. \
+         Fix the chord or the hint, add a PROOF_PLACES entry that sets up where it \
+         works, or list it in UNPROVEN with why:\n{}",
+        unproven.len(),
+        unproven.join("\n")
+    );
+}
+
+/// Every key sequence the F1 sheet lists, spelled as the ledger spells it.
+fn f1_chords() -> BTreeSet<String> {
+    let mut chords = BTreeSet::new();
+    for group in crate::widgets::shortcuts::SHORTCUT_GROUPS {
+        for entry in group.entries {
+            if unpressed_f1_row(group.title, entry.keys).is_none() {
+                for keys in linux_keys(entry.keys).into_iter().flatten() {
+                    chords.insert(spell(&keys));
+                }
+            }
+        }
+    }
+    chords
+}
+
+/// The chords written in backticks in `text`, one per run of backticked
+/// keys: `` `Cmd`+`Opt`+`S` ``, `` `Cmd+K` `L` `` and `` `Enter`/`F3` `` are
+/// one run each. `` `Cmd+K` `Cmd+1` … `Cmd+K` `Cmd+7` `` is the range
+/// `Cmd+K Cmd+1..7`.
+fn backticked_chords(text: &str) -> Vec<String> {
+    // Each run of backticked keys, with the text before it.
+    let mut runs: Vec<(&str, String)> = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('`') {
+        let Some(len) = rest[open + 1..].find('`') else {
+            break;
+        };
+        let between = &rest[..open];
+        let span = &rest[open + 1..open + 1 + len];
+        match runs.last_mut() {
+            // `Cmd`+`Opt`+`Shift`+`U` / `L`: the bare key takes the modifiers.
+            Some((_, run)) if matches!(between, "+" | "/" | " " | " / ") => {
+                run.push_str(between);
+                run.push_str(span);
+            }
+            // `Ctrl+p` / `Cmd+p`, then `#`: each chord, then the key.
+            Some((_, run)) if matches!(between, ", then " | " then ") => {
+                *run = run
+                    .split(" / ")
+                    .map(|chord| format!("{chord} then {span}"))
+                    .collect::<Vec<_>>()
+                    .join(" / ");
+            }
+            _ => runs.push((between, span.to_string())),
+        }
+        rest = &rest[open + len + 2..];
+    }
+    let mut out: Vec<String> = Vec::new();
+    for (between, run) in runs {
+        // `X1 … X7`, the same keys but the last digit, is the range X1..7.
+        if between == " … "
+            && let Some(prev) = out.last_mut()
+            && let (Some(a), Some(b)) = (prev.chars().last(), run.chars().last())
+            && a.is_ascii_digit()
+            && b.is_ascii_digit()
+            && prev[..prev.len() - 1] == run[..run.len() - 1]
+        {
+            prev.push_str(&format!("..{b}"));
+        } else {
+            out.push(run);
+        }
+    }
+    out
+}
+
+/// Every key sequence docs/KEYBINDINGS.md writes in backticks, spelled as the
+/// ledger spells it. Spans that name no keys (a setting, a file) are skipped.
+fn documented_chords() -> BTreeSet<String> {
+    let doc =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/KEYBINDINGS.md"))
+            .unwrap();
+    let mut chords = BTreeSet::new();
+    for line in doc.lines() {
+        for run in backticked_chords(line) {
+            for alt in alternatives(&run) {
+                // The docs write some letters small (`Cmd+Shift+s`); hints
+                // and the Linux spelling rules write them capital.
+                let alt: String = alt
+                    .split(' ')
+                    .map(|step| match step.rsplit_once('+') {
+                        Some((mods, key)) if key.len() == 1 => {
+                            format!("{mods}+{}", key.to_ascii_uppercase())
+                        }
+                        _ => step.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let linux = crate::command_registry::hint_for_platform(&alt, false);
+                if let Ok(keys) = keys_of(&linux) {
+                    chords.insert(spell(&keys));
+                }
+            }
+        }
+    }
+    chords
+}
+
+/// A chord in a palette hint is where people look for it: the F1 sheet lists
+/// it, and so does docs/KEYBINDINGS.md.
+#[test]
+fn every_palette_chord_is_on_the_f1_sheet_and_in_the_docs() {
+    let f1 = f1_chords();
+    let docs = documented_chords();
+    let mut missing = Vec::new();
+    for cmd in crate::command_registry::ALL_COMMANDS {
+        let hint = cmd.keybinding_hint();
+        for keys in linux_keys(hint).into_iter().flatten() {
+            let chord = spell(&keys);
+            let gone: Vec<&str> = [("the F1 sheet", &f1), ("docs/KEYBINDINGS.md", &docs)]
+                .into_iter()
+                .filter(|(_, listed)| !listed.contains(&chord))
+                .map(|(place, _)| place)
+                .collect();
+            if !gone.is_empty() {
+                missing.push(format!(
+                    "{} [{hint}] {chord}: not in {}",
+                    cmd.id(),
+                    gone.join(" or ")
+                ));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "{} palette chord(s) missing where people look for them:\n{}",
+        missing.len(),
+        missing.join("\n")
+    );
+}
+
+#[test]
+fn backticked_keys_read_as_the_chords_they_spell() {
+    assert_eq!(
+        backticked_chords("| `Cmd`+`Opt`+`Shift`+`S` | x |"),
+        ["Cmd+Opt+Shift+S"]
+    );
+    assert_eq!(
+        backticked_chords("`Cmd+K` `L` / `Ctrl+K` `L`"),
+        ["Cmd+K L / Ctrl+K L"]
+    );
+    assert_eq!(backticked_chords("`Enter`/`F3` forward"), ["Enter/F3"]);
+    assert_eq!(
+        backticked_chords("| `Cmd`+`Opt`+`Shift`+`U` / `L` |"),
+        ["Cmd+Opt+Shift+U / L"]
+    );
+    assert_eq!(
+        backticked_chords("`Ctrl+p` / `Cmd+p`, then `#`"),
+        ["Ctrl+p then # / Cmd+p then #"]
+    );
+    assert_eq!(
+        backticked_chords("| `Cmd+K` `Cmd+1` … `Cmd+K` `Cmd+7` | Fold |"),
+        ["Cmd+K Cmd+1..7"]
+    );
+    assert_eq!(
+        backticked_chords("set `tab_size`, and `Esc`"),
+        ["tab_size", "Esc"]
+    );
 }

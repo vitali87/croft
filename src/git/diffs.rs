@@ -48,7 +48,7 @@ pub(super) fn diff_text(root: &Path, args: &[&str]) -> Result<String, String> {
     let path_str = root
         .to_str()
         .ok_or_else(|| "non-utf8 workspace path".to_string())?;
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::proc::command("git");
     cmd.args(["-C", path_str]);
     match args.split_first() {
         // The patch croft parses, never the user's display settings

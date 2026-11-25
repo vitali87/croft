@@ -1,0 +1,1 @@
+fix: In xterm and other terminals that cannot read underline colours, opening a file no longer blanks most of the screen: croft sends underline colours only to terminals known to read them, and elsewhere draws the underline in the text's colour.

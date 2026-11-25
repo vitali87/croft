@@ -2180,7 +2180,11 @@ fn saved_bookmarks_reach_the_tabs_of_every_split() {
     let mut marks = std::collections::HashMap::new();
     marks.insert(a.clone(), std::collections::BTreeSet::from([2]));
     app.restore_bookmarks_everywhere(&marks);
-    let split = app.editor_layout.inactive_groups()[0]
+    let split = app
+        .editor_layout
+        .inactive_groups()
+        .next()
+        .unwrap()
         .editors
         .iter()
         .find(|e| e.path.as_deref() == Some(a.as_path()))
@@ -2770,4 +2774,216 @@ fn a_restored_editor_focus_is_drawn_on_the_editor() {
     assert!(next.focus == Pane::Editor, "keys go to the editor");
     assert!(next.editor.focused, "the editor draws focused");
     assert!(!next.tree.focused, "the Explorer does not");
+}
+
+/// #2670: screen reader mode read the pane behind eight pop-ups (the
+/// connect dialog, F1, the branch picker, command history, Jump to
+/// Directory, the process list and both symbol pickers) and had nothing to
+/// say for the stash-drop and terminal-paste questions. Every pop-up is read
+/// in place of what it covers.
+#[test]
+fn every_popup_is_read_instead_of_the_pane_behind_it() {
+    use crate::app::popups::Popup;
+    let mut behind_read = Vec::new();
+    for p in Popup::ALL {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("notes.txt");
+        std::fs::write(&file, "one\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open(&file).unwrap();
+        app.focus_pane(Pane::Editor);
+        let behind = app.a11y_snapshot();
+        let _hook = super::popups::open(&mut app, p);
+        let snap = app.a11y_snapshot();
+        if snap.focus == behind.focus && snap.item == behind.item {
+            behind_read.push(format!("{p:?} ({:?})", snap.focus));
+        }
+    }
+    assert!(
+        behind_read.is_empty(),
+        "screen reader mode read the pane behind these pop-ups: {}",
+        behind_read.join(", ")
+    );
+}
+
+/// #2673 review (CodeRabbit): with the terminal focused, screen reader mode
+/// left the real cursor on the shell's cursor under the branch picker,
+/// command history, Jump to Directory, the process list and both symbol
+/// pickers, so a reader that follows the cursor read the shell and never
+/// the pop-up. Under every pop-up the cursor now sits on the announcement,
+/// or on a caret the pop-up places in a field of its own.
+#[cfg(unix)]
+#[test]
+fn the_screen_reader_cursor_leaves_the_shell_for_every_popup() {
+    use crate::app::popups::Popup;
+    let mut stayed = Vec::new();
+    for p in Popup::ALL {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+            "/bin/sh",
+            &[String::from("-c"), String::from("sleep 30")],
+            tmp.path(),
+        )
+        .unwrap();
+        app.active_terminal = 0;
+        app.show_terminal = true;
+        app.focus_pane(Pane::Terminal);
+        app.screen_reader = true;
+        let (_term, before) = draw_and_cursor(&mut app);
+        let shell = app.terminals[0]
+            .screen_cursor()
+            .expect("the shell's cursor shows");
+        assert_eq!(
+            (before.x, before.y),
+            shell,
+            "setup: the cursor is the shell's"
+        );
+        let _hook = super::popups::open(&mut app, p);
+        let (_term, at) = draw_and_cursor(&mut app);
+        let announced = app.announce_pos;
+        assert!(announced.is_some(), "{p:?}: the status bar shows its line");
+        let own_caret = app.cursor_should_be_visible();
+        if (at.x, at.y) == shell || (!own_caret && Some((at.x, at.y)) != announced) {
+            stayed.push(format!("{p:?}"));
+        }
+    }
+    assert!(
+        stayed.is_empty(),
+        "the cursor was not on the announcement under: {}",
+        stayed.join(", ")
+    );
+}
+
+/// #2670: the two questions that had no words say what they ask and which
+/// key does what.
+#[test]
+fn the_stash_drop_and_terminal_paste_questions_are_announced() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.pending_stash_drop = Some(PendingStashDrop {
+        root: tmp.path().to_path_buf(),
+        oid: String::from("0123abcd"),
+        label: String::from("stash@{0}: WIP on main"),
+    });
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Drop stash?");
+    assert_eq!(
+        snap.item.as_deref(),
+        Some(
+            "stash@{0}: WIP on main. This permanently deletes the stash. \
+             Y, yes, drop it. N or Escape, no"
+        )
+    );
+    app.pending_stash_drop = None;
+    app.pending_terminal_paste = Some(b"echo a\necho b\n".to_vec());
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Paste 2 lines into the terminal?");
+    assert_eq!(
+        snap.item.as_deref(),
+        Some(
+            "Each line break is an Enter here, so the lines run as they land. \
+             echo a; echo b. \
+             Y or Enter, paste. L, paste as one line. N or Escape, cancel"
+        )
+    );
+}
+
+/// #2670: the connect dialog reads what it asks and the keys for that step,
+/// never what was typed into it.
+#[test]
+fn the_connect_dialog_reads_its_question_but_not_the_password() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let mut dialog = crate::widgets::connect_dialog::ConnectDialog::new(String::from("devbox"));
+    dialog.set_prompt(
+        crate::remote_connect::PromptKind::Password,
+        String::from("dev@devbox's password:"),
+    );
+    for c in "hunter2".chars() {
+        dialog.push_input_char(c);
+    }
+    app.connect_dialog = Some(dialog);
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Connect to devbox");
+    let item = snap.item.unwrap_or_default();
+    assert!(item.contains("dev@devbox's password:"), "{item}");
+    assert!(
+        item.ends_with("Type the answer. Enter, send. Escape, cancel"),
+        "{item}"
+    );
+    assert!(
+        !item.contains("hunter2"),
+        "the password is never read: {item}"
+    );
+}
+
+/// #2670 review: what the pickers read tells their rows apart and says what
+/// Enter does. F1 reads the shortcut at the top, so each scroll is heard; a
+/// workspace symbol carries its file and line; `:42` in Go to Symbol reads
+/// the line; the branch picker says Delete when Enter deletes; a failed
+/// connection reads its error.
+#[test]
+fn the_pickers_read_what_tells_their_rows_apart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+
+    app.shortcuts_modal = Some(crate::widgets::shortcuts::ShortcutsModal::default());
+    let first = app.a11y_snapshot().item.unwrap_or_default();
+    assert!(first.contains(": "), "a shortcut is read: {first}");
+    let modal = app.shortcuts_modal.as_mut().unwrap();
+    modal.last_content_height = 400;
+    modal.last_inner_height = 10;
+    modal.scroll_down(10);
+    let later = app.a11y_snapshot().item.unwrap_or_default();
+    assert_ne!(first, later, "scrolling reads the next shortcut");
+    app.shortcuts_modal = None;
+
+    let mut ws = crate::widgets::workspace_symbols::WorkspaceSymbolPicker::new(
+        tmp.path().to_path_buf(),
+        "new",
+    );
+    ws.set_results(vec![crate::lsp::manager::WorkspaceSymbolItem {
+        name: String::from("new"),
+        kind: crate::lsp::manager::OutlineKind::Function,
+        path: tmp.path().join("src/b.rs"),
+        line: 41,
+        character: 4,
+        container: Some(String::from("Parser")),
+    }]);
+    app.workspace_symbols = Some(ws);
+    assert_eq!(
+        app.a11y_snapshot().item.as_deref(),
+        Some("new, in Parser, src/b.rs:42")
+    );
+    app.workspace_symbols = None;
+
+    let mut sym =
+        crate::widgets::symbol_picker::SymbolPicker::new(PathBuf::from("a.rs"), Vec::new());
+    sym.query = String::from(":42");
+    app.go_to_symbol = Some(sym);
+    assert_eq!(app.a11y_snapshot().item.as_deref(), Some("Go to line 42"));
+    app.go_to_symbol = None;
+
+    let branch = |name: &str| crate::git::BranchInfo {
+        display: name.to_string(),
+        checkout_name: name.to_string(),
+        is_current: false,
+        is_remote: false,
+        track: None,
+    };
+    app.branch_picker = Some(crate::widgets::branch_picker::BranchPicker::new(vec![
+        branch("feature"),
+    ]));
+    app.branch_purpose = crate::app::BranchPurpose::Delete;
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Delete Branch", "named for what Enter does");
+    assert_eq!(snap.item.as_deref(), Some("feature"));
+    app.branch_picker = None;
+
+    let mut dialog = crate::widgets::connect_dialog::ConnectDialog::new(String::from("devbox"));
+    dialog.set_failed(String::from("Permission denied (publickey)"));
+    app.connect_dialog = Some(dialog);
+    let item = app.a11y_snapshot().item.unwrap_or_default();
+    assert!(item.contains("Permission denied (publickey)"), "{item}");
 }

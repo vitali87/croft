@@ -79,7 +79,7 @@ pub fn blame(root: &Path, rel_path: &str) -> Blame {
     let Some(path_str) = dir.to_str() else {
         return Blame::default();
     };
-    let output = Command::new("git")
+    let output = crate::proc::command("git")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .args(["-C", path_str, "blame", "--porcelain", "--", &name])
         .output();

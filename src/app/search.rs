@@ -2,6 +2,8 @@
 //! diffs and logs), Quick Open, and Switch Header/Source.
 
 use super::*;
+use crate::widgets::confirm_frame::{ConfirmFrame, Inset, confirm_width, draw_confirm};
+use crate::widgets::picker_rows::{PickerMouse, answer_mouse};
 
 /// A Search Editor tab's label (#615): not a file on disk, so it names the
 /// query rather than a path the save path could clobber.
@@ -168,8 +170,7 @@ impl App {
         let Some((occurrences, files, skipped)) = self.pending_replace_all else {
             return;
         };
-        let area = frame.area();
-        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
+        let width = confirm_width(frame.area());
         let prompt = format!(
             "Replace {occurrences} occurrence(s) across {files} file(s) with \"{}\"?",
             self.search.replace
@@ -180,54 +181,34 @@ impl App {
         let inner_w = width.saturating_sub(2);
         let prompt_rows = wrap_cells_variable_width(&prompt, inner_w, inner_w).len() as u16;
         let skipped_rows = u16::from(skipped > 0);
-        let height: u16 = 6 + prompt_rows + skipped_rows;
-        let rect = Rect {
-            x: (area.width.saturating_sub(width)) / 2 + area.x,
-            y: (area.height.saturating_sub(height)) / 2 + area.y,
-            width,
-            height,
+        let frame_spec = ConfirmFrame {
+            title: " REPLACE ALL? ",
+            accent: self.theme.ui(Color::Rgb(0xe7, 0xa7, 0x3c)),
+            title_fg: Color::Black,
+            height: 6 + prompt_rows + skipped_rows,
+            inset: Inset::Tight,
         };
-        let rect = rect.intersection(area);
-        let warn = self.theme.ui(Color::Rgb(0xe7, 0xa7, 0x3c));
-        let block = ratatui::widgets::Block::default()
-            .borders(ratatui::widgets::Borders::ALL)
-            .border_style(Style::default().fg(warn))
-            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
-            .title(ratatui::text::Span::styled(
-                " REPLACE ALL? ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(warn)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        frame.render_widget(ratatui::widgets::Clear, rect);
-        let inner = block.inner(rect);
-        frame.render_widget(block, rect);
-        let mut lines = vec![
-            Line::from(prompt),
-            Line::from(""),
-            Line::from("Files are rewritten on disk."),
-        ];
-        if skipped > 0 {
-            lines.push(Line::from(format!(
-                "{skipped} open file(s) with unsaved changes will be skipped."
+        draw_confirm(frame, self.theme, frame_spec, |frame, inner| {
+            let mut lines = vec![
+                Line::from(prompt),
+                Line::from(""),
+                Line::from("Files are rewritten on disk."),
+            ];
+            if skipped > 0 {
+                lines.push(Line::from(format!(
+                    "{skipped} open file(s) with unsaved changes will be skipped."
+                )));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Enter / Y replaces \u{00b7} Esc cancels",
+                Style::default().fg(self.theme.ui(Color::Rgb(0x9a, 0xa4, 0xb8))),
             )));
-        }
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "Enter / Y replaces \u{00b7} Esc cancels",
-            Style::default().fg(self.theme.ui(Color::Rgb(0x9a, 0xa4, 0xb8))),
-        )));
-        frame.render_widget(
-            Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
-            inner,
-        );
-        crate::widgets::approval_popup::paint_warning_card(
-            frame.buffer_mut(),
-            rect,
-            self.theme,
-            warn,
-        );
+            frame.render_widget(
+                Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+                inner,
+            );
+        });
     }
 
     pub(super) fn handle_search_key(&mut self, key: KeyEvent) {
@@ -451,15 +432,9 @@ impl App {
     /// Every path open with unsaved edits, across the active group and all
     /// inactive split leaves.
     pub(super) fn dirty_open_paths(&self) -> std::collections::HashSet<PathBuf> {
-        self.editor
-            .editors
-            .iter()
-            .chain(
-                self.editor_layout
-                    .inactive_leaf_tabs()
-                    .into_iter()
-                    .flat_map(|tabs| tabs.editors.iter()),
-            )
+        self.editor_layout
+            .all_groups(&self.editor)
+            .flat_map(|g| g.editors.iter())
             .filter(|e| e.dirty)
             .filter_map(|e| e.path.clone())
             .collect()
@@ -633,10 +608,6 @@ impl App {
         true
     }
 
-    pub fn consume_file_finder_image_clear(&mut self) -> bool {
-        self.overlays.file_finder_clear.consume()
-    }
-
     /// Take the background build's index into `file_finder_index`
     /// without blocking. Called from `open_file_finder` and from the
     /// main loop tick. Accepts REPLACEMENT results too: when the FS
@@ -782,13 +753,13 @@ impl App {
         let mut finder = crate::widgets::file_finder::FileFinder::new(entries);
         finder.set_open_lines(self.open_text_line_counts());
         self.file_finder = Some(finder);
-        self.overlays.file_finder_clear.request();
+        self.overlays.popup_clear.request();
         self.status = format!("Go to File: {count} files indexed — Esc to close");
     }
 
     pub(super) fn close_file_finder(&mut self) {
         if self.file_finder.take().is_some() {
-            self.overlays.file_finder_clear.request();
+            self.overlays.popup_clear.request();
             self.overlays.activity.mark_dirty();
             self.overlays.welcome.mark_dirty();
             self.overlays.hero.mark_dirty();
@@ -967,21 +938,30 @@ impl App {
                     // file (or one that saturated in the parser) was clamped
                     // above, and the clamped truth is the useful signal.
                     let last_line = self.editor.lines.len().max(1);
-                    self.status = match hint {
-                        Some(hint) => match hint.end {
-                            Some(end) => format!(
-                                "Opened {}:{}-{}",
-                                self.status_path(&path),
-                                hint.line.min(last_line),
-                                end.min(last_line)
-                            ),
-                            None => format!(
-                                "Opened {}:{}",
-                                self.status_path(&path),
-                                hint.line.min(last_line)
-                            ),
-                        },
-                        None => format!("Opened {}", self.status_path(&path)),
+                    self.status = if let Some(why) = self.editor.hex_routed_because() {
+                        // Its own viewer declined the file: say why, as the
+                        // Explorer does, line hint or not (#2711).
+                        format!(
+                            "Opened {} in the hex viewer: {why}",
+                            self.status_path(&path)
+                        )
+                    } else {
+                        match hint {
+                            Some(hint) => match hint.end {
+                                Some(end) => format!(
+                                    "Opened {}:{}-{}",
+                                    self.status_path(&path),
+                                    hint.line.min(last_line),
+                                    end.min(last_line)
+                                ),
+                                None => format!(
+                                    "Opened {}:{}",
+                                    self.status_path(&path),
+                                    hint.line.min(last_line)
+                                ),
+                            },
+                            None => format!("Opened {}", self.status_path(&path)),
+                        }
                     };
                 }
                 Err(e) => {
@@ -995,31 +975,10 @@ impl App {
         let Some(finder) = self.file_finder.as_mut() else {
             return;
         };
-        let inside = rect_contains(finder.last_rect, m.column, m.row);
-        match m.kind {
-            MouseEventKind::ScrollDown => {
-                for _ in 0..3 {
-                    finder.select_next();
-                }
-            }
-            MouseEventKind::ScrollUp => {
-                for _ in 0..3 {
-                    finder.select_prev();
-                }
-            }
-            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
-                if !inside =>
-            {
-                self.close_file_finder();
-            }
-            // Click a row to open it, the way VS Code's quick-pick behaves.
-            MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(idx) = finder.row_index_at(m.row) {
-                    finder.selected = idx;
-                    self.open_file_finder_selection();
-                }
-            }
-            _ => {}
+        match answer_mouse(finder, m) {
+            PickerMouse::Close => self.close_file_finder(),
+            PickerMouse::Accept => self.open_file_finder_selection(),
+            PickerMouse::Stay => {}
         }
     }
 

@@ -72,7 +72,7 @@ fn resting_on_an_activity_icon_arms_its_button_hint() {
     let backend = ratatui::backend::TestBackend::new(140, 50);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
-    let icon = app.sidebar_areas.search_icon;
+    let icon = app.sidebar_areas.activity_icons[ActivityIcon::Search];
     let (cx, cy) = (icon.x + icon.width / 2, icon.y);
     app.on_mouse_moved(cx, cy, false);
     assert_eq!(
@@ -437,47 +437,7 @@ fn resize_arms_a_one_shot_terminal_clear_to_evict_stale_activity_icons() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     // Pretend init_graphics baked the activity-bar icon images — images mode
     // is the only state in which the stale layer can exist.
-    app.overlays.activity.set_images(ActivityBarImages {
-        explorer_active: String::new(),
-        explorer_inactive: String::new(),
-        explorer_hovered: String::new(),
-        search_active: String::new(),
-        search_inactive: String::new(),
-        search_hovered: String::new(),
-        source_control_active: String::new(),
-        source_control_inactive: String::new(),
-        source_control_hovered: String::new(),
-        remote_active: String::new(),
-        remote_inactive: String::new(),
-        remote_hovered: String::new(),
-        run_debug_active: String::new(),
-        run_debug_inactive: String::new(),
-        run_debug_hovered: String::new(),
-        extensions_active: String::new(),
-        extensions_inactive: String::new(),
-        extensions_hovered: String::new(),
-        testing_active: String::new(),
-        testing_inactive: String::new(),
-        testing_hovered: String::new(),
-        codeql_active: String::new(),
-        codeql_inactive: String::new(),
-        codeql_hovered: String::new(),
-        sponsor_inactive: String::new(),
-        sponsor_hovered: String::new(),
-        settings_active: String::new(),
-        settings_inactive: String::new(),
-        settings_hovered: String::new(),
-        layout_sidebar_on: String::new(),
-        layout_sidebar_on_hover: String::new(),
-        layout_sidebar_off: String::new(),
-        layout_sidebar_off_hover: String::new(),
-        layout_panel_on: String::new(),
-        layout_panel_on_hover: String::new(),
-        layout_panel_off: String::new(),
-        layout_panel_off_hover: String::new(),
-        layout_customize: String::new(),
-        layout_customize_hover: String::new(),
-    });
+    app.overlays.activity.set_images(empty_activity_images());
     app.on_resize();
     assert!(
         app.consume_activity_image_clear(),
@@ -504,55 +464,16 @@ fn activity_bar_icons_moving_within_the_flush_arms_a_one_shot_terminal_clear() {
     use ratatui::layout::Rect;
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.overlays.activity.set_images(ActivityBarImages {
-        explorer_active: String::new(),
-        explorer_inactive: String::new(),
-        explorer_hovered: String::new(),
-        search_active: String::new(),
-        search_inactive: String::new(),
-        search_hovered: String::new(),
-        source_control_active: String::new(),
-        source_control_inactive: String::new(),
-        source_control_hovered: String::new(),
-        remote_active: String::new(),
-        remote_inactive: String::new(),
-        remote_hovered: String::new(),
-        run_debug_active: String::new(),
-        run_debug_inactive: String::new(),
-        run_debug_hovered: String::new(),
-        extensions_active: String::new(),
-        extensions_inactive: String::new(),
-        extensions_hovered: String::new(),
-        testing_active: String::new(),
-        testing_inactive: String::new(),
-        testing_hovered: String::new(),
-        codeql_active: String::new(),
-        codeql_inactive: String::new(),
-        codeql_hovered: String::new(),
-        sponsor_inactive: String::new(),
-        sponsor_hovered: String::new(),
-        settings_active: String::new(),
-        settings_inactive: String::new(),
-        settings_hovered: String::new(),
-        layout_sidebar_on: String::new(),
-        layout_sidebar_on_hover: String::new(),
-        layout_sidebar_off: String::new(),
-        layout_sidebar_off_hover: String::new(),
-        layout_panel_on: String::new(),
-        layout_panel_on_hover: String::new(),
-        layout_panel_off: String::new(),
-        layout_panel_off_hover: String::new(),
-        layout_customize: String::new(),
-        layout_customize_hover: String::new(),
-    });
+    app.overlays.activity.set_images(empty_activity_images());
     let place = |app: &mut App, base: u16| {
-        app.sidebar_areas.explorer_icon = Rect::new(0, base, 2, 1);
-        app.sidebar_areas.search_icon = Rect::new(0, base + 2, 2, 1);
-        app.sidebar_areas.source_control_icon = Rect::new(0, base + 4, 2, 1);
-        app.sidebar_areas.remote_icon = Rect::new(0, base + 6, 2, 1);
-        app.sidebar_areas.run_debug_icon = Rect::new(0, base + 8, 2, 1);
-        app.sidebar_areas.extensions_icon = Rect::new(0, base + 10, 2, 1);
-        app.sidebar_areas.testing_icon = Rect::new(0, base + 12, 2, 1);
+        app.sidebar_areas.activity_icons[ActivityIcon::Explorer] = Rect::new(0, base, 2, 1);
+        app.sidebar_areas.activity_icons[ActivityIcon::Search] = Rect::new(0, base + 2, 2, 1);
+        app.sidebar_areas.activity_icons[ActivityIcon::SourceControl] =
+            Rect::new(0, base + 4, 2, 1);
+        app.sidebar_areas.activity_icons[ActivityIcon::Remote] = Rect::new(0, base + 6, 2, 1);
+        app.sidebar_areas.activity_icons[ActivityIcon::RunDebug] = Rect::new(0, base + 8, 2, 1);
+        app.sidebar_areas.activity_icons[ActivityIcon::Extensions] = Rect::new(0, base + 10, 2, 1);
+        app.sidebar_areas.activity_icons[ActivityIcon::Testing] = Rect::new(0, base + 12, 2, 1);
     };
     // First emit at one layout: records the positions, arms no clear.
     place(&mut app, 2);
@@ -697,7 +618,7 @@ fn croft_loch_activity_icons_rest_muted_hover_to_text_and_tint_their_badge() {
     let backend = ratatui::backend::TestBackend::new(120, 40);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|frame| app.render(frame)).unwrap();
-    let search = app.sidebar_areas.search_icon;
+    let search = app.sidebar_areas.activity_icons[ActivityIcon::Search];
     app.handle_mouse(crossterm::event::MouseEvent {
         kind: crossterm::event::MouseEventKind::Moved,
         column: search.x + 1,
@@ -799,7 +720,7 @@ fn croft_loch_leaves_the_sponsor_hearts_rows_to_its_baked_image() {
         .surfaces()
         .unwrap()
         .chrome();
-    let heart = app.sidebar_areas.sponsor_icon;
+    let heart = app.sidebar_areas.activity_icons[ActivityIcon::Sponsor];
     assert!(!heart.is_empty(), "a 40-row bar has room for the heart");
     for y in heart.top()..heart.bottom() {
         assert_ne!(
@@ -809,8 +730,10 @@ fn croft_loch_leaves_the_sponsor_hearts_rows_to_its_baked_image() {
         );
     }
     let above = heart.top() - 1;
-    let last_view = app.sidebar_areas.testing_icon.bottom();
-    assert!(above >= last_view.max(app.sidebar_areas.codeql_icon.bottom()));
+    let last_view = app.sidebar_areas.activity_icons[ActivityIcon::Testing].bottom();
+    assert!(
+        above >= last_view.max(app.sidebar_areas.activity_icons[ActivityIcon::CodeQL].bottom())
+    );
     assert_eq!(
         buf[(heart.x, above)].bg,
         chrome,
@@ -1026,9 +949,9 @@ fn activity_bar_render_lays_out_run_debug_between_source_control_and_remote() {
     let backend = ratatui::backend::TestBackend::new(40, 30);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render_activity_bar(f, bar)).unwrap();
-    let scm = app.sidebar_areas.source_control_icon;
-    let run = app.sidebar_areas.run_debug_icon;
-    let rem = app.sidebar_areas.remote_icon;
+    let scm = app.sidebar_areas.activity_icons[ActivityIcon::SourceControl];
+    let run = app.sidebar_areas.activity_icons[ActivityIcon::RunDebug];
+    let rem = app.sidebar_areas.activity_icons[ActivityIcon::Remote];
     assert!(run.height > 0, "run-debug icon must claim a non-zero block");
     assert!(
         run.y > scm.y,
@@ -1592,35 +1515,58 @@ fn hovering_a_non_selected_activity_icon_emits_its_hovered_variant() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     // Distinguishable payloads so the emitted set reveals which variant won.
     app.overlays.activity.set_images(ActivityBarImages {
-        explorer_active: "EA".into(),
-        explorer_inactive: "EI".into(),
-        explorer_hovered: "EH".into(),
-        search_active: "SA".into(),
-        search_inactive: "SI".into(),
-        search_hovered: "SH".into(),
-        source_control_active: "CA".into(),
-        source_control_inactive: "CI".into(),
-        source_control_hovered: "CH".into(),
-        remote_active: "RA".into(),
-        remote_inactive: "RI".into(),
-        remote_hovered: "RH".into(),
-        run_debug_active: "DA".into(),
-        run_debug_inactive: "DI".into(),
-        run_debug_hovered: "DH".into(),
-        extensions_active: "XA".into(),
-        extensions_inactive: "XI".into(),
-        extensions_hovered: "XH".into(),
-        testing_active: "TA".into(),
-        testing_inactive: "TI".into(),
-        testing_hovered: "TH".into(),
-        codeql_active: "CA".into(),
-        codeql_inactive: "CI".into(),
-        codeql_hovered: "CH".into(),
-        sponsor_inactive: "HI".into(),
-        sponsor_hovered: "HH".into(),
-        settings_active: "GA".into(),
-        settings_inactive: "GI".into(),
-        settings_hovered: "GH".into(),
+        icons: [
+            ActivityIconImages {
+                active: Some("EA".into()),
+                inactive: "EI".into(),
+                hovered: "EH".into(),
+            },
+            ActivityIconImages {
+                active: Some("SA".into()),
+                inactive: "SI".into(),
+                hovered: "SH".into(),
+            },
+            ActivityIconImages {
+                active: Some("CA".into()),
+                inactive: "CI".into(),
+                hovered: "CH".into(),
+            },
+            ActivityIconImages {
+                active: Some("RA".into()),
+                inactive: "RI".into(),
+                hovered: "RH".into(),
+            },
+            ActivityIconImages {
+                active: Some("DA".into()),
+                inactive: "DI".into(),
+                hovered: "DH".into(),
+            },
+            ActivityIconImages {
+                active: Some("XA".into()),
+                inactive: "XI".into(),
+                hovered: "XH".into(),
+            },
+            ActivityIconImages {
+                active: Some("TA".into()),
+                inactive: "TI".into(),
+                hovered: "TH".into(),
+            },
+            ActivityIconImages {
+                active: Some("CA".into()),
+                inactive: "CI".into(),
+                hovered: "CH".into(),
+            },
+            ActivityIconImages {
+                active: None,
+                inactive: "HI".into(),
+                hovered: "HH".into(),
+            },
+            ActivityIconImages {
+                active: Some("GA".into()),
+                inactive: "GI".into(),
+                hovered: "GH".into(),
+            },
+        ],
         layout_sidebar_on: "LS".into(),
         layout_sidebar_on_hover: "LSh".into(),
         layout_sidebar_off: "LF".into(),
@@ -1633,13 +1579,13 @@ fn hovering_a_non_selected_activity_icon_emits_its_hovered_variant() {
         layout_customize_hover: "LCh".into(),
     });
     // Every view icon needs a non-empty block or the emit early-returns.
-    app.sidebar_areas.explorer_icon = Rect::new(0, 0, 2, 1);
-    app.sidebar_areas.search_icon = Rect::new(0, 2, 2, 1);
-    app.sidebar_areas.source_control_icon = Rect::new(0, 4, 2, 1);
-    app.sidebar_areas.remote_icon = Rect::new(0, 6, 2, 1);
-    app.sidebar_areas.run_debug_icon = Rect::new(0, 8, 2, 1);
-    app.sidebar_areas.extensions_icon = Rect::new(0, 10, 2, 1);
-    app.sidebar_areas.testing_icon = Rect::new(0, 12, 2, 1);
+    app.sidebar_areas.activity_icons[ActivityIcon::Explorer] = Rect::new(0, 0, 2, 1);
+    app.sidebar_areas.activity_icons[ActivityIcon::Search] = Rect::new(0, 2, 2, 1);
+    app.sidebar_areas.activity_icons[ActivityIcon::SourceControl] = Rect::new(0, 4, 2, 1);
+    app.sidebar_areas.activity_icons[ActivityIcon::Remote] = Rect::new(0, 6, 2, 1);
+    app.sidebar_areas.activity_icons[ActivityIcon::RunDebug] = Rect::new(0, 8, 2, 1);
+    app.sidebar_areas.activity_icons[ActivityIcon::Extensions] = Rect::new(0, 10, 2, 1);
+    app.sidebar_areas.activity_icons[ActivityIcon::Testing] = Rect::new(0, 12, 2, 1);
     app.sidebar_view = SidebarView::Explorer;
     // Hover Search, a non-selected icon.
     app.hovered_activity_icon = Some(ActivityIcon::Search);
@@ -1668,11 +1614,13 @@ fn hovering_a_non_selected_activity_icon_emits_its_hovered_variant() {
 fn hovering_the_sponsor_heart_emits_its_hovered_variant() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.overlays.activity.set_images(ActivityBarImages {
-        sponsor_inactive: "HI".into(),
-        sponsor_hovered: "HH".into(),
-        ..Default::default()
-    });
+    let mut images = ActivityBarImages::default();
+    images.icons[ActivityIcon::Sponsor as usize] = ActivityIconImages {
+        active: None,
+        inactive: "HI".into(),
+        hovered: "HH".into(),
+    };
+    app.overlays.activity.set_images(images);
     let emitted = |app: &App| -> Vec<String> {
         app.pending_activity_image_overlays()
             .into_iter()
@@ -1681,7 +1629,7 @@ fn hovering_the_sponsor_heart_emits_its_hovered_variant() {
     };
     draw(&mut app, 120, 40);
     assert!(emitted(&app).contains(&"HI".to_string()));
-    let heart = app.sidebar_areas.sponsor_icon;
+    let heart = app.sidebar_areas.activity_icons[ActivityIcon::Sponsor];
     app.handle_mouse(crossterm::event::MouseEvent {
         kind: crossterm::event::MouseEventKind::Moved,
         column: heart.x,
@@ -1701,12 +1649,13 @@ fn hovering_the_sponsor_heart_emits_its_hovered_variant() {
 fn a_collapsed_side_bar_unpills_its_views_activity_icon() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.overlays.activity.set_images(ActivityBarImages {
-        explorer_active: "EA".into(),
-        explorer_inactive: "EI".into(),
-        explorer_hovered: "EH".into(),
-        ..Default::default()
-    });
+    let mut images = ActivityBarImages::default();
+    images.icons[ActivityIcon::Explorer as usize] = ActivityIconImages {
+        active: Some("EA".into()),
+        inactive: "EI".into(),
+        hovered: "EH".into(),
+    };
+    app.overlays.activity.set_images(images);
     let emitted = |app: &App| -> Vec<String> {
         app.pending_activity_image_overlays()
             .into_iter()
@@ -1738,7 +1687,7 @@ fn moving_over_an_activity_icon_marks_it_hovered_and_redirties_the_overlay() {
     use ratatui::layout::Rect;
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.sidebar_areas.search_icon = Rect::new(0, 4, 2, 2);
+    app.sidebar_areas.activity_icons[ActivityIcon::Search] = Rect::new(0, 4, 2, 2);
     // Baseline: no hover, icons already emitted (clean).
     app.hovered_activity_icon = None;
     app.overlays.activity.mark_emitted();
@@ -2581,7 +2530,7 @@ fn clicking_the_open_views_activity_icon_collapses_then_reopens_the_side_bar() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     draw(&mut app, 120, 40);
-    let explorer = app.sidebar_areas.explorer_icon;
+    let explorer = app.sidebar_areas.activity_icons[ActivityIcon::Explorer];
     assert!(app.show_tree && app.sidebar_view == SidebarView::Explorer);
     app.focus_pane(Pane::Tree);
     left_click(&mut app, explorer.x, explorer.y);
@@ -2605,8 +2554,8 @@ fn clicking_another_views_activity_icon_switches_and_expands_a_collapsed_side_ba
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     draw(&mut app, 120, 40);
-    let explorer = app.sidebar_areas.explorer_icon;
-    let search = app.sidebar_areas.search_icon;
+    let explorer = app.sidebar_areas.activity_icons[ActivityIcon::Explorer];
+    let search = app.sidebar_areas.activity_icons[ActivityIcon::Search];
     left_click(&mut app, search.x, search.y);
     assert!(
         app.show_tree,
@@ -2630,7 +2579,7 @@ fn collapsing_the_side_bar_from_its_icon_keeps_a_maximized_terminal() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     draw(&mut app, 120, 40);
-    let explorer = app.sidebar_areas.explorer_icon;
+    let explorer = app.sidebar_areas.activity_icons[ActivityIcon::Explorer];
     app.show_terminal = true;
     app.terminal_maximized = true;
     app.focus_pane(Pane::Tree);
@@ -4068,38 +4017,38 @@ fn a_chrome_image_is_sent_only_when_it_could_be_missing() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let at = Rect::new(2, 2, 3, 1);
     let mut buf = Buffer::empty(Rect::new(0, 0, 20, 10));
-    app.drawn_buffer = Some(buf.clone());
     app.inline_protocol = InlineImageProtocol::ITerm2;
-    assert!(app.chrome_image_due("k", "img", at), "new");
+    assert!(app.chrome_image_due("k", "img", at, &buf), "new");
     app.end_chrome_flush();
-    assert!(!app.chrome_image_due("k", "img", at), "unchanged frame");
-    app.end_chrome_flush();
-    assert!(app.chrome_image_due("k", "img2", at), "changed");
     assert!(
-        app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1)),
+        !app.chrome_image_due("k", "img", at, &buf),
+        "unchanged frame"
+    );
+    app.end_chrome_flush();
+    assert!(app.chrome_image_due("k", "img2", at, &buf), "changed");
+    assert!(
+        app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1), &buf),
         "moved"
     );
     app.end_chrome_flush();
     buf[(2, 2)].set_symbol("x");
-    app.drawn_buffer = Some(buf.clone());
     assert!(
-        app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1)),
+        app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1), &buf),
         "a neighbour repainted on iTerm2"
     );
     app.end_chrome_flush();
     app.end_chrome_flush();
     assert!(
-        app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1)),
+        app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1), &buf),
         "back after a frame hidden"
     );
     app.end_chrome_flush();
     app.inline_protocol = InlineImageProtocol::Kitty;
-    assert!(app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1)));
+    assert!(app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1), &buf));
     app.end_chrome_flush();
     buf[(2, 3)].set_symbol("y");
-    app.drawn_buffer = Some(buf);
     assert!(
-        !app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1)),
+        !app.chrome_image_due("k", "img2", Rect::new(3, 2, 3, 1), &buf),
         "Kitty ignores neighbours"
     );
 }
@@ -4276,7 +4225,7 @@ fn typing_customize_layout_in_the_palette_opens_the_popup() {
 /// the active one.
 #[test]
 fn every_customize_layout_row_has_a_palette_command_that_does_the_same() {
-    use crate::widgets::command_palette::{ALL_COMMANDS, Command, LAYOUT_COMMANDS};
+    use crate::command_registry::{ALL_COMMANDS, Command, LAYOUT_COMMANDS};
     fn command_for(action: &MenuAction) -> Option<Command> {
         match action {
             MenuAction::ToggleActivityBar => Some(Command::ToggleActivityBar),
@@ -4482,4 +4431,172 @@ fn the_secondary_side_bar_leaves_the_explorer_outline_s_focus_alone() {
     app.focus_pane(Pane::Editor);
     draw(&mut app, 140, 40);
     assert!(!app.outline.focused, "and then it does not");
+}
+
+/// #2062: the activity-bar table keeps every view icon where it was: the
+/// stack starts one row below the bar's top, one icon height apart, with
+/// Run and Debug above Remote and CodeQL last. The table's draw order is
+/// also the order its blocks are stored in, so looking up an icon's block
+/// finds that icon's.
+#[test]
+fn the_activity_bar_table_keeps_each_icon_in_its_place() {
+    use ratatui::layout::Rect;
+    let bar = Rect::new(0, 3, ACTIVITY_BAR_WIDTH, 40);
+    let tops: Vec<(ActivityIcon, u16)> = ActivityIcon::ALL
+        .into_iter()
+        .filter_map(|icon| {
+            icon.slot()
+                .map(|slot| (icon, activity_view_block(bar, slot).y))
+        })
+        .collect();
+    assert_eq!(
+        tops,
+        vec![
+            (ActivityIcon::Explorer, 4),
+            (ActivityIcon::Search, 6),
+            (ActivityIcon::SourceControl, 8),
+            (ActivityIcon::Remote, 12),
+            (ActivityIcon::RunDebug, 10),
+            (ActivityIcon::Extensions, 14),
+            (ActivityIcon::Testing, 16),
+            (ActivityIcon::CodeQL, 18),
+        ]
+    );
+    for (index, icon) in ActivityIcon::ALL.into_iter().enumerate() {
+        assert_eq!(icon as usize, index, "{icon:?} is stored where it is drawn");
+    }
+}
+
+/// #2062: hovering each icon's block finds that icon, and its tooltip names
+/// it as before.
+#[test]
+fn every_activity_icon_is_found_under_the_pointer_and_named() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let names: Vec<(ActivityIcon, &str)> = ActivityIcon::ALL
+        .into_iter()
+        .filter(|&icon| app.sidebar_areas.activity_icons[icon].width > 0)
+        .map(|icon| {
+            let block = app.sidebar_areas.activity_icons[icon];
+            assert_eq!(app.activity_icon_at(block.x, block.y), Some(icon));
+            (icon, icon.label())
+        })
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            (ActivityIcon::Explorer, "Explorer"),
+            (ActivityIcon::Search, "Search"),
+            (ActivityIcon::SourceControl, "Source Control"),
+            (ActivityIcon::Remote, "Remote"),
+            (ActivityIcon::RunDebug, "Run and Debug"),
+            (ActivityIcon::Extensions, "Extensions"),
+            (ActivityIcon::Testing, "Testing"),
+            (ActivityIcon::Sponsor, "Sponsor croft"),
+            (ActivityIcon::Settings, "Manage"),
+        ],
+        "CodeQL is not added by default, so it has no block"
+    );
+}
+
+/// #2062: one count-badge type serves every activity-bar badge. It is built
+/// again only when its count changes (or after the pictures were baked
+/// again), it clears at zero, it only tracks the count where pictures are
+/// off, and it sits on its icon's bottom-right cells, as wide as the count.
+#[test]
+fn an_activity_badge_is_built_again_only_when_its_count_changes() {
+    use ratatui::layout::Rect;
+    let mut badge = CountBadge::default();
+    let builds = std::cell::Cell::new(0);
+    let build = |n: usize| {
+        builds.set(builds.get() + 1);
+        Some(format!("BADGE{n}"))
+    };
+    assert!(
+        badge.refresh(3, true, || build(3)),
+        "a new count changes it"
+    );
+    assert!(
+        !badge.refresh(3, true, || build(3)),
+        "the same count does not"
+    );
+    assert_eq!(builds.get(), 1, "and is not built again");
+    let icon = Rect::new(0, 4, 4, 2);
+    let width = crate::iterm2_inline::count_badge_cells_w;
+    assert_eq!(
+        badge.placed(icon),
+        Some((Rect::new(4 - width(3), 5, width(3), 1), "BADGE3")),
+        "on the icon's bottom row, against its right edge"
+    );
+    assert!(badge.refresh(12, true, || build(12)));
+    assert_eq!(
+        badge.placed(icon),
+        Some((Rect::new(4 - width(12), 5, width(12), 1), "BADGE12")),
+        "as wide as the count needs"
+    );
+    badge.invalidate();
+    assert!(
+        badge.refresh(12, true, || build(12)),
+        "new pictures rebuild it"
+    );
+    assert_eq!(builds.get(), 3);
+    assert!(badge.refresh(0, true, || build(0)), "zero changes it");
+    assert_eq!(badge.placed(icon), None, "and clears the picture");
+    assert_eq!(builds.get(), 3, "without building one");
+    assert!(
+        badge.refresh(5, false, || build(5)),
+        "without pictures the count still changes"
+    );
+    assert_eq!(badge.placed(icon), None, "but no picture is built");
+    assert_eq!(builds.get(), 3);
+}
+
+/// #2062: a count badge goes out as a picture over its icon's bottom-right
+/// cells, after every icon, so it is drawn on top. Here the Explorer's
+/// unsaved-file badge, built as a Kitty picture with the badge's own id.
+#[test]
+fn the_explorer_badge_goes_out_over_its_icon_after_every_icon() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "aaa").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
+    app.format_on_save = false;
+    app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::Kitty;
+    app.cell_pixel = Some((8, 16));
+    app.overlays.activity.set_images(empty_activity_images());
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.unsaved_count(), 1);
+    draw(&mut app, 120, 40);
+    let sent = app.pending_activity_image_overlays();
+    let explorer = app.sidebar_areas.activity_icons[ActivityIcon::Explorer];
+    let width = crate::iterm2_inline::count_badge_cells_w(1);
+    let corner = (
+        explorer.x + explorer.width - width,
+        explorer.y + explorer.height - 1,
+    );
+    let badge_at = sent
+        .iter()
+        .position(|(at, _)| *at == corner)
+        .expect("the badge goes out at the Explorer icon's bottom-right");
+    let shown_icons = ActivityIcon::ALL
+        .into_iter()
+        .filter(|&icon| app.sidebar_areas.activity_icons[icon].width > 0)
+        .count();
+    assert!(
+        badge_at >= shown_icons,
+        "after every icon: {badge_at} of {sent:?}"
+    );
+    let id = crate::iterm2_inline::KITTY_ID_EXPLORER_BADGE;
+    assert!(
+        sent[badge_at].1.contains(&format!("i={id}")),
+        "built with the Explorer badge's own picture id"
+    );
 }

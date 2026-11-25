@@ -91,6 +91,7 @@ use transforms::*;
 use typing::*;
 use undo::*;
 pub(crate) use viewers::ansi_color_to_tui;
+pub use viewers::delete_own_gunzip_copies;
 pub(crate) use viewers::format_bytes_human;
 pub use viewers::sqlite_wal_path;
 use viewers::*;
@@ -1401,6 +1402,20 @@ impl Editor {
     fn pin_on_edit(&mut self) {
         self.preview = false;
         self.reveal_cursor_fold();
+    }
+
+    /// One undoable edit at the caret, its steps in the order every such
+    /// command takes them: pin the tab and open the caret's fold
+    /// ([`Self::pin_on_edit`]), record the undo step `kind`, make the change
+    /// (`edit`), then mark the buffer changed and colour it again. A command
+    /// that leaves folds shut, records its step only sometimes, or marks the
+    /// buffer changed only when the edit applied calls the steps itself.
+    fn undoable_edit(&mut self, kind: EditKind, edit: impl FnOnce(&mut Self)) {
+        self.pin_on_edit();
+        self.push_undo(kind);
+        edit(self);
+        self.mark_buffer_changed();
+        self.recompute_highlights();
     }
 
     /// Whether the primary caret or an extra one is on `line`.

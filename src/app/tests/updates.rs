@@ -863,8 +863,8 @@ fn the_update_card_holds_back_the_activity_icons_it_covers() {
             .map(|(cell, _)| *cell)
             .collect()
     };
-    let gear = app.sidebar_areas.settings_icon;
-    let heart = app.sidebar_areas.sponsor_icon;
+    let gear = app.sidebar_areas.activity_icons[ActivityIcon::Settings];
+    let heart = app.sidebar_areas.activity_icons[ActivityIcon::Sponsor];
     assert!(sent(&app).contains(&(gear.x, gear.y)), "precondition");
     app.overlays.activity.mark_emitted();
     term.draw(|f| app.render(f)).unwrap();

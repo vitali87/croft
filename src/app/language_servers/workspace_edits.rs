@@ -25,8 +25,8 @@ impl App {
     /// Every open tab's file and `edit_seq`, in every split group: the
     /// baseline a workspace edit is checked against when it lands (#1151).
     pub(in crate::app) fn edit_seqs_in_every_group(&self) -> Vec<(PathBuf, u64)> {
-        std::iter::once(&self.editor)
-            .chain(self.editor_layout.inactive_groups())
+        self.editor_layout
+            .all_groups(&self.editor)
             .flat_map(|group| group.edit_seqs())
             .collect()
     }
@@ -36,8 +36,8 @@ impl App {
     /// may show only a diff of the file while another holds the file
     /// itself (#1113).
     pub(in crate::app) fn buffer_group(&self, path: &Path) -> Option<&EditorTabs> {
-        std::iter::once(&self.editor)
-            .chain(self.editor_layout.inactive_groups())
+        self.editor_layout
+            .all_groups(&self.editor)
             .find(|group| group.find_buffer_tab(path).is_some())
     }
 
@@ -49,12 +49,8 @@ impl App {
         path: &Path,
         edits: &[crate::widgets::editor::TextSpanEdit],
     ) -> Option<usize> {
-        if let Some(n) = self.editor.apply_rename_to_open_tab(path, edits) {
-            return Some(n);
-        }
         self.editor_layout
-            .inactive_groups_mut()
-            .into_iter()
+            .all_groups_mut(&mut self.editor)
             .find_map(|group| group.apply_rename_to_open_tab(path, edits))
     }
 

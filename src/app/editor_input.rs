@@ -120,24 +120,117 @@ impl App {
         }
     }
 
-    /// Whether the single-line prompt (New File, Rename, ...) is the one
-    /// taking keys: open, with nothing `handle_key_inner` answers ahead of it
-    /// on top. A paste goes into the prompt only then, so it never edits the
-    /// name held under a picker, dialog or confirm drawn over it.
-    pub(super) fn prompt_takes_input(&self) -> bool {
-        self.prompt.is_some()
-            && !self.modal_overlay_open()
-            && self.connect_dialog.is_none()
-            && self.settings_editor.is_none()
-            && self.pending_lossy_save.is_none()
-            && self.pending_unsaved.is_none()
-            && self.pending_replace_all.is_none()
-            && self.pending_unsaved_scm.is_none()
-            && self.pending_stash_drop.is_none()
-            && !self.pending_discard_all
-            && self.pending_run_block.is_none()
-            && self.pending_terminal_paste.is_none()
-            && !self.pending_broadcast_enable
+    /// Hand a paste to the pop-up that takes the keys, the way typing its
+    /// characters would reach it: into the field of a pop-up that has one,
+    /// at once and without the line breaks, and dropped by one that has
+    /// none. True when a pop-up was open, so the paste never reaches the
+    /// file, the shell or the panel the pop-up hides (#2665). The pop-ups
+    /// are asked in the order `handle_key_inner` answers them, except that
+    /// the input box and the four search pickers keep the order they had
+    /// here. A paste is never replayed as keys: in a confirm, a typed `d`
+    /// or `y` answers it.
+    fn paste_into_popup(&mut self, s: &str) -> bool {
+        let text: String = s.chars().filter(|c| !c.is_control()).collect();
+        if self.pending_terminal_warning {
+            return true;
+        }
+        if let Some(ui) = self.approval_ui.as_mut() {
+            // The reason for refusing an edit, once `r` has opened it.
+            if let Some(reason) = ui.reason.as_mut() {
+                reason.push_str(&text);
+            }
+            return true;
+        }
+        if let Some(dialog) = self.connect_dialog.as_mut() {
+            // A password, passphrase or code; ignored while none is asked.
+            text.chars().for_each(|c| dialog.push_input_char(c));
+            return true;
+        }
+        if self.shortcuts_modal.is_some() {
+            return true;
+        }
+        if self.input_prompt.is_none()
+            && let Some(ed) = self.settings_editor.as_mut()
+        {
+            let query = format!("{}{text}", ed.query);
+            ed.set_query(query);
+            return true;
+        }
+        if let Some(prompt) = self.input_prompt.as_mut() {
+            text.chars().for_each(|c| prompt.push_char(c));
+            return true;
+        }
+        if let Some(palette) = self.command_palette.as_mut() {
+            text.chars().for_each(|c| palette.push_char(c));
+            return true;
+        }
+        if let Some(picker) = self.go_to_symbol.as_mut() {
+            text.chars().for_each(|c| picker.push_char(c));
+            return true;
+        }
+        if let Some(picker) = self.workspace_symbols.as_mut() {
+            text.chars().for_each(|c| picker.push_char(c));
+            self.workspace_symbols_requery();
+            return true;
+        }
+        if let Some(finder) = self.file_finder.as_mut() {
+            text.chars().for_each(|c| finder.push_char(c));
+            self.follow_quick_open_prefix();
+            return true;
+        }
+        if self.process_picker.is_some() {
+            return true;
+        }
+        if let Some(jump) = self.zoxide_jump.as_mut() {
+            text.chars().for_each(|c| jump.push_char(c));
+            self.refresh_zoxide_results();
+            return true;
+        }
+        if let Some(history) = self.command_history_popup.as_mut() {
+            text.chars().for_each(|c| history.push_char(c));
+            self.refresh_command_history_results();
+            return true;
+        }
+        if let Some(picker) = self.branch_picker.as_mut() {
+            text.chars().for_each(|c| picker.push_char(c));
+            return true;
+        }
+        if let Some(picker) = self.list_picker.as_mut() {
+            text.chars().for_each(|c| picker.push_char(c));
+            return true;
+        }
+        // The confirms answered before the single-line prompt.
+        if self.pending_lossy_save.is_some()
+            || self.pending_unsaved.is_some()
+            || self.pending_replace_all.is_some()
+            || self.pending_unsaved_scm.is_some()
+            || self.pending_stash_drop.is_some()
+            || self.pending_discard_all
+            || self.pending_run_block.is_some()
+        {
+            return true;
+        }
+        if self.pending_terminal_paste.is_some() {
+            // It holds the first paste, which this one neither replaces
+            // nor slips past into the shell.
+            self.status = String::from("Resolve the pending paste before pasting again");
+            return true;
+        }
+        if self.pending_broadcast_enable {
+            return true;
+        }
+        // New File, Rename and the other single-line prompts take it at the
+        // caret, as the find bar does.
+        if let Some(prompt) = self.prompt.as_mut() {
+            prompt.edit(|t, at| crate::widgets::line_edit::insert_at(t, at, &text));
+            return true;
+        }
+        // The confirms answered after it, then a right-click menu, which
+        // takes every key while it is open and has no field (Codex).
+        self.pending_local_open.is_some()
+            || self.pending_discard.is_some()
+            || self.pending_revert_hunk.is_some()
+            || self.context_menu.is_some()
     }
 
     /// Flip native modal (vim) editing on or off. Driven by the global Cmd+E
@@ -503,7 +596,7 @@ impl App {
             }
             return;
         }
-        // Cursor Align (Alt+A / Alt+F / Ctrl+Alt+A / Ctrl+Alt+Shift+A) pads
+        // Cursor Align (Alt+A / Alt+F / Ctrl+Alt+A / Ctrl+Alt+L) pads
         // every caret's selection into one column. It needs a real text
         // buffer, so a diff, sheet or image tab swallows the chord untouched,
         // as the comment and wrap chords above do.
@@ -1242,9 +1335,7 @@ impl App {
     /// editor group the change was entered on.
     pub(super) fn end_vim_undo_groups(&mut self) {
         self.editor.end_undo_group();
-        for group in
-            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut())
-        {
+        for group in self.editor_layout.all_groups_mut(&mut self.editor) {
             group.end_open_undo_groups();
         }
     }
@@ -2312,6 +2403,8 @@ impl App {
         let capture =
             self.macro_recording.is_some() && !self.macro_replaying && self.focus == Pane::Editor;
         let into_editor = self.handle_paste_inner(s);
+        #[cfg(test)]
+        self.assert_one_view_per_tab();
         if self.macro_recording.is_none() || self.macro_replaying {
             return;
         }
@@ -2338,66 +2431,13 @@ impl App {
     /// Route a paste to whatever owns it; true only when it went into the
     /// editor's text, the one place a recording macro can replay it.
     pub(super) fn handle_paste_inner(&mut self, s: &str) -> bool {
-        // Modal overlays own paste entirely while open — paste lands in
-        // the modal's input field, never in the editor / tree / terminal
-        // behind it. Without this, hitting Cmd+V right after Cmd+P pastes
-        // into whatever pane was last focused instead of into the finder
-        // query, which makes the "open + paste a filename" path that the
-        // VS Code Quick Open is meant to support unusable.
-        if let Some(prompt) = self.input_prompt.as_mut() {
-            for c in s.chars() {
-                if !c.is_control() {
-                    prompt.push_char(c);
-                }
-            }
-            return false;
-        }
-        if let Some(palette) = self.command_palette.as_mut() {
-            for c in s.chars() {
-                if !c.is_control() {
-                    palette.push_char(c);
-                }
-            }
-            return false;
-        }
-        if let Some(picker) = self.go_to_symbol.as_mut() {
-            for c in s.chars() {
-                if !c.is_control() {
-                    picker.push_char(c);
-                }
-            }
-            return false;
-        }
-        if let Some(picker) = self.workspace_symbols.as_mut() {
-            for c in s.chars() {
-                if !c.is_control() {
-                    picker.push_char(c);
-                }
-            }
-            self.workspace_symbols_requery();
-            return false;
-        }
-        if let Some(finder) = self.file_finder.as_mut() {
-            for c in s.chars() {
-                if !c.is_control() {
-                    finder.push_char(c);
-                }
-            }
-            self.follow_quick_open_prefix();
-            return false;
-        }
-        // New File, Rename and the other single-line prompts take a paste at
-        // the caret, as the find bar does, but only while they take the keys.
-        // Quick Open and the palette above take it when open over a prompt;
-        // under any other picker, dialog or confirm the paste is dropped,
-        // so it never edits the name the prompt holds out of sight.
-        if self.prompt.is_some() {
-            if self.prompt_takes_input()
-                && let Some(prompt) = self.prompt.as_mut()
-            {
-                let text: String = s.chars().filter(|c| !c.is_control()).collect();
-                prompt.edit(|t, at| crate::widgets::line_edit::insert_at(t, at, &text));
-            }
+        // Pop-ups own a paste entirely while open: it lands in the pop-up's
+        // own field, never in the editor, tree or terminal behind it. Without
+        // this, hitting Cmd+V right after Cmd+P pastes into whatever pane was
+        // last focused instead of into the finder query, which makes the
+        // "open + paste a filename" path that the VS Code Quick Open is meant
+        // to support unusable.
+        if self.paste_into_popup(s) {
             return false;
         }
         // The in-file find bar is a pane-scoped widget, not a modal: it only
@@ -3062,6 +3102,9 @@ pub(super) fn is_vim_chord_y(key: KeyEvent) -> bool {
     is_vim_chord_letter(key, 'y')
 }
 
+/// `Cmd+Shift+G` / `Ctrl+Shift+G`: the bottom of the file, or the line a
+/// pending count names. Opt is rejected: `Cmd+Opt+Shift+G` is Debug: Switch
+/// Session, which leaves the caret alone when no session runs (#2647).
 pub(super) fn is_vim_goto_bottom(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;
@@ -3069,7 +3112,7 @@ pub(super) fn is_vim_goto_bottom(key: KeyEvent) -> bool {
     if !c.eq_ignore_ascii_case(&'g') {
         return false;
     }
-    if !key.modifiers.contains(KeyModifiers::SHIFT) {
+    if !key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::ALT) {
         return false;
     }
     key.modifiers.contains(KeyModifiers::SUPER) || key.modifiers.contains(KeyModifiers::CONTROL)

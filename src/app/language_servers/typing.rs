@@ -20,8 +20,7 @@ impl App {
         // every editor in every group (the active one is already drained by
         // the `take` above) so a trigger can only ever fire from the tab
         // that was active at its tick.
-        let groups =
-            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut());
+        let groups = self.editor_layout.all_groups_mut(&mut self.editor);
         for ed in groups.flat_map(|g| g.editors.iter_mut()) {
             ed.last_typed = None;
         }
@@ -62,7 +61,7 @@ impl App {
             tab_size,
             insert_spaces,
         );
-        self.on_type_request = Some((id, seq, path));
+        self.on_type_request = Some(FileRequest { id, path, seq });
     }
 
     /// What to do with one on-type formatting reply. Extracted from the
@@ -73,7 +72,12 @@ impl App {
         &self,
         result: &crate::lsp::manager::FormatResult,
     ) -> OnTypeReply {
-        let Some((id, seq, ref requested)) = self.on_type_request else {
+        let Some(FileRequest {
+            id,
+            path: ref requested,
+            seq,
+        }) = self.on_type_request
+        else {
             return OnTypeReply::NotOurs;
         };
         // A superseded reply must NOT clear the armed request: a newer one
@@ -173,7 +177,12 @@ impl App {
             }
             self.editor.clear_linked_ranges();
         }
-        let cur = (path, row, col, self.editor.edit_seq);
+        let cur = CaretSpot {
+            path,
+            row,
+            col,
+            seq: self.editor.edit_seq,
+        };
         if self.linked_observed.as_ref() != Some(&cur) {
             self.linked_observed = Some(cur);
             self.linked_observed_at = std::time::Instant::now();
@@ -188,8 +197,12 @@ impl App {
         let Some(lsp) = self.lsp.as_mut() else {
             return mirrored;
         };
-        let id = lsp.request_linked_editing(cur.0.clone(), uline, uchar);
-        self.linked_request = Some((id, cur.0, cur.3));
+        let id = lsp.request_linked_editing(cur.path.clone(), uline, uchar);
+        self.linked_request = Some(FileRequest {
+            id,
+            path: cur.path,
+            seq: cur.seq,
+        });
         self.linked_asked = true;
         mirrored
     }
@@ -208,7 +221,7 @@ impl App {
         }
         let mut changed = false;
         for result in results {
-            let Some((id, path, seq)) = self.linked_request.as_ref() else {
+            let Some(FileRequest { id, path, seq }) = self.linked_request.as_ref() else {
                 continue;
             };
             if result.request_id != *id

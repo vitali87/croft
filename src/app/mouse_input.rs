@@ -53,18 +53,7 @@ impl App {
         // Activity bar: always visible, so it is checked regardless of which
         // sidebar view is open.
         if let Some(icon) = self.activity_icon_at(col, row) {
-            return Some(match icon {
-                ActivityIcon::Explorer => "Explorer",
-                ActivityIcon::Search => "Search",
-                ActivityIcon::SourceControl => "Source Control",
-                ActivityIcon::Remote => "Remote",
-                ActivityIcon::RunDebug => "Run and Debug",
-                ActivityIcon::Extensions => "Extensions",
-                ActivityIcon::Testing => "Testing",
-                ActivityIcon::CodeQL => "CodeQL",
-                ActivityIcon::Sponsor => "Sponsor croft",
-                ActivityIcon::Settings => "Manage",
-            });
+            return Some(icon.label());
         }
         // Sidebar header actions, dispatched by the view that owns them so a
         // panel's stored geometry is never consulted once another view has
@@ -597,6 +586,51 @@ impl App {
         }
     }
 
+    /// End every press and drag under way without doing what its release
+    /// would (#2678 review): no drop, no reorder, no copy-on-select. A press
+    /// a program in a terminal pane asked for still gets its release there,
+    /// so the program never sees the button held down.
+    pub(super) fn abandon_mouse_gestures(&mut self, m: &MouseEvent) {
+        self.editor_tab_drag_from = None;
+        self.editor_line_drag = None;
+        if let Some(fp) = self.terminal_pointer_forwarded.take()
+            && let Some(idx) = self.forwarded_pane_index(fp)
+        {
+            let (col, row) = self.terminals[idx].clamp_to_grid(m.column, m.row);
+            self.terminals[idx].report_mouse(
+                MouseButtonKind::Left,
+                MouseAction::Release,
+                col,
+                row,
+                mouse_mods(m),
+            );
+            if fp.selecting {
+                self.terminals[idx].end_drag();
+            }
+        }
+        self.terminal_select_autoscroll = None;
+        self.terminal_drag_from = None;
+        if self.editor.box_selecting() {
+            self.editor.end_box_select();
+        }
+        self.splitter_drag = None;
+        self.minimap_drag = false;
+        self.scrollbar_drag = None;
+        self.editor_hscrollbar_drag = false;
+        self.breakpoint_lane_press = false;
+        self.outline_scrollbar_drag = false;
+        self.secondary_outline_scrollbar_drag = false;
+        self.open_editors_scrollbar_drag = false;
+        self.timeline_scrollbar_drag = false;
+        self.deps_scrollbar_drag = false;
+        self.testing_scrollbar_drag = false;
+        self.graph_scrollbar_drag = false;
+        self.scrub_dragging = false;
+        if self.tree_drag.take().is_some() {
+            self.tree.drag_target = None;
+        }
+    }
+
     pub(super) fn handle_mouse_inner(&mut self, m: MouseEvent) {
         // So does a click (#1609), except on the message itself, which opens
         // its full text below.
@@ -625,14 +659,18 @@ impl App {
         }
         // The pending paste was checked against the active pane and the
         // broadcast set; a click that switched panes would send it to one
-        // that was never checked. Only the popup's keys answer it.
+        // that was never checked. Only the popup's keys answer it. A drag
+        // it cut short ends without its drop, as under the others below.
         if self.pending_terminal_paste.is_some() {
+            if matches!(m.kind, MouseEventKind::Up(_)) {
+                self.abandon_mouse_gestures(&m);
+            }
             return;
         }
         // A click on a find bar (in the editor or over a terminal) puts the
         // caret of the row it lands on, before the pane under it sees it.
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
-            && !self.modal_overlay_open()
+            && !self.popup_open()
             && self.context_menu.is_none()
         {
             if self
@@ -663,13 +701,11 @@ impl App {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollLeft => Some(-1),
             MouseEventKind::ScrollDown | MouseEventKind::ScrollRight => Some(1),
             _ => None,
-        } && !self.modal_overlay_open()
+        } && !self.popup_open()
             && self.context_menu.is_none()
         {
             let mut scrolled = false;
-            for g in
-                std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut())
-            {
+            for g in self.editor_layout.all_groups_mut(&mut self.editor) {
                 if g.tab_strip_contains(m.column, m.row) {
                     g.scroll_tabs_wheel(delta);
                     scrolled = true;
@@ -682,30 +718,36 @@ impl App {
         }
         // A click on the port-detection toast's action buttons is consumed
         // before anything else; clicks elsewhere fall through to normal
-        // handling, so the toast never blocks the rest of the UI.
+        // handling, so the toast never blocks the rest of the UI. The pop-ups
+        // are drawn over the toasts, so while one is open a click on a
+        // button it hides must not press it (#2678 review).
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+            && !self.popup_open()
             && (self.handle_port_toast_click(m.column, m.row)
                 || self.handle_update_toast_click(m.column, m.row))
         {
             return;
         }
-        // The approval popup takes no clicks, and none reach what it covers.
-        if self.approval_ui.is_some() {
-            return;
-        }
-        // Nor does the unsaved-changes prompt (#862): a click behind it must
-        // not close or move the tabs it is asking about.
-        if self.pending_unsaved.is_some() {
-            return;
-        }
-        // Nor the lossy-save prompt (#1053), for the tab it asks about.
-        if self.pending_lossy_save.is_some() {
+        // A pop-up that handles no mouse of its own (an agent's proposal,
+        // every confirm, the New File box, Settings, the startup warning)
+        // takes every mouse
+        // event: a click behind the unsaved-changes prompt must not close or
+        // move the tabs it is asking about (#862), and the same holds for
+        // what each of the others asks about (#2674).
+        if self.popup_takes_the_mouse() {
+            // A drag under way when the pop-up opened ends with the release
+            // the pop-up takes, without its drop: left live, the next release
+            // after the pop-up closed finished it, moving a file into the
+            // folder it was over (#2678 review).
+            if matches!(m.kind, MouseEventKind::Up(_)) {
+                self.abandon_mouse_gestures(&m);
+            }
             return;
         }
         // The history scrubber's slider (#371): a press on the track seeks
         // there, and a drag that started on it keeps seeking wherever the
         // pointer goes, so the handle can be dragged off the row and back.
-        if self.scrubber.is_some() && !self.modal_overlay_open() {
+        if self.scrubber.is_some() && !self.popup_open() {
             let on_track = rect_contains(self.scrub_slider, m.column, m.row);
             match m.kind {
                 MouseEventKind::Down(MouseButton::Left) if on_track => {
@@ -882,11 +924,6 @@ impl App {
                 self.open_customize_layout_menu();
                 return;
             }
-        }
-
-        // While a prompt is open, mouse events are ignored.
-        if self.prompt.is_some() {
-            return;
         }
 
         // While a context menu is open, route clicks to it.

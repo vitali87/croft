@@ -189,65 +189,63 @@ impl Editor {
 
         // A real edit from here on: pin a preview tab, or the next preview
         // open reuses it and the bump is lost with it.
-        self.pin_on_edit();
         // One undo step for every caret's bump.
-        self.push_undo(EditKind::BumpNumber);
-        // Never coalesce: a run of bumps must undo one at a time, the way
-        // holding Ctrl-A in vim does.
-        self.last_edit_kind = None;
+        self.undoable_edit(EditKind::BumpNumber, |this| {
+            // Never coalesce: a run of bumps must undo one at a time, the way
+            // holding Ctrl-A in vim does.
+            this.last_edit_kind = None;
 
-        // Where every caret lands, worked out on the text before the edits.
-        // Literals are ASCII, so a bump's growth in bytes is its growth in
-        // chars, and a point moves by what the bumps left of it on its row
-        // added.
-        let char_of =
-            |this: &Self, row: usize, byte: usize| this.lines[row][..byte].chars().count();
-        let growth_before = |this: &Self, row: usize, col: usize| -> isize {
-            bumps
+            // Where every caret lands, worked out on the text before the edits.
+            // Literals are ASCII, so a bump's growth in bytes is its growth in
+            // chars, and a point moves by what the bumps left of it on its row
+            // added.
+            let char_of =
+                |this: &Self, row: usize, byte: usize| this.lines[row][..byte].chars().count();
+            let growth_before = |this: &Self, row: usize, col: usize| -> isize {
+                bumps
+                    .iter()
+                    .filter(|(r, t, _)| *r == row && char_of(this, row, t.end) <= col)
+                    .map(|(_, t, rep)| rep.len() as isize - (t.end - t.start) as isize)
+                    .sum()
+            };
+            let shift = |this: &Self, (row, col): (usize, usize)| {
+                (
+                    row,
+                    col.saturating_add_signed(growth_before(this, row, col)),
+                )
+            };
+            let moved: Vec<EditorSelection> = all
                 .iter()
-                .filter(|(r, t, _)| *r == row && char_of(this, row, t.end) <= col)
-                .map(|(_, t, rep)| rep.len() as isize - (t.end - t.start) as isize)
-                .sum()
-        };
-        let shift = |this: &Self, (row, col): (usize, usize)| {
-            (
-                row,
-                col.saturating_add_signed(growth_before(this, row, col)),
-            )
-        };
-        let moved: Vec<EditorSelection> = all
-            .iter()
-            .zip(&owned)
-            .map(|(s, own)| {
-                let bump = own.and_then(|(row, start)| {
-                    bumps.iter().find(|(r, t, _)| *r == row && t.start == start)
-                });
-                match bump {
-                    // vim leaves the caret on the number's last digit, which
-                    // is what makes a repeated bump keep working on the same
-                    // literal even as it grows a digit.
-                    Some((row, tok, rep)) => {
-                        let start = char_of(self, *row, tok.start);
-                        let (_, start) = shift(self, (*row, start));
-                        EditorSelection::new(*row, start + rep.len().saturating_sub(1))
+                .zip(&owned)
+                .map(|(s, own)| {
+                    let bump = own.and_then(|(row, start)| {
+                        bumps.iter().find(|(r, t, _)| *r == row && t.start == start)
+                    });
+                    match bump {
+                        // vim leaves the caret on the number's last digit, which
+                        // is what makes a repeated bump keep working on the same
+                        // literal even as it grows a digit.
+                        Some((row, tok, rep)) => {
+                            let start = char_of(this, *row, tok.start);
+                            let (_, start) = shift(this, (*row, start));
+                            EditorSelection::new(*row, start + rep.len().saturating_sub(1))
+                        }
+                        None => EditorSelection {
+                            anchor: shift(this, s.anchor),
+                            head: shift(this, s.head),
+                        },
                     }
-                    None => EditorSelection {
-                        anchor: shift(self, s.anchor),
-                        head: shift(self, s.head),
-                    },
-                }
-            })
-            .collect();
+                })
+                .collect();
 
-        // Right to left along each row, so an edit never moves a literal
-        // still waiting for its own.
-        bumps.sort_by(|(ra, ta, _), (rb, tb, _)| (rb, tb.start).cmp(&(ra, ta.start)));
-        for (row, tok, replacement) in &bumps {
-            self.lines[*row].replace_range(tok.start..tok.end, replacement);
-        }
-        self.set_selections(&moved);
-        self.mark_buffer_changed();
-        self.recompute_highlights();
+            // Right to left along each row, so an edit never moves a literal
+            // still waiting for its own.
+            bumps.sort_by(|(ra, ta, _), (rb, tb, _)| (rb, tb.start).cmp(&(ra, ta.start)));
+            for (row, tok, replacement) in &bumps {
+                this.lines[*row].replace_range(tok.start..tok.end, replacement);
+            }
+            this.set_selections(&moved);
+        });
         self.ensure_cursor_col_visible();
         true
     }

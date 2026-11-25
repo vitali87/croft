@@ -3,6 +3,7 @@
 //! rebase-todo editing, self-update and relaunch, and the update card.
 
 use super::*;
+use crate::widgets::confirm_frame::{ConfirmFrame, Inset, draw_confirm};
 
 /// Why Help: Update croft must not check for a release itself (#1844),
 /// for the same reasons the startup check stays off: a remote-launched
@@ -144,105 +145,56 @@ impl App {
         if !self.pending_terminal_warning {
             return;
         }
-        let area = frame.area();
-        // The lower clamp bound must never beat the frame itself: on a
-        // terminal narrower than 50 columns the modal used to come out
-        // WIDER than the buffer and the paint panicked at launch (#192).
-        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
-        let height: u16 = 11u16.min(area.height);
-        let x = (area.width.saturating_sub(width)) / 2 + area.x;
-        let y = (area.height.saturating_sub(height)) / 2 + area.y;
-        let rect = Rect {
-            x,
-            y,
-            width,
-            height,
+        let frame_spec = ConfirmFrame {
+            title: " UNSUPPORTED TERMINAL ",
+            accent: self.theme.ui(Color::Rgb(0xff, 0xa5, 0x00)),
+            title_fg: Color::Black,
+            height: 11,
+            inset: Inset::Wide,
         };
-        let rect = rect.intersection(area);
-        let warn = self.theme.ui(Color::Rgb(0xff, 0xa5, 0x00));
-        let accent = self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff));
-        let block = ratatui::widgets::Block::default()
-            .borders(ratatui::widgets::Borders::ALL)
-            .border_style(Style::default().fg(warn))
-            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
-            .title(ratatui::text::Span::styled(
-                " UNSUPPORTED TERMINAL ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(warn)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        frame.render_widget(ratatui::widgets::Clear, rect);
-        frame.render_widget(block, rect);
-        let inner = Rect {
-            x: rect.x + 2,
-            y: rect.y + 1,
-            width: rect.width.saturating_sub(4),
-            height: rect.height.saturating_sub(2),
-        };
-        let current = std::env::var("TERM_PROGRAM")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| std::env::var("TERM").ok().filter(|s| !s.is_empty()))
-            .unwrap_or_else(|| String::from("this terminal"));
-        let body = ratatui::text::Text::from(vec![
-            Line::from(Span::styled(
-                "Croft draws its icons and images with inline-image protocols",
-                Style::default().fg(self.theme.ui(Color::White)),
-            )),
-            Line::from(Span::styled(
-                format!("that {current} does not support, so the activity bar and"),
-                Style::default().fg(self.theme.ui(Color::White)),
-            )),
-            Line::from(Span::styled(
-                "file icons stay blank. Croft still runs; for the full UI use:",
-                Style::default().fg(self.theme.ui(Color::White)),
-            )),
-            Line::from(""),
-            Line::from(vec![
-                Span::raw("  macOS:  "),
-                Span::styled(
-                    "iTerm2",
-                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  or  "),
-                Span::styled(
-                    "Ghostty",
-                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Line::from(vec![
-                Span::raw("  Linux:  "),
-                Span::styled(
-                    "Ghostty",
-                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled(
-                    "[any key]",
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" dismiss    "),
-                Span::styled(
-                    "[D]",
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("on't show again"),
-            ]),
-        ]);
-        frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
-        crate::widgets::approval_popup::paint_warning_card(
-            frame.buffer_mut(),
-            rect,
-            self.theme,
-            warn,
-        );
+        draw_confirm(frame, self.theme, frame_spec, |frame, inner| {
+            let accent = self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff));
+            let current = std::env::var("TERM_PROGRAM")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .or_else(|| std::env::var("TERM").ok().filter(|s| !s.is_empty()))
+                .unwrap_or_else(|| String::from("this terminal"));
+            let text = Style::default().fg(self.theme.ui(Color::White));
+            let name = Style::default().fg(accent).add_modifier(Modifier::BOLD);
+            let key = Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD);
+            let body = ratatui::text::Text::from(vec![
+                Line::from(Span::styled(
+                    "Croft draws its icons and images with inline-image protocols",
+                    text,
+                )),
+                Line::from(Span::styled(
+                    format!("that {current} does not support, so the activity bar and"),
+                    text,
+                )),
+                Line::from(Span::styled(
+                    "file icons stay blank. Croft still runs; for the full UI use:",
+                    text,
+                )),
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw("  macOS:  "),
+                    Span::styled("iTerm2", name),
+                    Span::raw("  or  "),
+                    Span::styled("Ghostty", name),
+                ]),
+                Line::from(vec![Span::raw("  Linux:  "), Span::styled("Ghostty", name)]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("[any key]", key),
+                    Span::raw(" dismiss    "),
+                    Span::styled("[D]", key),
+                    Span::raw("on't show again"),
+                ]),
+            ]);
+            frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+        });
     }
 
     /// Paint the update card in the bottom-LEFT corner (the port toast
@@ -1239,6 +1191,10 @@ impl App {
                 self.sync_open_file_poll_mtime();
                 self.status = if crate::rebase_todo::is_todo(path) {
                     String::from(crate::rebase_todo::HINT)
+                } else if let Some(why) = self.editor.hex_routed_because() {
+                    // Its own viewer declined the file: say why, as the
+                    // Explorer does (#2711).
+                    format!("Opened {} in the hex viewer: {why}", path.display())
                 } else {
                     format!("Opened {}", path.display())
                 };
@@ -1317,15 +1273,9 @@ impl App {
         let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let is_it = |p: &Path| p == path || p.canonicalize().is_ok_and(|c| c == canon);
         let open = self
-            .editor
-            .editors
-            .iter()
-            .chain(
-                self.editor_layout
-                    .inactive_groups()
-                    .into_iter()
-                    .flat_map(|g| g.editors.iter()),
-            )
+            .editor_layout
+            .all_groups(&self.editor)
+            .flat_map(|g| g.editors.iter())
             .any(|t| t.path.as_deref().is_some_and(is_it));
         if open {
             crate::view_ipc::ViewReply::Err {

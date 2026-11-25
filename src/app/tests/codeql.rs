@@ -35,8 +35,8 @@ fn codeql_icon_sits_below_testing_and_opens_the_codeql_side_bar() {
         let mut app = codeql_app(tmp.path().to_path_buf());
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
         term.draw(|f| app.render(f)).unwrap();
-        let ql = app.sidebar_areas.codeql_icon;
-        let testing = app.sidebar_areas.testing_icon;
+        let ql = app.sidebar_areas.activity_icons[ActivityIcon::CodeQL];
+        let testing = app.sidebar_areas.activity_icons[ActivityIcon::Testing];
         assert!(ql.width > 0, "the QL icon lays out on a tall bar");
         assert_eq!(ql.y, testing.y + testing.height, "directly below Testing");
         left_click(&mut app, ql.x, ql.y);
@@ -330,7 +330,11 @@ fn codeql_is_added_from_the_index_and_uninstalled_back_to_it() {
         };
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
         term.draw(|f| app.render(f)).unwrap();
-        assert_eq!(app.sidebar_areas.codeql_icon.width, 0, "no QL icon");
+        assert_eq!(
+            app.sidebar_areas.activity_icons[ActivityIcon::CodeQL].width,
+            0,
+            "no QL icon"
+        );
         assert_eq!(codeql_rows(&mut app), 0, "no CodeQL commands");
         app.open_codeql_view();
         assert_ne!(app.sidebar_view, SidebarView::CodeQL);
@@ -364,7 +368,10 @@ fn codeql_is_added_from_the_index_and_uninstalled_back_to_it() {
         add_codeql_in(&croft);
         app.set_sidebar_view(SidebarView::Extensions);
         term.draw(|f| app.render(f)).unwrap();
-        assert!(app.sidebar_areas.codeql_icon.width > 0, "the QL icon");
+        assert!(
+            app.sidebar_areas.activity_icons[ActivityIcon::CodeQL].width > 0,
+            "the QL icon"
+        );
         assert!(codeql_rows(&mut app) > 1, "the CodeQL commands");
         app.open_codeql_view();
         assert_eq!(app.sidebar_view, SidebarView::CodeQL);
@@ -374,7 +381,11 @@ fn codeql_is_added_from_the_index_and_uninstalled_back_to_it() {
         assert!(!croft.join("extensions/codeql").exists());
         assert_eq!(app.sidebar_view, SidebarView::Explorer, "its view closes");
         term.draw(|f| app.render(f)).unwrap();
-        assert_eq!(app.sidebar_areas.codeql_icon.width, 0, "the icon goes");
+        assert_eq!(
+            app.sidebar_areas.activity_icons[ActivityIcon::CodeQL].width,
+            0,
+            "the icon goes"
+        );
         assert_eq!(codeql_rows(&mut app), 0, "and its commands");
     });
 }
@@ -530,9 +541,13 @@ fn disabling_codeql_hides_its_icon_and_leaves_its_view() {
         );
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
         term.draw(|f| app.render(f)).unwrap();
-        assert_eq!(app.sidebar_areas.codeql_icon.width, 0, "the icon is gone");
+        assert_eq!(
+            app.sidebar_areas.activity_icons[ActivityIcon::CodeQL].width,
+            0,
+            "the icon is gone"
+        );
         assert!(
-            app.sidebar_areas.settings_icon.width > 0,
+            app.sidebar_areas.activity_icons[ActivityIcon::Settings].width > 0,
             "the gear still lays out"
         );
         app.open_codeql_view();
@@ -545,7 +560,7 @@ fn disabling_codeql_hides_its_icon_and_leaves_its_view() {
         app.set_extension_enabled("codeql", true);
         term.draw(|f| app.render(f)).unwrap();
         assert!(
-            app.sidebar_areas.codeql_icon.width > 0,
+            app.sidebar_areas.activity_icons[ActivityIcon::CodeQL].width > 0,
             "re-enabling restores it"
         );
     });

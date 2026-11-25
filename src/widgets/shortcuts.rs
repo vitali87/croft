@@ -107,6 +107,76 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_cmd_k_leader_key",
             },
             ShortcutEntry {
+                keys: "Cmd/Ctrl+K Cmd/Ctrl+S",
+                description: "Open the Keyboard Shortcuts view: every command with its chord, searchable",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Cmd/Ctrl+T",
+                description: "Pick a color theme",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K F",
+                description: "Toggle Format on Save",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Shift+W",
+                description: "Reopen the editor closed last",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+P then #",
+                description: "Go to a symbol anywhere in the workspace (Quick Open, then #)",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K B",
+                description: "Show the Testing view",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K A",
+                description: "Session: who is attached to this persistent session",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Shift+Q",
+                description: "Session: detach, leaving the session running",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K X",
+                description: "Collab: cancel a pair collaborator's AI stream into this file and revert its text",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Q",
+                description: "Navigator: ask about the caret line or the selected lines",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Y",
+                description: "Navigator: yield the turn; it reviews the active file and leaves comments",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "F4 / Shift+F4",
+                description: "Navigator: go to the next comment / ignore the comment at the caret",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Shift+L",
+                description: "Agent: new worktree lane: a worktree, its workspace folder and a pane running the lane agent",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Shift+G",
+                description: "Turn inline AI suggestions on or off",
+                handler: "",
+            },
+            ShortcutEntry {
                 keys: "Cmd/Ctrl+Shift+E",
                 description: "Jump to the Explorer sidebar",
                 handler: "is_explorer_jump_key",
@@ -397,7 +467,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_align_cursors_using_tabs_key",
             },
             ShortcutEntry {
-                keys: "Ctrl+Alt+Shift+a",
+                keys: "Ctrl+Alt+l",
                 description: "Align Line Last Cursors: line up the end of every affected line",
                 handler: "is_align_line_last_cursors_key",
             },
@@ -621,6 +691,46 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 description: "Expand the Emmet abbreviation before the cursor",
                 handler: "is_emmet_expand_key",
             },
+            ShortcutEntry {
+                keys: "Shift+Alt+Right / Left",
+                description: "Expand / shrink every selection to the next meaningful range (no language server needed)",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Alt+L",
+                description: "Find bar: toggle Find in Selection",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+Shift+Opt+Up / Down / Left / Right",
+                description: "Column (box) select a line up / down or a character left / right",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+Shift+Opt+PageUp / PageDown",
+                description: "Column (box) select a page up / down",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Cmd/Ctrl+M",
+                description: "Bookmarks: list every bookmark",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Cmd/Ctrl+F",
+                description: "Format the selection through the language server",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Ctrl+Shift+PageUp / PageDown",
+                description: "Move the active tab one place left / right in its group",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "F3",
+                description: "Find the next match, in the Find bar and in the hex view",
+                handler: "",
+            },
         ],
     },
     ShortcutGroup {
@@ -690,6 +800,46 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 keys: "Ctrl+Shift+F12",
                 description: "Go to declaration",
                 handler: "is_go_to_declaration_key",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Cmd/Ctrl+L",
+                description: "Fold or unfold the block at the caret",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Cmd/Ctrl+0 / Cmd/Ctrl+K Cmd/Ctrl+J",
+                description: "Fold / unfold every block",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Cmd/Ctrl+1..7",
+                description: "Fold level 1 to 7: fold every block that many levels deep or deeper",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Cmd/Ctrl+/",
+                description: "Fold every block comment",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Cmd/Ctrl+8 / Cmd/Ctrl+K Cmd/Ctrl+9",
+                description: "Fold / unfold every #region",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Cmd/Ctrl+Q",
+                description: "Go to the last edit location",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Shift+U / Cmd/Ctrl+K Shift+D",
+                description: "Show the supertypes / subtypes of the type at the caret",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Shift+E",
+                description: "Run the CodeLens on the caret line",
+                handler: "",
             },
         ],
     },
@@ -1011,6 +1161,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 description: "Show outgoing calls: everything the function at the caret calls, each entry jumping to the callee's definition",
                 handler: "",
             },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Enter",
+                description: "Testing: run the test at the caret",
+                handler: "",
+            },
         ],
     },
     ShortcutGroup {
@@ -1121,6 +1276,21 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 description: "Open the link (a remote dev-server port forwards home first)",
                 handler: "",
             },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K K",
+                description: "Clear the active terminal",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K R",
+                description: "Rename the active terminal",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K [ / Cmd/Ctrl+K ]",
+                description: "Collapse the active pane / restore every collapsed pane",
+                handler: "",
+            },
         ],
     },
     ShortcutGroup {
@@ -1145,6 +1315,16 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 keys: "Alt+D",
                 description: "Show or hide the files to include / exclude inputs",
                 handler: "is_search_details_key",
+            },
+            ShortcutEntry {
+                keys: "Alt+P",
+                description: "Toggle Preserve Case for Replace",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Shift+F / Cmd/Ctrl+K Shift+R",
+                description: "Open the results in a Search Editor / rerun the active Search Editor",
+                handler: "",
             },
             ShortcutEntry {
                 keys: "Up / Down + Enter",
@@ -1278,6 +1458,30 @@ impl ShortcutsModal {
             }
         }
         out
+    }
+
+    /// The first shortcut at or below the top of the visible list, as
+    /// screen reader mode reads it: its group, keys and what they do. The
+    /// line count matches [`Self::lines`]: a blank line between groups, the
+    /// group title and its rule, then one line per entry.
+    pub fn spoken_row(&self) -> Option<String> {
+        let top = usize::from(self.scroll);
+        let mut line = 0usize;
+        for (i, group) in SHORTCUT_GROUPS.iter().enumerate() {
+            line += usize::from(i > 0) + 2;
+            for entry in group.entries {
+                if line >= top {
+                    return Some(format!(
+                        "{}: {}, {}",
+                        group.title,
+                        entry.keys.trim(),
+                        entry.description
+                    ));
+                }
+                line += 1;
+            }
+        }
+        None
     }
 
     pub fn scroll_down(&mut self, by: u16) {

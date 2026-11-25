@@ -1848,11 +1848,13 @@ pub(super) fn is_compare_key(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
 }
 
+/// `Cmd+Shift+F` / `Ctrl+Shift+F`: jump to the Search view. Opt is
+/// rejected: `Cmd+Opt+Shift+F` is Format Document (#2647).
 pub(super) fn is_search_jump_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;
     };
-    if !c.eq_ignore_ascii_case(&'f') {
+    if !c.eq_ignore_ascii_case(&'f') || key.modifiers.contains(KeyModifiers::ALT) {
         return false;
     }
     let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -2029,8 +2031,8 @@ pub(super) fn is_toggle_wrap_key(key: KeyEvent) -> bool {
 /// The Cursor Align chords, one predicate each so the F1 cheat sheet and the
 /// key ledger can name the handler that answers each chord: `Alt+A` aligns
 /// every caret's selection into one column, `Alt+F` pads the front only
-/// (right-aligning the text), `Ctrl+Alt+A` pads with tabs, and
-/// `Ctrl+Alt+Shift+A` pads whole lines so the right-most selection end of
+/// (right-aligning the text), `Ctrl+Alt+A` pads with tabs, and `Ctrl+Alt+L`
+/// pads whole lines so the right-most selection end of
 /// each lines up. `Shift+Alt+A` is Toggle Block Comment and is never matched
 /// here, and no Super chord is.
 fn is_align_chord(key: KeyEvent, letter: char, ctrl: bool, shift: bool) -> bool {
@@ -2062,9 +2064,10 @@ pub(super) fn is_align_cursors_using_tabs_key(key: KeyEvent) -> bool {
     is_align_chord(key, 'a', true, false)
 }
 
-/// `Ctrl+Alt+Shift+A`: Align Line Last Cursors.
+/// `Ctrl+Alt+L`: Align Line Last Cursors. Not `Ctrl+Alt+Shift+A`: that is the
+/// Linux spelling of `Cmd+Opt+Shift+A`, which Sort Lines Ascending owns.
 pub(super) fn is_align_line_last_cursors_key(key: KeyEvent) -> bool {
-    is_align_chord(key, 'a', true, true)
+    is_align_chord(key, 'l', true, false)
 }
 
 /// The Cursor Align command `key` asks for, if it is one of the four: returned
@@ -2507,17 +2510,16 @@ pub(super) fn is_command_history_key(key: KeyEvent) -> bool {
 /// In the SUPER branch we reject SHIFT so the `Cmd+Shift+T` focus chord
 /// (see `is_terminal_focus_key`) does not double-fire as a split, and
 /// reject ALT so `Cmd+Opt+T` (iTerm2's relocated New Tab) is left alone.
+/// Both forms reject ALT: `Ctrl+Alt+Shift+T` converts indentation to tabs
+/// off macOS (#2647).
 pub(super) fn is_terminal_split_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;
     };
-    if !c.eq_ignore_ascii_case(&'t') {
+    if !c.eq_ignore_ascii_case(&'t') || key.modifiers.contains(KeyModifiers::ALT) {
         return false;
     }
-    if has_cmd(key.modifiers)
-        && !key.modifiers.contains(KeyModifiers::SHIFT)
-        && !key.modifiers.contains(KeyModifiers::ALT)
-    {
+    if has_cmd(key.modifiers) && !key.modifiers.contains(KeyModifiers::SHIFT) {
         return true;
     }
     key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT)

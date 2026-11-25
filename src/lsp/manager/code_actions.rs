@@ -109,7 +109,7 @@ impl LspManager {
     }
 
     pub fn drain_code_action(&self) -> Option<CodeActionResult> {
-        self.code_action_rx.try_recv().ok()
+        self.replies.code_action.try_recv().ok()
     }
 
     /// Whether the server for `lang` implements `textDocument/codeAction`.

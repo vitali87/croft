@@ -322,7 +322,7 @@ impl Editor {
                     // failure (#493): the file still opens as hex, but the
                     // reason rides along so the viewer can say why the
                     // browser it expected was declined.
-                    Err(e) if crate::archive::is_list_cap_refusal(&e.to_string()) => {
+                    Err(e) if refusal(&e) == Some(Refusal::PastCap) => {
                         self.route_note = Some((path.to_path_buf(), e.to_string()));
                     }
                     Err(_) => {}
@@ -333,7 +333,7 @@ impl Editor {
                 // through to content routing instead of failing the open.
                 // Filesystem errors stay errors — the file may not exist.
                 match self.open_image(path) {
-                    Err(e) if e.to_string().starts_with("Could not decode image") => {}
+                    Err(e) if refusal(&e) == Some(Refusal::NotItsFormat) => {}
                     other => return other,
                 }
             }
@@ -365,9 +365,7 @@ impl Editor {
                 // cap, and rerouting it into the text path would silently
                 // bypass the guard the cap exists to enforce (#188 review).
                 match self.open_sheet(path) {
-                    Err(e)
-                        if e.to_string().starts_with("Spreadsheet open failed")
-                            && !e.to_string().contains("too large") => {}
+                    Err(e) if refusal(&e) == Some(Refusal::NotItsFormat) => {}
                     other => return other,
                 }
             }
@@ -435,7 +433,7 @@ impl Editor {
                 match self.open_archive(path, crate::archive::ArchiveKind::Zip) {
                     Ok(()) => return Ok(()),
                     // The same deliberate cap as the extension route (#493).
-                    Err(e) if crate::archive::is_list_cap_refusal(&e.to_string()) => {
+                    Err(e) if refusal(&e) == Some(Refusal::PastCap) => {
                         self.route_note = Some((path.to_path_buf(), e.to_string()));
                     }
                     Err(_) => {}
@@ -464,7 +462,7 @@ impl Editor {
                 };
                 match self.open_archive(path, kind) {
                     Ok(()) => return Ok(()),
-                    Err(e) if crate::archive::is_list_cap_refusal(&e.to_string()) => {
+                    Err(e) if refusal(&e) == Some(Refusal::PastCap) => {
                         self.route_note = Some((path.to_path_buf(), e.to_string()));
                     }
                     Err(_) => {}
@@ -476,7 +474,7 @@ impl Editor {
             Some(crate::magic::Magic::Tar) => {
                 match self.open_archive(path, crate::archive::ArchiveKind::Tar) {
                     Ok(()) => return Ok(()),
-                    Err(e) if crate::archive::is_list_cap_refusal(&e.to_string()) => {
+                    Err(e) if refusal(&e) == Some(Refusal::PastCap) => {
                         self.route_note = Some((path.to_path_buf(), e.to_string()));
                     }
                     Err(_) => {}

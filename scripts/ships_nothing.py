@@ -451,10 +451,12 @@ def _included_name(arg):
 
 
 def _resolved(folder, value):
-    """`value`, a `#[path]` relative to `folder`, as a path in the
-    repository; None when it is unreadable, absolute or leaves the
-    repository."""
-    if value is None or value.startswith("/"):
+    """`value`, a `#[path]` or an `include!` relative to `folder`, as a path
+    in the repository; None when it is unreadable, absolute, leaves the
+    repository or steps up a folder. A `..` after a symlinked folder leaves
+    from the link's target, not from the folder the path names, so the file
+    it reaches cannot be told from the path alone (#2723 review)."""
+    if value is None or value.startswith("/") or ".." in value.split("/"):
         return None
     target = posixpath.normpath(posixpath.join(folder, value))
     if target == ".." or target.startswith("../"):
@@ -499,13 +501,17 @@ def _test_module_spans(toks):
 def _loaders_in(path, toks):
     """What one file's own text can load beside its plain `mod` children:
     `(files a top-level #[path] mod x; loads, folders another #[path] can
-    load from, names an include_str! or include_bytes! reads)`. None stands
-    for one this cannot pin down: an `include!`, whose pasted code can
-    declare modules or read files that nothing here follows, and an include
-    macro renamed by a `use` (`use std::include_str as text;`), after which
-    `text!("helper.rs")` reads a file under a name this does not know. Only a
-    `use` can rename a macro; elsewhere `include` is an ordinary name (croft
-    has a search field called that).
+    load from, names an include_str! or include_bytes! reads, files an
+    include! pastes in)`. None stands for one this cannot pin down: an
+    `include!` of anything but a plain string, whose pasted code could be
+    any file's, and an include macro renamed by a `use` (`use
+    std::include_str as text;`), after which `text!("helper.rs")` reads a
+    file under a name this does not know. Only a `use` can rename a macro;
+    elsewhere `include` is an ordinary name (croft has a search field called
+    that). An `include!("file")` names the file it pastes in, relative to
+    this one's folder: its name joins the names, since the file ships as
+    release code, and the caller reads that file's code as part of this
+    one's (#2722).
 
     An include macro inside a `#[cfg(test)]` module compiles only for tests,
     so it is not counted: croft's port detector has a test that reads its own
@@ -527,7 +533,7 @@ def _loaders_in(path, toks):
     """
     depths = _brace_depths(toks)
     folder = posixpath.dirname(path)
-    roots, folders, names = [], [], []
+    roots, folders, names, pasted = [], [], [], []
     in_use = False
     # The test modules only matter to a file that names an include macro.
     test_spans = (
@@ -580,14 +586,31 @@ def _loaders_in(path, toks):
             called = (
                 i + 2 < len(toks) and toks[i + 1] == ("punct", "!") and _opens(toks[i + 2])
             )
+            arg = toks[i + 3 : _closing(toks, i + 2)] if called else []
+            if arg and arg[-1] == ("punct", ","):
+                arg = arg[:-1]
             if called and tok[1].removeprefix("r#") != "include":
-                names.append(_included_name(toks[i + 3 : _closing(toks, i + 2)]))
+                names.append(_included_name(arg))
+            elif called and len(arg) == 1 and arg[0][0] == "str" and _resolved(folder, arg[0][1]):
+                # Code pasted in from a file this names: the caller reads it
+                # for what it loads, and the file itself ships, as one an
+                # include_str! embeds does, whatever else declares it.
+                pasted.append(_resolved(folder, arg[0][1]))
+                names.append(_file_name(arg[0][1]))
             elif called or in_use:
-                # Pasted code, or a renamed macro: it can embed a file or
-                # declare a module that nothing here sees.
+                # Code pasted in from a file this cannot name, or a renamed
+                # macro: it can embed a file or declare a module that
+                # nothing here sees.
                 names.append(None)
                 roots.append(None)
-    return roots, folders, names
+    return roots, folders, names, pasted
+
+
+def _declares_a_module(toks):
+    """Whether `toks` declare a module: `mod name`, with a body or without."""
+    return any(
+        toks[m] == ("ident", "mod") and toks[m + 1][0] == "ident" for m in range(len(toks) - 1)
+    )
 
 
 def _cargo_roots(commit, cwd):
@@ -634,7 +657,14 @@ def module_loaders(rev, cwd=None):
 
 @functools.lru_cache(maxsize=None)
 def _module_loaders(commit, cwd):
-    tree = set(git("ls-tree", "-r", "-z", "--name-only", commit, cwd=cwd).split("\0")) - {""}
+    tree, links = set(), set()
+    for entry in git("ls-tree", "-r", "-z", commit, cwd=cwd).split("\0"):
+        if not entry:
+            continue
+        meta, name = entry.split("\t", 1)
+        tree.add(name)
+        if meta.split(" ", 1)[0] == "120000":
+            links.add(name)
     roots = [p for p in ("src/main.rs", "src/lib.rs", "build.rs") if p in tree]
     roots += [p for p in tree if re.fullmatch(r"src/bin/[^/]+\.rs|src/bin/[^/]+/main\.rs", p)]
     roots += _cargo_roots(commit, cwd)
@@ -644,25 +674,45 @@ def _module_loaders(commit, cwd):
     # Rust reads as plain whitespace.
     paths = sorted(p for p in tree if p.endswith(".rs"))
     read = set()
+    # Files an `include!("file")` pastes in, and whether each file read
+    # declares a module (or could not be read).
+    pasted, declares = set(), {}
     while paths:
         read.update(paths)
         for path, text in zip(paths, _blobs(commit, paths, cwd)):
+            if path in links:
+                # A symlink's blob is the path it points to, not the code
+                # rustc reads through it: what that code loads is unknown.
+                roots.append(None)
+                names.append(None)
+                declares[path] = True
+                continue
             try:
-                more_roots, more_folders, more_names = _loaders_in(path, rust_tokens(text))
+                toks = rust_tokens(text)
+                more_roots, more_folders, more_names, more_pasted = _loaders_in(path, toks)
+                declares[path] = _declares_a_module(toks)
             except LexError:
-                more_roots, more_folders, more_names = [None], [], [None]
+                more_roots, more_folders, more_names, more_pasted = [None], [], [None], []
+                declares[path] = True
             roots += more_roots
             folders += more_folders
             names += more_names
+            pasted.update(more_pasted)
         # A `#[path]` can load a file of any name (`production.inc`), and
         # that file's own loaders count as much as a `.rs` file's: read
-        # each one too, until none is new. One that is not in the tree is
-        # generated at build time, and what it loads or embeds is unknown.
+        # each one too, until none is new. So can an `include!` paste one
+        # in. One that is not in the tree is generated at build time, and
+        # what it loads or embeds is unknown.
         loaded = {r for r in roots if r is not None and r not in read}
+        loaded |= pasted - read
         missing = [r for r in loaded if r not in tree]
         roots += [None for _ in missing]
         names += [None for _ in missing]
         paths = sorted(r for r in loaded if r in tree)
+    # Pasted code that declares a module: the declaration check reads only
+    # the file that is the module's parent, so it would miss this one.
+    if any(declares.get(p, True) for p in pasted if p in tree):
+        roots.append(None)
     unknown_load = None in roots or None in folders
     return (
         frozenset(r for r in roots if r is not None),

@@ -339,8 +339,9 @@ fn close_all_closes_every_split_group() {
     app.split_editor(); // right group (focused) duplicates a.rs
     app.editor.open_pinned(&b).unwrap();
     assert!(app.editor_layout.is_split(), "two groups before Close All");
-    let total: usize = std::iter::once(&app.editor)
-        .chain(app.editor_layout.inactive_groups())
+    let total: usize = app
+        .editor_layout
+        .all_groups(&app.editor)
         .map(|g| g.editors.len())
         .sum();
     assert!(total >= 2, "tabs are spread over both groups");
@@ -1143,7 +1144,7 @@ fn split_editor_duplicates_active_file_into_a_focused_right_group() {
         "the new group holds exactly the file, with no stray blank tab"
     );
     // The original group survives in the left column.
-    let groups = app.editor_layout.inactive_groups();
+    let groups = app.editor_layout.inactive_groups().collect::<Vec<_>>();
     assert_eq!(groups[0].path.as_deref(), Some(path.as_path()));
 }
 
@@ -1167,7 +1168,7 @@ fn split_down_makes_a_vertical_split_with_the_new_group_active_below() {
         "the new (focused) group is the LOWER leaf"
     );
     assert_eq!(app.editor.path.as_deref(), Some(path.as_path()));
-    let groups = app.editor_layout.inactive_groups();
+    let groups = app.editor_layout.inactive_groups().collect::<Vec<_>>();
     assert_eq!(groups[0].path.as_deref(), Some(path.as_path()));
 }
 
@@ -1259,7 +1260,7 @@ fn move_right_with_no_neighbor_creates_a_new_group_with_the_moved_tab() {
         Some(b.as_path()),
         "the moved tab is active in the new group"
     );
-    let groups = app.editor_layout.inactive_groups();
+    let groups = app.editor_layout.inactive_groups().collect::<Vec<_>>();
     assert_eq!(groups.len(), 1);
     assert!(
         groups[0]
@@ -1304,7 +1305,7 @@ fn split_in_group_opens_a_second_view_of_the_active_file_beside_it() {
     app.split_in_group();
     assert_eq!(app.editor_layout.leaf_count(), 2, "a second group appears");
     assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
-    let groups = app.editor_layout.inactive_groups();
+    let groups = app.editor_layout.inactive_groups().collect::<Vec<_>>();
     assert_eq!(
         groups[0].path.as_deref(),
         Some(a.as_path()),
@@ -1399,7 +1400,7 @@ fn opening_a_file_in_the_split_replaces_the_duplicate_instead_of_stacking() {
     );
     assert_eq!(app.editor.path.as_deref(), Some(b.as_path()));
     // The left column is untouched, giving a true side-by-side of two files.
-    let groups = app.editor_layout.inactive_groups();
+    let groups = app.editor_layout.inactive_groups().collect::<Vec<_>>();
     let left = groups[0];
     assert_eq!(left.tab_count(), 1);
     assert_eq!(
@@ -1429,7 +1430,7 @@ fn focus_editor_group_swaps_focus_but_keeps_physical_columns_fixed() {
         "after the swap `editor` is the original left group"
     );
     assert!(
-        app.editor.focused && !app.editor_layout.inactive_groups()[0].focused,
+        app.editor.focused && !app.editor_layout.inactive_groups().next().unwrap().focused,
         "only the focused group's border lights up"
     );
 
@@ -1572,7 +1573,6 @@ fn a_second_dump_closes_the_stale_tab_in_every_editor_group() {
     let stale_elsewhere = app
         .editor_layout
         .inactive_groups()
-        .iter()
         .any(|g| g.find_tab_with_path(&path).is_some());
     assert!(
         !stale_elsewhere,
@@ -1588,7 +1588,6 @@ fn a_second_dump_closes_the_stale_tab_in_every_editor_group() {
     assert!(
         app.editor_layout
             .inactive_groups()
-            .iter()
             .all(|g| !g.is_blank_initial()),
         "an inactive group emptied by the close is pruned, not left blank"
     );
@@ -1638,7 +1637,6 @@ fn a_tab_switch_disarms_the_background_tabs_on_type_trigger() {
     let armed = app
         .editor_layout
         .inactive_groups_mut()
-        .iter()
         .any(|g| g.editors.iter().any(|e| e.last_typed.is_some()));
     assert!(
         !armed,
@@ -1745,7 +1743,7 @@ fn a_rename_reaches_the_files_tab_in_another_split_group() {
         "greet(1);\ngreet(2);\n// todo\n",
         "the open tab takes the rename; the disk waits for its save"
     );
-    let other = app.editor_layout.inactive_groups()[0];
+    let other = app.editor_layout.inactive_groups().next().unwrap();
     let tab = &other.editors[other.find_buffer_tab(&main).unwrap()];
     assert_eq!(tab.lines[..3], ["welcome(1);", "welcome(2);", "x// todo"]);
     assert!(tab.dirty);
@@ -1787,7 +1785,7 @@ fn a_rename_keeps_the_unsaved_edits_of_a_file_open_in_the_other_split_group() {
     app.sync_lsp();
 
     assert_eq!(app.editor.path.as_deref(), Some(main_py.as_path()));
-    let seq = app.editor_layout.inactive_groups()[0].edit_seq;
+    let seq = app.editor_layout.inactive_groups().next().unwrap().edit_seq;
     assert_eq!(
         app.lsp_last_seen.get(&store),
         Some(&seq),
@@ -1814,7 +1812,7 @@ fn a_rename_keeps_the_unsaved_edits_of_a_file_open_in_the_other_split_group() {
 
     assert_eq!(app.status, "Renamed 3 occurrence(s) across 2 file(s)");
     assert_eq!(app.editor.lines[0], "from store import read_items");
-    let other = app.editor_layout.inactive_groups()[0];
+    let other = app.editor_layout.inactive_groups().next().unwrap();
     assert_eq!(
         other.document_text(),
         unsaved.replace("load_items", "read_items"),
@@ -1895,7 +1893,7 @@ fn moving_a_file_repoints_its_tab_in_every_split() {
         &[root.join("a.txt")],
         ExplorerClipMode::Cut
     ));
-    let groups = app.editor_layout.inactive_groups_mut();
+    let groups = app.editor_layout.inactive_groups_mut().collect::<Vec<_>>();
     let paths: Vec<_> = groups[0]
         .editors
         .iter()
@@ -1935,7 +1933,6 @@ fn a_split_preview_follows_the_source_pane_scroll() {
     let preview_pane = app
         .editor_layout
         .inactive_groups()
-        .into_iter()
         .find_map(|g| g.editors.get(g.active_index()))
         .and_then(|t| t.markdown_preview.as_ref())
         .expect("the other pane still shows the preview");
@@ -1952,7 +1949,7 @@ fn a_split_preview_follows_the_source_pane_scroll() {
 #[test]
 fn a_side_preview_follows_the_typing_and_stays_a_preview_across_a_save() {
     fn side(app: &App) -> (String, bool) {
-        let groups = app.editor_layout.inactive_groups();
+        let groups = app.editor_layout.inactive_groups().collect::<Vec<_>>();
         let tab = &groups[0].editors[groups[0].active_index()];
         let md = tab
             .markdown_preview
@@ -2481,7 +2478,7 @@ fn move_editor_into_next_group_splits_then_previous_brings_it_back() {
     );
     assert_eq!(app.editor_layout.active_dfs_index(), 1, "to the right");
     assert_eq!(app.editor.path.as_deref(), Some(c.as_path()));
-    let left = &app.editor_layout.inactive_groups()[0];
+    let left = &app.editor_layout.inactive_groups().next().unwrap();
     assert_eq!(
         tab_names_852(left),
         ["a.py", "b.py"],
@@ -2543,9 +2540,16 @@ fn a_wheel_burst_over_a_background_split_pdf_steps_one_page() {
         width: 50,
         height: 30,
     };
-    app.editor_layout.inactive_groups_mut()[0].last_full_area = area;
+    app.editor_layout
+        .inactive_groups_mut()
+        .next()
+        .unwrap()
+        .last_full_area = area;
     let page = |app: &App| {
-        app.editor_layout.inactive_groups()[0]
+        app.editor_layout
+            .inactive_groups()
+            .next()
+            .unwrap()
             .image
             .as_ref()
             .and_then(|i| i.pdf.as_ref())
@@ -2618,7 +2622,7 @@ fn the_wheel_finds_a_background_group_from_the_whole_editor_area() {
     app.editor_layout_area = whole;
     app.editor.last_full_area = rects[active];
     {
-        let mut groups = app.editor_layout.inactive_groups_mut();
+        let mut groups = app.editor_layout.inactive_groups_mut().collect::<Vec<_>>();
         groups[0].last_full_area = Rect::default();
         // Its text view has a height, so a scroll can land.
         groups[0].active_editor_mut().last_inner = Rect {
@@ -2628,7 +2632,10 @@ fn the_wheel_finds_a_background_group_from_the_whole_editor_area() {
     }
     let (col, row) = (other.x + other.width / 2, other.y + other.height / 2);
     assert!(app.scroll_inactive_group_at(col, row, 3));
-    assert_eq!(app.editor_layout.inactive_groups()[0].scroll, 3);
+    assert_eq!(
+        app.editor_layout.inactive_groups().next().unwrap().scroll,
+        3
+    );
 }
 
 /// Go to Line from the status bar takes the keyboard to the editor (the

@@ -1316,7 +1316,6 @@ fn a_diff_view_in_an_inactive_split_group_is_refreshed_too() {
     let stale = app
         .editor_layout
         .inactive_groups_mut()
-        .into_iter()
         .flat_map(|g| g.editors.iter())
         .filter_map(|e| e.diff.as_ref())
         .any(|d| d.right_lines.len() != 3);
@@ -1640,7 +1639,6 @@ fn a_merge_editor_in_another_group_is_not_backed_up_either() {
     assert!(
         app.editor_layout
             .inactive_groups()
-            .iter()
             .any(|g| g.editors.iter().any(|e| e.merge.is_some())),
         "setup: the merge editor is in the other group"
     );

@@ -146,6 +146,12 @@ impl PairHost {
         self.pilot.as_ref().map(|p| std::sync::Arc::clone(&p.state))
     }
 
+    /// Test seam: the seated child's process id, for checking it by id.
+    #[cfg(test)]
+    pub(crate) fn child_id_for_tests(&self) -> Option<u32> {
+        self.pilot.as_ref().and_then(|p| p.child_id())
+    }
+
     /// This seat's site id in every live file: the navigator's wire
     /// identity. The App paints these carets in the navigator accent and
     /// clears exactly them on unseat — display names are neither unique (a

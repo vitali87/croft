@@ -22,16 +22,13 @@ impl App {
             return;
         };
         let locals = crate::dap::session::inline_locals(&session.scopes, &session.variables);
-        for ed in self.editor.editors.iter_mut() {
+        for ed in self
+            .editor_layout
+            .all_groups_mut(&mut self.editor)
+            .flat_map(|g| g.editors.iter_mut())
+        {
             if ed.path.as_deref() == Some(path.as_path()) {
                 ed.set_inline_values_from_locals(line, &locals);
-            }
-        }
-        for group in self.editor_layout.inactive_groups_mut() {
-            for ed in group.editors.iter_mut() {
-                if ed.path.as_deref() == Some(path.as_path()) {
-                    ed.set_inline_values_from_locals(line, &locals);
-                }
             }
         }
     }
@@ -39,13 +36,12 @@ impl App {
     /// Drop every inline-value trailer, in every editor of every group —
     /// called wherever the stop arrow clears (resume, step, terminate).
     pub(in crate::app) fn clear_inline_values(&mut self) {
-        for ed in self.editor.editors.iter_mut() {
+        for ed in self
+            .editor_layout
+            .all_groups_mut(&mut self.editor)
+            .flat_map(|g| g.editors.iter_mut())
+        {
             ed.inline_values.clear();
-        }
-        for group in self.editor_layout.inactive_groups_mut() {
-            for ed in group.editors.iter_mut() {
-                ed.inline_values.clear();
-            }
         }
     }
 

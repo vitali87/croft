@@ -102,17 +102,18 @@ editor | ctrl+alt+b | status="Secondary side bar shown" +aux
 editor | ctrl+alt+c | status="Copied path: <root>/main.rs" clip="<root>/main.rs"
 editor | ctrl+alt+down | carets=5:8
 editor | ctrl+alt+f | status="Replace: Tab switches field, Enter replaces, Cmd+Opt+Enter replaces all, Esc close" +find
+editor | ctrl+alt+l | status="Align Line Last Cursors needs more than one caret"
 editor | ctrl+alt+m | status="Minimap off" -minimap
 editor | ctrl+alt+r | -
 editor | ctrl+alt+s | status="Save All: nothing to save"
-editor | ctrl+alt+shift+a | status="Align Line Last Cursors needs more than one caret"
+editor | ctrl+alt+shift+a | tabs=*● main.rs text=15L#4c3e40da
 editor | ctrl+alt+shift+b | status="No bookmarks in this file"
 editor | ctrl+alt+shift+c | status="Copied relative path: main.rs" clip="main.rs"
 editor | ctrl+alt+shift+d | tabs=*● main.rs text=14L#80f7c600
 editor | ctrl+alt+shift+down | caret=5:8 carets=4:8
 editor | ctrl+alt+shift+e | status="Emmet: not available in Rust files"
-editor | ctrl+alt+shift+f | focus=side side=Search search="" @Query:0 hits=0@0
-editor | ctrl+alt+shift+g | caret=14:0 status="Bottom of file"
+editor | ctrl+alt+shift+f | status="No language server for this file"
+editor | ctrl+alt+shift+g | -
 editor | ctrl+alt+shift+j | tabs=*● main.rs text=14L#53b114fc caret=4:26
 editor | ctrl+alt+shift+k | marks=-/5 status="Bookmark set on line 5"
 editor | ctrl+alt+shift+l | tabs=*● main.rs
@@ -122,7 +123,7 @@ editor | ctrl+alt+shift+pagedown | caret=14:8 carets=4:8,5:8,6:8,7:5,8:1,9:0,10:
 editor | ctrl+alt+shift+pageup | caret=0:2 carets=1:8,2:3,3:8,4:8
 editor | ctrl+alt+shift+right | caret=4:9 sel=4:8-4:9
 editor | ctrl+alt+shift+s | status="Converted indentation to spaces"
-editor | ctrl+alt+shift+t | focus=panel status="Split terminal: 2 active" terms=2@1
+editor | ctrl+alt+shift+t | tabs=*● main.rs text=15L#91137b68 status="Converted indentation to tabs"
 editor | ctrl+alt+shift+u | tabs=*● main.rs text=15L#d70f871e
 editor | ctrl+alt+shift+up | caret=3:8 carets=4:8
 editor | ctrl+alt+shift+w | -
@@ -373,17 +374,18 @@ selection | ctrl+alt+b | status="Secondary side bar shown" +aux
 selection | ctrl+alt+c | status="Copied path: <root>/main.rs" clip="<root>/main.rs"
 selection | ctrl+alt+down | carets=5:13
 selection | ctrl+alt+f | status="Replace: Tab switches field, Enter replaces, Cmd+Opt+Enter replaces all, Esc close" +find
+selection | ctrl+alt+l | status="Align Line Last Cursors needs more than one caret"
 selection | ctrl+alt+m | status="Minimap off" -minimap
 selection | ctrl+alt+r | -
 selection | ctrl+alt+s | status="Save All: nothing to save"
-selection | ctrl+alt+shift+a | status="Align Line Last Cursors needs more than one caret"
+selection | ctrl+alt+shift+a | -
 selection | ctrl+alt+shift+b | status="No bookmarks in this file"
 selection | ctrl+alt+shift+c | status="Copied relative path: main.rs" clip="main.rs"
 selection | ctrl+alt+shift+d | -
 selection | ctrl+alt+shift+down | caret=5:13 sel=5:8-5:13 carets=4:8-4:13
 selection | ctrl+alt+shift+e | status="Emmet: not available in Rust files"
-selection | ctrl+alt+shift+f | focus=side side=Search search="" @Query:0 hits=0@0
-selection | ctrl+alt+shift+g | caret=14:0 sel=- status="Bottom of file"
+selection | ctrl+alt+shift+f | status="No language server for this file"
+selection | ctrl+alt+shift+g | -
 selection | ctrl+alt+shift+j | tabs=*● main.rs text=14L#53b114fc caret=4:26 sel=-
 selection | ctrl+alt+shift+k | marks=-/5 status="Bookmark set on line 5"
 selection | ctrl+alt+shift+l | tabs=*● main.rs
@@ -393,7 +395,7 @@ selection | ctrl+alt+shift+pagedown | caret=14:13 sel=14:8-14:13 carets=4:8-4:13
 selection | ctrl+alt+shift+pageup | caret=0:2 sel=- carets=1:8-1:13,2:3,3:8-3:11,4:8-4:13
 selection | ctrl+alt+shift+right | caret=4:14 sel=4:8-4:14
 selection | ctrl+alt+shift+s | status="Converted indentation to spaces"
-selection | ctrl+alt+shift+t | focus=panel status="Split terminal: 2 active" terms=2@1
+selection | ctrl+alt+shift+t | tabs=*● main.rs text=15L#91137b68 status="Converted indentation to tabs"
 selection | ctrl+alt+shift+u | tabs=*● main.rs text=15L#d70f871e
 selection | ctrl+alt+shift+up | caret=3:11 sel=3:8-3:11 carets=4:8-4:13
 selection | ctrl+alt+shift+w | -
@@ -644,6 +646,7 @@ explorer | ctrl+alt+b | status="Secondary side bar shown" +aux
 explorer | ctrl+alt+c | status="Copied 1 item"
 explorer | ctrl+alt+down | -
 explorer | ctrl+alt+f | -
+explorer | ctrl+alt+l | -
 explorer | ctrl+alt+m | status="Minimap off" -minimap
 explorer | ctrl+alt+r | -
 explorer | ctrl+alt+s | status="Save All: nothing to save"
@@ -653,7 +656,7 @@ explorer | ctrl+alt+shift+c | status="Copied 1 item"
 explorer | ctrl+alt+shift+d | -
 explorer | ctrl+alt+shift+down | -
 explorer | ctrl+alt+shift+e | -
-explorer | ctrl+alt+shift+f | side=Search search="" @Query:0 hits=0@0
+explorer | ctrl+alt+shift+f | -
 explorer | ctrl+alt+shift+g | -
 explorer | ctrl+alt+shift+j | -
 explorer | ctrl+alt+shift+k | -
@@ -664,7 +667,7 @@ explorer | ctrl+alt+shift+pagedown | tree=./+,.vscode/,docs/,main.rs > main.rs m
 explorer | ctrl+alt+shift+pageup | tree=./+,.vscode/,docs/,main.rs > . marked=.
 explorer | ctrl+alt+shift+right | status="Opened <root>/main.rs"
 explorer | ctrl+alt+shift+s | -
-explorer | ctrl+alt+shift+t | focus=panel status="Split terminal: 2 active" terms=2@1
+explorer | ctrl+alt+shift+t | -
 explorer | ctrl+alt+shift+u | -
 explorer | ctrl+alt+shift+up | tree=./+,.vscode/,docs/,main.rs > docs marked=.,.vscode,docs
 explorer | ctrl+alt+shift+w | -
@@ -914,6 +917,7 @@ terminal | ctrl+alt+b | status="Secondary side bar shown" +aux
 terminal | ctrl+alt+c | typed=0:"\u{1b}\u{3}"
 terminal | ctrl+alt+down | status="No command marks yet (shell integration needs a zsh prompt)"
 terminal | ctrl+alt+f | typed=0:"\u{1b}\u{6}"
+terminal | ctrl+alt+l | typed=0:"\u{1b}\u{c}"
 terminal | ctrl+alt+m | status="Minimap off" -minimap
 terminal | ctrl+alt+r | typed=0:"\u{1b}\u{12}"
 terminal | ctrl+alt+s | status="Save All: nothing to save"
@@ -923,7 +927,7 @@ terminal | ctrl+alt+shift+c | status="Nothing selected: drag to select first"
 terminal | ctrl+alt+shift+d | typed=0:"\u{1b}\u{4}"
 terminal | ctrl+alt+shift+down | status="No command marks yet (shell integration needs a zsh prompt)"
 terminal | ctrl+alt+shift+e | typed=0:"\u{1b}\u{5}"
-terminal | ctrl+alt+shift+f | focus=side side=Search search="" @Query:0 hits=0@0
+terminal | ctrl+alt+shift+f | typed=0:"\u{1b}\u{6}"
 terminal | ctrl+alt+shift+g | typed=0:"\u{1b}\u{7}"
 terminal | ctrl+alt+shift+j | typed=0:"\u{1b}\n"
 terminal | ctrl+alt+shift+k | typed=0:"\u{1b}\u{b}"
@@ -934,7 +938,7 @@ terminal | ctrl+alt+shift+pagedown | -
 terminal | ctrl+alt+shift+pageup | -
 terminal | ctrl+alt+shift+right | typed=0:"\u{1b}[1;8C"
 terminal | ctrl+alt+shift+s | typed=0:"\u{1b}\u{13}"
-terminal | ctrl+alt+shift+t | status="Split terminal: 2 active" terms=2@1
+terminal | ctrl+alt+shift+t | typed=0:"\u{1b}\u{14}"
 terminal | ctrl+alt+shift+u | typed=0:"\u{1b}\u{15}"
 terminal | ctrl+alt+shift+up | status="No command marks yet (shell integration needs a zsh prompt)"
 terminal | ctrl+alt+shift+w | status="Cannot close the last terminal; press Ctrl+J to hide"
@@ -1185,6 +1189,7 @@ search | ctrl+alt+b | status="Secondary side bar shown" +aux
 search | ctrl+alt+c | -
 search | ctrl+alt+down | search="total" @Query:5 hits=4@1
 search | ctrl+alt+f | status="Search: unhandled Ctrl+f"
+search | ctrl+alt+l | status="Search: unhandled Ctrl+l"
 search | ctrl+alt+m | status="Minimap off" -minimap
 search | ctrl+alt+r | status="Search: unhandled Ctrl+r"
 search | ctrl+alt+s | status="Save All: nothing to save"
@@ -1194,7 +1199,7 @@ search | ctrl+alt+shift+c | -
 search | ctrl+alt+shift+d | status="Search: unhandled Ctrl+D"
 search | ctrl+alt+shift+down | search="total" @Query:5 hits=4@1
 search | ctrl+alt+shift+e | status="Search: unhandled Ctrl+E"
-search | ctrl+alt+shift+f | search="total" @Query:5 sel=0-5 hits=4@0
+search | ctrl+alt+shift+f | status="Search: unhandled Ctrl+F"
 search | ctrl+alt+shift+g | status="Search: unhandled Ctrl+G"
 search | ctrl+alt+shift+j | status="Search: unhandled Ctrl+J"
 search | ctrl+alt+shift+k | status="Search: unhandled Ctrl+K"
@@ -1205,7 +1210,7 @@ search | ctrl+alt+shift+pagedown | -
 search | ctrl+alt+shift+pageup | -
 search | ctrl+alt+shift+right | -
 search | ctrl+alt+shift+s | status="Search: unhandled Ctrl+S"
-search | ctrl+alt+shift+t | focus=panel status="Split terminal: 2 active" terms=2@1 search="total" hits=4@0
+search | ctrl+alt+shift+t | status="Search: unhandled Ctrl+T"
 search | ctrl+alt+shift+u | status="Search: unhandled Ctrl+U"
 search | ctrl+alt+shift+up | -
 search | ctrl+alt+shift+w | status="Search: unhandled Ctrl+W"
@@ -1456,6 +1461,7 @@ scm | ctrl+alt+b | status="Secondary side bar shown" +aux
 scm | ctrl+alt+c | -
 scm | ctrl+alt+down | scm="Ship it"@7 +focus +list sel=0 multi=0 StagedModified:docs/notes.md Untracked:todo.txt
 scm | ctrl+alt+f | -
+scm | ctrl+alt+l | -
 scm | ctrl+alt+m | status="Minimap off" -minimap
 scm | ctrl+alt+r | -
 scm | ctrl+alt+s | status="Save All: nothing to save"
@@ -1465,7 +1471,7 @@ scm | ctrl+alt+shift+c | -
 scm | ctrl+alt+shift+d | -
 scm | ctrl+alt+shift+down | scm="Ship it"@7 +focus +list sel=0 multi=0 StagedModified:docs/notes.md Untracked:todo.txt
 scm | ctrl+alt+shift+e | -
-scm | ctrl+alt+shift+f | side=Search search="" @Query:0 hits=0@0 scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+alt+shift+f | -
 scm | ctrl+alt+shift+g | -
 scm | ctrl+alt+shift+j | -
 scm | ctrl+alt+shift+k | -
@@ -1476,7 +1482,7 @@ scm | ctrl+alt+shift+pagedown | -
 scm | ctrl+alt+shift+pageup | -
 scm | ctrl+alt+shift+right | -
 scm | ctrl+alt+shift+s | status="No change selected to stage"
-scm | ctrl+alt+shift+t | focus=panel status="Split terminal: 2 active" terms=2@1 scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+alt+shift+t | -
 scm | ctrl+alt+shift+u | -
 scm | ctrl+alt+shift+up | -
 scm | ctrl+alt+shift+w | -
@@ -1727,6 +1733,7 @@ palette | ctrl+alt+b | -
 palette | ctrl+alt+c | -
 palette | ctrl+alt+down | ~palette("" @0 > "Move Line Down")
 palette | ctrl+alt+f | -
+palette | ctrl+alt+l | -
 palette | ctrl+alt+m | -
 palette | ctrl+alt+r | -
 palette | ctrl+alt+s | -
@@ -1743,7 +1750,7 @@ palette | ctrl+alt+shift+k | -
 palette | ctrl+alt+shift+l | -
 palette | ctrl+alt+shift+left | -
 palette | ctrl+alt+shift+n | -
-palette | ctrl+alt+shift+pagedown | ~palette("" @0 > "Align Cursors Using Indentation Settings")
+palette | ctrl+alt+shift+pagedown | ~palette("" @0 > "Kill to End of Line")
 palette | ctrl+alt+shift+pageup | -
 palette | ctrl+alt+shift+right | -
 palette | ctrl+alt+shift+s | -
@@ -1869,7 +1876,7 @@ palette | ctrl+shift+m | -
 palette | ctrl+shift+n | -
 palette | ctrl+shift+o | -
 palette | ctrl+shift+p | -
-palette | ctrl+shift+pagedown | ~palette("" @0 > "Align Cursors Using Indentation Settings")
+palette | ctrl+shift+pagedown | ~palette("" @0 > "Kill to End of Line")
 palette | ctrl+shift+pageup | -
 palette | ctrl+shift+r | -
 palette | ctrl+shift+s | -
@@ -1910,7 +1917,7 @@ palette | f9 | -
 palette | home | -
 palette | left | -
 palette | n | ~palette("n" @1 > "Go to Next Change")
-palette | pagedown | ~palette("" @0 > "Align Cursors Using Indentation Settings")
+palette | pagedown | ~palette("" @0 > "Kill to End of Line")
 palette | pageup | -
 palette | r | ~palette("r" @1 > "Redo")
 palette | right | -
@@ -1929,7 +1936,7 @@ palette | shift+f8 | -
 palette | shift+f9 | -
 palette | shift+home | -
 palette | shift+left | -
-palette | shift+pagedown | ~palette("" @0 > "Align Cursors Using Indentation Settings")
+palette | shift+pagedown | ~palette("" @0 > "Kill to End of Line")
 palette | shift+pageup | -
 palette | shift+right | -
 palette | shift+up | -
@@ -2001,6 +2008,7 @@ confirm | ctrl+alt+b | -
 confirm | ctrl+alt+c | -
 confirm | ctrl+alt+down | -
 confirm | ctrl+alt+f | -
+confirm | ctrl+alt+l | -
 confirm | ctrl+alt+m | -
 confirm | ctrl+alt+r | -
 confirm | ctrl+alt+s | -

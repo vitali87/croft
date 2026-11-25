@@ -1,0 +1,1 @@
+fix: A damaged spreadsheet whose zip structure is corrupt in one particular way (the zip reader reports "Archive header is too large") now opens in the hex viewer like any other unreadable workbook, instead of refusing to open as if it were past a size limit (#2709).

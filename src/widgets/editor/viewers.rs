@@ -10,6 +10,43 @@ pub(super) const MAX_GUNZIP_BYTES: u64 = 256 * 1024 * 1024;
 
 pub(super) const MAX_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
 
+/// Why a viewer declined a file (#2062), carried in its error so the open
+/// picks the next route by the reason, never by the wording of the message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Refusal {
+    /// The bytes are not the format the viewer reads, such as an image
+    /// that does not decode: the next route may read them.
+    NotItsFormat,
+    /// A deliberate size cap, on the file or on what it expands to: the
+    /// open says so instead of quietly taking another route around it.
+    PastCap,
+}
+
+/// A viewer's refusal: its [`Refusal`] and the message the user sees.
+#[derive(Debug)]
+struct Refused {
+    reason: Refusal,
+    message: String,
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// An error that says `message` and carries `reason` for the router.
+pub(super) fn refused(reason: Refusal, message: String) -> anyhow::Error {
+    anyhow::Error::new(Refused { reason, message })
+}
+
+/// Why a viewer declined, when the error is a refusal made by [`refused`].
+pub(super) fn refusal(e: &anyhow::Error) -> Option<Refusal> {
+    e.downcast_ref::<Refused>().map(|r| r.reason)
+}
+
 /// An image's pixel size from its header alone. Opening a tab decoded the
 /// whole picture on the render thread just to read these two numbers: a
 /// 48-megapixel photo meant a ~190 MB decode per open, and one past the
@@ -1057,18 +1094,21 @@ impl Editor {
         self.sarif = None;
     }
 
-    pub(super) fn open_image(&mut self, path: &Path) -> Result<()> {
-        let meta = std::fs::metadata(path)?;
-        if meta.len() > MAX_IMAGE_BYTES {
-            anyhow::bail!("Image too large ({} bytes)", meta.len());
-        }
-        let bytes = std::fs::read(path)?;
-        let (pixel_w, pixel_h) =
-            image_dimensions_of(&bytes).ok_or_else(|| anyhow::anyhow!("Could not decode image"))?;
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let format_label = image_format_label_from_ext(ext);
+    /// Turn this tab into a viewer of `path`, whose text side is an empty
+    /// stub: drop the text, its history, its language and the place in it,
+    /// and clear every other view ([`Self::clear_viewers`]), so nothing of
+    /// what the tab showed before survives into the new view. `disk_stamp`
+    /// is what a later check for changes on disk compares against. The
+    /// caller then fills its own view and status line.
+    pub(super) fn become_viewer(
+        &mut self,
+        path: &Path,
+        disk_stamp: Option<(std::time::SystemTime, u64)>,
+    ) {
         self.path = Some(path.to_path_buf());
-        self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_stamp = disk_stamp;
+        // A viewer shows a file that exists: whatever the tab expected of a
+        // file not yet created no longer applies.
         self.disk_expect_absent = false;
         self.disk_conflict = false;
         // A whole-buffer swap: whatever the previous contents could not be
@@ -1080,8 +1120,8 @@ impl Editor {
         // placeholder line was written by no seat, and a save from the
         // viewer must not persist the old map against the new bytes.
         self.provenance = crate::provenance::Provenance::new();
-        // A whole-buffer swap like every other opener: caches memoised on
-        // edit_seq (conflicts, git marks) must not survive into this tab.
+        // Caches memoised on edit_seq (conflicts, git marks) must not
+        // survive into this tab.
         self.edit_seq = self.edit_seq.wrapping_add(1);
         self.lang = None;
         self.language_by_hand = false;
@@ -1095,6 +1135,49 @@ impl Editor {
         self.last_edit_kind = None;
         self.highlights = vec![Vec::new()];
         self.clear_viewers();
+    }
+
+    /// The view slots this tab has filled, by name: the viewers that stand
+    /// in for its text and the two layers drawn over it (a merge, a Markdown
+    /// preview). A tab shows one at most; two is the state #2069 was, where
+    /// keys went to a document preview hidden under the image opened after
+    /// it. Test builds check every tab after every key, click and paste
+    /// (`App::assert_one_view_per_tab`).
+    #[cfg(test)]
+    pub(crate) fn views_filled(&self) -> Vec<&'static str> {
+        [
+            ("diff", self.diff.is_some()),
+            ("merge", self.merge.is_some()),
+            ("image", self.image.is_some()),
+            ("sheet", self.sheet.is_some()),
+            ("hex", self.hex.is_some()),
+            ("log", self.log.is_some()),
+            ("archive", self.archive.is_some()),
+            ("markdown preview", self.markdown_preview.is_some()),
+            ("PR review", self.pr_review.is_some()),
+            ("fleet", self.fleet.is_some()),
+            ("SARIF", self.sarif.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(name, filled)| filled.then_some(name))
+        .collect()
+    }
+
+    pub(super) fn open_image(&mut self, path: &Path) -> Result<()> {
+        let meta = std::fs::metadata(path)?;
+        if meta.len() > MAX_IMAGE_BYTES {
+            anyhow::bail!("Image too large ({} bytes)", meta.len());
+        }
+        let bytes = std::fs::read(path)?;
+        let (pixel_w, pixel_h) = image_dimensions_of(&bytes).ok_or_else(|| {
+            refused(
+                Refusal::NotItsFormat,
+                String::from("Could not decode image"),
+            )
+        })?;
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let format_label = image_format_label_from_ext(ext);
+        self.become_viewer(path, Self::disk_stamp_of(path));
         self.image = Some(ImageView {
             bytes,
             format_label,
@@ -1110,8 +1193,14 @@ impl Editor {
     }
 
     pub(super) fn open_sheet(&mut self, path: &Path) -> Result<()> {
-        let view = crate::sheet::open_sheet(path)
-            .map_err(|e| anyhow::anyhow!("Spreadsheet open failed: {e}"))?;
+        let view = crate::sheet::open_sheet(path).map_err(|e| {
+            let reason = if crate::sheet::is_size_refusal(&e) {
+                Refusal::PastCap
+            } else {
+                Refusal::NotItsFormat
+            };
+            refused(reason, format!("Spreadsheet open failed: {e}"))
+        })?;
         self.install_sheet_view(path, view);
         Ok(())
     }
@@ -1129,29 +1218,7 @@ impl Editor {
             &mut self.registry,
             Some(&scratch),
         );
-        self.path = Some(path.to_path_buf());
-        self.disk_stamp = Self::disk_stamp_of(path);
-        self.disk_conflict = false;
-        self.encoding_loss = false;
-        self.lossy_save_armed = false;
-        self.lines = vec![String::new()];
-        // The map described the text this swap replaced (#349); a viewer's
-        // placeholder line was written by no seat, and a save from the
-        // viewer must not persist the old map against the new bytes.
-        self.provenance = crate::provenance::Provenance::new();
-        self.edit_seq = self.edit_seq.wrapping_add(1);
-        self.lang = None;
-        self.language_by_hand = false;
-        self.scroll = 0;
-        self.cursor_row = 0;
-        self.cursor_col = 0;
-        self.dirty = false;
-        self.selection = None;
-        self.undo_stack.clear();
-        self.redo_stack.clear();
-        self.last_edit_kind = None;
-        self.highlights = vec![Vec::new()];
-        self.clear_viewers();
+        self.become_viewer(path, Self::disk_stamp_of(path));
         self.markdown_preview = Some(crate::markdown::MarkdownPreview {
             rows: Vec::new(),
             selection: None,
@@ -1200,29 +1267,7 @@ impl Editor {
             &mut self.registry,
             Some(&scratch),
         );
-        self.path = Some(path.to_path_buf());
-        self.disk_stamp = Self::disk_stamp_of(path);
-        self.disk_conflict = false;
-        self.encoding_loss = false;
-        self.lossy_save_armed = false;
-        self.lines = vec![String::new()];
-        // The map described the text this swap replaced (#349); a viewer's
-        // placeholder line was written by no seat, and a save from the
-        // viewer must not persist the old map against the new bytes.
-        self.provenance = crate::provenance::Provenance::new();
-        self.edit_seq = self.edit_seq.wrapping_add(1);
-        self.lang = None;
-        self.language_by_hand = false;
-        self.scroll = 0;
-        self.cursor_row = 0;
-        self.cursor_col = 0;
-        self.dirty = false;
-        self.selection = None;
-        self.undo_stack.clear();
-        self.redo_stack.clear();
-        self.last_edit_kind = None;
-        self.highlights = vec![Vec::new()];
-        self.clear_viewers();
+        self.become_viewer(path, Self::disk_stamp_of(path));
         self.markdown_preview = Some(crate::markdown::MarkdownPreview {
             rows: Vec::new(),
             selection: None,
@@ -1256,34 +1301,18 @@ impl Editor {
         path: &Path,
         kind: crate::archive::ArchiveKind,
     ) -> Result<()> {
-        let view = crate::archive::list(path, kind)
-            .map_err(|e| anyhow::anyhow!("Archive open failed: {e}"))?;
+        let view = crate::archive::list(path, kind).map_err(|e| {
+            let reason = if crate::archive::is_list_cap_error(&e) {
+                Refusal::PastCap
+            } else {
+                Refusal::NotItsFormat
+            };
+            refused(reason, format!("Archive open failed: {e}"))
+        })?;
         // A listing that succeeds positively disproves any refusal armed
         // for this path, so it cannot be left to explain a later view.
         self.route_note = None;
-        self.path = Some(path.to_path_buf());
-        self.disk_stamp = Self::disk_stamp_of(path);
-        self.disk_conflict = false;
-        self.encoding_loss = false;
-        self.lossy_save_armed = false;
-        self.lines = vec![String::new()];
-        // The map described the text this swap replaced (#349); a viewer's
-        // placeholder line was written by no seat, and a save from the
-        // viewer must not persist the old map against the new bytes.
-        self.provenance = crate::provenance::Provenance::new();
-        self.edit_seq = self.edit_seq.wrapping_add(1);
-        self.lang = None;
-        self.language_by_hand = false;
-        self.scroll = 0;
-        self.cursor_row = 0;
-        self.cursor_col = 0;
-        self.dirty = false;
-        self.selection = None;
-        self.undo_stack.clear();
-        self.redo_stack.clear();
-        self.last_edit_kind = None;
-        self.highlights = vec![Vec::new()];
-        self.clear_viewers();
+        self.become_viewer(path, Self::disk_stamp_of(path));
         self.archive = Some(view);
         self.status = format!("Opened archive {}", path.display());
         Ok(())
@@ -1303,34 +1332,7 @@ impl Editor {
             pixels: (pixel_w, pixel_h),
             natural,
         } = crate::svg::render(&src).map_err(|e| anyhow::anyhow!("SVG render failed: {e}"))?;
-        self.path = Some(path.to_path_buf());
-        self.disk_stamp = Self::disk_stamp_of(path);
-        self.disk_expect_absent = false;
-        self.disk_conflict = false;
-        // A whole-buffer swap: whatever the previous contents could not be
-        // encoded as is no longer this tab's problem.
-        self.encoding_loss = false;
-        self.lossy_save_armed = false;
-        self.lines = vec![String::new()];
-        // The map described the text this swap replaced (#349); a viewer's
-        // placeholder line was written by no seat, and a save from the
-        // viewer must not persist the old map against the new bytes.
-        self.provenance = crate::provenance::Provenance::new();
-        // A whole-buffer swap like every other opener: caches memoised on
-        // edit_seq (conflicts, git marks) must not survive into this tab.
-        self.edit_seq = self.edit_seq.wrapping_add(1);
-        self.lang = None;
-        self.language_by_hand = false;
-        self.scroll = 0;
-        self.cursor_row = 0;
-        self.cursor_col = 0;
-        self.dirty = false;
-        self.selection = None;
-        self.undo_stack.clear();
-        self.redo_stack.clear();
-        self.last_edit_kind = None;
-        self.highlights = vec![Vec::new()];
-        self.clear_viewers();
+        self.become_viewer(path, Self::disk_stamp_of(path));
         self.image = Some(ImageView {
             bytes: png,
             format_label: String::from("SVG"),
@@ -1352,35 +1354,10 @@ impl Editor {
     /// router (#174), which fetches the view by sniffed kind instead of
     /// by extension.
     pub(super) fn install_sheet_view(&mut self, path: &Path, view: crate::sheet::SheetView) {
-        self.path = Some(path.to_path_buf());
-        self.disk_stamp =
-            Self::disk_stamp_with_wal(path, view.kind == crate::sheet::SheetKind::Sqlite);
-        self.disk_expect_absent = false;
-        self.disk_conflict = false;
-        // A whole-buffer swap: whatever the previous contents could not be
-        // encoded as is no longer this tab's problem.
-        self.encoding_loss = false;
-        self.lossy_save_armed = false;
-        self.lines = vec![String::new()];
-        // The map described the text this swap replaced (#349); a viewer's
-        // placeholder line was written by no seat, and a save from the
-        // viewer must not persist the old map against the new bytes.
-        self.provenance = crate::provenance::Provenance::new();
-        // A whole-buffer swap like every other opener: caches memoised on
-        // edit_seq (conflicts, git marks) must not survive into this tab.
-        self.edit_seq = self.edit_seq.wrapping_add(1);
-        self.lang = None;
-        self.language_by_hand = false;
-        self.scroll = 0;
-        self.cursor_row = 0;
-        self.cursor_col = 0;
-        self.dirty = false;
-        self.selection = None;
-        self.undo_stack.clear();
-        self.redo_stack.clear();
-        self.last_edit_kind = None;
-        self.highlights = vec![Vec::new()];
-        self.clear_viewers();
+        self.become_viewer(
+            path,
+            Self::disk_stamp_with_wal(path, view.kind == crate::sheet::SheetKind::Sqlite),
+        );
         self.status = format!("Opened {} ({})", path.display(), view.kind.label());
         self.sheet = Some(view);
     }
@@ -1403,34 +1380,7 @@ impl Editor {
             .map_err(|e| anyhow::anyhow!("PDF render failed: {e}"))?;
         let (pixel_w, pixel_h) = image_dimensions_of(&bytes)
             .ok_or_else(|| anyhow::anyhow!("Could not decode rasterised PDF"))?;
-        self.path = Some(path.to_path_buf());
-        self.disk_stamp = Self::disk_stamp_of(path);
-        self.disk_expect_absent = false;
-        self.disk_conflict = false;
-        // A whole-buffer swap: whatever the previous contents could not be
-        // encoded as is no longer this tab's problem.
-        self.encoding_loss = false;
-        self.lossy_save_armed = false;
-        self.lines = vec![String::new()];
-        // The map described the text this swap replaced (#349); a viewer's
-        // placeholder line was written by no seat, and a save from the
-        // viewer must not persist the old map against the new bytes.
-        self.provenance = crate::provenance::Provenance::new();
-        // A whole-buffer swap like every other opener: caches memoised on
-        // edit_seq (conflicts, git marks) must not survive into this tab.
-        self.edit_seq = self.edit_seq.wrapping_add(1);
-        self.lang = None;
-        self.language_by_hand = false;
-        self.scroll = 0;
-        self.cursor_row = 0;
-        self.cursor_col = 0;
-        self.dirty = false;
-        self.selection = None;
-        self.undo_stack.clear();
-        self.redo_stack.clear();
-        self.last_edit_kind = None;
-        self.highlights = vec![Vec::new()];
-        self.clear_viewers();
+        self.become_viewer(path, Self::disk_stamp_of(path));
         self.image = Some(ImageView {
             bytes,
             format_label: String::from("PDF"),
@@ -1450,6 +1400,12 @@ impl Editor {
         });
         self.status = format!("Opened PDF {}", path.display());
         Ok(())
+    }
+
+    /// Why this tab shows its file in the hex viewer rather than the viewer
+    /// its kind gets, when that viewer declined it (#2711).
+    pub fn hex_routed_because(&self) -> Option<&str> {
+        self.hex.as_ref()?.routed_because.as_deref()
     }
 
     /// True when this tab shows any non-text view: a diff, sheet,
@@ -1485,7 +1441,7 @@ impl Editor {
     pub(super) fn route_gzip(&mut self, path: &Path) -> bool {
         match self.open_archive(path, crate::archive::ArchiveKind::TarGz) {
             Ok(()) => return true,
-            Err(e) if crate::archive::is_list_cap_refusal(&e.to_string()) => {
+            Err(e) if refusal(&e) == Some(Refusal::PastCap) => {
                 self.route_note = Some((path.to_path_buf(), e.to_string()));
                 return false;
             }
@@ -1496,7 +1452,7 @@ impl Editor {
         match self.open_gunzipped(path) {
             Ok(()) => true,
             Err(e) => {
-                if e.to_string().contains("too large") {
+                if refusal(&e) == Some(Refusal::PastCap) {
                     self.route_note = Some((path.to_path_buf(), e.to_string()));
                 }
                 false
@@ -1546,7 +1502,19 @@ impl Editor {
             path.hash(&mut h);
             h.finish()
         };
-        let scratch = gunzip_scratch_dir()?.join(format!("{key:016x}-{inner}"));
+        let dir = gunzip_scratch_dir()?;
+        // Off this thread: an archive restored at launch opens before the
+        // first frame, and the sweep must not hold that frame up.
+        let swept = dir.clone();
+        let _ = std::thread::Builder::new()
+            .name(String::from("gunzip-sweep"))
+            .spawn(move || sweep_gunzip_copies(&swept, false));
+        let scratch = dir.join(gunzip_copy_name(
+            key,
+            std::process::id(),
+            next_gunzip_copy_number(key),
+            &inner,
+        ));
         // Never follow a link planted at the name: unlink whatever is there
         // (a link, not its target) and create the file exclusively.
         match std::fs::remove_file(&scratch) {
@@ -1557,17 +1525,25 @@ impl Editor {
             .write(true)
             .create_new(true)
             .open(&scratch)?;
+        // From here every way out deletes the copy (#2675): a gzip corrupt
+        // partway, one too large, or a view that cannot open it.
+        let copy = crate::log_view::OwnedCopy::new(scratch.clone());
         out.write_all(&head)?;
         let written = head.len() as u64 + std::io::copy(&mut decoder, &mut out)?;
         drop(out);
         if written > MAX_GUNZIP_BYTES {
-            let _ = std::fs::remove_file(&scratch);
-            anyhow::bail!(
-                "Decompressed file too large to show (over {} MiB)",
-                MAX_GUNZIP_BYTES / (1024 * 1024)
-            );
+            return Err(refused(
+                Refusal::PastCap,
+                format!(
+                    "Decompressed file too large to show (over {} MiB)",
+                    MAX_GUNZIP_BYTES / (1024 * 1024)
+                ),
+            ));
         }
         self.open_log(&scratch)?;
+        if let Some(log) = self.log.as_mut() {
+            log.own_copy(copy);
+        }
         self.path = Some(path.to_path_buf());
         self.disk_stamp = Self::disk_stamp_of(path);
         self.status = format!("Opened {} decompressed, read-only", path.display());
@@ -1581,29 +1557,7 @@ impl Editor {
     pub fn open_log(&mut self, path: &Path) -> Result<()> {
         let view = crate::log_view::LogView::open(path)
             .map_err(|e| anyhow::anyhow!("Log open failed: {e}"))?;
-        self.path = Some(path.to_path_buf());
-        self.disk_stamp = Self::disk_stamp_of(path);
-        self.disk_conflict = false;
-        self.encoding_loss = false;
-        self.lossy_save_armed = false;
-        self.lines = vec![String::new()];
-        // The map described the text this swap replaced (#349); a viewer's
-        // placeholder line was written by no seat, and a save from the
-        // viewer must not persist the old map against the new bytes.
-        self.provenance = crate::provenance::Provenance::new();
-        self.edit_seq = self.edit_seq.wrapping_add(1);
-        self.lang = None;
-        self.language_by_hand = false;
-        self.scroll = 0;
-        self.cursor_row = 0;
-        self.cursor_col = 0;
-        self.dirty = false;
-        self.selection = None;
-        self.undo_stack.clear();
-        self.redo_stack.clear();
-        self.last_edit_kind = None;
-        self.highlights = vec![Vec::new()];
-        self.clear_viewers();
+        self.become_viewer(path, Self::disk_stamp_of(path));
         self.log = Some(view);
         self.log_reload_top = None;
         self.status = format!("Opened {} as a rendered log", path.display());
@@ -1622,29 +1576,7 @@ impl Editor {
         let text = String::from_utf8_lossy(&bytes);
         let log = crate::sarif::load::parse_log(&text).map_err(|e| anyhow::anyhow!("{e}"))?;
         let view = crate::sarif::view::SarifView::open(path, log);
-        self.path = Some(path.to_path_buf());
-        self.disk_stamp = Self::disk_stamp_of(path);
-        self.disk_conflict = false;
-        self.encoding_loss = false;
-        self.lossy_save_armed = false;
-        self.lines = vec![String::new()];
-        // The map described the text this swap replaced (#349); a viewer's
-        // placeholder line was written by no seat, and a save from the
-        // viewer must not persist the old map against the new bytes.
-        self.provenance = crate::provenance::Provenance::new();
-        self.edit_seq = self.edit_seq.wrapping_add(1);
-        self.lang = None;
-        self.language_by_hand = false;
-        self.scroll = 0;
-        self.cursor_row = 0;
-        self.cursor_col = 0;
-        self.dirty = false;
-        self.selection = None;
-        self.undo_stack.clear();
-        self.redo_stack.clear();
-        self.last_edit_kind = None;
-        self.highlights = vec![Vec::new()];
-        self.clear_viewers();
+        self.become_viewer(path, Self::disk_stamp_of(path));
         let n = view.entries.len();
         self.sarif = Some(view);
         self.status = format!(
@@ -1710,47 +1642,23 @@ impl Editor {
             self.disk_conflict = false;
             return Ok(());
         }
-        let view =
+        let mut view =
             crate::hex::HexView::open(path).map_err(|e| anyhow::anyhow!("Hex open failed: {e}"))?;
-        self.path = Some(path.to_path_buf());
-        self.disk_stamp = Self::disk_stamp_of(path);
-        self.disk_expect_absent = false;
-        self.disk_conflict = false;
-        // A whole-buffer swap: whatever the previous contents could not be
-        // encoded as is no longer this tab's problem.
-        self.encoding_loss = false;
-        self.lossy_save_armed = false;
-        self.lines = vec![String::new()];
-        // The map described the text this swap replaced (#349); a viewer's
-        // placeholder line was written by no seat, and a save from the
-        // viewer must not persist the old map against the new bytes.
-        self.provenance = crate::provenance::Provenance::new();
-        // A whole-buffer swap like every other opener: caches memoised on
-        // edit_seq (conflicts, git marks) must not survive into this tab.
-        self.edit_seq = self.edit_seq.wrapping_add(1);
-        self.lang = None;
-        self.language_by_hand = false;
-        self.scroll = 0;
-        self.cursor_row = 0;
-        self.cursor_col = 0;
-        self.dirty = false;
-        self.selection = None;
-        self.undo_stack.clear();
-        self.redo_stack.clear();
-        self.last_edit_kind = None;
-        self.highlights = vec![Vec::new()];
-        self.clear_viewers();
-        self.hex = Some(view);
+        self.become_viewer(path, Self::disk_stamp_of(path));
         // Only for the file it was set for: an open can set the note and
         // then fail before reaching a viewer, and this is also reached
         // directly by "Reopen as Hex", so a note that outlived its open
         // would explain the wrong file.
-        self.status = match self.route_note.take() {
-            Some((noted, why)) if noted == path => {
-                format!("Opened {} in the hex viewer: {why}", path.display())
-            }
-            _ => format!("Opened {} in the hex viewer", path.display()),
+        let why = match self.route_note.take() {
+            Some((noted, why)) if noted == path => Some(why),
+            _ => None,
         };
+        self.status = match &why {
+            Some(why) => format!("Opened {} in the hex viewer: {why}", path.display()),
+            None => format!("Opened {} in the hex viewer", path.display()),
+        };
+        view.routed_because = why;
+        self.hex = Some(view);
         Ok(())
     }
 
@@ -2492,6 +2400,21 @@ pub(super) fn log_span_style(s: &crate::ansi_text::AnsiStyle, theme: crate::them
     style
 }
 
+/// Where the private folder for decompressed gzip copies lives, whether or
+/// not it exists yet: one per user.
+fn gunzip_scratch_path() -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        // SAFETY: getuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        std::env::temp_dir().join(format!("croft-gunzip-{uid}"))
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::temp_dir().join("croft-gunzip")
+    }
+}
+
 /// The private folder that holds decompressed gzip copies (#1469): one per
 /// user, mode 0700 on unix, and refused unless it is a real directory this
 /// user owns that no one else can enter, so another local user can neither
@@ -2502,7 +2425,7 @@ pub(super) fn gunzip_scratch_dir() -> std::io::Result<std::path::PathBuf> {
         use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
         // SAFETY: getuid has no preconditions and cannot fail.
         let uid = unsafe { libc::getuid() };
-        let dir = std::env::temp_dir().join(format!("croft-gunzip-{uid}"));
+        let dir = gunzip_scratch_path();
         match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
             Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
             _ => {}
@@ -2518,9 +2441,117 @@ pub(super) fn gunzip_scratch_dir() -> std::io::Result<std::path::PathBuf> {
     }
     #[cfg(not(unix))]
     {
-        let dir = std::env::temp_dir().join("croft-gunzip");
+        let dir = gunzip_scratch_path();
         std::fs::create_dir_all(&dir)?;
         Ok(dir)
+    }
+}
+
+/// The file name of the `n`th copy this process makes of the archive whose
+/// path hashes to `key` (#2675). Every opening gets its own file, so a tab
+/// closing never deletes a copy another tab still reads, and the process id
+/// tells a later croft whose copy it is. The archive's own name ends it,
+/// cut from the front to its last [`GUNZIP_NAME_KEEP`] bytes, so the whole
+/// stays within the 255 bytes most file systems allow a name and a long
+/// one still opens.
+pub(super) fn gunzip_copy_name(key: u64, pid: u32, n: u64, inner: &str) -> String {
+    let mut cut = inner.len().saturating_sub(GUNZIP_NAME_KEEP);
+    while !inner.is_char_boundary(cut) {
+        cut += 1;
+    }
+    format!("{key:016x}-{pid}-{n}-{}", &inner[cut..])
+}
+
+/// How much of an archive's name its copy keeps: 255 bytes less the
+/// longest key, process id and count with their dashes (16, 10 and 20
+/// digits, 3 dashes).
+const GUNZIP_NAME_KEEP: usize = 255 - (16 + 10 + 20 + 3);
+
+/// How many copies of the archive hashing to `key` this process has made
+/// before this one.
+fn next_gunzip_copy_number(key: u64) -> u64 {
+    static MADE: std::sync::Mutex<std::collections::BTreeMap<u64, u64>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    let n = made.entry(key).or_insert(0);
+    *n += 1;
+    *n - 1
+}
+
+/// The process that made the copy named `name`, for a name
+/// [`gunzip_copy_name`] wrote.
+fn gunzip_copy_owner(name: &str) -> Option<u32> {
+    let mut parts = name.splitn(4, '-');
+    let key = parts.next()?;
+    let pid = parts.next()?;
+    let n = parts.next()?;
+    parts.next()?;
+    let named = key.len() == 16
+        && key.bytes().all(|b| b.is_ascii_hexdigit())
+        && !n.is_empty()
+        && n.bytes().all(|b| b.is_ascii_digit());
+    named.then(|| pid.parse().ok()).flatten()
+}
+
+/// Delete the copies in `dir` that no running croft reads (#2675): those
+/// of a process that is gone, such as one killed or cut off with its ssh
+/// session, and, when `own` is set, this process's own. The way out that
+/// skips the tabs' own clean-up sets it: the self-update relaunch keeps
+/// this process id, so its copies would look in use forever.
+pub(super) fn sweep_gunzip_copies(dir: &Path, own: bool) {
+    let me = std::process::id();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(gunzip_copy_owner) else {
+            continue;
+        };
+        let unused = if pid == me {
+            own
+        } else {
+            !process_is_running(pid)
+        };
+        if unused {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Whether a process with this id may be running. Only "no such process"
+/// counts as gone: one this user may not signal, because a security policy
+/// says no or another user took the id, counts as running, so a copy still
+/// in use is never deleted. Where that cannot be asked, every other process
+/// counts as running.
+fn process_is_running(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return true;
+        };
+        if pid <= 0 {
+            return true;
+        }
+        // SAFETY: signal 0 only checks the process exists; nothing is sent.
+        let probe = unsafe { libc::kill(pid, 0) };
+        probe == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+/// Delete this process's decompressed copies before an exit that skips the
+/// tabs' own clean-up (#2675): the self-update relaunch and the drop back
+/// to the local machine.
+pub fn delete_own_gunzip_copies() {
+    let dir = gunzip_scratch_path();
+    if dir.is_dir()
+        && let Ok(dir) = gunzip_scratch_dir()
+    {
+        sweep_gunzip_copies(&dir, true);
     }
 }
 
