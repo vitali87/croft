@@ -1,0 +1,1 @@
+fix: The second SSH connection croft opens for large remote transfers now keeps its socket in a new folder only you can enter, as the main connection already did, so another user on the same machine cannot take that folder first (#2717).
