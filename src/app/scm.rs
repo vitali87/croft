@@ -1467,7 +1467,7 @@ impl App {
     }
 
     pub(super) fn initialize_repository(&mut self) {
-        match std::process::Command::new("git")
+        match crate::proc::command("git")
             .arg("-C")
             .arg(&self.tree.root)
             .arg("init")

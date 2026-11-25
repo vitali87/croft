@@ -57,7 +57,7 @@ impl SshAuth {
             })
             .context("openpty for ssh auth")?;
 
-        let mut cmd = CommandBuilder::new("ssh");
+        let mut cmd = CommandBuilder::new(crate::proc::program("ssh"));
         cmd.arg("-M");
         cmd.arg("-S");
         cmd.arg(&socket_path);
@@ -172,7 +172,7 @@ impl SshAuth {
         let _ = self.child.kill();
         let _ = self.child.wait();
         if self.socket_path.exists() {
-            let _ = std::process::Command::new("ssh")
+            let _ = crate::proc::command("ssh")
                 .arg("-S")
                 .arg(&self.socket_path)
                 .arg("-O")
@@ -212,7 +212,7 @@ impl Drop for SshAuth {
             let _ = self.child.wait();
         }
         if !self.handed_off && self.socket_path.exists() {
-            let _ = std::process::Command::new("ssh")
+            let _ = crate::proc::command("ssh")
                 .arg("-S")
                 .arg(&self.socket_path)
                 .arg("-O")

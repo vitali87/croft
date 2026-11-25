@@ -316,7 +316,7 @@ pub(super) fn ship_file_rsync_command(
     local: &Path,
     dest: &str,
 ) -> Command {
-    let mut rsync = Command::new("rsync");
+    let mut rsync = crate::proc::command("rsync");
     rsync.args(["-az", "--checksum"]);
     rsync.args(lane.rsync_throttle_args());
     rsync.arg("-e").arg(lane.rsync_ssh_arg(interactive_socket));

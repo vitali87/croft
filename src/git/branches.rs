@@ -22,7 +22,7 @@ pub fn default_branch(root: &Path) -> Result<String, String> {
     let path_str = root
         .to_str()
         .ok_or_else(|| "non-utf8 workspace path".to_string())?;
-    if let Ok(out) = Command::new("git")
+    if let Ok(out) = crate::proc::command("git")
         .args([
             "-C",
             path_str,
@@ -43,7 +43,7 @@ pub fn default_branch(root: &Path) -> Result<String, String> {
         }
     }
     for candidate in ["main", "master", "develop", "trunk"] {
-        let out = Command::new("git")
+        let out = crate::proc::command("git")
             .args([
                 "-C",
                 path_str,

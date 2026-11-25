@@ -32,7 +32,7 @@ impl SshControl {
     pub(super) fn start(host: &str) -> Result<Self> {
         let socket_dir = ssh_control_dir()?;
         let socket_path = socket_dir.join("ctl");
-        let status = Command::new("ssh")
+        let status = crate::proc::command("ssh")
             .arg("-M")
             .arg("-S")
             .arg(&socket_path)
@@ -87,14 +87,6 @@ impl SshControl {
     }
 }
 
-pub(super) fn ssh_program() -> OsString {
-    #[cfg(test)]
-    if let Some(p) = TEST_SSH.with(|p| p.borrow().clone()) {
-        return p.into_os_string();
-    }
-    OsString::from("ssh")
-}
-
 /// A background command whose output croft reads: `script` on `host` over
 /// the control socket.
 pub(super) fn ssh_socket_read(socket_path: &Path, host: &str, script: &str) -> Command {
@@ -115,7 +107,7 @@ pub(super) fn ssh_socket_read(socket_path: &Path, host: &str, script: &str) -> C
 /// onto the alt screen. The interactive session is the one caller that must
 /// keep the terminal, so it passes `false`.
 pub(super) fn ssh_socket_command(socket_path: &Path, background: bool) -> Command {
-    let mut command = Command::new(ssh_program());
+    let mut command = crate::proc::command("ssh");
     command
         .arg("-S")
         .arg(socket_path)
@@ -139,7 +131,7 @@ pub(super) fn ssh_socket_command(socket_path: &Path, background: bool) -> Comman
 
 impl Drop for SshControl {
     fn drop(&mut self) {
-        let _ = Command::new("ssh")
+        let _ = crate::proc::command("ssh")
             .arg("-S")
             .arg(&self.socket_path)
             .arg("-O")
@@ -154,7 +146,7 @@ impl Drop for SshControl {
 /// nested master). Used for the relay inbox bookkeeping (`mkdir`, sentinel
 /// writes). Returns whether it exited zero.
 pub(super) fn ssh_exec(host: &str, socket: &Path, cmd: &str) -> bool {
-    Command::new("ssh")
+    crate::proc::command("ssh")
         .arg("-S")
         .arg(socket)
         .arg("-o")

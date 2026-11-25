@@ -11,7 +11,7 @@ pub(super) fn handle_clipboard_request(
 ) {
     let dest_dir = format!("{inbox_dir}/{request_id}");
     let mkdir = format!("mkdir -p {}", shell_quote(&dest_dir));
-    let mkdir_ok = Command::new("ssh")
+    let mkdir_ok = crate::proc::command("ssh")
         .arg("-S")
         .arg(socket)
         .arg("-o")
@@ -45,7 +45,7 @@ pub(super) fn handle_clipboard_request(
         "cat > {dst}",
         dst = shell_quote(&format!("{dest_dir}/clipboard.txt")),
     );
-    let mut ssh_recv = match Command::new("ssh")
+    let mut ssh_recv = match crate::proc::command("ssh")
         .arg("-S")
         .arg(socket)
         .arg("-o")
@@ -77,7 +77,7 @@ pub(super) fn handle_clipboard_request(
     match status {
         Ok(s) if s.success() => {
             let touch = format!("touch {}/.ok", shell_quote(&dest_dir));
-            let _ = Command::new("ssh")
+            let _ = crate::proc::command("ssh")
                 .arg("-S")
                 .arg(socket)
                 .arg("-o")
@@ -135,7 +135,7 @@ pub(super) fn handle_copy_request(host: &str, socket: &Path, inbox_dir: &str, re
     // `cat` would have streamed into local memory without end.
     let limit = MAX_COPY_PAYLOAD_BYTES + 1;
     let remote_cmd = format!("head -c {limit} {quoted}; rm -f {quoted}");
-    let Ok(mut child) = Command::new("ssh")
+    let Ok(mut child) = crate::proc::command("ssh")
         .arg("-S")
         .arg(socket)
         .arg("-o")

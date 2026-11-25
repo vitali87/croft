@@ -120,7 +120,7 @@ pub(super) fn handle_pull_request(
         "set -e; mkdir -p {dir} && tar -x -f - -C {dir}",
         dir = shell_quote(&dest_dir),
     );
-    let ssh_recv = match Command::new("ssh")
+    let ssh_recv = match crate::proc::command("ssh")
         .arg("-S")
         .arg(socket)
         .arg("-o")
@@ -150,7 +150,7 @@ pub(super) fn handle_pull_request(
     match (tar_out, ssh_out) {
         (Ok(t), Ok(s)) if t.status.success() && s.status.success() => {
             let touch = format!("touch {}/.ok", shell_quote(&dest_dir));
-            let _ = Command::new("ssh")
+            let _ = crate::proc::command("ssh")
                 .arg("-S")
                 .arg(socket)
                 .arg("-o")

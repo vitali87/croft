@@ -24,7 +24,7 @@ pub(super) fn install_remote_croft(ssh: &SshControl, source_stamp: &str) -> Resu
             shell_quote_for_e_arg(&ssh.socket_path),
         );
         let dest = format!("{}:.cargo/bin/croft.new", ssh.host);
-        let status = Command::new("rsync")
+        let status = crate::proc::command("rsync")
             .args(["-az", "--checksum", "-e"])
             .arg(&ssh_e)
             .arg(binary)

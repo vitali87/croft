@@ -198,7 +198,7 @@ fn join_raw(root: &Path, raw: &[u8]) -> PathBuf {
 /// NUL-separated filenames, and `check-ignore` uses exit 1 as an answer.
 fn git_raw(root: &Path, args: &[&str], stdin_data: Option<&[u8]>) -> Option<Vec<u8>> {
     use std::io::Write;
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::proc::command("git");
     cmd.arg("-C")
         .arg(root)
         // A read-only poll must never take `index.lock` out from under a user
@@ -254,7 +254,7 @@ fn run_git(path: &Path, args: &[&str]) -> std::io::Result<String> {
     let path_str = path
         .to_str()
         .ok_or_else(|| std::io::Error::other("non-utf8 workspace path"))?;
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::proc::command("git");
     // Read-only queries must never take `.git/index.lock`: `git status` /
     // `git diff` opportunistically rewrite the refreshed index, and that
     // background lock races user-initiated mutations (`git add`, `git
@@ -355,7 +355,7 @@ fn run_mutation_inner(
         crate::output::OutputLevel::Info,
         &format!("> git {}", args.join(" ")),
     );
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::proc::command("git");
     cmd.args(["-C", path_str]).args(args);
     cmd.envs(envs.iter().copied());
     never_prompt(&mut cmd);
@@ -413,7 +413,7 @@ fn run_git_mut(dir: &Path, args: &[&str]) -> Result<(), String> {
     let Some(dir) = dir.to_str() else {
         return Err(String::from("path is not valid UTF-8"));
     };
-    let output = Command::new("git")
+    let output = crate::proc::command("git")
         .args(["-C", dir])
         .args(args)
         .output()

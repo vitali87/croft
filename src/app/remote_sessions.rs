@@ -1318,7 +1318,7 @@ pub(super) fn run_pending_scp_uploads(app: &mut App, terminal: &mut CroftTermina
             continue;
         }
         let dest = format!("{}:", upload.alias);
-        let status = std::process::Command::new("scp")
+        let status = crate::proc::command("scp")
             .arg("-r")
             .arg(&upload.src)
             .arg(&dest)

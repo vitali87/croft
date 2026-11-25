@@ -6,7 +6,7 @@ use super::*;
 /// The clean/smudge filter `rel_path` goes through (`lfs` for a Git LFS
 /// file), from `git check-attr filter`. `None` when no filter applies.
 pub fn path_filter(root: &Path, rel_path: &str) -> Option<String> {
-    let out = Command::new("git")
+    let out = crate::proc::command("git")
         .arg("-C")
         .arg(root)
         .args(["check-attr", "filter", "--", rel_path])
@@ -26,7 +26,7 @@ pub fn path_filter(root: &Path, rel_path: &str) -> Option<String> {
 
 /// Whether git config defines a `filter.<name>` driver.
 pub(super) fn filter_driver_configured(root: &Path, name: &str) -> bool {
-    Command::new("git")
+    crate::proc::command("git")
         .arg("-C")
         .arg(root)
         .args(["config", "--get-regexp"])
@@ -83,7 +83,7 @@ pub fn read_bytes_at_head(root: &Path, rel_path: &str) -> Result<Vec<u8>, String
 /// the file and not the pointer (#1238, #1338). Anything else is read with
 /// `git show`, byte for byte as git stores it.
 pub(super) fn show_blob(root: &Path, spec: &str, rel_path: &str) -> Command {
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::proc::command("git");
     cmd.arg("-C").arg(root);
     match path_filter(root, rel_path) {
         Some(_) => cmd.args(["cat-file", "--filters"]),
@@ -169,7 +169,7 @@ pub fn remerge_diff3(root: &Path, rel_path: &str) -> Result<String, String> {
         for (name, text) in &sides {
             std::fs::write(dir.join(name), text).map_err(|e| e.to_string())?;
         }
-        let output = Command::new("git")
+        let output = crate::proc::command("git")
             .arg("-C")
             .arg(root)
             .args(["merge-file", "-p", "-q", "--diff3"])

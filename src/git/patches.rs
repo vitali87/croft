@@ -52,7 +52,7 @@ pub(super) fn patch_path(patch: &str) -> Option<&str> {
 pub(super) fn strips_cr_on_add(root: &Path, rel: &str) -> bool {
     let hash = |input: &[u8], args: &[&str]| -> Option<String> {
         use std::io::Write as _;
-        let mut child = Command::new("git")
+        let mut child = crate::proc::command("git")
             .arg("-C")
             .arg(root)
             .args(["hash-object", "--stdin"])
@@ -193,7 +193,7 @@ pub fn apply_patch(
         crate::output::OutputLevel::Info,
         &format!("> git {} <<patch", args[2..].join(" ")),
     );
-    let mut child = Command::new("git")
+    let mut child = crate::proc::command("git")
         .args(&args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())

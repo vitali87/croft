@@ -98,7 +98,7 @@ impl BulkLane {
     }
 
     fn base_ssh_command(&self, interactive_socket: &Path) -> Command {
-        let mut command = Command::new("ssh");
+        let mut command = crate::proc::command("ssh");
         command
             .arg("-S")
             .arg(self.socket(interactive_socket))
@@ -193,7 +193,7 @@ struct MasterGuard {
 
 impl Drop for MasterGuard {
     fn drop(&mut self) {
-        let _ = Command::new("ssh")
+        let _ = crate::proc::command("ssh")
             .arg("-S")
             .arg(&self.socket_path)
             .arg("-O")
@@ -263,7 +263,7 @@ pub fn establish(host: &str, interactive_socket: &Path, log: impl Fn(String)) ->
 }
 
 fn open_dedicated_master(host: &str) -> Option<MasterGuard> {
-    let probe_ok = Command::new("ssh")
+    let probe_ok = crate::proc::command("ssh")
         .args(probe_args(host))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -282,7 +282,7 @@ fn open_dedicated_master(host: &str) -> Option<MasterGuard> {
         std::env::temp_dir().join(format!("croft-ssh-bulk-{}-{now}", std::process::id()));
     std::fs::create_dir_all(&socket_dir).ok()?;
     let socket_path = socket_dir.join("ctl");
-    let started = Command::new("ssh")
+    let started = crate::proc::command("ssh")
         .args(bulk_master_args(&socket_path, host))
         .stdin(Stdio::null())
         .stdout(Stdio::null())

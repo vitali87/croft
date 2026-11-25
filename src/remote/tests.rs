@@ -8,7 +8,7 @@ fn fake_ssh(dir: &Path, home: &Path) {
     let shim = dir.join("ssh");
     std::fs::write(&shim, fake_ssh_script(home)).unwrap();
     std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
-    TEST_SSH.with(|p| *p.borrow_mut() = Some(shim));
+    crate::proc::stand_in("ssh", shim);
 }
 
 /// [`fake_ssh`]'s script: drop ssh's own flags and the host, then run the
@@ -41,7 +41,7 @@ fn busy_fake_ssh(dir: &Path, home: &Path, hold: std::time::Duration) {
         std::thread::sleep(hold);
         drop(f);
     });
-    TEST_SSH.with(|p| *p.borrow_mut() = Some(shim));
+    crate::proc::stand_in("ssh", shim);
 }
 
 #[cfg(unix)]
