@@ -1,1 +1,0 @@
-refactor: A test now records every git call croft's git module makes (its arguments, environment, folder, streams and whether it runs apart from croft's terminal), so later changes to how croft starts git can prove they change nothing (#2062). Nothing changes in use.
