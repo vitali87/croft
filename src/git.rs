@@ -434,4 +434,6 @@ fn run_git_mut(dir: &Path, args: &[&str]) -> Result<(), String> {
 }
 
 #[cfg(test)]
+mod recorded_calls;
+#[cfg(test)]
 mod tests;

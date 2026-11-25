@@ -9,6 +9,9 @@
 use std::ffi::OsString;
 use std::process::Command;
 
+#[cfg(test)]
+pub(crate) mod record;
+
 /// The program croft starts for `name`: `name` itself, or in a test the
 /// stand-in this thread put in its place.
 pub fn program(name: &str) -> OsString {
