@@ -42,8 +42,8 @@ use backend::*;
 use captures::*;
 use clock::*;
 pub use commands::CommandDecoration;
+pub use commands::PromptJump;
 pub use commands::human_duration;
-pub use commands::pick_prompt_jump;
 use commands::*;
 pub use images::SIXEL_HOST;
 use images::*;
@@ -61,6 +61,7 @@ pub use processes::process_cmdline;
 pub use processes::process_name;
 use processes::*;
 pub(crate) use scroll::resize_term;
+use scroll::scroll_line_to_top;
 #[cfg(test)]
 use scroll::*;
 pub use selection::Selection;

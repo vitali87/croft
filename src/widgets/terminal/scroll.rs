@@ -31,27 +31,9 @@ impl PtyTerminal {
         self.pty_dirty.store(true, Ordering::Release);
     }
 
-    /// The viewport-top grid line: what `pick_prompt_jump` navigates from.
+    /// The viewport-top grid line: what a prompt jump navigates from.
     pub fn viewport_top_line(&self) -> i32 {
         -(self.term.lock().grid().display_offset() as i32)
-    }
-
-    /// Scroll so absolute grid line `abs_line` sits at the top of the pane
-    /// (VS Code parks the jumped-to command at the top). No-op in alternate
-    /// screen, like the other scrollback moves.
-    pub fn scroll_line_to_top(&mut self, abs_line: i32) {
-        let mut term = self.term.lock();
-        if term.mode().contains(TermMode::ALT_SCREEN) {
-            return;
-        }
-        let max_off = (-term.grid().topmost_line().0).max(0);
-        let desired = (-abs_line).clamp(0, max_off);
-        let delta = desired - term.grid().display_offset() as i32;
-        if delta != 0 {
-            term.scroll_display(Scroll::Delta(delta));
-        }
-        drop(term);
-        self.pty_dirty.store(true, Ordering::Release);
     }
 
     /// Current scrollback offset: how many rows the viewport is scrolled
@@ -348,4 +330,20 @@ pub(super) fn unclip_row(row: &mut Row<Cell>, cols: usize) -> bool {
 /// target means `display_offset = rows/2 - abs_line`. Pure for testing.
 pub fn scroll_offset_for_line(rows: i32, max_off: i32, abs_line: i32) -> i32 {
     (rows / 2 - abs_line).clamp(0, max_off.max(0))
+}
+
+/// Scroll the locked `term` so absolute grid line `abs_line` sits at the top
+/// of the pane (VS Code parks the jumped-to command at the top). No-op in
+/// alternate screen, like the other scrollback moves. The caller marks the
+/// pane dirty once it lets go of the lock.
+pub(super) fn scroll_line_to_top(term: &mut Term<VoidListener>, abs_line: i32) {
+    if term.mode().contains(TermMode::ALT_SCREEN) {
+        return;
+    }
+    let max_off = (-term.grid().topmost_line().0).max(0);
+    let desired = (-abs_line).clamp(0, max_off);
+    let delta = desired - term.grid().display_offset() as i32;
+    if delta != 0 {
+        term.scroll_display(Scroll::Delta(delta));
+    }
 }

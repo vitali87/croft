@@ -186,10 +186,25 @@ pub fn human_duration(d: std::time::Duration) -> String {
 /// thousands would mean a very long session — drop the oldest).
 pub(super) const MARKS_MAX: usize = 2000;
 
+/// What Cmd+Opt+Up / Cmd+Opt+Down found ([`PtyTerminal::jump_to_prompt`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptJump {
+    /// The view's top now sits on the previous / next prompt mark.
+    Jumped,
+    /// The pane has no prompt marks at all.
+    NoMarks,
+    /// No prompt mark lies that way from the view's top.
+    NoneThatWay,
+}
+
 /// The nearest prompt line strictly above (`forward == false`) or below
 /// (`forward == true`) the viewport-top grid line `current_top`. Feeds
 /// Cmd+Up / Cmd+Down command navigation.
-pub fn pick_prompt_jump(prompt_lines: &[i32], current_top: i32, forward: bool) -> Option<i32> {
+pub(super) fn pick_prompt_jump(
+    prompt_lines: &[i32],
+    current_top: i32,
+    forward: bool,
+) -> Option<i32> {
     if forward {
         prompt_lines
             .iter()
@@ -219,10 +234,17 @@ impl PtyTerminal {
     /// The marks with current grid lines and, for `CommandEnd`, the measured
     /// command duration. GC + drift adjustment as in [`Self::command_marks`].
     pub(super) fn marks_snapshot(&self) -> Vec<MarkView> {
-        let mut term = self.term.lock();
-        let now = self.clock.lock().unwrap().tick(&mut term);
+        self.marks_snapshot_locked(&mut self.term.lock())
+    }
+
+    /// [`Self::marks_snapshot`] against an already-locked term. The lock is
+    /// held while the marks are read (order term -> marks, as the reader
+    /// records them): output landing between reading the clock and reading
+    /// the marks would give a mark recorded after it a line off by the
+    /// rows that output scrolled.
+    fn marks_snapshot_locked(&self, term: &mut Term<VoidListener>) -> Vec<MarkView> {
+        let now = self.clock.lock().unwrap().tick(term);
         let floor = term.grid().topmost_line().0;
-        drop(term);
         let mut marks = self.marks.lock().unwrap();
         marks.retain(|m| m.line_rec - (now - m.clock_rec) as i32 >= floor);
         marks
@@ -235,6 +257,34 @@ impl PtyTerminal {
                 dur: m.dur,
             })
             .collect()
+    }
+
+    /// Cmd+Opt+Up / Cmd+Opt+Down: park the previous / next OSC 133 prompt
+    /// mark at the top of the pane. The marks, the view's top and the scroll
+    /// are all taken under one hold of the term: output landing in between
+    /// moves the view (alacritty keeps a scrolled-back view on its rows) but
+    /// not marks already read, so the mark at the top would look like a
+    /// next one and the scroll would land rows off it (#2726).
+    pub fn jump_to_prompt(&mut self, forward: bool) -> PromptJump {
+        let mut term = self.term.lock();
+        let prompts: Vec<i32> = self
+            .marks_snapshot_locked(&mut term)
+            .into_iter()
+            .filter(|m| m.kind == crate::shell_integration::OscEvent::PromptStart)
+            .map(|m| m.line)
+            .collect();
+        let top = -(term.grid().display_offset() as i32);
+        let Some(target) = pick_prompt_jump(&prompts, top, forward) else {
+            return if prompts.is_empty() {
+                PromptJump::NoMarks
+            } else {
+                PromptJump::NoneThatWay
+            };
+        };
+        scroll_line_to_top(&mut term, target);
+        drop(term);
+        self.pty_dirty.store(true, Ordering::Release);
+        PromptJump::Jumped
     }
 
     /// One record per finished command, for the gutter decorations: prompt

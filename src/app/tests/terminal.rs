@@ -801,14 +801,15 @@ fn cmd_opt_up_parks_the_previous_prompt_mark_at_the_viewport_top() {
     .unwrap();
     crate::test_budget::await_spawned(
         crate::test_budget::tests::SHELL_PAINT_BASE,
-        "the prompt mark and filler output",
+        "the prompt mark, the filler output and the exit footer",
         || {
+            // The pane prints `[Process exited]` once the script ends: wait
+            // for it, so no output lands while the keys are pressed and the
+            // view read (#2726).
+            let (lines, _) = app.terminals[0].grid_lines();
             !app.terminals[0].prompt_lines().is_empty()
-                && app.terminals[0]
-                    .grid_lines()
-                    .0
-                    .iter()
-                    .any(|l| l.contains("filler-39"))
+                && lines.iter().any(|l| l.contains("filler-39"))
+                && lines.iter().any(|l| l.contains("[Process exited]"))
         },
     );
     app.focus_pane(Pane::Terminal);
