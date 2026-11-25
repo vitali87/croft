@@ -198,6 +198,35 @@ git -C <repo> log -1 --no-show-signature '--format=%an <%ae>%n%ad (%ar)%ncommit 
 ## blame
 git -C <repo> blame --porcelain -- a.txt
     in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## read_file_at_head of a filtered file
+git -C <repo> check-attr filter -- data.dat
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> cat-file --filters HEAD:data.dat
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## read_file_at_rev of a filtered file
+git -C <repo> check-attr filter -- data.dat
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> cat-file --filters 5c56933ed89ba6b159f9d26831a1e8433c7ce3bb:./data.dat
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## show_commit_file_diff of a filtered file
+git -C <repo> rev-parse --show-toplevel --show-prefix
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> check-attr filter -- data.dat
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> check-attr filter -- data.dat
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> cat-file --filters 5c56933ed89ba6b159f9d26831a1e8433c7ce3bb:./data.dat
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> check-attr filter -- data.dat
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> cat-file --filters 5c56933ed89ba6b159f9d26831a1e8433c7ce3bb:./data.dat
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> check-attr filter -- data.dat
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> cat-file --filters 5c56933ed89ba6b159f9d26831a1e8433c7ce3bb^:./data.dat
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> show --no-color --no-ext-diff -s 5c56933ed89ba6b159f9d26831a1e8433c7ce3bb
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
 ## stage_path
 git -C <repo> diff --no-relative --name-only --diff-filter=U -z
     in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
@@ -512,6 +541,12 @@ git -C <repo> config --get branch.main.remote
     in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
 git -C <repo> remote get-url origin
     in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> cat-file -e HEAD:a.txt
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> rev-parse HEAD
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> branch -r --contains 026b5f946a738084ed76fc3c9022a23db49aad44 --list 'origin/*'
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
 ## share_link branch
 git -C <repo> rev-parse --show-toplevel
     in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
@@ -522,6 +557,14 @@ git -C <repo> remote
 git -C <repo> config --get branch.main.remote
     in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
 git -C <repo> remote get-url origin
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> cat-file -e HEAD:a.txt
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> config --get branch.main.merge
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> rev-parse --verify --quiet refs/remotes/origin/main
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> merge-base --is-ancestor HEAD refs/remotes/origin/main
     in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
 ## add_worktree_lane
 git -C <repo> symbolic-ref --quiet --short HEAD
@@ -549,6 +592,23 @@ git -C <repo> remote -v
 ## checkout_pr_worktree
 git -C <repo> fetch --quiet origin refs/pull/7/head
     in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+git -C <repo> rev-parse FETCH_HEAD
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> worktree add --detach <tmp>/pr-7 9d6b52ba72720e034a8b9fd526a54a87f6a6662f
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## checkout_pr_worktree when the pull request moved
+git -C <repo> fetch --quiet origin refs/pull/7/head
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+git -C <repo> rev-parse FETCH_HEAD
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> worktree list --porcelain
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <tmp>/pr-7 rev-parse HEAD
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <tmp>/pr-7 status --porcelain --ignored
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <tmp>/pr-7 checkout --quiet --detach c59cbc2d25b7cff77ef7bcd3426317cfc363251d
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
 ## merge_branch that conflicts
 git -C <repo> merge clash
     in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session

@@ -278,6 +278,39 @@ fn child_records_every_git_call() {
     let _ = blame(&repo, "a.txt");
     s.step("blame");
 
+    // A filtered file, as Git LFS keeps one: read through its filter, and
+    // its commit diffed from the filtered sides.
+    write(&repo.join(".gitattributes"), "*.dat filter=demo\n");
+    fixture(&repo, &["config", "filter.demo.clean", "cat"]);
+    fixture(&repo, &["config", "filter.demo.smudge", "cat"]);
+    write(&repo.join("data.dat"), "filtered\n");
+    fixture(&repo, &["add", ".gitattributes", "data.dat"]);
+    fixture(
+        &repo,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "filtered",
+            "--",
+            ".gitattributes",
+            "data.dat",
+        ],
+    );
+    let filtered = fixture(&repo, &["rev-parse", "HEAD"]);
+    let read = read_file_at_head(&repo, "data.dat");
+    assert_eq!(read.as_deref(), Ok("filtered\n"));
+    s.step("read_file_at_head of a filtered file");
+    let read = read_file_at_rev(&repo, &filtered, "data.dat");
+    assert_eq!(read.as_deref(), Ok("filtered\n"));
+    s.step("read_file_at_rev of a filtered file");
+    let diff = show_commit_file_diff(&repo, &filtered, "data.dat");
+    assert!(
+        diff.as_ref().is_ok_and(|d| d.contains("+filtered")),
+        "{diff:?}"
+    );
+    s.step("show_commit_file_diff of a filtered file");
+
     // Staging and patches.
     write(&repo.join("d.txt"), "new\n");
     let _ = stage_path(&repo, "a.txt");
@@ -451,10 +484,25 @@ fn child_records_every_git_call() {
     fixture(&repo, &["checkout", "-q", "main"]);
     let _ = clone_into(&tmp, &origin.display().to_string());
     s.step("clone_into");
-    let _ = share_link(&repo.join("a.txt"), Some((1, 2)), LinkRev::Commit);
+    // A web link needs a GitHub-style remote; main is pushed, so both the
+    // commit and the branch are on it, and no network is used.
+    let local_origin = origin.display().to_string();
+    fixture(
+        &repo,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/owner/repo.git",
+        ],
+    );
+    let link = share_link(&repo.join("a.txt"), Some((1, 2)), LinkRev::Commit);
+    assert!(link.is_ok(), "{link:?}");
     s.step("share_link commit");
-    let _ = share_link(&repo.join("a.txt"), None, LinkRev::Branch);
+    let link = share_link(&repo.join("a.txt"), None, LinkRev::Branch);
+    assert!(link.is_ok(), "{link:?}");
     s.step("share_link branch");
+    fixture(&repo, &["remote", "set-url", "origin", &local_origin]);
 
     // Worktrees.
     let mut lane = worktrees::WorktreeLane::plan(&repo, "lane one").unwrap();
@@ -472,8 +520,17 @@ fn child_records_every_git_call() {
     s.step("pr_worktree_path");
     let _ = remote_for_slug(&repo, "owner/repo");
     s.step("remote_for_slug");
-    let _ = checkout_pr_worktree(&repo, "origin", 7, &tmp.join("pr-7"), None);
+    // A pull request's head, as GitHub keeps one: checked out into a new
+    // worktree, then moved on when the pull request moves.
+    let pr = tmp.join("pr-7");
+    fixture(&origin, &["update-ref", "refs/pull/7/head", &feature]);
+    let made = checkout_pr_worktree(&repo, "origin", 7, &pr, None);
+    assert!(made.as_ref().is_ok_and(|w| w.created), "{made:?}");
     s.step("checkout_pr_worktree");
+    fixture(&origin, &["update-ref", "refs/pull/7/head", &second]);
+    let moved = checkout_pr_worktree(&repo, "origin", 7, &pr, Some(&feature));
+    assert!(moved.as_ref().is_ok_and(|w| !w.created), "{moved:?}");
+    s.step("checkout_pr_worktree when the pull request moved");
 
     // Operations in progress: a merge that conflicts, aborted; a
     // cherry-pick that conflicts, resolved and continued; one skipped; then
