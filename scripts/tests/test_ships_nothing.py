@@ -1031,6 +1031,19 @@ class TestOnlyModules(unittest.TestCase):
             )
         )
 
+    def test_a_test_module_also_pasted_into_release_code_ships(self):
+        """#2723 review: a file declared `#[cfg(test)] mod helper;` that a
+        release `include!("helper.rs")` also pastes in is release code."""
+        self.assertFalse(
+            self.shipped_by(
+                {
+                    "src/main.rs": (
+                        '#[cfg(test)]\nmod helper;\ninclude!("helper.rs");\nfn main() {}\n'
+                    )
+                }
+            )
+        )
+
     def test_pasted_code_that_declares_a_module_ships(self):
         """Pasted code can declare `mod helper;` for the release build, and
         the declaration check reads only the file it is pasted into."""

@@ -507,7 +507,8 @@ def _loaders_in(path, toks):
     file under a name this does not know. Only a `use` can rename a macro;
     elsewhere `include` is an ordinary name (croft has a search field called
     that). An `include!("file")` names the file it pastes in, relative to
-    this one's folder, and the caller reads that file's code as part of this
+    this one's folder: its name joins the names, since the file ships as
+    release code, and the caller reads that file's code as part of this
     one's (#2722).
 
     An include macro inside a `#[cfg(test)]` module compiles only for tests,
@@ -589,8 +590,11 @@ def _loaders_in(path, toks):
             if called and tok[1].removeprefix("r#") != "include":
                 names.append(_included_name(arg))
             elif called and len(arg) == 1 and arg[0][0] == "str" and _resolved(folder, arg[0][1]):
-                # Code pasted in from a file this names: the caller reads it.
+                # Code pasted in from a file this names: the caller reads it
+                # for what it loads, and the file itself ships, as one an
+                # include_str! embeds does, whatever else declares it.
                 pasted.append(_resolved(folder, arg[0][1]))
+                names.append(_file_name(arg[0][1]))
             elif called or in_use:
                 # Code pasted in from a file this cannot name, or a renamed
                 # macro: it can embed a file or declare a module that
