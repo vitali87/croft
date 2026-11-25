@@ -619,7 +619,8 @@ Not supported yet: transforms such as `${TM_FILENAME/(.*)\\..+$/$1/}`, a picker 
 | `Cmd`+`Opt`+`Shift`+`K` | Bookmarks: toggle a bookmark on the cursor's line |
 | `Cmd`+`Opt`+`.` / `Cmd`+`Opt`+`,` | Bookmarks: jump to the next / previous bookmark, wrapping around the file |
 | `Cmd`+`Opt`+`Shift`+`B` | Bookmarks: clear every bookmark in the file |
-| `Cmd+K` `Cmd+M` | Bookmarks: list every bookmark; `Enter` jumps to one |
+| `Cmd+K` `Cmd+M` | Bookmarks: list the bookmarks of the open files; `Enter` jumps to one |
+| `Cmd+K` `Shift+B` | Bookmarks: list every bookmark, files that are closed included |
 | Click a breadcrumb | Breadcrumbs: a folder or file crumb lists that folder, a symbol crumb lists the symbols beside it; Enter opens or jumps. Type to filter, Backspace widens, Esc clears then closes |
 | `Cmd+Shift+.` / `Ctrl+Shift+.` | View: Focus and Select Breadcrumbs: the last crumb's list; Left / Right move to the neighbouring crumb's list |
 | Click a sticky-scroll header | Jump to that pinned scope header's line (class, function) |
