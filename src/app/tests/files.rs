@@ -850,7 +850,6 @@ fn an_external_write_reloads_a_tab_in_an_inactive_split_group() {
     let stale: Vec<String> = app
         .editor_layout
         .inactive_groups()
-        .into_iter()
         .flat_map(|g| g.editors.iter())
         .filter(|e| e.path.as_deref() == Some(side.as_path()))
         .map(|e| e.lines.join("\n"))
@@ -1375,8 +1374,9 @@ fn save_all_writes_neither_of_two_different_unsaved_copies_of_a_file() {
         app.status
     );
     assert_eq!(std::fs::read_to_string(&a).unwrap(), "alpha\n");
-    let mut texts: Vec<String> = std::iter::once(&app.editor)
-        .chain(app.editor_layout.inactive_groups())
+    let mut texts: Vec<String> = app
+        .editor_layout
+        .all_groups(&app.editor)
         .flat_map(|g| g.editors.iter())
         .filter(|e| e.path.as_deref() == Some(a.as_path()))
         .inspect(|e| assert!(e.dirty, "both copies stay unsaved"))
@@ -4722,7 +4722,6 @@ fn save_all_counts_a_file_dirty_in_two_splits_once() {
         .chain(
             app.editor_layout
                 .inactive_groups()
-                .into_iter()
                 .flat_map(|g| g.editors.iter()),
         )
         .filter(|e| e.dirty && e.path.as_deref() == Some(a.as_path()))

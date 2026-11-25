@@ -16,6 +16,7 @@ use ratatui::{
 };
 
 use crate::dap::discovery::PyTarget;
+use crate::widgets::picker_colours;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// The picker's owned state.
@@ -179,9 +180,9 @@ pub fn render_process_picker(
     );
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))))
+        .border_style(Style::default().fg(theme.ui(picker_colours::BORDER)))
         .title(title.clone())
-        .style(Style::default().bg(theme.ui(Color::Rgb(0x16, 0x18, 0x1f))));
+        .style(Style::default().bg(theme.ui(picker_colours::BODY)));
     let inner = Rect {
         x: rect.x + 1,
         y: rect.y + 1,
@@ -197,7 +198,7 @@ pub fn render_process_picker(
         let (r, g, b) = crate::gradient::POPUP_SEL_BG;
         Color::Rgb(r, g, b)
     } else {
-        theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e))
+        theme.ui(picker_colours::SELECTION)
     };
     let tones = crate::widgets::surface::tones(theme);
 
@@ -224,7 +225,7 @@ pub fn render_process_picker(
         let row_style = match tones {
             Some(t) => Style::default().fg(if is_selected { t.strong() } else { t.text() }),
             None if is_selected => Style::default().bg(sel_bg).fg(theme.ui(Color::White)),
-            None => Style::default().fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4))),
+            None => Style::default().fg(theme.ui(picker_colours::TEXT)),
         };
         let prefix = if is_selected && tones.is_none() {
             "> "

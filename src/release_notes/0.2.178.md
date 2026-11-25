@@ -1,0 +1,1 @@
+fix: Opening a compressed text file, such as a rotated app.log.1.gz, no longer leaves its unpacked copy in the temp folder: the copy is now deleted when the tab closes or shows something else, when croft quits, and when unpacking fails partway, and a copy left by a croft that was killed or lost its ssh session is cleared the next time an archive opens.

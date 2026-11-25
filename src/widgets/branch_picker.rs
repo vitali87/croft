@@ -12,6 +12,8 @@
 //! and the one subprocess call stays off the render path.
 
 use crate::git::BranchInfo;
+use crate::widgets::picker_colours;
+use crate::widgets::picker_query;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -70,18 +72,6 @@ impl BranchPicker {
             last_rect: Rect::default(),
             last_inner_height: 0,
         }
-    }
-
-    fn char_count(&self) -> usize {
-        self.query.chars().count()
-    }
-
-    fn byte_offset(&self, char_idx: usize) -> usize {
-        self.query
-            .char_indices()
-            .nth(char_idx)
-            .map(|(b, _)| b)
-            .unwrap_or(self.query.len())
     }
 
     /// Indices of branches whose display name contains the query
@@ -157,37 +147,30 @@ impl BranchPicker {
     // --- query editing (mirrors ZoxideJump) -------------------------------
 
     pub fn push_char(&mut self, c: char) {
-        let at = self.byte_offset(self.cursor);
-        self.query.insert(at, c);
-        self.cursor += 1;
+        picker_query::insert(&mut self.query, &mut self.cursor, c);
         self.reset_selection();
     }
 
     pub fn pop_char(&mut self) {
-        if self.cursor == 0 {
+        if !picker_query::backspace(&mut self.query, &mut self.cursor) {
             return;
         }
-        let at = self.byte_offset(self.cursor - 1);
-        self.query.remove(at);
-        self.cursor -= 1;
         self.reset_selection();
     }
 
     pub fn delete_char(&mut self) {
-        if self.cursor >= self.char_count() {
+        if !picker_query::delete(&mut self.query, self.cursor) {
             return;
         }
-        let at = self.byte_offset(self.cursor);
-        self.query.remove(at);
         self.reset_selection();
     }
 
     pub fn move_cursor_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
+        picker_query::left(&mut self.cursor);
     }
 
     pub fn move_cursor_right(&mut self) {
-        self.cursor = (self.cursor + 1).min(self.char_count());
+        picker_query::right(&self.query, &mut self.cursor);
     }
 
     pub fn move_cursor_home(&mut self) {
@@ -195,7 +178,7 @@ impl BranchPicker {
     }
 
     pub fn move_cursor_end(&mut self) {
-        self.cursor = self.char_count();
+        picker_query::end(&self.query, &mut self.cursor);
     }
 
     /// A query edit reshapes the row list, so collapse the highlight back
@@ -256,9 +239,9 @@ pub fn render_branch_picker(
     );
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))))
+        .border_style(Style::default().fg(theme.ui(picker_colours::BORDER)))
         .title(title.clone())
-        .style(Style::default().bg(theme.ui(Color::Rgb(0x16, 0x18, 0x1f))));
+        .style(Style::default().bg(theme.ui(picker_colours::BODY)));
     let inner = Rect {
         x: rect.x + 1,
         y: rect.y + 1,
@@ -274,7 +257,7 @@ pub fn render_branch_picker(
         let (r, g, b) = crate::gradient::POPUP_SEL_BG;
         Color::Rgb(r, g, b)
     } else {
-        theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e))
+        theme.ui(picker_colours::SELECTION)
     };
     let tones = crate::widgets::surface::tones(theme);
 
@@ -284,11 +267,11 @@ pub fn render_branch_picker(
 
     // Prompt row with a blinking caret, identical treatment to the jumper.
     let query_style = Style::default()
-        .fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
+        .fg(theme.ui(picker_colours::TEXT))
         .add_modifier(Modifier::BOLD);
     let caret_style = Style::default()
-        .fg(theme.ui(Color::Rgb(0x16, 0x18, 0x1f)))
-        .bg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
+        .fg(theme.ui(picker_colours::BODY))
+        .bg(theme.ui(picker_colours::TEXT))
         .add_modifier(Modifier::SLOW_BLINK);
     let cursor = picker.cursor.min(picker.query.chars().count());
     let before: String = picker.query.chars().take(cursor).collect();
@@ -298,7 +281,7 @@ pub fn render_branch_picker(
     let prompt_line = Line::from(vec![
         Span::styled(
             "\u{ea68} ",
-            Style::default().fg(theme.ui(Color::Rgb(0x88, 0xc0, 0xd0))),
+            Style::default().fg(theme.ui(picker_colours::PROMPT)),
         ),
         Span::styled(before, query_style),
         Span::styled(caret_glyph, caret_style),
@@ -346,7 +329,7 @@ pub fn render_branch_picker(
         Widget::render(
             Paragraph::new(Line::from(Span::styled(
                 "  No branches",
-                Style::default().fg(theme.ui(Color::Rgb(0x7a, 0x82, 0x90))),
+                Style::default().fg(theme.ui(picker_colours::DIM)),
             ))),
             list_rect,
             buf,
@@ -373,7 +356,7 @@ pub fn render_branch_picker(
         let base = match tones {
             Some(t) => Style::default().fg(if is_selected { t.strong() } else { t.text() }),
             None if is_selected => Style::default().bg(sel_bg).fg(theme.ui(Color::White)),
-            None => Style::default().fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4))),
+            None => Style::default().fg(theme.ui(picker_colours::TEXT)),
         };
         let prefix = if is_selected && tones.is_none() {
             "> "
@@ -399,8 +382,7 @@ pub fn render_branch_picker(
                 ));
                 spans.push(Span::styled(b.display.clone(), base));
                 if b.is_remote {
-                    let muted =
-                        tones.map_or_else(|| theme.ui(Color::Rgb(0x7a, 0x82, 0x90)), |t| t.muted());
+                    let muted = tones.map_or_else(|| theme.ui(picker_colours::DIM), |t| t.muted());
                     spans.push(Span::styled(
                         "  (remote)".to_string(),
                         Style::default().fg(muted),
@@ -411,7 +393,7 @@ pub fn render_branch_picker(
                 let accent = match tones {
                     Some(t) => Style::default().fg(t.accent()),
                     None => Style::default()
-                        .fg(theme.ui(Color::Rgb(0x88, 0xc0, 0xd0)))
+                        .fg(theme.ui(picker_colours::PROMPT))
                         .add_modifier(Modifier::BOLD),
                 };
                 let accent_text = match tones {

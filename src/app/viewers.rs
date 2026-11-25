@@ -485,8 +485,9 @@ impl App {
     /// again. The preview's buffer is never touched, so it stays clean.
     /// Returns true when a preview was rebuilt.
     pub fn sync_markdown_side_previews(&mut self) -> bool {
-        let mut tabs: Vec<&mut crate::widgets::editor::Editor> = std::iter::once(&mut self.editor)
-            .chain(self.editor_layout.inactive_groups_mut())
+        let mut tabs: Vec<&mut crate::widgets::editor::Editor> = self
+            .editor_layout
+            .all_groups_mut(&mut self.editor)
             .filter_map(|group| {
                 let idx = group.active_index();
                 group.editors.get_mut(idx)
@@ -552,9 +553,7 @@ impl App {
     pub(super) fn set_log_highlight(&mut self, on: bool) {
         self.log_highlight = on;
         seed_log_highlight_default(on);
-        for group in
-            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut())
-        {
+        for group in self.editor_layout.all_groups_mut(&mut self.editor) {
             for ed in &mut group.editors {
                 if let Some(log) = ed.log.as_mut() {
                     log.set_highlight(on);

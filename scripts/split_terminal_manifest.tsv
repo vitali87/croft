@@ -130,7 +130,7 @@ pr	file	kind	impl	name
 8	processes	fn	impl PtyTerminal	kernel_shell_cwd
 16	status	fn	impl PtyTerminal	drain_notifications
 12	scroll	fn	impl PtyTerminal	viewport_top_line
-12	scroll	fn	impl PtyTerminal	scroll_line_to_top
+12	scroll	fn	-	scroll_line_to_top
 16	status	fn	impl PtyTerminal	take_bell
 13	input	fn	impl PtyTerminal	take_clipboard_store
 8	processes	fn	impl PtyTerminal	foreground_pid

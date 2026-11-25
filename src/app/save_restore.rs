@@ -3,6 +3,7 @@
 //! launch file.
 
 use super::*;
+use crate::widgets::confirm_frame::{ConfirmFrame, Inset, confirm_width, draw_confirm};
 
 /// What an unsaved-changes prompt (#862) goes on to do once it is answered.
 /// Everything that would drop a dirty buffer asks first: a quit that goes
@@ -114,7 +115,7 @@ impl App {
         let mut paths: std::collections::HashSet<&std::path::Path> =
             std::collections::HashSet::new();
         let mut pathless = 0usize;
-        let groups = std::iter::once(&self.editor).chain(self.editor_layout.inactive_groups());
+        let groups = self.editor_layout.all_groups(&self.editor);
         // A scratch tab's edits are nothing a save writes (#951).
         for ed in groups
             .flat_map(|g| g.editors.iter())
@@ -169,66 +170,40 @@ impl App {
             return;
         };
         let (headline, names, save, discard) = self.unsaved_confirm_text(exit);
-        let area = frame.area();
-        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
-        let height: u16 = 8;
-        let rect = Rect {
-            x: (area.width.saturating_sub(width)) / 2 + area.x,
-            y: (area.height.saturating_sub(height)) / 2 + area.y,
-            width,
-            height,
+        let title = format!(" {} ", crate::i18n::tr("UNSAVED CHANGES"));
+        let frame_spec = ConfirmFrame {
+            title: &title,
+            accent: self.theme.ui(Color::Rgb(0xe7, 0xa7, 0x3c)),
+            title_fg: Color::Black,
+            height: 8,
+            inset: Inset::Wide,
         };
-        let rect = rect.intersection(area);
-        let warn = self.theme.ui(Color::Rgb(0xe7, 0xa7, 0x3c));
-        let block = ratatui::widgets::Block::default()
-            .borders(ratatui::widgets::Borders::ALL)
-            .border_style(Style::default().fg(warn))
-            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
-            .title(ratatui::text::Span::styled(
-                format!(" {} ", crate::i18n::tr("UNSAVED CHANGES")),
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(warn)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        frame.render_widget(ratatui::widgets::Clear, rect);
-        frame.render_widget(block, rect);
-        let inner = Rect {
-            x: rect.x + 2,
-            y: rect.y + 1,
-            width: rect.width.saturating_sub(4),
-            height: rect.height.saturating_sub(2),
-        };
-        let key = |k: &'static str, color: Color| {
-            Span::styled(k, Style::default().fg(color).add_modifier(Modifier::BOLD))
-        };
-        let body = ratatui::text::Text::from(vec![
-            Line::from(Span::styled(
-                headline,
-                Style::default().fg(self.theme.ui(Color::White)),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                truncate_for_display(&names, inner.width as usize),
-                Style::default().fg(self.theme.ui(Color::Rgb(0xeb, 0xcb, 0x8b))),
-            )),
-            Line::from(""),
-            Line::from(vec![
-                key("[S]", Color::Green),
-                Span::raw(format!("{save}   ")),
-                key("[D]", Color::Red),
-                Span::raw(format!("{discard}   ")),
-                key("[Esc]", self.theme.ui(Color::White)),
-                Span::raw(" cancel"),
-            ]),
-        ]);
-        frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
-        crate::widgets::approval_popup::paint_warning_card(
-            frame.buffer_mut(),
-            rect,
-            self.theme,
-            warn,
-        );
+        draw_confirm(frame, self.theme, frame_spec, |frame, inner| {
+            let key = |k: &'static str, color: Color| {
+                Span::styled(k, Style::default().fg(color).add_modifier(Modifier::BOLD))
+            };
+            let body = ratatui::text::Text::from(vec![
+                Line::from(Span::styled(
+                    headline,
+                    Style::default().fg(self.theme.ui(Color::White)),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    truncate_for_display(&names, inner.width as usize),
+                    Style::default().fg(self.theme.ui(Color::Rgb(0xeb, 0xcb, 0x8b))),
+                )),
+                Line::from(""),
+                Line::from(vec![
+                    key("[S]", Color::Green),
+                    Span::raw(format!("{save}   ")),
+                    key("[D]", Color::Red),
+                    Span::raw(format!("{discard}   ")),
+                    key("[Esc]", self.theme.ui(Color::White)),
+                    Span::raw(" cancel"),
+                ]),
+            ]);
+            frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+        });
     }
 
     /// The lossy-save prompt (#1053): what the file's encoding would destroy,
@@ -240,71 +215,45 @@ impl App {
             return;
         };
         let [what, consequence, keep] = asked.text();
-        let area = frame.area();
-        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
-        let inner_w = width.saturating_sub(4);
+        let inner_w = confirm_width(frame.area()).saturating_sub(4);
         let rows = |s: &str| wrap_cells_variable_width(s, inner_w, inner_w).len() as u16;
-        // Three texts, a blank line after each, and the keys.
-        let height = 2 + rows(&what) + rows(&consequence) + rows(&keep) + 4;
-        let rect = Rect {
-            x: (area.width.saturating_sub(width)) / 2 + area.x,
-            y: (area.height.saturating_sub(height)) / 2 + area.y,
-            width,
-            height,
-        };
-        let rect = rect.intersection(area);
         let danger = self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70));
-        let block = ratatui::widgets::Block::default()
-            .borders(ratatui::widgets::Borders::ALL)
-            .border_style(Style::default().fg(danger))
-            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
-            .title(ratatui::text::Span::styled(
-                " SAVE WOULD LOSE DATA ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(danger)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        frame.render_widget(ratatui::widgets::Clear, rect);
-        frame.render_widget(block, rect);
-        let inner = Rect {
-            x: rect.x + 2,
-            y: rect.y + 1,
-            width: rect.width.saturating_sub(4),
-            height: rect.height.saturating_sub(2),
+        let frame_spec = ConfirmFrame {
+            title: " SAVE WOULD LOSE DATA ",
+            accent: danger,
+            title_fg: Color::Black,
+            // Three texts, a blank line after each, and the keys.
+            height: 2 + rows(&what) + rows(&consequence) + rows(&keep) + 4,
+            inset: Inset::Wide,
         };
-        let key = |k: &'static str, color: Color| {
-            Span::styled(k, Style::default().fg(color).add_modifier(Modifier::BOLD))
-        };
-        let text = self.theme.ui(Color::White);
-        let dim = self.theme.ui(Color::Rgb(0x9a, 0xa4, 0xb8));
-        let body = ratatui::text::Text::from(vec![
-            Line::from(Span::styled(what, Style::default().fg(text))),
-            Line::from(""),
-            Line::from(Span::styled(
-                consequence,
-                Style::default().fg(danger).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(keep, Style::default().fg(dim))),
-            Line::from(""),
-            Line::from(vec![
-                key("[S]", Color::Red),
-                Span::raw(" save anyway   "),
-                key("[Esc]", text),
-                Span::raw(" keep the file as it is"),
-            ]),
-        ]);
-        frame.render_widget(
-            Paragraph::new(body).wrap(ratatui::widgets::Wrap { trim: false }),
-            inner,
-        );
-        crate::widgets::approval_popup::paint_warning_card(
-            frame.buffer_mut(),
-            rect,
-            self.theme,
-            danger,
-        );
+        draw_confirm(frame, self.theme, frame_spec, |frame, inner| {
+            let key = |k: &'static str, color: Color| {
+                Span::styled(k, Style::default().fg(color).add_modifier(Modifier::BOLD))
+            };
+            let text = self.theme.ui(Color::White);
+            let dim = self.theme.ui(Color::Rgb(0x9a, 0xa4, 0xb8));
+            let body = ratatui::text::Text::from(vec![
+                Line::from(Span::styled(what, Style::default().fg(text))),
+                Line::from(""),
+                Line::from(Span::styled(
+                    consequence,
+                    Style::default().fg(danger).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(keep, Style::default().fg(dim))),
+                Line::from(""),
+                Line::from(vec![
+                    key("[S]", Color::Red),
+                    Span::raw(" save anyway   "),
+                    key("[Esc]", text),
+                    Span::raw(" keep the file as it is"),
+                ]),
+            ]);
+            frame.render_widget(
+                Paragraph::new(body).wrap(ratatui::widgets::Wrap { trim: false }),
+                inner,
+            );
+        });
     }
 
     /// Open `path` as a pinned editor tab and focus the editor. Used at launch
@@ -662,7 +611,6 @@ impl App {
         let in_splits = self
             .editor_layout
             .inactive_groups_mut()
-            .into_iter()
             .flat_map(|g| g.editors.iter_mut());
         for ed in self.editor.editors.iter_mut().chain(in_splits) {
             let Some(path) = ed.path.clone().filter(|_| ed.dirty) else {
@@ -1429,15 +1377,9 @@ impl App {
     pub(super) fn write_tab_to_disk(&mut self, path: &std::path::Path) {
         use crate::widgets::editor::SaveOutcome;
         let found = self
-            .editor
-            .editors
-            .iter_mut()
-            .chain(
-                self.editor_layout
-                    .inactive_groups_mut()
-                    .into_iter()
-                    .flat_map(|g| g.editors.iter_mut()),
-            )
+            .editor_layout
+            .all_groups_mut(&mut self.editor)
+            .flat_map(|g| g.editors.iter_mut())
             .find(|e| e.path.as_deref() == Some(path));
         let Some(editor) = found else {
             // The tab was closed while the formatter was thinking; there is no
@@ -1685,8 +1627,9 @@ impl App {
         for (path, bytes, pane) in std::mem::take(&mut self.pending_sudo_saves) {
             let mut open = false;
             let mut settled = None;
-            for e in std::iter::once(&mut self.editor)
-                .chain(self.editor_layout.inactive_groups_mut())
+            for e in self
+                .editor_layout
+                .all_groups_mut(&mut self.editor)
                 .flat_map(|g| g.editors.iter_mut())
                 .filter(|e| e.path.as_ref() == Some(&path))
             {
@@ -1914,8 +1857,9 @@ impl App {
         let Some(ed) = self.editor.editors.get(idx).filter(|e| holds_unsaved(e)) else {
             return false;
         };
-        !std::iter::once(&self.editor)
-            .chain(self.editor_layout.inactive_groups())
+        !self
+            .editor_layout
+            .all_groups(&self.editor)
             .flat_map(|g| g.editors.iter())
             .any(|other| {
                 !std::ptr::eq(other, ed)
@@ -1932,8 +1876,9 @@ impl App {
     pub(super) fn unsaved_files(&self) -> Vec<String> {
         let mut seen: Vec<&Path> = Vec::new();
         let mut labels = Vec::new();
-        for ed in std::iter::once(&self.editor)
-            .chain(self.editor_layout.inactive_groups())
+        for ed in self
+            .editor_layout
+            .all_groups(&self.editor)
             .flat_map(|g| g.editors.iter())
             .filter(|e| holds_unsaved(e))
         {
@@ -1960,8 +1905,9 @@ impl App {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         let mut any = false;
-        for ed in std::iter::once(&self.editor)
-            .chain(self.editor_layout.inactive_groups())
+        for ed in self
+            .editor_layout
+            .all_groups(&self.editor)
             .flat_map(|g| g.editors.iter())
             .filter(|e| holds_unsaved(e) || e.sheet_pending_cell().is_some())
         {
@@ -2011,8 +1957,8 @@ impl App {
 
     /// When the most recently edited unsaved buffer last changed.
     pub(super) fn newest_unsaved_edit(&self) -> Option<std::time::Instant> {
-        std::iter::once(&self.editor)
-            .chain(self.editor_layout.inactive_groups())
+        self.editor_layout
+            .all_groups(&self.editor)
             .flat_map(|g| g.editors.iter())
             .filter(|e| holds_unsaved(e))
             .filter_map(|e| e.last_edit_at)
@@ -2089,8 +2035,9 @@ impl App {
     /// matched it. Hex and sheet tabs carry no text and are left out, as
     /// from the relaunch.
     pub(super) fn capture_hot_exit(&self) -> crate::hot_exit::Backup {
-        let editors: Vec<&Editor> = std::iter::once(&self.editor)
-            .chain(self.editor_layout.inactive_groups())
+        let editors: Vec<&Editor> = self
+            .editor_layout
+            .all_groups(&self.editor)
             .flat_map(|g| g.editors.iter())
             .collect();
         let buffers = self
@@ -2420,8 +2367,9 @@ impl App {
         let mut copies: Vec<(PathBuf, usize, bool)> = Vec::new();
         if only.is_none() {
             let mut seen: Vec<(PathBuf, &Editor)> = Vec::new();
-            for ed in std::iter::once(&self.editor)
-                .chain(self.editor_layout.inactive_groups())
+            for ed in self
+                .editor_layout
+                .all_groups(&self.editor)
                 .flat_map(|g| g.editors.iter())
                 .filter(|e| holds_unsaved(e) && e.hex.is_none() && e.sheet.is_none())
             {
@@ -2516,10 +2464,10 @@ impl App {
                 }
             }
             None => {
-                self.editor.editors.iter_mut().for_each(&mut save);
-                for group in self.editor_layout.inactive_groups_mut() {
-                    group.editors.iter_mut().for_each(&mut save);
-                }
+                self.editor_layout
+                    .all_groups_mut(&mut self.editor)
+                    .flat_map(|g| g.editors.iter_mut())
+                    .for_each(&mut save);
             }
         }
         if only.is_none() && !saved.is_empty() {
@@ -2571,8 +2519,9 @@ impl App {
     pub(super) fn new_untitled_file(&mut self) {
         // The lowest number no tab holds in any split group: each group
         // numbering its own would give two tabs the same name.
-        let taken: Vec<usize> = std::iter::once(&self.editor)
-            .chain(self.editor_layout.inactive_groups())
+        let taken: Vec<usize> = self
+            .editor_layout
+            .all_groups(&self.editor)
             .flat_map(|group| group.editors.iter().filter_map(|e| e.untitled))
             .collect();
         let n = (1..).find(|n| !taken.contains(n)).unwrap_or(1);

@@ -1,0 +1,292 @@
+croft screen golden v1
+scene: confirm-replace-all-dark-blue
+size: 80x24
+theme: dark-blue
+colour depth: truecolor
+settled after: 1 frame
+caret: hidden
+--- symbols
+00|    ┌ EXPLORER ───────────────── ⋯ ┐ main.rs ✕                               |
+01|▎  │▾  golden                    │ src › main.rs                              |
+02|    │  ▾  src                     │┌──────────────────────────────────────────┐|
+03|   │       greeting.rs           ││   1  //! A tiny greeter.                 │|
+04|    │       main.rs               ││   2                                      │|
+05|   │     notes.txt               ││   3  use std::fmt;                       │|
+06|    │     README.md               ││   4                                      │|
+07|   │                              ││   5  /// Who to greet, and how.          │|
+08|    ┌ REPLACE ALL? ────────────────────────────────────────────────────────┐   │|
+09|   │Replace 12 occurrence(s) across 3 file(s) with "farewell"?            │   │|
+10|    │                                                                      │   │|
+11|   │Files are rewritten on disk.                                          │   │|
+12|    │1 open file(s) with unsaved changes will be skipped.                  │  ━│|
+13|   │                                                                      │▄  │|
+14|    │Enter / Y replaces · Esc cancels                                      │───┘|
+15|    └──────────────────────────────────────────────────────────────────────┘S   |
+16|    │                              │                           All ▾   Grouped  |
+17|    │                              │▾  main.rs src  1                          |
+18|   └──────────────────────────────┘    unused variable: `count` rust-analyzer |
+19|     ▸ OUTLINE                                                                  |
+20|   ────────────────────────────────                                            |
+21|     ▸ TIMELINE                                                                 |
+22|    ────────────────────────────────                                            |
+23| <> golden    0  1   Ready     Ln 1, Col 1   Spaces: 4   UTF-8   LF   Rust|
+--- cells
+r00 c072 icon U+EBF3
+r00 c075 icon U+EBF2
+r00 c078 icon U+EBEB
+r01 c002 icon U+EAF0
+r01 c007 icon U+EAF7
+r02 c009 icon U+EAF7
+r03 c002 icon U+EA6D
+r03 c011 icon U+E7A8
+r04 c011 icon U+E7A8
+r05 c002 icon U+EA68
+r05 c009 icon U+F15C
+r06 c009 icon U+F48A
+r07 c002 icon U+EB91
+r09 c002 icon U+EB39
+r11 c002 icon U+EAE6
+r13 c002 icon U+EA79
+r17 c038 icon U+E7A8
+r18 c002 icon U+EB05
+r18 c039 icon U+EA6C
+r20 c002 icon U+EB51
+r23 c011 icon U+E0B4
+r23 c014 icon U+EA87
+r23 c018 icon U+EA6C
+r23 c072 icon U+E0B6
+r23 c073 icon U+E7A8
+r23 c079 icon U+E0B4
+--- styles
+r00 c000-003 fg=reset bg=#1e222e
+r00 c004-004 fg=darkgray bg=#1e222e
+r00 c005-014 fg=white bg=#1e3a6e mod=BOLD
+r00 c015-031 fg=darkgray bg=#1e222e
+r00 c032-034 fg=white bg=#1e3a6e mod=BOLD
+r00 c035-035 fg=darkgray bg=#1e222e
+r00 c036-046 fg=white bg=#1e3a6e mod=BOLD
+r00 c047-071 fg=reset bg=#1f2436
+r00 c072-072 fg=#cccccc bg=#1f2436
+r00 c073-074 fg=reset bg=#1f2436
+r00 c075-075 fg=#cccccc bg=#1f2436
+r00 c076-077 fg=reset bg=#1f2436
+r00 c078-078 fg=#cccccc bg=#1f2436
+r00 c079-079 fg=reset bg=#1f2436
+r01 c000-000 fg=#4e9aff bg=#1e222e
+r01 c001-001 fg=reset bg=#1e222e
+r01 c002-002 fg=#ffffff bg=#1e222e mod=BOLD
+r01 c003-003 fg=reset bg=#1e222e
+r01 c004-004 fg=darkgray bg=#1e222e
+r01 c005-006 fg=gray bg=#1e222e
+r01 c007-008 fg=#dcb67a bg=#1e222e
+r01 c009-014 fg=white bg=#1e222e mod=BOLD
+r01 c015-034 fg=reset bg=#1e222e
+r01 c035-035 fg=darkgray bg=#1e222e
+r01 c036-036 fg=reset bg=#1e222e
+r01 c037-049 fg=darkgray bg=#1e222e
+r01 c050-079 fg=reset bg=#1e222e
+r02 c000-003 fg=reset bg=#1e222e
+r02 c004-004 fg=darkgray bg=#1e222e
+r02 c005-006 fg=reset bg=#1e222e
+r02 c007-008 fg=gray bg=#1e222e
+r02 c009-010 fg=#dcb67a bg=#1e222e
+r02 c011-013 fg=white bg=#1e222e mod=BOLD
+r02 c014-034 fg=reset bg=#1e222e
+r02 c035-035 fg=darkgray bg=#1e222e
+r02 c036-079 fg=#4e9aff bg=#1e222e
+r03 c000-001 fg=reset bg=#1e222e
+r03 c002-002 fg=#9da5b4 bg=#1e222e mod=BOLD
+r03 c003-003 fg=reset bg=#1e222e
+r03 c004-004 fg=darkgray bg=#1e222e
+r03 c005-010 fg=reset bg=#1e222e
+r03 c011-012 fg=#dea584 bg=#1e222e
+r03 c013-023 fg=white bg=#1e222e
+r03 c024-034 fg=reset bg=#1e222e
+r03 c035-035 fg=darkgray bg=#1e222e
+r03 c036-036 fg=#4e9aff bg=#1e222e
+r03 c037-041 fg=#c6c6c6 bg=#222c3f
+r03 c042-042 fg=reset bg=#222c3f
+r03 c043-061 fg=#65737e bg=#222c3f mod=ITALIC
+r03 c062-076 fg=reset bg=#222c3f
+r03 c077-077 fg=reset bg=#1e222e
+r03 c078-078 fg=reset bg=#4f5054
+r03 c079-079 fg=#4e9aff bg=#1e222e
+r04 c000-003 fg=reset bg=#1e222e
+r04 c004-004 fg=darkgray bg=#1e222e
+r04 c005-010 fg=reset bg=#094d77
+r04 c011-012 fg=#dea584 bg=#094d77
+r04 c013-019 fg=white bg=#094d77
+r04 c020-034 fg=reset bg=#094d77
+r04 c035-035 fg=darkgray bg=#1e222e
+r04 c036-036 fg=#4e9aff bg=#1e222e
+r04 c037-041 fg=darkgray bg=#1e222e
+r04 c042-077 fg=reset bg=#1e222e
+r04 c078-078 fg=reset bg=#4f5054
+r04 c079-079 fg=#4e9aff bg=#1e222e
+r05 c000-001 fg=reset bg=#1e222e
+r05 c002-002 fg=#9da5b4 bg=#1e222e mod=BOLD
+r05 c003-003 fg=reset bg=#1e222e
+r05 c004-004 fg=darkgray bg=#1e222e
+r05 c005-008 fg=reset bg=#1e222e
+r05 c009-010 fg=#cccccc bg=#1e222e
+r05 c011-019 fg=white bg=#1e222e
+r05 c020-034 fg=reset bg=#1e222e
+r05 c035-035 fg=darkgray bg=#1e222e
+r05 c036-036 fg=#4e9aff bg=#1e222e
+r05 c037-041 fg=darkgray bg=#1e222e
+r05 c042-042 fg=reset bg=#1e222e
+r05 c043-045 fg=#b48ead bg=#1e222e mod=BOLD
+r05 c046-046 fg=#c0c5ce bg=#1e222e
+r05 c047-049 fg=#ebcb8b bg=#1e222e
+r05 c050-055 fg=#c0c5ce bg=#1e222e
+r05 c056-077 fg=reset bg=#1e222e
+r05 c078-078 fg=reset bg=#4f5054
+r05 c079-079 fg=#4e9aff bg=#1e222e
+r06 c000-003 fg=reset bg=#1e222e
+r06 c004-004 fg=darkgray bg=#1e222e
+r06 c005-008 fg=reset bg=#1e222e
+r06 c009-010 fg=#519aba bg=#1e222e
+r06 c011-019 fg=white bg=#1e222e
+r06 c020-034 fg=reset bg=#1e222e
+r06 c035-035 fg=darkgray bg=#1e222e
+r06 c036-036 fg=#4e9aff bg=#1e222e
+r06 c037-041 fg=darkgray bg=#1e222e
+r06 c042-077 fg=reset bg=#1e222e
+r06 c078-078 fg=reset bg=#4f5054
+r06 c079-079 fg=#4e9aff bg=#1e222e
+r07 c000-001 fg=reset bg=#1e222e
+r07 c002-002 fg=#9da5b4 bg=#1e222e mod=BOLD
+r07 c003-003 fg=reset bg=#1e222e
+r07 c004-004 fg=darkgray bg=#1e222e
+r07 c005-034 fg=reset bg=#1e222e
+r07 c035-035 fg=darkgray bg=#1e222e
+r07 c036-036 fg=#4e9aff bg=#1e222e
+r07 c037-041 fg=darkgray bg=#1e222e
+r07 c042-042 fg=reset bg=#1e222e
+r07 c043-068 fg=#65737e bg=#1e222e mod=ITALIC
+r07 c069-077 fg=reset bg=#1e222e
+r07 c078-078 fg=reset bg=#4f5054
+r07 c079-079 fg=#4e9aff bg=#1e222e
+r08 c000-003 fg=reset bg=#1e222e
+r08 c004-004 fg=#e7a73c bg=#1e1e1e
+r08 c005-018 fg=black bg=#e7a73c mod=BOLD
+r08 c019-075 fg=#e7a73c bg=#1e1e1e
+r08 c076-078 fg=reset bg=#1e222e
+r08 c079-079 fg=#4e9aff bg=#1e222e
+r09 c000-001 fg=reset bg=#1e222e
+r09 c002-002 fg=#9da5b4 bg=#1e222e mod=BOLD
+r09 c003-003 fg=reset bg=#1e222e
+r09 c004-004 fg=#e7a73c bg=#1e1e1e
+r09 c005-074 fg=reset bg=#1e1e1e
+r09 c075-075 fg=#e7a73c bg=#1e1e1e
+r09 c076-078 fg=reset bg=#1e222e
+r09 c079-079 fg=#4e9aff bg=#1e222e
+r10 c000-003 fg=reset bg=#1e222e
+r10 c004-004 fg=#e7a73c bg=#1e1e1e
+r10 c005-074 fg=reset bg=#1e1e1e
+r10 c075-075 fg=#e7a73c bg=#1e1e1e
+r10 c076-078 fg=reset bg=#1e222e
+r10 c079-079 fg=#4e9aff bg=#1e222e
+r11 c000-001 fg=reset bg=#1e222e
+r11 c002-002 fg=#9da5b4 bg=#1e222e mod=BOLD
+r11 c003-003 fg=reset bg=#1e222e
+r11 c004-004 fg=#e7a73c bg=#1e1e1e
+r11 c005-074 fg=reset bg=#1e1e1e
+r11 c075-075 fg=#e7a73c bg=#1e1e1e
+r11 c076-078 fg=reset bg=#1e222e
+r11 c079-079 fg=#4e9aff bg=#1e222e
+r12 c000-003 fg=reset bg=#1e222e
+r12 c004-004 fg=#e7a73c bg=#1e1e1e
+r12 c005-074 fg=reset bg=#1e1e1e
+r12 c075-075 fg=#e7a73c bg=#1e1e1e
+r12 c076-077 fg=reset bg=#1e222e
+r12 c078-078 fg=#cca700 bg=#1e222e
+r12 c079-079 fg=#4e9aff bg=#1e222e
+r13 c000-001 fg=reset bg=#1e222e
+r13 c002-002 fg=#9da5b4 bg=#1e222e mod=BOLD
+r13 c003-003 fg=reset bg=#1e222e
+r13 c004-004 fg=#e7a73c bg=#1e1e1e
+r13 c005-074 fg=reset bg=#1e1e1e
+r13 c075-075 fg=#e7a73c bg=#1e1e1e
+r13 c076-076 fg=#1e222e bg=#1e222e
+r13 c077-078 fg=reset bg=#1e222e
+r13 c079-079 fg=#4e9aff bg=#1e222e
+r14 c000-003 fg=reset bg=#1e222e
+r14 c004-004 fg=#e7a73c bg=#1e1e1e
+r14 c005-036 fg=#9aa4b8 bg=#1e1e1e
+r14 c037-074 fg=reset bg=#1e1e1e
+r14 c075-075 fg=#e7a73c bg=#1e1e1e
+r14 c076-079 fg=#4e9aff bg=#1e222e
+r15 c000-003 fg=reset bg=#1e222e
+r15 c004-075 fg=#e7a73c bg=#1e1e1e
+r15 c076-077 fg=#808898 bg=#1e222e
+r15 c078-078 fg=reset bg=#1e222e
+r15 c079-079 fg=#808898 bg=#1e222e
+r16 c000-003 fg=reset bg=#1e222e
+r16 c004-004 fg=darkgray bg=#1e222e
+r16 c005-034 fg=reset bg=#1e222e
+r16 c035-035 fg=darkgray bg=#1e222e
+r16 c036-061 fg=reset bg=#1e222e
+r16 c062-068 fg=#9a9ca1 bg=#1e222e
+r16 c069-069 fg=reset bg=#1e222e
+r16 c070-078 fg=#9a9ca1 bg=#1e222e
+r16 c079-079 fg=reset bg=#1e222e
+r17 c000-003 fg=reset bg=#1e222e
+r17 c004-004 fg=darkgray bg=#1e222e
+r17 c005-034 fg=reset bg=#1e222e
+r17 c035-035 fg=darkgray bg=#1e222e
+r17 c036-037 fg=#606878 bg=#1e222e
+r17 c038-039 fg=#dea584 bg=#1e222e
+r17 c040-046 fg=#e8eef8 bg=#1e222e mod=BOLD
+r17 c047-053 fg=#606878 bg=#1e222e
+r17 c054-079 fg=reset bg=#1e222e
+r18 c000-001 fg=reset bg=#1e222e
+r18 c002-002 fg=#db61a2 bg=#1e222e mod=BOLD
+r18 c003-003 fg=reset bg=#1e222e
+r18 c004-035 fg=darkgray bg=#1e222e
+r18 c036-040 fg=#cca700 bg=#1e222e
+r18 c041-064 fg=#cccccc bg=#1e222e
+r18 c065-079 fg=#606878 bg=#1e222e
+r19 c000-004 fg=reset bg=#1e222e
+r19 c005-006 fg=#606878 bg=#1e222e
+r19 c007-013 fg=#e8eef8 bg=#1e222e mod=BOLD
+r19 c014-079 fg=reset bg=#1e222e
+r20 c000-001 fg=reset bg=#1e222e
+r20 c002-002 fg=#9da5b4 bg=#1e222e mod=BOLD
+r20 c003-003 fg=reset bg=#1e222e
+r20 c004-035 fg=#606878 bg=#1e222e
+r20 c036-079 fg=reset bg=#1e222e
+r21 c000-004 fg=reset bg=#1e222e
+r21 c005-006 fg=#606878 bg=#1e222e
+r21 c007-014 fg=#e8eef8 bg=#1e222e mod=BOLD
+r21 c015-079 fg=reset bg=#1e222e
+r22 c000-003 fg=reset bg=#1e222e
+r22 c004-035 fg=#606878 bg=#1e222e
+r22 c036-079 fg=reset bg=#1e222e
+r23 c000-000 fg=reset bg=#094d77
+r23 c001-002 fg=#e97c41 bg=#094d77 mod=BOLD
+r23 c003-010 fg=#c0c5ce bg=#094d77 mod=BOLD
+r23 c011-011 fg=#094d77 bg=#1e3a6e
+r23 c012-012 fg=reset bg=#1e3a6e
+r23 c013-016 fg=#50648c bg=#1e3a6e
+r23 c017-019 fg=#e5b54a bg=#1e3a6e
+r23 c020-021 fg=#c0c5ce bg=#1e3a6e
+r23 c022-023 fg=reset bg=#1e3a6e
+r23 c024-028 fg=#9aa4b8 bg=#1e3a6e
+r23 c029-032 fg=reset bg=#1e3a6e
+r23 c033-036 fg=#50648c bg=#1e3a6e
+r23 c037-037 fg=#c0c5ce bg=#1e3a6e
+r23 c038-043 fg=#50648c bg=#1e3a6e
+r23 c044-044 fg=#c0c5ce bg=#1e3a6e
+r23 c045-045 fg=#50648c bg=#1e3a6e
+r23 c046-046 fg=reset bg=#1e3a6e
+r23 c047-057 fg=#9aa4b8 bg=#1e3a6e
+r23 c058-058 fg=reset bg=#1e3a6e
+r23 c059-065 fg=#9aa4b8 bg=#1e3a6e
+r23 c066-066 fg=reset bg=#1e3a6e
+r23 c067-070 fg=#9aa4b8 bg=#1e3a6e
+r23 c071-071 fg=reset bg=#1e3a6e
+r23 c072-072 fg=#2a3140 bg=#1e3a6e
+r23 c073-073 fg=#dea584 bg=#2a3140
+r23 c074-078 fg=#c0c5ce bg=#2a3140
+r23 c079-079 fg=#2a3140 bg=#1e3a6e

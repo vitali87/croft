@@ -4,7 +4,7 @@ size: 120x40
 theme: loch
 colour depth: truecolor
 settled after: 1 frame
-caret: row 3 col 43
+caret: hidden
 --- symbols
 00|    ▏ EXPLORER                   ⋯ ▕  main.rs ✕                                                                     |
 01|▎  ▏  golden                    ▕ src ›  main.rs                                                                    |
@@ -88,7 +88,7 @@ r00 c035-035 fg=#23282a bg=#0e1011
 r00 c036-036 fg=reset bg=#000000
 r00 c037-037 fg=#dea584 bg=#000000
 r00 c038-038 fg=reset bg=#000000
-r00 c039-045 fg=#f2f3f3 bg=#000000 ul=#4fb1a6 mod=UNDERLINED
+r00 c039-045 fg=#f2f3f3 bg=#000000
 r00 c046-046 fg=reset bg=#000000
 r00 c047-047 fg=#7d8786 bg=#000000
 r00 c048-048 fg=reset bg=#000000

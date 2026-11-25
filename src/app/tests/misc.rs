@@ -596,8 +596,9 @@ fn every_post_draw_overlay_writer_checks_the_screen_bound() {
          change here means a writer was added or removed - guard it."
     );
     assert!(
-        src.contains("if !self.overlay_fits_on_screen(*x, *y, 1, 1)"),
-        "the activity-bar writer keeps its own guard"
+        src.contains("self.overlay_fits_on_screen(*x, *y, 1, 1)"),
+        "the activity-bar writer keeps its own guard, which picks the icons \
+         that go in its batch"
     );
 }
 

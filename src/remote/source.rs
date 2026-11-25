@@ -86,7 +86,7 @@ pub(super) fn source_sync_rsync_command(
     source_arg: &std::ffi::OsStr,
     dest: &str,
 ) -> Command {
-    let mut rsync = Command::new("rsync");
+    let mut rsync = crate::proc::command("rsync");
     rsync.args(["-a", "-z", "--delete"]);
     rsync.args(source_sync_filter_args());
     rsync.args(lane.rsync_throttle_args());
@@ -132,7 +132,7 @@ pub(super) fn sync_via_rsync(ssh: &SshControl) -> Result<()> {
     let mut source_arg: std::ffi::OsString = source.clone().into_os_string();
     source_arg.push("/");
     let dest = format!("{}:.cache/croft/source/", ssh.host);
-    let status = Command::new("rsync")
+    let status = crate::proc::command("rsync")
         .args(["-a", "-z", "--delete"])
         .args(source_sync_filter_args())
         .arg("-e")

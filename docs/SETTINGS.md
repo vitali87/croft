@@ -456,3 +456,5 @@ croft picks the depth on its own: 24-bit when `COLORTERM` is `truecolor` or `24b
 * `"color_depth": "truecolor"` (also `"24bit"`), `"256"` or `"16"`.
 
 User-config only; it is read at startup.
+
+Some underlines are coloured: the active tab's name and some underlines in the editor. A terminal that cannot read underline colours misreads them, and xterm hid the rest of the screen (#2661), so croft sends them only to terminals known to read them: iTerm2, WezTerm, Ghostty, kitty, Alacritty, foot, VS Code's terminal, tmux, croft's own terminal, GNOME Terminal and other VTE terminals, and a few others. Elsewhere the underline is drawn in the text's colour. Over SSH and in a dev container croft carries the answer along, and in a persistent remote session, which terminals from different machines may attach to over its life, each attached terminal gets underline colours only if it reads them. For a terminal left off the list that does read them, set `CROFT_UNDERLINE_COLORS=1` in its environment (`0` turns them off).

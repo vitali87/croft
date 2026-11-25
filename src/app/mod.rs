@@ -50,6 +50,7 @@ mod mouse_input;
 mod nav;
 mod overlay;
 mod perf_hud;
+mod popups;
 mod prompts;
 mod remote_sessions;
 mod review;
@@ -248,33 +249,24 @@ fn fallback_popup_rect(full: Rect, max_w_cap: u16) -> Rect {
 
 #[derive(Default, Clone, Copy)]
 struct SidebarAreas {
-    /// Block occupied by the Explorer activity-bar icon, in absolute coords.
-    /// Multi-row when image rendering is active; the hit-test still uses the
-    /// whole block.
-    explorer_icon: Rect,
-    /// Block occupied by the Search activity-bar icon, in absolute coords.
-    search_icon: Rect,
-    /// Block occupied by the Source Control activity-bar icon, in absolute coords.
-    source_control_icon: Rect,
-    /// Block occupied by the Remote Explorer activity-bar icon, in absolute coords.
-    remote_icon: Rect,
-    /// Block occupied by the Run and Debug activity-bar icon, in absolute coords.
-    run_debug_icon: Rect,
-    /// Block occupied by the Extensions activity-bar icon, in absolute coords.
-    extensions_icon: Rect,
-    /// Block occupied by the Testing (beaker) activity-bar icon, in absolute coords.
-    testing_icon: Rect,
-    /// Block occupied by the CodeQL (QL) activity-bar icon; empty while the
-    /// built-in CodeQL extension is disabled.
-    codeql_icon: Rect,
-    /// Block occupied by the sponsor heart directly above the settings gear;
-    /// empty when the bar is too short for it. Clicking it opens croft's
-    /// GitHub Sponsors page.
-    sponsor_icon: Rect,
-    /// Block occupied by the settings gear, bottom-anchored on the activity
-    /// bar (VS Code's "Manage" button). Asymmetric to the view icons up top;
-    /// clicking it opens the settings menu (Color Theme picker).
-    settings_icon: Rect,
+    /// Where each activity-bar icon sits. Clicking the sponsor heart opens
+    /// croft's GitHub Sponsors page; the settings gear, bottom-anchored like
+    /// VS Code's "Manage" button, opens the settings menu.
+    activity_icons: ActivityBlocks,
+}
+
+/// One activity-bar icon's pre-encoded pictures, one per state, so a hover
+/// only swaps which one is sent and never bakes again.
+#[cfg_attr(test, derive(Default))]
+pub struct ActivityIconImages {
+    /// Shown while the icon is selected: its view is open, or for the
+    /// settings gear its menu is, so the button reads as pressed. `None` for
+    /// the sponsor heart, which opens a web page and is never selected.
+    active: Option<String>,
+    /// At rest.
+    inactive: String,
+    /// Brightened while the pointer rests on it.
+    hovered: String,
 }
 
 /// Pre-encoded iTerm2 OSC-1337 inline-image escape sequences for each icon
@@ -283,40 +275,8 @@ struct SidebarAreas {
 /// frame draw, since ratatui's bg-clear overdraws the image.
 #[cfg_attr(test, derive(Default))]
 pub struct ActivityBarImages {
-    explorer_active: String,
-    explorer_inactive: String,
-    explorer_hovered: String,
-    search_active: String,
-    search_inactive: String,
-    search_hovered: String,
-    source_control_active: String,
-    source_control_inactive: String,
-    source_control_hovered: String,
-    remote_active: String,
-    remote_inactive: String,
-    remote_hovered: String,
-    run_debug_active: String,
-    run_debug_inactive: String,
-    run_debug_hovered: String,
-    extensions_active: String,
-    extensions_inactive: String,
-    extensions_hovered: String,
-    testing_active: String,
-    testing_inactive: String,
-    testing_hovered: String,
-    codeql_active: String,
-    codeql_inactive: String,
-    codeql_hovered: String,
-    /// The sponsor heart. It opens a web page rather than a view or a menu,
-    /// so it is never selected and has no active variant.
-    sponsor_inactive: String,
-    sponsor_hovered: String,
-    /// The settings gear. `active` is shown while its menu is open so the
-    /// button reads as pressed, mirroring the view icons' selected state;
-    /// `hovered` brightens it while the pointer rests on it.
-    settings_active: String,
-    settings_inactive: String,
-    settings_hovered: String,
+    /// Each activity-bar icon's pictures, indexed by [`ActivityIcon`].
+    icons: [ActivityIconImages; ActivityIcon::ALL.len()],
     /// Customize Layout toolbar icons (top-right of the editor / welcome),
     /// baked OPAQUE at the 4×2-cell toolbar box so they paint in front of the
     /// container's top line. The side-bar / panel icons carry an on/off pair
@@ -2067,38 +2027,11 @@ pub struct App {
     /// save (#178/#194): armed by the save that held them back, distinct
     /// from `force_save_armed` (the disk-conflict consent).
     formula_overwrite_armed: bool,
-    /// Pre-encoded inline-image for the source-control change-count badge (an
-    /// accent pill + count, VS Code's `activityBarBadge`), emitted at z=1 over
-    /// the SCM activity icon's bottom-right. `None` when there are no changes,
-    /// not in a repo, or image rendering is off (the glyph path draws a text
-    /// badge instead). Rebuilt by `refresh_scm_change_badge` when the change
-    /// set, theme, or cell size shifts.
-    scm_change_badge: Option<String>,
-    /// Change count the cached `scm_change_badge` was built for; drives the
-    /// dirty check and the badge's on-screen cell width.
-    scm_change_badge_count: usize,
-    /// Pre-encoded inline-image for the Explorer change badge: the count of
-    /// open editors with unsaved edits (VS Code's Explorer activity badge),
-    /// emitted at z=1 over the Explorer icon's bottom-right. `None` when nothing
-    /// is unsaved or image rendering is off. Mirrors the SCM badge plumbing;
-    /// rebuilt by `refresh_explorer_unsaved_badge`.
-    explorer_unsaved_badge: Option<String>,
-    /// Unsaved-file count the cached `explorer_unsaved_badge` was built for.
-    explorer_unsaved_count: usize,
-    /// Pre-encoded inline-image for the Remote icon's forwarded-ports badge
-    /// (VS Code's Ports view count), emitted at z=1 over the Remote icon. `None`
-    /// when no port is forwarded or image rendering is off. Same plumbing as the
-    /// other count badges; rebuilt by `refresh_remote_ports_badge`.
-    remote_ports_badge: Option<String>,
-    /// Forwarded-port count the cached `remote_ports_badge` was built for.
-    remote_ports_count: usize,
-    /// Pre-encoded inline-image for the Testing icon's failing-test count badge
-    /// (red pill, VS Code's Testing badge), emitted at z=1 over the beaker icon.
-    /// `None` when nothing is failing or image rendering is off. Same plumbing as
-    /// the other count badges; rebuilt by `refresh_testing_badge`.
-    testing_badge: Option<String>,
-    /// Failing-test count the cached `testing_badge` was built for.
-    testing_badge_count: usize,
+    /// The activity-bar count badges, indexed by [`ActivityIcon`] (VS Code's
+    /// `activityBarBadge`): unsaved files on the Explorer, Source Control
+    /// changes, forwarded ports on Remote and failed tests on Testing (see
+    /// [`ActivityIcon::badge`]). Kept current by `refresh_activity_badges`.
+    activity_badges: [CountBadge; ActivityIcon::ALL.len()],
     /// Problem count the cached `overlays.problems_badge` circle was built for;
     /// gates the per-frame rebuild in `refresh_problems_badge`.
     problems_badge_count: usize,
@@ -2134,6 +2067,8 @@ pub struct App {
     /// Hit-test rect of the on-screen minimap image (text-aligned rows), for
     /// click-to-scroll and the right-click menu. Empty when the minimap is off.
     minimap_img_rect: Rect,
+    /// Which pictures a pop-up was drawn over this frame (#2663).
+    picture_cover: popups::PictureCover,
     /// Pixel height the lines are mapped into within the image (top-aligned;
     /// `<=` the image's pixel height for short files). Click mapping divides by
     /// this, not the full strip height, so clicks land on the right line.
@@ -2151,11 +2086,10 @@ pub struct App {
     /// Whether the editor was wide enough for the strip on the last frame,
     /// so turning the minimap on can say why it does not show.
     minimap_room: bool,
-    /// The buffer ratatui drew last, and what each small chrome image (the
-    /// PROBLEMS badge, Run and Debug icon, sidebar illustrations) was sent
-    /// over, keyed by overlay, for [`App::chrome_image_due`]. Keys not
-    /// checked in a frame (the image was hidden) are dropped.
-    drawn_buffer: Option<ratatui::buffer::Buffer>,
+    /// What each small chrome image (the PROBLEMS badge, Run and Debug
+    /// icon, sidebar illustrations) was last sent over, keyed by overlay,
+    /// for [`App::chrome_image_due`]. Keys not checked in a frame (the image
+    /// was hidden) are dropped.
     chrome_sent: std::collections::HashMap<&'static str, u64>,
     chrome_seen: std::collections::HashSet<&'static str>,
     /// A left-drag is panning the view via the minimap strip.
@@ -2212,6 +2146,9 @@ pub struct App {
     /// (#1433): the `color_depth` setting, else what the terminal's
     /// environment advertises.
     pub(crate) color_depth: crate::color_depth::ColorDepth,
+    /// Whether the terminal reads underline colours (#2661); when it does
+    /// not, each frame drops them before it is written.
+    pub(crate) underline_colors: bool,
     /// Which panes are worktree lanes' (#348), by pane uid: saved with the
     /// terminal session so a relaunch seats the agent again, and consulted
     /// when a lane closes so its pane goes with it.
@@ -2914,15 +2851,16 @@ pub struct App {
     implementation_request_id: Option<u64>,
     references_request_id: Option<u64>,
     call_hierarchy_request_id: Option<u64>,
-    /// In-flight documentHighlight request, with the (path, row, col,
-    /// edit_seq) it was fired for so a reply for a caret or buffer state the
-    /// editor has since left is dropped.
-    occurrences_request: Option<(u64, PathBuf, usize, usize, u64)>,
-    /// In-flight linkedEditingRange request (#254): (id, path, edit_seq).
-    linked_request: Option<(u64, PathBuf, u64)>,
-    /// Last observed `(path, row, col, seq)` for the linked-editing
-    /// debounce, and when it settled — occurrences' idle pattern.
-    linked_observed: Option<(PathBuf, usize, usize, u64)>,
+    /// In-flight documentHighlight request, with the caret spot it was
+    /// fired for so a reply for a caret or buffer state the editor has
+    /// since left is dropped.
+    occurrences_request: Option<CaretRequest>,
+    /// In-flight linkedEditingRange request (#254), with the file and edit
+    /// seq it was asked for.
+    linked_request: Option<FileRequest>,
+    /// Last observed caret spot for the linked-editing debounce, and when
+    /// it settled — occurrences' idle pattern.
+    linked_observed: Option<CaretSpot>,
     linked_observed_at: std::time::Instant,
     /// A request already went out for `linked_observed` (#1299). Kept
     /// apart from `linked_request`, which the reply clears: a `null`
@@ -2939,7 +2877,7 @@ pub struct App {
     selection_range_request: Option<PendingSelectionRanges>,
     /// The caret state `tick_occurrences` last observed, and when it changed.
     /// A caret resting on one spot for `OCCURRENCES_IDLE` fires one request.
-    occ_observed: Option<(PathBuf, usize, usize, u64)>,
+    occ_observed: Option<CaretSpot>,
     occ_observed_at: std::time::Instant,
     rename_request_id: Option<u64>,
     /// The open buffers' `edit_seq`s when the in-flight rename went out
@@ -2948,9 +2886,9 @@ pub struct App {
     /// An Explorer rename or move waiting on the servers' `willRenameFiles`
     /// edit (#610); it runs when the answer lands or its deadline passes.
     pending_file_move: Option<PendingFileMove>,
-    /// In-flight prepareRename (#254): (id, path, row, col, edit_seq) —
-    /// the deferred rename prompt's context.
-    prepare_rename_request: Option<(u64, PathBuf, usize, usize, u64)>,
+    /// In-flight prepareRename (#254), with the caret spot that is the
+    /// deferred rename prompt's context.
+    prepare_rename_request: Option<CaretRequest>,
     format_request_id: Option<u64>,
     /// True when the in-flight format request is Format Selection (#254)
     /// — the drain words its statuses accordingly.
@@ -2961,11 +2899,11 @@ pub struct App {
     /// VS Code's `editor.formatOnType` (#254): typing a server trigger
     /// character runs onTypeFormatting at the spot. Off by default.
     format_on_type: bool,
-    /// In-flight on-type request: (id, the edit_seq it was computed
-    /// against, the tab's path). The reply applies only while that same
-    /// tab is active and its buffer has not moved since — `edit_seq` is
-    /// per-tab, so the seq alone cannot tell tabs apart.
-    on_type_request: Option<(u64, u64, PathBuf)>,
+    /// In-flight on-type request, with the tab's path and the edit_seq it
+    /// was computed against. The reply applies only while that same tab is
+    /// active and its buffer has not moved since — `edit_seq` is per-tab,
+    /// so the seq alone cannot tell tabs apart.
+    on_type_request: Option<FileRequest>,
     code_action_request_id: Option<u64>,
     /// True when the in-flight code-action request is a `codeAction/resolve`
     /// (the reply is one resolved action to apply directly) rather than the
@@ -4554,14 +4492,7 @@ impl App {
             welcome_bake: None,
             last_pdf_wheel: None,
             formula_overwrite_armed: false,
-            scm_change_badge: None,
-            scm_change_badge_count: 0,
-            explorer_unsaved_badge: None,
-            explorer_unsaved_count: 0,
-            remote_ports_badge: None,
-            remote_ports_count: 0,
-            testing_badge: None,
-            testing_badge_count: 0,
+            activity_badges: Default::default(),
             problems_badge_count: 0,
             problems_badge_cell: None,
             inline_protocol: crate::iterm2_inline::detect_inline_image_protocol(),
@@ -4571,13 +4502,13 @@ impl App {
             minimap_side: MinimapSide::Right,
             minimap_base: None,
             minimap_img_rect: Rect::default(),
+            picture_cover: popups::PictureCover::default(),
             minimap_content_h: 0,
             minimap_baked_at: None,
             minimap_edit_pending: false,
             minimap_text: false,
             minimap_text_cache: None,
             minimap_room: true,
-            drawn_buffer: None,
             chrome_sent: std::collections::HashMap::new(),
             chrome_seen: std::collections::HashSet::new(),
             minimap_drag: false,
@@ -4610,6 +4541,9 @@ impl App {
                 .unwrap_or_else(|| {
                     crate::color_depth::ColorDepth::detect(|name| std::env::var(name).ok())
                 }),
+            underline_colors: crate::color_depth::underline_colors_supported(|name| {
+                std::env::var(name).ok()
+            }),
             lane_panes: std::collections::BTreeMap::new(),
             tree_clipboard: None,
             tree_typeahead: None,
@@ -5193,7 +5127,6 @@ impl App {
     /// this frame; the next frame clears, full-redraws, and re-emits a single
     /// clean set at the new cells.
     pub fn flush_activity_image_overlays(&mut self, around: &[u64]) {
-        use std::io::Write;
         // The keepalive re-emit fights iTerm2's image-cache eviction. Neither
         // the sixel cell buffer nor Kitty's image layer evicts, so there the
         // icons re-emit only when dirty: on Kitty the keepalive cost about
@@ -5251,34 +5184,27 @@ impl App {
             self.overlays.activity.set_sent(sent);
             return;
         }
-        let mut out = stdout();
         let cursor_on = self.cursor_should_be_visible();
-        let _ = write!(out, "\x1b[?25l\x1b[s");
-        for ((x, y), seq) in &overlays {
-            // Same screen bound as the image writers (#513): a raw
-            // absolute-CUP write that ratatui cannot repair, so the origin
-            // is checked before it is used.
-            //
-            // 1x1 is NARROWER than some payloads here, and knowingly so.
-            // `pending_activity_image_overlays` discards each block's
-            // `Rect` and returns only its origin, and a count badge is 2-3
-            // cells wide (`count_badge_cells_w`), so a badge whose left
-            // edge is on screen and right edge is not would pass this.
-            // Not reachable today -- the badges anchor to the left-hand
-            // activity bar -- and making it exact means returning the
-            // `Rect` from that function, which is a wider change than this
-            // guard. Recorded rather than left to be rediscovered.
-            if !self.overlay_fits_on_screen(*x, *y, 1, 1) {
-                continue;
-            }
-            let _ = write!(out, "\x1b[{};{}H", y + 1, x + 1); // 1-based
-            let _ = out.write_all(seq.as_bytes());
-        }
-        let _ = write!(out, "\x1b[u");
-        if cursor_on {
-            let _ = write!(out, "\x1b[?25h");
-        }
-        let _ = out.flush();
+        let on_screen = overlays
+            .iter()
+            .filter(|((x, y), _)| {
+                // Same screen bound as the image writers (#513): a raw
+                // absolute-CUP write that ratatui cannot repair, so the origin
+                // is checked before it is used.
+                //
+                // 1x1 is NARROWER than some payloads here, and knowingly so.
+                // `pending_activity_image_overlays` discards each block's
+                // `Rect` and returns only its origin, and a count badge is 2-3
+                // cells wide (`count_badge_cells_w`), so a badge whose left
+                // edge is on screen and right edge is not would pass this.
+                // Not reachable today -- the badges anchor to the left-hand
+                // activity bar -- and making it exact means returning the
+                // `Rect` from that function, which is a wider change than this
+                // guard. Recorded rather than left to be rediscovered.
+                self.overlay_fits_on_screen(*x, *y, 1, 1)
+            })
+            .map(|((x, y), seq)| (*x, *y, seq.as_bytes()));
+        write_inline_images(&mut stdout(), on_screen, cursor_on);
         self.overlays.activity.mark_emitted();
         self.overlays.activity.store_positions(positions);
         self.overlays.activity.set_neighbourhood(around.to_vec());
@@ -5369,18 +5295,12 @@ impl App {
     }
 
     /// Every open buffer's path, across the active leaf and every inactive
-    /// one. `App::editor` is the hoisted active leaf and `inactive_leaf_tabs`
+    /// one. `App::editor` is the hoisted active leaf and `inactive_groups`
     /// walks the rest, so together they cover each leaf exactly once.
     fn open_buffer_paths(&self) -> std::collections::BTreeSet<PathBuf> {
-        self.editor
-            .editors
-            .iter()
-            .chain(
-                self.editor_layout
-                    .inactive_leaf_tabs()
-                    .into_iter()
-                    .flat_map(|g| g.editors.iter()),
-            )
+        self.editor_layout
+            .all_groups(&self.editor)
+            .flat_map(|g| g.editors.iter())
             .filter_map(|e| e.path.clone())
             .collect()
     }
@@ -5418,24 +5338,6 @@ impl App {
 
     pub fn terminal_mut(&mut self) -> &mut PtyTerminal {
         &mut self.terminals[self.active_terminal]
-    }
-
-    /// Whether a modal overlay owns the screen right now. The same eleven-way
-    /// check was repeated verbatim at three overlay-flush sites; auto-hide
-    /// (#260) needs it too, so it lives here once.
-    fn modal_overlay_open(&self) -> bool {
-        self.approval_ui.is_some()
-            || self.shortcuts_modal.is_some()
-            || self.file_finder.is_some()
-            || self.command_palette.is_some()
-            || self.go_to_symbol.is_some()
-            || self.workspace_symbols.is_some()
-            || self.process_picker.is_some()
-            || self.zoxide_jump.is_some()
-            || self.command_history_popup.is_some()
-            || self.branch_picker.is_some()
-            || self.input_prompt.is_some()
-            || self.list_picker.is_some()
     }
 
     fn focus_pane(&mut self, p: Pane) {
@@ -5488,9 +5390,7 @@ impl App {
     /// every tab of another group, on the old look (#2075).
     pub(super) fn apply_view_prefs(&mut self) {
         let (langs, ws_global) = (&self.language_prefs, self.whitespace_mode);
-        for group in
-            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut())
-        {
+        for group in self.editor_layout.all_groups_mut(&mut self.editor) {
             for ed in &mut group.editors {
                 ed.show_indent_guides = self.indent_guides_enabled;
                 ed.show_bracket_colors = self.bracket_colors_enabled;
@@ -5598,23 +5498,17 @@ impl App {
         // when disabled, the editor opens those file types as plain text.
         let pdf_on = self.is_extension_enabled("pdf");
         let csv_on = self.is_extension_enabled("csv");
-        for ed in self.editor.editors.iter_mut() {
+        for ed in self
+            .editor_layout
+            .all_groups_mut(&mut self.editor)
+            .flat_map(|g| g.editors.iter_mut())
+        {
             ed.focus_gradient = gradient;
             ed.theme = self.theme;
             ed.pdf_viewer_enabled = pdf_on;
             ed.csv_viewer_enabled = csv_on;
             ed.provenance_overlay = self.provenance_overlay;
             ed.diff_ws_default = self.diff_ws_default;
-        }
-        for group in self.editor_layout.inactive_groups_mut() {
-            for ed in group.editors.iter_mut() {
-                ed.focus_gradient = gradient;
-                ed.theme = self.theme;
-                ed.pdf_viewer_enabled = pdf_on;
-                ed.csv_viewer_enabled = csv_on;
-                ed.provenance_overlay = self.provenance_overlay;
-                ed.diff_ws_default = self.diff_ws_default;
-            }
         }
         self.apply_view_prefs();
         self.tree.focus_gradient = gradient;
@@ -6406,6 +6300,7 @@ pub fn run(
     }
     result?;
     if app.drop_to_local {
+        crate::widgets::editor::delete_own_gunzip_copies();
         std::process::exit(crate::remote::DROP_TO_LOCAL_EXIT_CODE);
     }
     // A background self-update landed: serialize the session and replace
@@ -6440,6 +6335,8 @@ pub fn run(
         cmd.arg(app.workspace_root())
             .arg("--restore-session")
             .arg(&session_path);
+        // The relaunched croft reopens each archive from the saved session.
+        crate::widgets::editor::delete_own_gunzip_copies();
         let err = CommandExt::exec(&mut cmd);
         eprintln!("croft self-relaunch failed: {err}");
         return Ok(());
@@ -6514,14 +6411,7 @@ fn consume_any_image_clear(app: &mut App) -> bool {
         app.consume_run_debug_image_clear(),
         app.consume_problems_badge_image_clear(),
         app.consume_no_repo_hero_image_clear(),
-        app.consume_shortcuts_image_clear(),
-        app.consume_file_finder_image_clear(),
-        app.consume_command_palette_image_clear(),
-        app.consume_process_picker_image_clear(),
-        app.consume_zoxide_jump_image_clear(),
-        app.consume_branch_picker_image_clear(),
-        app.consume_input_prompt_image_clear(),
-        app.consume_list_picker_image_clear(),
+        app.consume_popup_image_clear(),
         app.consume_ssh_empty_state_image_clear(),
         app.consume_minimap_image_clear(),
         app.consume_activity_image_clear(),
@@ -6662,11 +6552,12 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             }
             crate::startup_trace::mark("loop work done");
             let draw_start = std::time::Instant::now();
-            let drawn = terminal.draw(|f| app.render_for_terminal(f))?;
+            // The frame ratatui just drew, read in place by the picture
+            // flushes below rather than copied (#2062).
+            let mut drawn = terminal.draw(|f| app.render_for_terminal(f))?.buffer;
             crate::startup_trace::mark("frame drawn");
             app.sync_caret_style();
-            let mut underlays = app.image_underlays(drawn.buffer);
-            app.keep_drawn_buffer(drawn.buffer);
+            let mut underlays = app.image_underlays(drawn);
             // Record render+flush time and the bytes ratatui shipped this
             // frame so the F8 HUD can show where remote latency goes.
             app.perf.record_draw(draw_start.elapsed().as_micros());
@@ -6680,9 +6571,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 app.overlays.welcome.mark_dirty();
                 app.overlays.hero.mark_dirty();
                 app.forget_sent_images();
-                let drawn = terminal.draw(|f| app.render_for_terminal(f))?;
-                underlays = app.image_underlays(drawn.buffer);
-                app.keep_drawn_buffer(drawn.buffer);
+                drawn = terminal.draw(|f| app.render_for_terminal(f))?.buffer;
+                underlays = app.image_underlays(drawn);
             }
             // After ratatui flushes its diff, paint the activity-bar icons
             // directly via OSC-1337 on every redraw. We previously gated
@@ -6714,17 +6604,13 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                     if !app.overlays.editor[side].needs_emit(underlays.editor[side]) {
                         continue;
                     }
-                    use std::io::Write;
-                    let mut out = stdout();
-                    let cursor_on = app.cursor_should_be_visible();
-                    let _ = write!(out, "\x1b[?25l\x1b[s");
-                    let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
-                    let _ = out.write_all(osc.as_bytes());
-                    let _ = write!(out, "\x1b[u");
-                    if cursor_on {
-                        let _ = write!(out, "\x1b[?25h");
-                    }
-                    let _ = out.flush();
+                    write_inline_image(
+                        &mut stdout(),
+                        layout.cell_x,
+                        layout.cell_y,
+                        osc.as_bytes(),
+                        app.cursor_should_be_visible(),
+                    );
                     app.mark_editor_image_displayed(side);
                     app.overlays.editor[side].mark_sent_over(underlays.editor[side]);
                 } else {
@@ -6742,17 +6628,13 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 )
             {
                 if app.overlays.terminal_image.needs_emit(underlays.terminal) {
-                    use std::io::Write;
-                    let mut out = stdout();
-                    let cursor_on = app.cursor_should_be_visible();
-                    let _ = write!(out, "\x1b[?25l\x1b[s");
-                    let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
-                    let _ = out.write_all(osc.as_bytes());
-                    let _ = write!(out, "\x1b[u");
-                    if cursor_on {
-                        let _ = write!(out, "\x1b[?25h");
-                    }
-                    let _ = out.flush();
+                    write_inline_image(
+                        &mut stdout(),
+                        layout.cell_x,
+                        layout.cell_y,
+                        osc.as_bytes(),
+                        app.cursor_should_be_visible(),
+                    );
                     app.mark_terminal_image_displayed();
                     app.overlays
                         .terminal_image
@@ -6772,17 +6654,13 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 )
             {
                 if app.overlays.markdown_image.needs_emit(underlays.markdown) {
-                    use std::io::Write;
-                    let mut out = stdout();
-                    let cursor_on = app.cursor_should_be_visible();
-                    let _ = write!(out, "\x1b[?25l\x1b[s");
-                    let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
-                    let _ = out.write_all(osc.as_bytes());
-                    let _ = write!(out, "\x1b[u");
-                    if cursor_on {
-                        let _ = write!(out, "\x1b[?25h");
-                    }
-                    let _ = out.flush();
+                    write_inline_image(
+                        &mut stdout(),
+                        layout.cell_x,
+                        layout.cell_y,
+                        osc.as_bytes(),
+                        app.cursor_should_be_visible(),
+                    );
                     app.mark_markdown_image_displayed();
                     app.overlays
                         .markdown_image
@@ -6802,34 +6680,28 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 )
             {
                 if app.overlays.minimap.needs_emit(underlays.minimap) {
-                    use std::io::Write;
-                    let mut out = stdout();
-                    let cursor_on = app.cursor_should_be_visible();
-                    let _ = write!(out, "\x1b[?25l\x1b[s");
-                    let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
-                    let _ = out.write_all(osc.as_bytes());
-                    let _ = write!(out, "\x1b[u");
-                    if cursor_on {
-                        let _ = write!(out, "\x1b[?25h");
-                    }
-                    let _ = out.flush();
+                    write_inline_image(
+                        &mut stdout(),
+                        layout.cell_x,
+                        layout.cell_y,
+                        osc.as_bytes(),
+                        app.cursor_should_be_visible(),
+                    );
                     app.mark_minimap_image_displayed();
                     app.overlays.minimap.mark_sent_over(underlays.minimap);
                 }
             } else {
                 app.overlays.minimap.forget_sent();
             }
-            // Run-and-Debug headline icon: same re-emit-every-frame trick.
-            // Only fires while the sidebar is on the Run-Debug view and the
-            // panel reserved a cell for the icon on its last render. On
-            // view change the `consume_run_debug_image_clear` gate above
-            // already armed `terminal.clear()`, evicting the cached
-            // image cells before the next sidebar paints.
-            app.flush_run_debug_icon_overlay();
-            app.flush_problems_badge_overlay();
-            app.flush_no_repo_hero_overlay();
-            app.flush_ssh_empty_state_overlay();
-            app.end_chrome_flush();
+            // The small chrome pictures: the Run-and-Debug headline icon,
+            // the PROBLEMS badge and the source-control and SSH
+            // illustrations. The icon only fires while the sidebar is on
+            // the Run-Debug view and the panel reserved a cell for it on
+            // its last render. On view change the
+            // `consume_run_debug_image_clear` gate above already armed
+            // `terminal.clear()`, evicting the cached image cells before
+            // the next sidebar paints.
+            app.flush_chrome_images(drawn);
             // Welcome-screen logo: same OSC-1337 trick, gated by its own
             // dirty flag and only emitted while the editor pane is in its
             // blank initial state.
@@ -6841,17 +6713,13 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                     layout.cell_h,
                 )
             {
-                use std::io::Write;
-                let mut out = stdout();
-                let cursor_on = app.cursor_should_be_visible();
-                let _ = write!(out, "\x1b[?25l\x1b[s");
-                let _ = write!(out, "\x1b[{};{}H", layout.cell_y + 1, layout.cell_x + 1);
-                let _ = out.write_all(img.as_bytes());
-                let _ = write!(out, "\x1b[u");
-                if cursor_on {
-                    let _ = write!(out, "\x1b[?25h");
-                }
-                let _ = out.flush();
+                write_inline_image(
+                    &mut stdout(),
+                    layout.cell_x,
+                    layout.cell_y,
+                    img.as_bytes(),
+                    app.cursor_should_be_visible(),
+                );
                 app.mark_welcome_image_emitted();
             }
             // Last of all: re-paint the chrome tooltip on top of any sidebar

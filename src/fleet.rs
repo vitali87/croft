@@ -517,7 +517,7 @@ fn run_one_untimed(host: &str, command: &str, timeout: Duration) -> HostResult {
         with_timeout.append(&mut args);
         args = with_timeout;
     }
-    let mut cmd = std::process::Command::new(&program);
+    let mut cmd = crate::proc::command(&program);
     cmd.args(&args);
     run_killable(cmd, &program, host, timeout)
 }

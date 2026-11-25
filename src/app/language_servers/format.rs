@@ -148,24 +148,15 @@ impl App {
     /// unformatted: a busy, hung or unreachable server left it unsaved for
     /// good (#1491). Returns true when the next frame should redraw.
     pub(in crate::app) fn drain_lsp_format_at(&mut self, now: std::time::Instant) -> bool {
-        let mut arrived = false;
-        let mut edits: Option<Vec<crate::widgets::editor::TextSpanEdit>> = None;
-        let mut unsupported = false;
-        let mut path: Option<PathBuf> = None;
-        let mut server: Option<String> = None;
-        if let Some(lsp) = self.lsp.as_ref() {
-            while let Some(result) = lsp.drain_formatting() {
-                if Some(result.request_id) != self.format_request_id {
-                    continue;
-                }
-                arrived = true;
-                edits = result.edits;
-                unsupported = result.unsupported;
-                path = Some(result.path);
-                server = result.server;
-            }
-        }
-        if !arrived {
+        let reply = match self.lsp.as_ref() {
+            Some(lsp) => take_reply(
+                &mut self.format_request_id,
+                || lsp.drain_formatting(),
+                |r| r.request_id,
+            ),
+            None => None,
+        };
+        let Some(reply) = reply else {
             let overdue = self.save_after_format.is_some()
                 && self
                     .format_save_deadline
@@ -175,9 +166,13 @@ impl App {
                 self.save_without_formatting(&format!("the formatter did not answer in {secs} s"));
             }
             return overdue;
-        }
-        self.format_request_id = None;
-        self.land_format(edits, unsupported, path, server.as_deref());
+        };
+        self.land_format(
+            reply.edits,
+            reply.unsupported,
+            Some(reply.path),
+            reply.server.as_deref(),
+        );
         true
     }
 
@@ -205,8 +200,9 @@ impl App {
     /// tabs has unsaved edits. A closed file was not written, so it is not
     /// saved either.
     pub(in crate::app) fn path_is_saved(&self, path: &Path) -> bool {
-        let mut tabs = std::iter::once(&self.editor)
-            .chain(self.editor_layout.inactive_groups())
+        let mut tabs = self
+            .editor_layout
+            .all_groups(&self.editor)
             .flat_map(|g| g.editors.iter())
             .filter(|e| e.path.as_deref() == Some(path))
             .peekable();

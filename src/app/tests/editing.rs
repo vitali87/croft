@@ -2532,7 +2532,15 @@ fn a_multi_line_validated_range_falls_back_to_the_word_prompt() {
     app.focus_pane(Pane::Editor);
     app.editor.cursor_row = 1;
     app.editor.cursor_col = 9; // inside `value`
-    app.prepare_rename_request = Some((4, path.clone(), 1, 9, app.editor.edit_seq));
+    app.prepare_rename_request = Some(CaretRequest {
+        id: 4,
+        at: CaretSpot {
+            path: path.clone(),
+            row: 1,
+            col: 9,
+            seq: app.editor.edit_seq,
+        },
+    });
     assert!(app.apply_prepare_rename_verdict(PrepareRenameResult {
         request_id: 4,
         unsupported: false,

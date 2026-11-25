@@ -5,6 +5,9 @@
 //! macOS 26, `screen`, PuTTY's defaults) or the 16 ANSI colours (the Linux
 //! console) draws those wrong or not at all, so below truecolor every
 //! `Rgb` in the frame is mapped to the nearest colour the terminal has.
+//!
+//! The same pass drops underline colours where the terminal cannot read
+//! them (#2661): see [`underline_colors_supported`].
 
 use ratatui::buffer::Buffer;
 use ratatui::style::Color;
@@ -107,6 +110,167 @@ impl ColorDepth {
             cell.underline_color = self.fit(cell.underline_color);
         }
     }
+}
+
+/// The variable that carries [`underline_colors_supported`]'s answer to a
+/// croft that draws into the same terminal from elsewhere: over SSH or in a
+/// dev container, where the terminal's own variables do not follow. `1` or
+/// `0`; a user may also set it for a terminal the list below leaves out.
+pub const UNDERLINE_COLORS_ENV: &str = "CROFT_UNDERLINE_COLORS";
+
+/// Whether the terminal reads underline colours (SGR 58, #2661). One that
+/// does not skips the 58 and reads the numbers after it as codes of its own:
+/// in xterm `58;5;8` turns on blink and hides the text (code 8) for the rest
+/// of the frame. So underline colours go only to terminals known to read
+/// them: [`UNDERLINE_COLORS_ENV`] when set, then `TERM_PROGRAM` or `TERM`,
+/// tmux (which converts them for the terminal outside it), and VTE 0.52 or
+/// newer (GNOME Terminal and others). `COLORTERM` says nothing here: xterm
+/// draws 24-bit colour but not underline colours.
+pub fn underline_colors_supported(env: impl Fn(&str) -> Option<String>) -> bool {
+    match env(UNDERLINE_COLORS_ENV).as_deref().map(str::trim) {
+        Some("1") => return true,
+        Some("0") => return false,
+        _ => {}
+    }
+    let var = |name: &str| env(name).unwrap_or_default().to_ascii_lowercase();
+    const PROGRAMS: &[&str] = &[
+        "iterm.app",
+        "wezterm",
+        "ghostty",
+        "vscode",
+        "tmux",
+        "rio",
+        "croft",
+    ];
+    if PROGRAMS.contains(&var("TERM_PROGRAM").as_str()) {
+        return true;
+    }
+    const TERMS: &[&str] = &[
+        "kitty",
+        "ghostty",
+        "alacritty",
+        "wezterm",
+        "foot",
+        "contour",
+        "rio",
+        "tmux",
+    ];
+    let term = var("TERM");
+    if TERMS.iter().any(|t| term.contains(t)) {
+        return true;
+    }
+    var("VTE_VERSION").parse::<u32>().is_ok_and(|v| v >= 5200)
+}
+
+/// Clear every underline colour in a finished frame, for a terminal that
+/// cannot read them: the underline stays, in the text's own colour.
+pub fn drop_underline_colors(buffer: &mut Buffer) {
+    for cell in &mut buffer.content {
+        cell.underline_color = Color::Reset;
+    }
+}
+
+/// Removes underline colours (SGR 58) from a byte stream on its way to a
+/// terminal that cannot read them (#2661), for the bytes croft does not draw
+/// itself: a persistent session's output, shared by every attached client,
+/// is filtered per client. Only `ESC [ … m` sequences change; everything
+/// else, pictures and OSC strings included, passes through byte for byte.
+/// A sequence split across two writes is held until its end arrives.
+#[derive(Default)]
+pub struct UnderlineColorFilter {
+    pending: Vec<u8>,
+}
+
+impl UnderlineColorFilter {
+    /// A sequence longer than this without its final byte is not one croft
+    /// writes; it is passed on as it came.
+    const LONGEST: usize = 256;
+
+    /// Append `input` to `out` with every underline colour removed.
+    pub fn feed(&mut self, input: &[u8], out: &mut Vec<u8>) {
+        let joined;
+        let data: &[u8] = if self.pending.is_empty() {
+            input
+        } else {
+            self.pending.extend_from_slice(input);
+            joined = std::mem::take(&mut self.pending);
+            &joined
+        };
+        let mut at = 0;
+        while let Some(found) = memchr::memchr(0x1b, &data[at..]) {
+            let esc = at + found;
+            out.extend_from_slice(&data[at..esc]);
+            if esc + 1 == data.len() {
+                self.pending.extend_from_slice(&data[esc..]);
+                return;
+            }
+            if data[esc + 1] != b'[' {
+                out.push(0x1b);
+                at = esc + 1;
+                continue;
+            }
+            let body = esc + 2;
+            let Some(end) = data[body..].iter().position(|b| (0x40..=0x7e).contains(b)) else {
+                if data.len() - esc > Self::LONGEST {
+                    out.extend_from_slice(&data[esc..]);
+                } else {
+                    self.pending.extend_from_slice(&data[esc..]);
+                }
+                return;
+            };
+            let fin = body + end;
+            let params = &data[body..fin];
+            match (data[fin], without_underline_color(params)) {
+                (b'm', Some(kept)) if kept.is_empty() => {}
+                (b'm', Some(kept)) => {
+                    out.extend_from_slice(b"\x1b[");
+                    out.extend_from_slice(&kept);
+                    out.push(b'm');
+                }
+                _ => out.extend_from_slice(&data[esc..=fin]),
+            }
+            at = fin + 1;
+        }
+        out.extend_from_slice(&data[at..]);
+    }
+}
+
+/// `params` of an SGR sequence with its underline colours removed, or `None`
+/// when it holds none (or is not plain SGR parameters). `58;5;n` and
+/// `58;2;r;g;b` take their arguments with them; `38` and `48` keep theirs, so
+/// a `58` that is a colour index (`38;5;58`) stays.
+fn without_underline_color(params: &[u8]) -> Option<Vec<u8>> {
+    if !params
+        .iter()
+        .all(|b| b.is_ascii_digit() || *b == b';' || *b == b':')
+    {
+        return None;
+    }
+    let fields: Vec<&[u8]> = params.split(|b| *b == b';').collect();
+    let mut kept: Vec<&[u8]> = Vec::with_capacity(fields.len());
+    let mut changed = false;
+    let mut i = 0;
+    while i < fields.len() {
+        let field = fields[i];
+        let head = field.split(|b| *b == b':').next().unwrap_or_default();
+        let span = if field.contains(&b':') {
+            1
+        } else {
+            match (head, fields.get(i + 1).copied()) {
+                (b"38" | b"48" | b"58", Some(b"5")) => 3,
+                (b"38" | b"48" | b"58", Some(b"2")) => 5,
+                _ => 1,
+            }
+        };
+        let group = &fields[i..(i + span).min(fields.len())];
+        if head == b"58" {
+            changed = true;
+        } else {
+            kept.extend_from_slice(group);
+        }
+        i += span;
+    }
+    changed.then(|| kept.join(&b';'))
 }
 
 /// The xterm colour cube's six levels per channel.
@@ -314,6 +478,143 @@ mod tests {
             assert_eq!(cell.bg, Color::Indexed(16));
             assert_eq!(cell.underline_color, Color::Indexed(196));
         }
+    }
+
+    #[test]
+    fn underline_colours_go_only_to_terminals_that_read_them() {
+        use super::underline_colors_supported as reads;
+        // xterm, whatever its depth: 24-bit colour is not underline colour.
+        assert!(!reads(env(&[("TERM", "xterm")])));
+        assert!(!reads(env(&[
+            ("TERM", "xterm-256color"),
+            ("COLORTERM", "truecolor")
+        ])));
+        assert!(!reads(env(&[("TERM", "linux")])));
+        assert!(!reads(env(&[("TERM", "screen-256color")])));
+        assert!(!reads(env(&[
+            ("TERM_PROGRAM", "Apple_Terminal"),
+            ("TERM", "xterm-256color")
+        ])));
+        assert!(!reads(env(&[])));
+        for (k, v) in [
+            ("TERM_PROGRAM", "iTerm.app"),
+            ("TERM_PROGRAM", "WezTerm"),
+            ("TERM_PROGRAM", "ghostty"),
+            ("TERM_PROGRAM", "vscode"),
+            ("TERM_PROGRAM", "tmux"),
+            ("TERM_PROGRAM", "croft"),
+            ("TERM", "xterm-kitty"),
+            ("TERM", "alacritty"),
+            ("TERM", "foot"),
+            ("TERM", "tmux-256color"),
+        ] {
+            assert!(reads(env(&[(k, v)])), "{k}={v}");
+        }
+        assert!(reads(env(&[
+            ("TERM", "xterm-256color"),
+            ("VTE_VERSION", "7600")
+        ])));
+        assert!(!reads(env(&[
+            ("TERM", "xterm-256color"),
+            ("VTE_VERSION", "5000")
+        ])));
+    }
+
+    /// The answer carried from another croft wins both ways.
+    #[test]
+    fn the_carried_answer_wins() {
+        use super::{UNDERLINE_COLORS_ENV, underline_colors_supported as reads};
+        assert!(reads(env(&[
+            ("TERM", "xterm"),
+            (UNDERLINE_COLORS_ENV, "1")
+        ])));
+        assert!(!reads(env(&[
+            ("TERM_PROGRAM", "ghostty"),
+            (UNDERLINE_COLORS_ENV, "0")
+        ])));
+        assert!(reads(env(&[
+            ("TERM_PROGRAM", "ghostty"),
+            (UNDERLINE_COLORS_ENV, "maybe")
+        ])));
+    }
+
+    #[test]
+    fn dropping_underline_colours_keeps_the_underline() {
+        use ratatui::style::Modifier;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 2, 1));
+        buf.content[0].underline_color = Color::Rgb(0x4f, 0xb1, 0xa6);
+        buf.content[0].modifier = Modifier::UNDERLINED;
+        buf.content[0].fg = Color::Rgb(1, 2, 3);
+        super::drop_underline_colors(&mut buf);
+        assert_eq!(buf.content[0].underline_color, Color::Reset);
+        assert_eq!(buf.content[0].modifier, Modifier::UNDERLINED);
+        assert_eq!(buf.content[0].fg, Color::Rgb(1, 2, 3));
+    }
+
+    fn filtered(chunks: &[&[u8]]) -> Vec<u8> {
+        let mut filter = super::UnderlineColorFilter::default();
+        let mut out = Vec::new();
+        for chunk in chunks {
+            filter.feed(chunk, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn the_filter_removes_underline_colours_and_nothing_else() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"a\x1b[58;5;8mb", b"ab"),
+            (b"a\x1b[58;2;1;2;3mb", b"ab"),
+            (b"a\x1b[58:2::1:2:3mb", b"ab"),
+            (b"\x1b[4;58;5;8mx", b"\x1b[4mx"),
+            (b"\x1b[1;58;2;9;9;9;3mx", b"\x1b[1;3mx"),
+            // A colour index of 58 is a colour, not code 58.
+            (b"\x1b[38;5;58mx", b"\x1b[38;5;58mx"),
+            (b"\x1b[48;2;58;58;58mx", b"\x1b[48;2;58;58;58mx"),
+            // Resetting the underline colour, a reset and other sequences.
+            (b"\x1b[59m\x1b[m\x1b[0m", b"\x1b[59m\x1b[m\x1b[0m"),
+            (b"\x1b[58;5H\x1b[?2026h", b"\x1b[58;5H\x1b[?2026h"),
+            // Pictures and OSC strings pass byte for byte.
+            (
+                b"\x1bP0;1;0q#58;2;1;2;3~\x1b\\",
+                b"\x1bP0;1;0q#58;2;1;2;3~\x1b\\",
+            ),
+            (
+                b"\x1b]1337;File=inline=1:AAAA\x07",
+                b"\x1b]1337;File=inline=1:AAAA\x07",
+            ),
+            (
+                "caf\u{e9} \u{2014}".as_bytes(),
+                "caf\u{e9} \u{2014}".as_bytes(),
+            ),
+        ];
+        for (input, want) in cases {
+            assert_eq!(
+                filtered(&[input]),
+                want.to_vec(),
+                "{}",
+                String::from_utf8_lossy(input)
+            );
+        }
+    }
+
+    /// A write may end anywhere, even inside a sequence: the result is the
+    /// same however the stream is cut.
+    #[test]
+    fn the_filter_gives_the_same_bytes_however_the_stream_is_cut() {
+        let stream: &[u8] =
+            b"tab \x1b[3m\x1b[4m\x1b[58;5;8mname\x1b[24m\x1b[59m rest\x1b[38;5;58m!\x1b[0m\x1b";
+        let whole = filtered(&[stream]);
+        assert!(
+            !String::from_utf8_lossy(&whole).contains("[58;"),
+            "{whole:?}"
+        );
+        for cut in 0..=stream.len() {
+            let (a, b) = stream.split_at(cut);
+            assert_eq!(filtered(&[a, b]), whole, "cut at {cut}");
+        }
+        let bytes: Vec<&[u8]> = stream.chunks(1).collect();
+        assert_eq!(filtered(&bytes), whole, "one byte at a time");
     }
 
     /// Negative: at truecolor the frame is left exactly as drawn.

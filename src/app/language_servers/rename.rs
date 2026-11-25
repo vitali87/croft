@@ -34,7 +34,15 @@ impl App {
         // Overwriting also disarms any previous in-flight prepare: its caret
         // is abandoned, and a late verdict for it must not reopen a prompt
         // carrying the old (row, col) into the rename request.
-        self.prepare_rename_request = Some((id, path, row, col, self.editor.edit_seq));
+        self.prepare_rename_request = Some(CaretRequest {
+            id,
+            at: CaretSpot {
+                path,
+                row,
+                col,
+                seq: self.editor.edit_seq,
+            },
+        });
         self.status = String::from("Preparing rename…");
     }
 
@@ -95,7 +103,17 @@ impl App {
         &mut self,
         result: crate::lsp::manager::PrepareRenameResult,
     ) -> bool {
-        let Some((id, path, row, col, seq)) = self.prepare_rename_request.clone() else {
+        let Some(CaretRequest {
+            id,
+            at:
+                CaretSpot {
+                    path,
+                    row,
+                    col,
+                    seq,
+                },
+        }) = self.prepare_rename_request.clone()
+        else {
             return false;
         };
         if result.request_id != id {
@@ -163,25 +181,17 @@ impl App {
     }
 
     pub fn drain_lsp_rename(&mut self) -> bool {
-        let mut arrived = false;
-        let mut edits: Option<Vec<(PathBuf, Vec<crate::widgets::editor::TextSpanEdit>)>> = None;
-        {
-            let Some(lsp) = self.lsp.as_ref() else {
-                return false;
-            };
-            while let Some(result) = lsp.drain_rename() {
-                if Some(result.request_id) != self.rename_request_id {
-                    continue;
-                }
-                arrived = true;
-                edits = result.edits;
-            }
-        }
-        if !arrived {
+        let Some(lsp) = self.lsp.as_ref() else {
             return false;
-        }
-        self.rename_request_id = None;
-        self.land_rename(edits);
+        };
+        let Some(reply) = take_reply(
+            &mut self.rename_request_id,
+            || lsp.drain_rename(),
+            |r| r.request_id,
+        ) else {
+            return false;
+        };
+        self.land_rename(reply.edits);
         true
     }
 

@@ -905,7 +905,7 @@ fn provenance_is_synced_onto_the_inactive_group_too() {
     app.focus_pane(Pane::Editor);
     // Split before any sync: both groups hold the file, neither knows its map.
     app.split_editor();
-    let inactive = app.editor_layout.inactive_groups();
+    let inactive = app.editor_layout.inactive_groups().collect::<Vec<_>>();
     assert_eq!(inactive.len(), 1, "staging: one inactive group");
     assert_eq!(
         inactive[0].path.as_deref(),
@@ -918,7 +918,11 @@ fn provenance_is_synced_onto_the_inactive_group_too() {
         "staging: the focused tab is synced"
     );
     assert_eq!(
-        app.editor_layout.inactive_groups()[0].provenance,
+        app.editor_layout
+            .inactive_groups()
+            .next()
+            .unwrap()
+            .provenance,
         seats,
         "the inactive group's tab is synced too"
     );
@@ -946,7 +950,7 @@ fn an_inactive_group_save_records_the_map_of_that_buffer() {
     // The inactive group's buffer: the navigator types, so it is dirty and
     // due, and its map says navigator.
     {
-        let mut groups = app.editor_layout.inactive_groups_mut();
+        let mut groups = app.editor_layout.inactive_groups_mut().collect::<Vec<_>>();
         let other: &mut crate::widgets::editor::Editor = &mut *groups[0];
         assert_eq!(
             other.path.as_deref(),
@@ -998,7 +1002,7 @@ fn a_stale_tab_is_not_credited_with_the_map_of_the_saving_tab() {
     // The inactive group types and saves; the focused tab is untouched, so
     // it stays clean, unattributed, and holding the pre-save text.
     {
-        let mut groups = app.editor_layout.inactive_groups_mut();
+        let mut groups = app.editor_layout.inactive_groups_mut().collect::<Vec<_>>();
         let other: &mut crate::widgets::editor::Editor = &mut *groups[0];
         other.cursor_row = 0;
         other.cursor_col = 0;
@@ -1249,7 +1253,6 @@ fn the_provenance_lens_reaches_every_editor_after_the_flag_sync() {
         && app
             .editor_layout
             .inactive_groups()
-            .iter()
             .flat_map(|g| g.editors.iter())
             .all(|e| e.provenance_overlay);
     assert!(
@@ -1430,7 +1433,6 @@ fn every_editor(app: &App) -> Vec<&crate::widgets::editor::Editor> {
         .chain(
             app.editor_layout
                 .inactive_groups()
-                .into_iter()
                 .flat_map(|g| g.editors.iter()),
         )
         .collect()
@@ -2076,7 +2078,7 @@ fn a_syntax_pass_that_outlives_the_keystroke_lands_on_a_later_tick() {
         assert!(ed.highlight_pending(), "the keystroke did not wait");
     };
     type_into(&mut app.editor);
-    type_into(app.editor_layout.inactive_groups_mut()[0]);
+    type_into(app.editor_layout.inactive_groups_mut().next().unwrap());
     app.cell_pixel = Some((8, 16));
     app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::Kitty;
     let strip = ratatui::layout::Rect {
@@ -2090,7 +2092,13 @@ fn a_syntax_pass_that_outlives_the_keystroke_lands_on_a_later_tick() {
     assert!(carried.is_some());
 
     let pending = |app: &mut App| {
-        app.editor.highlight_pending() || app.editor_layout.inactive_groups()[0].highlight_pending()
+        app.editor.highlight_pending()
+            || app
+                .editor_layout
+                .inactive_groups()
+                .next()
+                .unwrap()
+                .highlight_pending()
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut landed = false;
@@ -2111,7 +2119,7 @@ fn a_syntax_pass_that_outlives_the_keystroke_lands_on_a_later_tick() {
             crate::widgets::editor::Editor::historical(&path, &lines.join("\n"), Vec::new());
         format!("{:?}", fresh.highlights_for_test())
     };
-    let inactive = &app.editor_layout.inactive_groups()[0];
+    let inactive = &app.editor_layout.inactive_groups().next().unwrap();
     assert_eq!(
         format!("{:?}", inactive.highlights_for_test()),
         want(&inactive.lines),
@@ -2545,8 +2553,8 @@ fn line_numbers_reach_every_split_group() {
     let mut app = app_with_open_file(tmp.path(), "a.txt", "a\nb\n");
     app.split_editor_dir(editor_layout::SplitDir::Horizontal, true);
     let modes = |app: &App| -> Vec<LineNumbers> {
-        std::iter::once(&app.editor)
-            .chain(app.editor_layout.inactive_groups())
+        app.editor_layout
+            .all_groups(&app.editor)
             .flat_map(|group| group.editors.iter().map(|e| e.line_numbers))
             .collect()
     };

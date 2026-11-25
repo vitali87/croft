@@ -32,6 +32,7 @@ mod misc;
 mod navigation;
 mod notebook;
 mod palette;
+mod popups;
 mod problems;
 mod remote;
 mod review;
@@ -113,6 +114,65 @@ fn crash_slot_lock() -> std::sync::MutexGuard<'static, ()> {
     static SLOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
     SLOT.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// `TestBackend`, plus whether the caret is shown, which it keeps private:
+/// the screen snapshots and the caret tests read both.
+pub(super) struct CaretBackend {
+    pub(super) inner: ratatui::backend::TestBackend,
+    pub(super) caret_shown: bool,
+}
+
+impl ratatui::backend::Backend for CaretBackend {
+    type Error = std::convert::Infallible;
+
+    fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
+    where
+        I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+    {
+        ratatui::backend::Backend::draw(&mut self.inner, content)
+    }
+
+    fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+        self.caret_shown = false;
+        ratatui::backend::Backend::hide_cursor(&mut self.inner)
+    }
+
+    fn show_cursor(&mut self) -> Result<(), Self::Error> {
+        self.caret_shown = true;
+        ratatui::backend::Backend::show_cursor(&mut self.inner)
+    }
+
+    fn get_cursor_position(&mut self) -> Result<ratatui::layout::Position, Self::Error> {
+        ratatui::backend::Backend::get_cursor_position(&mut self.inner)
+    }
+
+    fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+        &mut self,
+        position: P,
+    ) -> Result<(), Self::Error> {
+        ratatui::backend::Backend::set_cursor_position(&mut self.inner, position)
+    }
+
+    fn clear(&mut self) -> Result<(), Self::Error> {
+        ratatui::backend::Backend::clear(&mut self.inner)
+    }
+
+    fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> Result<(), Self::Error> {
+        ratatui::backend::Backend::clear_region(&mut self.inner, clear_type)
+    }
+
+    fn size(&self) -> Result<ratatui::layout::Size, Self::Error> {
+        ratatui::backend::Backend::size(&self.inner)
+    }
+
+    fn window_size(&mut self) -> Result<ratatui::backend::WindowSize, Self::Error> {
+        ratatui::backend::Backend::window_size(&mut self.inner)
+    }
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        ratatui::backend::Backend::flush(&mut self.inner)
+    }
 }
 
 fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
@@ -340,7 +400,8 @@ fn menu_action_of<'a>(items: &'a [MenuEntry], label: &str) -> Option<&'a MenuAct
 /// Explorer menus over `file` (with a copied file to paste and another to
 /// compare with), and of the rows with a shortcut in the menus built where
 /// they open: the editor's, its gutter's, the Outline's, a folder's in the
-/// Explorer, the terminal's, a finished command's and a CAPTURES row's. These
+/// Explorer, the terminal's, the status bar's indentation menu's, a finished
+/// command's and a CAPTURES row's. These
 /// are the rows whose shortcuts the menus advertise (#885).
 fn menu_row_actions(app: &App, file: &Path) -> Vec<MenuAction> {
     fn actions(entries: Vec<MenuEntry>) -> Vec<MenuAction> {
@@ -439,6 +500,8 @@ fn menu_row_actions(app: &App, file: &Path) -> Vec<MenuAction> {
         MenuAction::ToggleMaximizeTerminal(0),
         MenuAction::KillTerminal(0),
         MenuAction::ClearTerminal(0),
+        MenuAction::ConvertIndentation(true),
+        MenuAction::ConvertIndentation(false),
     ]);
     let finished = crate::widgets::terminal::CommandDecoration {
         id: 0,
@@ -458,38 +521,29 @@ fn menu_row_actions(app: &App, file: &Path) -> Vec<MenuAction> {
     all
 }
 
+/// Activity-bar pictures that are all empty, for tests that only need
+/// croft to be drawing pictures. The sponsor heart has no active picture,
+/// as when it is baked.
+fn empty_activity_images() -> ActivityBarImages {
+    ActivityBarImages {
+        icons: ActivityIcon::ALL.map(|icon| ActivityIconImages {
+            active: (icon != ActivityIcon::Sponsor).then(String::new),
+            inactive: String::new(),
+            hovered: String::new(),
+        }),
+        ..ActivityBarImages::default()
+    }
+}
+
 fn dummy_activity_images() -> ActivityBarImages {
     let s = || String::from("\x1b]1337;File=inline=1:Zm9v\x07");
     ActivityBarImages {
-        explorer_active: s(),
-        explorer_inactive: s(),
-        explorer_hovered: s(),
-        search_active: s(),
-        search_inactive: s(),
-        search_hovered: s(),
-        source_control_active: s(),
-        source_control_inactive: s(),
-        source_control_hovered: s(),
-        remote_active: s(),
-        remote_inactive: s(),
-        remote_hovered: s(),
-        run_debug_active: s(),
-        run_debug_inactive: s(),
-        run_debug_hovered: s(),
-        extensions_active: s(),
-        extensions_inactive: s(),
-        extensions_hovered: s(),
-        testing_active: s(),
-        testing_inactive: s(),
-        testing_hovered: s(),
-        codeql_active: s(),
-        codeql_inactive: s(),
-        codeql_hovered: s(),
-        sponsor_inactive: s(),
-        sponsor_hovered: s(),
-        settings_active: s(),
-        settings_inactive: s(),
-        settings_hovered: s(),
+        // The sponsor heart is never selected, so it has no active picture.
+        icons: ActivityIcon::ALL.map(|icon| ActivityIconImages {
+            active: (icon != ActivityIcon::Sponsor).then(s),
+            inactive: s(),
+            hovered: s(),
+        }),
         layout_sidebar_on: s(),
         layout_sidebar_on_hover: s(),
         layout_sidebar_off: s(),
@@ -1973,12 +2027,12 @@ fn linked_wake(app: &mut App) -> Option<u64> {
 
 /// The tick alone, the answer left to the caller.
 fn linked_tick_only(app: &mut App) -> Option<u64> {
-    let before = app.linked_request.as_ref().map(|r| r.0);
+    let before = app.linked_request.as_ref().map(|r| r.id);
     app.linked_observed_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
     app.tick_linked_editing();
     app.linked_request
         .as_ref()
-        .map(|r| r.0)
+        .map(|r| r.id)
         .filter(|id| Some(*id) != before)
 }
 
@@ -2950,7 +3004,7 @@ fn tabs_snapshot_852(app: &App) -> TabsSnapshot852 {
             .collect::<Vec<_>>()
     };
     let mut groups = vec![group(&app.editor)];
-    groups.extend(app.editor_layout.inactive_groups().into_iter().map(group));
+    groups.extend(app.editor_layout.inactive_groups().map(group));
     (
         groups,
         app.editor.active_index(),

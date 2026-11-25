@@ -89,7 +89,7 @@ impl App {
     pub(in crate::app) fn unsaved_editor_names(&self) -> Vec<String> {
         let mut seen: Vec<&std::path::Path> = Vec::new();
         let mut names = Vec::new();
-        let groups = std::iter::once(&self.editor).chain(self.editor_layout.inactive_groups());
+        let groups = self.editor_layout.all_groups(&self.editor);
         let active = self.editor.editors.get(self.editor.active_index());
         let tabs = active
             .into_iter()

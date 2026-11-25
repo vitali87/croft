@@ -3664,9 +3664,12 @@ fn a_link_planted_at_the_gunzip_scratch_name_is_not_followed() {
         gz.as_path().hash(&mut h);
         h.finish()
     };
-    let scratch = gunzip_scratch_dir()
-        .unwrap()
-        .join(format!("{key:016x}-planted.log"));
+    let scratch = gunzip_scratch_dir().unwrap().join(gunzip_copy_name(
+        key,
+        std::process::id(),
+        0,
+        "planted.log",
+    ));
     let _ = std::fs::remove_file(&scratch);
     std::os::unix::fs::symlink(&victim, &scratch).unwrap();
     let mut e = Editor::new();
@@ -3675,6 +3678,139 @@ fn a_link_planted_at_the_gunzip_scratch_name_is_not_followed() {
     assert!(!std::fs::symlink_metadata(&scratch).unwrap().is_symlink());
     assert_eq!(log_lines(&mut e, 1), ["decompressed text"]);
     let _ = std::fs::remove_file(&scratch);
+}
+
+/// #2675: the decompressed copy lasts only while a tab shows it. Opening
+/// something else in the tab, or closing it, deletes the copy; it used to
+/// stay in the temp folder until the machine cleared it.
+#[test]
+fn a_gunzipped_copy_is_deleted_once_no_tab_shows_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let gz = tmp.path().join("app.log.1.gz");
+    gzip_to(&gz, b"a rotated line\n");
+    let other = tmp.path().join("notes.txt");
+    std::fs::write(&other, "plain\n").unwrap();
+    let mut e = Editor::new();
+    e.open(&gz).unwrap();
+    let copy = e.log.as_ref().expect("the log view").path.clone();
+    assert!(copy.exists(), "the tab reads its decompressed copy");
+    e.open(&other).unwrap();
+    assert!(e.log.is_none(), "the tab now shows the text file");
+    assert!(!copy.exists(), "opening another file deletes the copy");
+    e.open(&gz).unwrap();
+    let copy = e.log.as_ref().expect("the log view").path.clone();
+    assert!(copy.exists());
+    drop(e);
+    assert!(!copy.exists(), "closing the tab deletes the copy");
+}
+
+/// #2675: a gzip that is cut short fails partway through decompressing
+/// and opens as hex. The part already written used to stay behind.
+#[test]
+fn a_gzip_cut_short_leaves_no_partial_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let gz = tmp.path().join("cut.log.gz");
+    let text: String = (0..20_000)
+        .map(|i| format!("{i:08} a line of a rotated log\n"))
+        .collect();
+    gzip_to(&gz, text.as_bytes());
+    let whole = std::fs::read(&gz).unwrap();
+    std::fs::write(&gz, &whole[..whole.len() / 2]).unwrap();
+    let mut e = Editor::new();
+    e.open(&gz).unwrap();
+    assert!(e.log.is_none(), "a gzip cut short is not shown as text");
+    let key = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        gz.as_path().hash(&mut h);
+        h.finish()
+    };
+    let prefix = format!("{key:016x}-");
+    let left: Vec<_> = std::fs::read_dir(gunzip_scratch_dir().unwrap())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(&prefix))
+        .collect();
+    assert!(left.is_empty(), "partial copies left behind: {left:?}");
+}
+
+/// #2676 review (Codex): a gzip whose name is near the 255 bytes a file
+/// name may have still opens as text. Its copy's name added a prefix to the
+/// whole name, went past the limit, and the gzip fell back to hex.
+#[test]
+fn a_gzip_with_a_long_name_still_opens_as_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let gz = tmp.path().join(format!("{}.log.gz", "a".repeat(244)));
+    gzip_to(&gz, b"a line with a long name\n");
+    let mut e = Editor::new();
+    e.open(&gz).unwrap();
+    assert!(e.hex.is_none(), "not hex");
+    assert_eq!(log_lines(&mut e, 1), ["a line with a long name"]);
+    let copy = e.log.as_ref().expect("the log view").path.clone();
+    let name = copy.file_name().unwrap().to_str().unwrap();
+    assert!(name.len() <= 255 && name.ends_with("aaa.log"), "{name}");
+}
+
+/// #2675: two tabs on one archive read copies of their own, so closing
+/// one never deletes the text the other is showing.
+#[test]
+fn closing_one_of_two_tabs_on_an_archive_keeps_the_others_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let gz = tmp.path().join("shared.log.gz");
+    gzip_to(&gz, b"first line\nsecond line\n");
+    let mut a = Editor::new();
+    a.open(&gz).unwrap();
+    let mut b = Editor::new();
+    b.open(&gz).unwrap();
+    let b_copy = b.log.as_ref().expect("the log view").path.clone();
+    assert_ne!(a.log.as_ref().expect("the log view").path, b_copy);
+    drop(a);
+    assert!(b_copy.exists(), "the other tab's copy stays");
+    assert_eq!(log_lines(&mut b, 2), ["first line", "second line"]);
+}
+
+/// #2675: a copy whose croft is gone, killed or cut off with its ssh
+/// session, is deleted the next time an archive opens. A running croft's
+/// copies stay, even one this user may not signal (#2676 review), and so
+/// do files that are not copies. This process's own go only on the way out
+/// that skips the tabs' clean-up.
+#[cfg(unix)]
+#[test]
+fn copies_of_a_croft_that_is_gone_are_swept() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    let gone = child.id();
+    child.wait().unwrap();
+    let running = std::os::unix::process::parent_id();
+    let me = std::process::id();
+    let copy = |pid| gunzip_copy_name(0xabc, pid, 0, "app.log");
+    let older = format!("{:016x}-app.log", 0xabc);
+    // Process 1 always runs, and a user other than root may not signal it:
+    // a probe that is refused must not read as a process that is gone.
+    let init = copy(1);
+    for name in [
+        copy(gone),
+        copy(running),
+        copy(me),
+        init.clone(),
+        "notes.txt".into(),
+        older.clone(),
+    ] {
+        std::fs::write(dir.path().join(name), b"x").unwrap();
+    }
+    let kept = |name: &str| dir.path().join(name).exists();
+    sweep_gunzip_copies(dir.path(), false);
+    assert!(!kept(&copy(gone)), "the copy of a croft that is gone");
+    assert!(kept(&copy(running)) && kept(&copy(me)));
+    assert!(kept(&init), "a process this user may not signal still runs");
+    assert!(
+        kept("notes.txt") && kept(&older),
+        "files that are not copies"
+    );
+    sweep_gunzip_copies(dir.path(), true);
+    assert!(!kept(&copy(me)), "this process's own, on the way out");
+    assert!(kept(&copy(running)));
 }
 
 #[test]
@@ -4900,6 +5036,53 @@ fn gutter_stream_stop_glyph_renders_maps_clicks_and_outranks_the_play_glyph() {
         "without a stream the test play glyph owns the cell again"
     );
     assert!(!e.stream_stop_at(sign_x, 2));
+}
+
+/// The sign cell answers a click with the glyph it shows (#2694): on the line an
+/// AI stream writes into, a breakpoint or the debugger's stop arrow
+/// outranks the stop square, so a click on it is the breakpoint lane's,
+/// never a cancel that reverts the stream.
+#[test]
+fn a_click_on_a_glyph_over_the_stream_line_does_not_stop_the_stream() {
+    let mut e = editor_with("fn a() {}\nfn b() {}\nfn c() {}");
+    let path = PathBuf::from("/x/a.rs");
+    e.path = Some(path.clone());
+    e.stream_stop_line = Some(1); // 0-based; the gutter's line 2
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 60,
+        height: 6,
+    };
+    let paint = |e: &mut Editor| {
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (e as &mut Editor).render(area, &mut buf);
+        buf
+    };
+    // Buffer line 1 paints on content row y = 2 (breadcrumb row above).
+    let buf = paint(&mut e);
+    let sign_x = e.last_inner.x;
+    assert_eq!(buf[(sign_x, 2)].symbol(), "■", "fixture: the stop square");
+    assert!(e.stream_stop_at(sign_x, 2), "the square is the button");
+
+    e.breakpoints
+        .insert(path.clone(), std::collections::BTreeSet::from([2]));
+    let buf = paint(&mut e);
+    assert_eq!(buf[(sign_x, 2)].symbol(), "●", "the breakpoint outranks it");
+    assert!(
+        !e.stream_stop_at(sign_x, 2),
+        "a click on the breakpoint dot must not stop the stream"
+    );
+    assert_eq!(e.breakpoint_lane_line_at(sign_x, 2), Some(1));
+
+    e.breakpoints.clear();
+    e.stop_line = Some((path, 2));
+    let buf = paint(&mut e);
+    assert_eq!(buf[(sign_x, 2)].symbol(), "▶", "the stop arrow outranks it");
+    assert!(
+        !e.stream_stop_at(sign_x, 2),
+        "a click on the stop arrow must not stop the stream"
+    );
 }
 
 /// A comment box anchored to line 0 renders as an unnumbered block
@@ -21386,6 +21569,44 @@ fn editing_reveals_a_fold_the_caret_ended_up_inside() {
     assert!(e.lines[1].contains('Z'), "and the text went to line 1");
 }
 
+/// The edit helper's steps, each in its place: the tab is pinned and the
+/// caret's fold opened before the change, the undo step holds the text from
+/// before it, and the buffer is marked changed (with the caret the change
+/// left) and coloured again after it.
+#[test]
+fn an_undoable_edit_takes_its_steps_in_order() {
+    let mut e = editor_with("fn a() {\n    x\n    y\n}\nafter");
+    e.preview = true;
+    e.toggle_fold(0);
+    e.cursor_row = 1;
+    e.cursor_col = 5;
+    let (seq, requests) = (e.edit_seq, e.highlight_requests);
+    e.undoable_edit(EditKind::Replace, |this| {
+        assert!(!this.preview, "the tab is pinned before the change");
+        assert!(!this.is_line_hidden(1), "and the caret's fold is open");
+        assert!(!this.dirty, "the buffer is marked changed only after it");
+        this.lines[1].push('Z');
+        this.cursor_col = 6;
+    });
+    assert!(e.dirty);
+    assert_eq!(e.edit_seq, seq.wrapping_add(1));
+    assert_eq!(
+        e.last_edit_pos,
+        Some((1, 6)),
+        "the change is marked where it left the caret"
+    );
+    assert_eq!(
+        e.highlight_requests,
+        requests.wrapping_add(1),
+        "and coloured again once"
+    );
+    assert!(e.undo());
+    assert_eq!(
+        e.lines[1], "    x",
+        "one undo brings back the text from before the change"
+    );
+}
+
 /// Waiting for an EDIT to reveal the fold is too late for a jump: a caret
 /// on a hidden line has no painted row at all, so `cursor_screen_pos`
 /// returns `None` and no caret is drawn anywhere on screen. Ctrl+G stands
@@ -22356,4 +22577,250 @@ fn the_toggle_disables_every_pair_behavior() {
     e.cursor_col = 1;
     e.backspace();
     assert_eq!(e.lines[0], ")", "off means plain backspace");
+}
+
+/// A file `bytes` long whose head is `head`: the rest reads as zeros and
+/// costs no disk, which is all a size check looks at.
+fn sized_file(p: &Path, head: &[u8], bytes: u64) {
+    std::fs::write(p, head).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(p)
+        .unwrap()
+        .set_len(bytes)
+        .unwrap();
+}
+
+/// A zip of one member `name` holding `body`, stored uncompressed.
+fn zip_of(p: &Path, name: &str, body: &[u8]) {
+    use std::io::Write as _;
+    let mut z = zip::ZipWriter::new(std::fs::File::create(p).unwrap());
+    let o =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    z.start_file(name, o).unwrap();
+    z.write_all(body).unwrap();
+    z.finish().unwrap();
+}
+
+/// Where each kind of file opens (#2062): the view it fills and the status
+/// line it leaves, or the error it fails with, for every route whose choice
+/// turns on why an earlier viewer refused (an image that does not decode, a
+/// sheet past its size cap, an archive past its listing cap, a gzip past
+/// its decompressed cap) and the routes around them. The table pins today's
+/// routing, message text included, before the refusals become typed.
+#[test]
+fn every_route_opens_the_view_it_opens_today() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let png = png_of(2, 2, |_, _| RED);
+    type Build = Box<dyn Fn(&Path)>;
+    let rows: Vec<(&str, Build)> = vec![
+        (
+            "pic.png",
+            Box::new(move |p| std::fs::write(p, &png).unwrap()),
+        ),
+        (
+            "notes.png",
+            Box::new(|p| std::fs::write(p, "just words\n").unwrap()),
+        ),
+        (
+            "junk.png",
+            Box::new(|p| std::fs::write(p, (0..=255u8).collect::<Vec<_>>()).unwrap()),
+        ),
+        (
+            "logo",
+            Box::new(|p| std::fs::write(p, png_of(2, 2, |_, _| BLUE)).unwrap()),
+        ),
+        (
+            "pic.svg",
+            Box::new(|p| std::fs::write(p, "this is not xml").unwrap()),
+        ),
+        (
+            "data.csv",
+            Box::new(|p| std::fs::write(p, "a,b\n1,2\n").unwrap()),
+        ),
+        (
+            "data.xlsx",
+            Box::new(|p| std::fs::write(p, "a,b\n").unwrap()),
+        ),
+        (
+            "big.csv",
+            Box::new(|p| sized_file(p, b"a,b\n", crate::sheet::CSV_BYTES_CAP + 1)),
+        ),
+        ("book", Box::new(write_minimal_xlsx)),
+        (
+            "big.zip",
+            Box::new(|p| sized_file(p, b"", crate::archive::ZIP_LIST_CAP + 1)),
+        ),
+        (
+            "bundle",
+            Box::new(|p| {
+                zip_of(p, "readme.txt", b"inside");
+                let len = crate::archive::ZIP_LIST_CAP + 1;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(p)
+                    .unwrap()
+                    .set_len(len)
+                    .unwrap();
+            }),
+        ),
+        (
+            "big.tar",
+            Box::new(|p| sized_file(p, b"", crate::archive::TAR_LIST_CAP + 1)),
+        ),
+        (
+            "doc.docx",
+            Box::new(|p| std::fs::write(p, "not a zip\n").unwrap()),
+        ),
+        (
+            "huge.docx",
+            Box::new(|p| {
+                zip_of(p, "word/document.xml", b"<w:document/>");
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(p)
+                    .unwrap()
+                    .set_len(crate::docx::MAX_DOC_LISTING_BYTES + 1)
+                    .unwrap();
+            }),
+        ),
+        (
+            "app.log.gz",
+            Box::new(|p| gzip_to(p, b"started\nstopped\n")),
+        ),
+        (
+            "bomb.log.gz",
+            Box::new(|p| {
+                use std::io::Write as _;
+                let mut gz = flate2::write::GzEncoder::new(
+                    std::fs::File::create(p).unwrap(),
+                    flate2::Compression::fast(),
+                );
+                let chunk = vec![b'a'; 1024 * 1024];
+                for _ in 0..=(MAX_GUNZIP_BYTES / chunk.len() as u64) {
+                    gz.write_all(&chunk).unwrap();
+                }
+                gz.finish().unwrap();
+            }),
+        ),
+        (
+            "r.sarif",
+            Box::new(|p| std::fs::write(p, "{not json").unwrap()),
+        ),
+        (
+            "damaged.xlsx",
+            Box::new(crate::sheet::tests::overflowing_zip),
+        ),
+    ];
+    let shown = |p: &Path| p.display().to_string();
+    let outcomes: Vec<String> = rows
+        .iter()
+        .map(|(name, build)| {
+            let p = dir.join(name);
+            build(&p);
+            let mut e = Editor::new();
+            let what = match e.open(&p) {
+                Ok(()) => format!("{:?} {}", e.views_filled(), e.status),
+                Err(err) => format!("error: {err}"),
+            };
+            format!("{name}: {}", what.replace(&shown(dir), "<dir>"))
+        })
+        .collect();
+    let expected = [
+        r#"pic.png: ["image"] Opened image <dir>/pic.png"#,
+        r#"notes.png: [] Opened <dir>/notes.png"#,
+        r#"junk.png: ["hex"] Opened <dir>/junk.png in the hex viewer"#,
+        r#"logo: ["image"] Opened image <dir>/logo"#,
+        r#"pic.svg: [] Opened <dir>/pic.svg"#,
+        r#"data.csv: ["sheet"] Opened <dir>/data.csv (CSV)"#,
+        r#"data.xlsx: [] Opened <dir>/data.xlsx"#,
+        r#"big.csv: error: Spreadsheet open failed: CSV/TSV too large (26214401 bytes)"#,
+        r#"book: ["sheet"] Opened <dir>/book (XLSX)"#,
+        r#"big.zip: ["hex"] Opened <dir>/big.zip in the hex viewer: Archive open failed: zip too large to list (8388609 bytes)"#,
+        r#"bundle: ["hex"] Opened <dir>/bundle in the hex viewer: Archive open failed: zip too large to list (8388609 bytes)"#,
+        r#"big.tar: ["hex"] Opened <dir>/big.tar in the hex viewer: Archive open failed: tar archive too large to list (104857601 bytes)"#,
+        r#"doc.docx: [] Opened <dir>/doc.docx"#,
+        r#"huge.docx: ["hex"] Opened <dir>/huge.docx in the hex viewer: Archive open failed: zip too large to list (8388609 bytes)"#,
+        r#"app.log.gz: ["log"] Opened <dir>/app.log.gz decompressed, read-only"#,
+        r#"bomb.log.gz: ["hex"] Opened <dir>/bomb.log.gz in the hex viewer: Decompressed file too large to show (over 256 MiB)"#,
+        r#"r.sarif: [] Opened <dir>/r.sarif as text: invalid JSON at 1:2: key must be a string at line 1 column 2"#,
+        r#"damaged.xlsx: ["hex"] Opened <dir>/damaged.xlsx in the hex viewer"#,
+    ];
+    pretty_assertions::assert_eq!(outcomes, expected);
+}
+
+/// Every viewer starts from the same reset (#2062): a text tab with edits,
+/// an undo history, a selection, a language and a place in the file keeps
+/// none of them once it shows an image, a sheet, an archive, a log or hex.
+#[test]
+fn a_tab_turned_viewer_keeps_nothing_of_its_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let png = dir.join("pic.png");
+    std::fs::write(&png, png_of(2, 2, |_, _| RED)).unwrap();
+    let csv = dir.join("data.csv");
+    std::fs::write(&csv, "a,b\n1,2\n").unwrap();
+    let zip = dir.join("bundle.zip");
+    zip_of(&zip, "readme.txt", b"inside");
+    let log = dir.join("run.log");
+    std::fs::write(&log, "\x1b[31mred\x1b[0m\n").unwrap();
+    let bin = dir.join("blob.bin");
+    std::fs::write(&bin, [0u8, 159, 146, 150, 0, 1]).unwrap();
+    let viewers: [(&Path, &str); 5] = [
+        (&png, "image"),
+        (&csv, "sheet"),
+        (&zip, "archive"),
+        (&log, "log"),
+        (&bin, "hex"),
+    ];
+    for (target, view) in viewers {
+        let src = dir.join("main.rs");
+        std::fs::write(&src, "fn main() {\n    let x = 1;\n}\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&src).unwrap();
+        e.cursor_row = 1;
+        e.cursor_col = 4;
+        e.insert_char('y');
+        e.select_all();
+        e.scroll = 1;
+        assert!(e.lang.is_some() && !e.undo_stack.is_empty(), "staging");
+
+        e.open(target).unwrap();
+        assert_eq!(e.views_filled(), [view], "{view}");
+        assert_eq!(e.lines, [""], "{view}: the text side is a stub");
+        assert!(e.undo_stack.is_empty() && e.redo_stack.is_empty(), "{view}");
+        assert!(
+            !e.dirty && e.selection.is_none() && e.lang.is_none(),
+            "{view}"
+        );
+        assert_eq!((e.cursor_row, e.cursor_col, e.scroll), (0, 0, 0), "{view}");
+        assert_eq!(e.path.as_deref(), Some(target), "{view}");
+    }
+}
+
+/// Every viewer clears what a tab expected of a file not yet created
+/// (#2062): five of the ten (document, media, archive, log, SARIF) kept the
+/// flag from a new-file tab they replaced. Nothing read it while a viewer
+/// showed, but the reset is one now and none keeps it.
+#[test]
+fn a_viewer_forgets_the_new_file_it_replaced() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let zip = dir.join("bundle.zip");
+    zip_of(&zip, "readme.txt", b"inside");
+    let log = dir.join("run.log");
+    std::fs::write(&log, "\x1b[31mred\x1b[0m\n").unwrap();
+    for (target, view) in [(&zip, "archive"), (&log, "log")] {
+        let mut e = Editor::new();
+        e.open_new_file(&dir.join("draft.md")).unwrap();
+        assert!(
+            e.disk_expect_absent,
+            "staging: a new file is expected absent"
+        );
+
+        e.open(target).unwrap();
+        assert_eq!(e.views_filled(), [view]);
+        assert!(!e.disk_expect_absent, "{view} must forget the new file");
+    }
 }

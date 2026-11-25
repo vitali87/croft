@@ -6,7 +6,38 @@ use std::path::Path;
 /// value on another worksheet.
 pub type SheetCellEdit = (String, usize, usize, String);
 
-const CSV_BYTES_CAP: u64 = 25 * 1024 * 1024;
+pub(crate) const CSV_BYTES_CAP: u64 = 25 * 1024 * 1024;
+
+/// A sheet refused at a deliberate size cap (the file's bytes, or the cells
+/// its grid would hold), not one that failed to parse: the open reports it
+/// instead of falling through to the text editor, which would get around the
+/// cap. It travels inside the `io::Error`, so callers tell the two apart by
+/// type ([`is_size_refusal`]).
+#[derive(Debug)]
+pub struct PastSheetCap(String);
+
+impl std::fmt::Display for PastSheetCap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PastSheetCap {}
+
+/// A [`PastSheetCap`] refusal saying `message`.
+fn past_sheet_cap(message: String) -> std::io::Error {
+    std::io::Error::other(PastSheetCap(message))
+}
+
+/// Whether a sheet open was refused for its size rather than failing to
+/// parse: one of this module's caps ([`PastSheetCap`]). An error from the
+/// workbook readers that only says "too large", such as the zip reader's
+/// "Archive header is too large" for a damaged archive, is a parse failure,
+/// and the file falls through to the hex viewer like any other unreadable
+/// workbook (#2709).
+pub fn is_size_refusal(e: &std::io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<PastSheetCap>())
+}
 const XLSX_BYTES_CAP: u64 = 50 * 1024 * 1024;
 /// The most cells one sheet's grid is built from, counting the dense
 /// rectangle between its outermost values. The compressed-size cap above
@@ -229,7 +260,7 @@ pub fn open_sheet_with_kind(path: &Path, kind: SheetKind) -> std::io::Result<She
     match kind {
         SheetKind::Csv | SheetKind::Tsv => {
             if meta.len() > CSV_BYTES_CAP {
-                return Err(std::io::Error::other(format!(
+                return Err(past_sheet_cap(format!(
                     "CSV/TSV too large ({} bytes)",
                     meta.len()
                 )));
@@ -259,7 +290,7 @@ pub fn open_sheet_with_kind(path: &Path, kind: SheetKind) -> std::io::Result<She
         )),
         SheetKind::Xlsx | SheetKind::Xls | SheetKind::Ods | SheetKind::Xlsb => {
             if meta.len() > XLSX_BYTES_CAP {
-                return Err(std::io::Error::other(format!(
+                return Err(past_sheet_cap(format!(
                     "Spreadsheet too large ({} bytes)",
                     meta.len()
                 )));
@@ -894,11 +925,11 @@ pub(crate) fn text_width(s: &str) -> usize {
     s.graphemes(true).map(grapheme_width).sum()
 }
 
-/// Refuse a sheet whose dense extent is over [`MAX_SHEET_CELLS`]. The
-/// message says "too large" so the open is not rerouted to the text editor.
+/// Refuse a sheet whose dense extent is over [`MAX_SHEET_CELLS`], as a
+/// [`PastSheetCap`] so the open is not rerouted to the text editor.
 fn check_sheet_extent(name: &str, rows: u64, cols: u64) -> std::io::Result<()> {
     if rows.saturating_mul(cols) > MAX_SHEET_CELLS {
-        return Err(std::io::Error::other(format!(
+        return Err(past_sheet_cap(format!(
             "Sheet too large: {name} is {rows}x{cols} cells (max {}M)",
             MAX_SHEET_CELLS / 1_000_000
         )));
@@ -1188,7 +1219,65 @@ pub(crate) fn format_float(f: f64) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use std::io::Write as _;
+    use std::path::Path;
+
+    /// A damaged zip (#2709): 16 bytes of junk in front shift every offset
+    /// the archive records, and its one entry claims, through its zip64
+    /// extra field, a local header at the last offset a u64 holds. Adding
+    /// the shift overflows, and the zip reader fails with its own "Archive
+    /// header is too large".
+    pub(crate) fn overflowing_zip(p: &Path) {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut z = zip::ZipWriter::new(&mut buf);
+            let o = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            z.start_file("xl/workbook.xml", o).unwrap();
+            z.write_all(b"<workbook/>").unwrap();
+            z.finish().unwrap();
+        }
+        let mut bytes = buf.into_inner();
+        let cd = bytes
+            .windows(4)
+            .position(|w| w == [0x50, 0x4b, 0x01, 0x02])
+            .expect("a central directory entry");
+        let name_len = u16::from_le_bytes([bytes[cd + 28], bytes[cd + 29]]) as usize;
+        let extra_len = u16::from_le_bytes([bytes[cd + 30], bytes[cd + 31]]) as usize;
+        // The local header offset becomes the zip64 sentinel, so the reader
+        // takes it from the extra field instead.
+        bytes[cd + 42..cd + 46].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut zip64 = vec![0x01, 0x00, 0x08, 0x00];
+        zip64.extend_from_slice(&u64::MAX.to_le_bytes());
+        let at = cd + 46 + name_len + extra_len;
+        bytes.splice(at..at, zip64.iter().copied());
+        bytes[cd + 30..cd + 32].copy_from_slice(&((extra_len + 12) as u16).to_le_bytes());
+        let eocd = bytes
+            .windows(4)
+            .rposition(|w| w == [0x50, 0x4b, 0x05, 0x06])
+            .expect("an end of central directory");
+        let cd_size = u32::from_le_bytes(bytes[eocd + 12..eocd + 16].try_into().unwrap()) + 12;
+        bytes[eocd + 12..eocd + 16].copy_from_slice(&cd_size.to_le_bytes());
+        let mut out = vec![0u8; 16];
+        out.extend_from_slice(&bytes);
+        std::fs::write(p, out).unwrap();
+    }
+
+    /// A damaged workbook whose zip reader says "too large" failed to
+    /// parse; it was not refused for its size (#2709).
+    #[test]
+    fn a_damaged_workbook_is_not_refused_for_its_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("damaged.xlsx");
+        overflowing_zip(&p);
+        let e = super::open_sheet(&p).unwrap_err();
+        assert!(
+            e.to_string().contains("Archive header is too large"),
+            "staging: the zip reader's own wording: {e}"
+        );
+        assert!(!super::is_size_refusal(&e), "{e}");
+    }
     #[test]
     fn formula_errors_read_as_the_codes_spreadsheets_show() {
         use calamine::{CellErrorType as E, Data};

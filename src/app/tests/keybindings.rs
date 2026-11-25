@@ -1846,11 +1846,11 @@ fn opening_the_shortcuts_modal_arms_one_image_clear_so_iterm_evicts_cached_osc_1
     app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE))
         .unwrap();
     assert!(
-        app.consume_shortcuts_image_clear(),
+        app.consume_popup_image_clear(),
         "F1 must arm terminal.clear() so iTerm2's image cache (activity bar icons, welcome wordmark, editor preview) is wiped before the modal paints, otherwise those cached image cells bleed through the modal text"
     );
     assert!(
-        !app.consume_shortcuts_image_clear(),
+        !app.consume_popup_image_clear(),
         "the flag is one-shot — a second consume call must return false so the driver does not re-clear every frame"
     );
 }
@@ -1861,11 +1861,11 @@ fn closing_the_shortcuts_modal_arms_image_clear_and_re_dirties_overlays() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE))
         .unwrap();
-    let _ = app.consume_shortcuts_image_clear();
+    let _ = app.consume_popup_image_clear();
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
     assert!(
-        app.consume_shortcuts_image_clear(),
+        app.consume_popup_image_clear(),
         "Esc must also arm terminal.clear() so the modal's text cells get wiped and the activity bar / welcome wordmark / hero icons can be re-emitted cleanly"
     );
     assert!(app.overlays.activity.dirty());
@@ -2441,6 +2441,57 @@ fn format_document_key_is_cmd_opt_shift_f() {
         KeyCode::Char('g'),
         KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT
     )));
+}
+
+/// #2647: three Cmd/Ctrl+Shift checks did not rule out Opt, so they took
+/// the Opt+Shift chord of another command, ahead of it. Pressed end to end,
+/// each Opt+Shift chord now reaches its own command, with Cmd (a Mac) and
+/// with Ctrl (elsewhere), and the Shift chords keep theirs.
+#[test]
+fn opt_shift_chords_reach_their_own_commands_not_the_shift_chords() {
+    for (name, cmd) in [
+        ("Cmd", KeyModifiers::SUPER),
+        ("Ctrl", KeyModifiers::CONTROL),
+    ] {
+        let opt_shift = cmd | KeyModifiers::ALT | KeyModifiers::SHIFT;
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("main.rs");
+        std::fs::write(&file, "fn main() {\n    let x = 1;\n}\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.lsp = None;
+        app.editor.open_pinned(&file).unwrap();
+        app.focus_pane(Pane::Editor);
+        let side = app.sidebar_view;
+        let terminals = app.terminals.len();
+
+        // Format Document, not the Search view.
+        app.handle_key(key(KeyCode::Char('F'), opt_shift)).unwrap();
+        assert_eq!(app.sidebar_view, side, "{name}+Opt+Shift+F opened Search");
+        assert!(app.focus == Pane::Editor, "{name}+Opt+Shift+F moved focus");
+        assert_eq!(app.status, "No language server for this file");
+
+        // Convert Indentation to Tabs, not a terminal split.
+        app.handle_key(key(KeyCode::Char('T'), opt_shift)).unwrap();
+        assert_eq!(app.terminals.len(), terminals, "{name}+Opt+Shift+T split");
+        assert_eq!(app.editor.lines[1], "\tlet x = 1;");
+        assert_eq!(app.status, "Converted indentation to tabs");
+
+        // Debug: Switch Session with none running leaves the caret alone.
+        (app.editor.cursor_row, app.editor.cursor_col) = (0, 0);
+        app.handle_key(key(KeyCode::Char('G'), opt_shift)).unwrap();
+        let caret = (app.editor.cursor_row, app.editor.cursor_col);
+        assert_eq!(caret, (0, 0), "{name}+Opt+Shift+G moved the caret");
+
+        // The Shift chords without Opt keep their own commands.
+        let shift = cmd | KeyModifiers::SHIFT;
+        assert!(is_search_jump_key(key(KeyCode::Char('F'), shift)));
+        assert!(is_vim_goto_bottom(key(KeyCode::Char('G'), shift)));
+    }
+    let ctrl_shift_t = key(
+        KeyCode::Char('T'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    );
+    assert!(is_terminal_split_key(ctrl_shift_t), "the older split chord");
 }
 
 #[test]

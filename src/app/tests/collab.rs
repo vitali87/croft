@@ -415,7 +415,6 @@ fn splitting_a_live_file_does_not_revert_the_session() {
         g.editor.lines == o.editor.lines
             && g.editor_layout
                 .inactive_groups()
-                .iter()
                 .all(|grp| grp.editors.iter().all(|ed| ed.lines == o.editor.lines))
     });
 }
@@ -812,7 +811,6 @@ fn offline_edits_in_split_panes_all_survive_a_reconnect() {
         g.editor.lines == session_text
             && g.editor_layout
                 .inactive_groups()
-                .iter()
                 .all(|grp| grp.editors.iter().all(|ed| ed.lines == session_text))
     });
 

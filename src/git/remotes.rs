@@ -11,7 +11,7 @@ pub fn push_current_branch(root: &Path) -> Result<String, String> {
     let path_str = root
         .to_str()
         .ok_or_else(|| "non-utf8 workspace path".to_string())?;
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::proc::command("git");
     cmd.args(["-C", path_str, "push"]);
     never_prompt(&mut cmd);
     let output = cmd

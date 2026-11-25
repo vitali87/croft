@@ -141,7 +141,7 @@ impl LspManager {
     }
 
     pub fn drain_inlay_hints(&self) -> Option<InlayHintsUpdate> {
-        self.inlay_rx.try_recv().ok()
+        self.replies.inlay_hints.try_recv().ok()
     }
 
     /// Ask for the document's link set (#254); fire-and-forget on the
@@ -152,7 +152,7 @@ impl LspManager {
     }
 
     pub fn drain_document_links(&self) -> Option<DocumentLinksUpdate> {
-        self.links_rx.try_recv().ok()
+        self.replies.document_links.try_recv().ok()
     }
 
     /// Ask for the document's code lenses (#608); the reply carries `seq`.
@@ -161,7 +161,7 @@ impl LspManager {
     }
 
     pub fn drain_code_lens(&self) -> Option<CodeLensUpdate> {
-        self.code_lens_rx.try_recv().ok()
+        self.replies.code_lens.try_recv().ok()
     }
 
     /// Ask the server for the document's fold spans (#254). Fire-and-forget
@@ -174,7 +174,7 @@ impl LspManager {
     }
 
     pub fn drain_folding_ranges(&self) -> Option<FoldingRangesUpdate> {
-        self.folding_rx.try_recv().ok()
+        self.replies.folding_ranges.try_recv().ok()
     }
 
     /// Ask for the document's color values (#254); same fire-and-forget
@@ -185,7 +185,7 @@ impl LspManager {
     }
 
     pub fn drain_document_colors(&self) -> Option<DocumentColorsUpdate> {
-        self.colors_rx.try_recv().ok()
+        self.replies.document_colors.try_recv().ok()
     }
 
     /// Ask for one color value's alternative spellings (#254); the reply
@@ -207,7 +207,7 @@ impl LspManager {
     }
 
     pub fn drain_color_presentations(&self) -> Option<ColorPresentationsResult> {
-        self.color_presentations_rx.try_recv().ok()
+        self.replies.color_presentations.try_recv().ok()
     }
 
     /// Returns and clears the "a server asked us to re-request inlay hints"

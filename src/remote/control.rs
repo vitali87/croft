@@ -15,9 +15,31 @@ pub struct AdoptedMaster {
 
 /// Close a handed-off control master that nothing will use, ending its ssh
 /// process and removing its socket's directory: an install that could not
-/// start (#2605).
+/// start (#2605), or one that failed (#2610).
+///
+/// Both happen while croft's screen is up, so ssh's streams go nowhere:
+/// inherited, its "Exit request sent." (or, with the master already gone,
+/// "Control socket connect(…)") landed on top of croft's screen (#2715).
+/// Dropping an [`SshControl`] keeps them, for the command-line paths that
+/// run with croft's screen torn down.
 pub fn close_master(a: AdoptedMaster) {
-    drop(SshControl::adopt(a));
+    let _ = exit_request(&a.socket_path, &a.host)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = std::fs::remove_dir_all(&a.socket_dir);
+}
+
+/// `ssh -S <socket> -O exit <host>`: ask the master behind `socket` to end.
+fn exit_request(socket_path: &Path, host: &str) -> Command {
+    let mut ssh = crate::proc::command("ssh");
+    ssh.arg("-S")
+        .arg(socket_path)
+        .arg("-O")
+        .arg("exit")
+        .arg(host);
+    ssh
 }
 
 impl SshControl {
@@ -32,7 +54,7 @@ impl SshControl {
     pub(super) fn start(host: &str) -> Result<Self> {
         let socket_dir = ssh_control_dir()?;
         let socket_path = socket_dir.join("ctl");
-        let status = Command::new("ssh")
+        let status = crate::proc::command("ssh")
             .arg("-M")
             .arg("-S")
             .arg(&socket_path)
@@ -87,14 +109,6 @@ impl SshControl {
     }
 }
 
-pub(super) fn ssh_program() -> OsString {
-    #[cfg(test)]
-    if let Some(p) = TEST_SSH.with(|p| p.borrow().clone()) {
-        return p.into_os_string();
-    }
-    OsString::from("ssh")
-}
-
 /// A background command whose output croft reads: `script` on `host` over
 /// the control socket.
 pub(super) fn ssh_socket_read(socket_path: &Path, host: &str, script: &str) -> Command {
@@ -115,7 +129,7 @@ pub(super) fn ssh_socket_read(socket_path: &Path, host: &str, script: &str) -> C
 /// onto the alt screen. The interactive session is the one caller that must
 /// keep the terminal, so it passes `false`.
 pub(super) fn ssh_socket_command(socket_path: &Path, background: bool) -> Command {
-    let mut command = Command::new(ssh_program());
+    let mut command = crate::proc::command("ssh");
     command
         .arg("-S")
         .arg(socket_path)
@@ -139,13 +153,7 @@ pub(super) fn ssh_socket_command(socket_path: &Path, background: bool) -> Comman
 
 impl Drop for SshControl {
     fn drop(&mut self) {
-        let _ = Command::new("ssh")
-            .arg("-S")
-            .arg(&self.socket_path)
-            .arg("-O")
-            .arg("exit")
-            .arg(&self.host)
-            .status();
+        let _ = exit_request(&self.socket_path, &self.host).status();
         let _ = std::fs::remove_dir_all(&self.socket_dir);
     }
 }
@@ -154,7 +162,7 @@ impl Drop for SshControl {
 /// nested master). Used for the relay inbox bookkeeping (`mkdir`, sentinel
 /// writes). Returns whether it exited zero.
 pub(super) fn ssh_exec(host: &str, socket: &Path, cmd: &str) -> bool {
-    Command::new("ssh")
+    crate::proc::command("ssh")
         .arg("-S")
         .arg(socket)
         .arg("-o")

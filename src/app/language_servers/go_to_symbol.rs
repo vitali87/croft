@@ -2,6 +2,7 @@
 //! its keys, mouse and drawing, and jumping to the chosen symbol.
 
 use super::*;
+use crate::widgets::picker_rows::{PickerMouse, answer_mouse};
 
 impl App {
     /// Open "Go to Symbol in Editor" (Cmd/Ctrl+Shift+O). Snapshots the active
@@ -23,13 +24,13 @@ impl App {
         self.go_to_symbol = Some(crate::widgets::symbol_picker::SymbolPicker::new(
             path, symbols,
         ));
-        self.overlays.command_palette_clear.request();
+        self.overlays.popup_clear.request();
         self.status = format!("Go to Symbol: {count} symbols — Esc to close");
     }
 
     pub(in crate::app) fn close_go_to_symbol(&mut self) {
         if self.go_to_symbol.take().is_some() {
-            self.overlays.command_palette_clear.request();
+            self.overlays.popup_clear.request();
             self.overlays.activity.mark_dirty();
             self.overlays.welcome.mark_dirty();
             self.overlays.hero.mark_dirty();
@@ -103,31 +104,10 @@ impl App {
         let Some(picker) = self.go_to_symbol.as_mut() else {
             return;
         };
-        let inside = rect_contains(picker.last_rect, m.column, m.row);
-        match m.kind {
-            MouseEventKind::ScrollDown => {
-                for _ in 0..3 {
-                    picker.select_next();
-                }
-            }
-            MouseEventKind::ScrollUp => {
-                for _ in 0..3 {
-                    picker.select_prev();
-                }
-            }
-            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
-                if !inside =>
-            {
-                self.close_go_to_symbol();
-            }
-            // Click a row to jump to it, the way VS Code's quick-pick behaves.
-            MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(idx) = picker.row_index_at(m.row) {
-                    picker.selected = idx;
-                    self.jump_to_go_to_symbol_selection();
-                }
-            }
-            _ => {}
+        match answer_mouse(picker, m) {
+            PickerMouse::Close => self.close_go_to_symbol(),
+            PickerMouse::Accept => self.jump_to_go_to_symbol_selection(),
+            PickerMouse::Stay => {}
         }
     }
 
