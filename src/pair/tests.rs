@@ -526,24 +526,25 @@ fn join_teardowns_reaps_a_dropped_hosts_child() {
         return;
     }
     let harness = OwnerHarness::start("hello world");
-    let marker = format!("croft-teardown-{}", std::process::id());
     let mut cmd = std::process::Command::new("python3");
-    cmd.arg("-c")
-        .arg("import time; time.sleep(120)")
-        .arg(&marker);
+    cmd.arg("-c").arg("import time; time.sleep(120)");
     let host = crate::pair_host::PairHost::spawn_cmd(&harness.socket, "nav", None, cmd).unwrap();
-    let alive = |m: &str| {
-        std::process::Command::new("pgrep")
-            .args(["-f", m])
-            .output()
-            .map(|o| !o.stdout.is_empty())
-            .unwrap_or(false)
-    };
-    assert!(alive(&marker), "the sleeper child must be running");
+    // Checked by process id, not by `pgrep -f` on a marker in the command
+    // line: for a moment after spawn returns, the kernel is still putting
+    // the new program's arguments in place, and a busy machine can stretch
+    // that moment past pgrep's start-up, so pgrep missed a running child
+    // (#2725). `kill(pid, 0)` answers from the moment the process exists
+    // until it is reaped.
+    let pid = host
+        .child_id_for_tests()
+        .expect("a claude seat has a child") as libc::pid_t;
+    // SAFETY: signal 0 only checks that `pid` exists; nothing is sent.
+    let exists = |pid| unsafe { libc::kill(pid, 0) } == 0;
+    assert!(exists(pid), "the sleeper child must be running");
     drop(host);
     crate::pair_host::join_teardowns();
     assert!(
-        !alive(&marker),
+        !exists(pid),
         "after join_teardowns the dropped host's child must be reaped"
     );
 }
