@@ -44,6 +44,31 @@ fn busy_fake_ssh(dir: &Path, home: &Path, hold: std::time::Duration) {
     crate::proc::stand_in("ssh", shim);
 }
 
+/// #2715: closing a connection nothing will use happens while croft's
+/// screen is up (a failed or unstarted install), so ssh's own words go
+/// nowhere. Inherited, its "Exit request sent." landed on top of the screen.
+#[cfg(target_os = "linux")]
+#[test]
+fn closing_an_unused_connection_prints_nothing_over_croft() {
+    let bin = tempfile::tempdir().unwrap();
+    let ssh = crate::proc::record_runs(bin.path(), "ssh");
+    let socket_dir = bin.path().join("socket");
+    std::fs::create_dir(&socket_dir).unwrap();
+    close_master(AdoptedMaster {
+        host: String::from("box"),
+        socket_dir: socket_dir.clone(),
+        socket_path: socket_dir.join("ctl"),
+    });
+    assert_eq!(
+        ssh.lines(),
+        [format!(
+            "-S {}/ctl -O exit box | stdin /dev/null | stdout /dev/null | stderr /dev/null",
+            socket_dir.display()
+        )]
+    );
+    assert!(!socket_dir.exists(), "the socket's directory is removed");
+}
+
 #[cfg(unix)]
 #[test]
 fn the_config_hash_read_sees_the_remotes_files() {
