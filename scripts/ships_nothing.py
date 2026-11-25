@@ -655,7 +655,14 @@ def module_loaders(rev, cwd=None):
 
 @functools.lru_cache(maxsize=None)
 def _module_loaders(commit, cwd):
-    tree = set(git("ls-tree", "-r", "-z", "--name-only", commit, cwd=cwd).split("\0")) - {""}
+    tree, links = set(), set()
+    for entry in git("ls-tree", "-r", "-z", commit, cwd=cwd).split("\0"):
+        if not entry:
+            continue
+        meta, name = entry.split("\t", 1)
+        tree.add(name)
+        if meta.split(" ", 1)[0] == "120000":
+            links.add(name)
     roots = [p for p in ("src/main.rs", "src/lib.rs", "build.rs") if p in tree]
     roots += [p for p in tree if re.fullmatch(r"src/bin/[^/]+\.rs|src/bin/[^/]+/main\.rs", p)]
     roots += _cargo_roots(commit, cwd)
@@ -671,6 +678,13 @@ def _module_loaders(commit, cwd):
     while paths:
         read.update(paths)
         for path, text in zip(paths, _blobs(commit, paths, cwd)):
+            if path in links:
+                # A symlink's blob is the path it points to, not the code
+                # rustc reads through it: what that code loads is unknown.
+                roots.append(None)
+                names.append(None)
+                declares[path] = True
+                continue
             try:
                 toks = rust_tokens(text)
                 more_roots, more_folders, more_names, more_pasted = _loaders_in(path, toks)

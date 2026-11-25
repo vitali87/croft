@@ -1044,6 +1044,25 @@ class TestOnlyModules(unittest.TestCase):
             )
         )
 
+    def test_code_pasted_in_through_a_symlink_ships(self):
+        """#2723 review: git stores a symlink as the path it points to, so
+        reading its blob as Rust misses what the code behind it embeds
+        (here `actual.inc` reads `helper.rs`). A link counts as unknown."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            (repo.path / "src").mkdir()
+            (repo.path / "src/main.rs").write_text(
+                '#[cfg(test)]\nmod helper;\ninclude!("generated.rs");\nfn main() {}\n'
+            )
+            (repo.path / "src/actual.inc").write_text('const S: &str = include_str!("helper.rs");\n')
+            (repo.path / "src/helper.rs").write_text("pub fn f() -> u8 {\n    1\n}\n")
+            (repo.path / "src/generated.rs").symlink_to("actual.inc")
+            run(repo.path, "git", "add", "-A")
+            run(repo.path, "git", "commit", "-q", "-m", "base")
+            run(repo.path, "git", "checkout", "-q", "-b", "change")
+            self.change(repo, {"src/helper.rs": "pub fn f() -> u8 {\n    2\n}\n"})
+            self.assertFalse(repo.verdict("src/helper.rs"))
+
     def test_pasted_code_that_declares_a_module_ships(self):
         """Pasted code can declare `mod helper;` for the release build, and
         the declaration check reads only the file it is pasted into."""
