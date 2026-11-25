@@ -451,10 +451,12 @@ def _included_name(arg):
 
 
 def _resolved(folder, value):
-    """`value`, a `#[path]` relative to `folder`, as a path in the
-    repository; None when it is unreadable, absolute or leaves the
-    repository."""
-    if value is None or value.startswith("/"):
+    """`value`, a `#[path]` or an `include!` relative to `folder`, as a path
+    in the repository; None when it is unreadable, absolute, leaves the
+    repository or steps up a folder. A `..` after a symlinked folder leaves
+    from the link's target, not from the folder the path names, so the file
+    it reaches cannot be told from the path alone (#2723 review)."""
+    if value is None or value.startswith("/") or ".." in value.split("/"):
         return None
     target = posixpath.normpath(posixpath.join(folder, value))
     if target == ".." or target.startswith("../"):

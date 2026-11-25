@@ -1063,6 +1063,22 @@ class TestOnlyModules(unittest.TestCase):
             self.change(repo, {"src/helper.rs": "pub fn f() -> u8 {\n    2\n}\n"})
             self.assertFalse(repo.verdict("src/helper.rs"))
 
+    def test_code_pasted_in_up_a_folder_ships(self):
+        """#2723 review: through a symlinked folder, `link/../generated.rs`
+        reads beside the link's target, not `src/generated.rs`. A path that
+        steps up a folder counts as unknown."""
+        self.assertFalse(
+            self.shipped_by(
+                {
+                    "src/main.rs": (
+                        '#[cfg(test)]\nmod helper;\ninclude!("link/../generated.rs");\n'
+                        "fn main() {}\n"
+                    ),
+                    "src/generated.rs": "const X: u8 = 1;\n",
+                }
+            )
+        )
+
     def test_pasted_code_that_declares_a_module_ships(self):
         """Pasted code can declare `mod helper;` for the release build, and
         the declaration check reads only the file it is pasted into."""
