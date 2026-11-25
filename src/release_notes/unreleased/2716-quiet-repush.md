@@ -1,1 +1,0 @@
-fix: During a remote session, re-pushing a config file you edit locally no longer lets rsync print over the remote croft's screen; the push logs to `config-sync.log` only, as it always meant to (#2716).
