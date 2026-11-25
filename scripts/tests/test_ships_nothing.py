@@ -1002,6 +1002,62 @@ class TestOnlyModules(unittest.TestCase):
             )
         )
 
+    def test_code_pasted_in_from_a_file_in_the_tree_is_read(self):
+        """#2722: `include!("generated.rs")` names the file it pastes in.
+        That file declares no module and reads no file, as the vendored
+        async-lsp's `omni_trait_generated.rs` does, so the test-only helper
+        still ships nothing. Before, any `include!` made every file ship."""
+        self.assertTrue(
+            self.shipped_by(
+                {
+                    "src/main.rs": (
+                        '#[cfg(test)]\nmod helper;\ninclude!("generated.rs");\nfn main() {}\n'
+                    ),
+                    "src/generated.rs": "const X: u8 = 1;\n",
+                }
+            )
+        )
+
+    def test_a_vendored_crates_include_leaves_the_exemption(self):
+        """#2722: the shape on `main`: a vendored crate pastes in a file
+        beside it with `include!("./x.rs")`."""
+        self.assertTrue(
+            self.shipped_by(
+                {
+                    "src/main.rs": "#[cfg(test)]\nmod helper;\nfn main() {}\n",
+                    "vendor/dep/src/lib.rs": 'include!("./generated.rs");\n',
+                    "vendor/dep/src/generated.rs": "pub fn g() {}\n",
+                }
+            )
+        )
+
+    def test_pasted_code_that_declares_a_module_ships(self):
+        """Pasted code can declare `mod helper;` for the release build, and
+        the declaration check reads only the file it is pasted into."""
+        self.assertFalse(
+            self.shipped_by(
+                {
+                    "src/main.rs": (
+                        '#[cfg(test)]\nmod helper;\ninclude!("decls.rs");\nfn main() {}\n'
+                    ),
+                    "src/decls.rs": "pub mod other;\n",
+                }
+            )
+        )
+
+    def test_code_pasted_in_from_a_file_not_in_the_tree_ships(self):
+        """A file the build generates is not in the tree: what it holds is
+        unknown."""
+        self.assertFalse(
+            self.shipped_by(
+                {
+                    "src/main.rs": (
+                        '#[cfg(test)]\nmod helper;\ninclude!("generated.rs");\nfn main() {}\n'
+                    )
+                }
+            )
+        )
+
     def test_a_renamed_include_macro_ships(self):
         """After `use std::include_str as text;`, `text!("helper.rs")` reads
         the file under a name this does not know."""
