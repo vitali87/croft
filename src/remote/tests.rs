@@ -4,19 +4,21 @@
 /// host, then runs the remote command locally with `home` as `$HOME`.
 #[cfg(unix)]
 fn fake_ssh(dir: &Path, home: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let shim = dir.join("ssh");
-    std::fs::write(&shim, fake_ssh_script(home)).unwrap();
-    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
-    crate::proc::stand_in("ssh", shim);
+    crate::proc::stand_in_script(dir, "ssh", &fake_ssh_body(home));
 }
 
 /// [`fake_ssh`]'s script: drop ssh's own flags and the host, then run the
 /// remote command with `home` as `$HOME`.
 #[cfg(unix)]
 fn fake_ssh_script(home: &Path) -> String {
+    format!("#!/bin/sh\n{}", fake_ssh_body(home))
+}
+
+/// [`fake_ssh_script`] after its `#!` line.
+#[cfg(unix)]
+fn fake_ssh_body(home: &Path) -> String {
     format!(
-        "#!/bin/sh\nwhile [ $# -gt 0 ]; do case \"$1\" in -S|-o) shift 2;; -*) shift;; *) break;; esac; done\nshift\nHOME='{}' exec sh -c \"$*\"\n",
+        "while [ $# -gt 0 ]; do case \"$1\" in -S|-o) shift 2;; -*) shift;; *) break;; esac; done\nshift\nHOME='{}' exec sh -c \"$*\"\n",
         home.display()
     )
 }
@@ -42,6 +44,38 @@ fn busy_fake_ssh(dir: &Path, home: &Path, hold: std::time::Duration) {
         drop(f);
     });
     crate::proc::stand_in("ssh", shim);
+}
+
+/// #2716: the live re-push logs, and never touches the terminal, which
+/// belongs to the remote croft. The rsync that ships each file inherited it,
+/// so whatever rsync or its ssh printed landed on the remote croft's screen,
+/// and rsync's stdin was the keyboard the remote session reads.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_live_repush_ships_a_file_without_touching_the_terminal() {
+    let bin = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    fake_ssh(bin.path(), home.path());
+    let rsync = crate::proc::record_runs(bin.path(), "rsync");
+    let local = bin.path().join("keybindings.json");
+    std::fs::write(&local, "[]\n").unwrap();
+    let keybindings = *crate::config_sync::SYNCABLE
+        .iter()
+        .find(|s| s.name == "keybindings.json")
+        .unwrap();
+    let result = push_over_bulk_lane(
+        "box",
+        &bin.path().join("ctl"),
+        &[(keybindings, local)],
+        &bin.path().join("config-sync.json"),
+    );
+    assert!(result.failed.is_empty(), "{:?}", result.failed);
+    let runs = rsync.lines();
+    assert_eq!(runs.len(), 1, "one file, one rsync: {runs:?}");
+    assert!(
+        runs[0].ends_with("| stdin /dev/null | stdout /dev/null | stderr /dev/null"),
+        "{runs:?}"
+    );
 }
 
 /// #2715: closing a connection nothing will use happens while croft's
