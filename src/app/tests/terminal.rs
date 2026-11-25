@@ -836,6 +836,96 @@ fn cmd_opt_up_parks_the_previous_prompt_mark_at_the_viewport_top() {
     );
 }
 
+/// #2726: Cmd+Opt+Down works out its jump from the marks and the view as
+/// they stand at one moment. It read them one after the other, so a line
+/// printed in between (a build still running) moved the view but not the
+/// marks already read: the mark at the view's top then looked like a next
+/// one, the key said nothing and parked the view lines below the mark.
+#[test]
+fn cmd_opt_down_at_the_last_mark_stays_put_while_output_streams() {
+    use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+
+    /// Lines the writer may print in all, well inside the 5,000-line
+    /// scrollback, so the mark never rotates out of history.
+    const STREAMED_MAX: usize = 2000;
+    const PRESSES: usize = 50;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // A pane whose program prints nothing: every line is the test's own.
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sleep",
+        &[String::from("60")],
+        tmp.path(),
+    )
+    .unwrap();
+    let grid = app.terminals[0].grid_lock_for_test();
+    let paint = |bytes: &[u8]| Processor::<StdSyncHandler>::new().advance(&mut *grid.lock(), bytes);
+    app.terminals[0].push_mark_for_test(crate::shell_integration::OscEvent::PromptStart, 0);
+    paint(b"PROMPT\r\n");
+    for i in 0..40 {
+        paint(format!("filler-{i}\r\n").as_bytes());
+    }
+    app.focus_pane(Pane::Terminal);
+    // Park the view's top on the only mark while nothing prints.
+    app.handle_terminal_key(key(KeyCode::Up, KeyModifiers::SUPER | KeyModifiers::ALT));
+    let mark = app.terminal().prompt_lines()[0];
+    assert!(mark < 0, "the mark scrolled into history");
+    assert_eq!(app.terminal().viewport_top_line(), mark);
+
+    // A writer that prints line after line while armed. The pane's lock
+    // serves waiters in turn, so a press that lets go of it part-way lets
+    // the writer's next line in before it looks again.
+    let armed = Arc::new(AtomicBool::new(false));
+    let idle = Arc::new(AtomicBool::new(true));
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (grid, armed, idle, stop) = (grid.clone(), armed.clone(), idle.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut p = Processor::<StdSyncHandler>::new();
+            let mut n = 0;
+            while !stop.load(SeqCst) {
+                if armed.load(SeqCst) && n < STREAMED_MAX {
+                    p.advance(&mut *grid.lock(), format!("streamed-{n}\r\n").as_bytes());
+                    n += 1;
+                } else {
+                    idle.store(true, SeqCst);
+                    std::thread::yield_now();
+                }
+            }
+        })
+    };
+
+    let mut failure = None;
+    for press in 0..PRESSES {
+        app.status.clear();
+        armed.store(true, SeqCst);
+        app.handle_terminal_key(key(KeyCode::Down, KeyModifiers::SUPER | KeyModifiers::ALT));
+        // Quiet the writer before looking, so the checks see one moment.
+        armed.store(false, SeqCst);
+        idle.store(false, SeqCst);
+        while !idle.load(SeqCst) {
+            std::thread::yield_now();
+        }
+        let mark = app.terminal().prompt_lines()[0];
+        let top = app.terminal().viewport_top_line();
+        if !app.status.contains("No next command") || top != mark {
+            failure = Some(format!(
+                "press {press}: status {:?}, view top {top}, mark {mark}",
+                app.status
+            ));
+            break;
+        }
+    }
+    stop.store(true, SeqCst);
+    writer.join().unwrap();
+    if let Some(failure) = failure {
+        panic!("Cmd+Opt+Down at the last mark must say so and stay put: {failure}");
+    }
+}
+
 #[test]
 fn ctrl_shift_space_quick_select_labels_matches_and_a_label_commits() {
     let tmp = tempfile::tempdir().unwrap();
