@@ -221,9 +221,9 @@ pub(super) fn pick_prompt_jump(
 }
 
 impl PtyTerminal {
-    /// OSC 133 marks with their *current* grid line (negative = scrollback),
-    /// oldest first. Marks whose content scrolled past the scrollback floor
-    /// are garbage-collected here.
+    /// Test-only: the OSC 133 marks with their *current* grid line, as
+    /// [`Self::marks_snapshot`] reads them.
+    #[cfg(test)]
     pub fn command_marks(&self) -> Vec<(crate::shell_integration::OscEvent, i32)> {
         self.marks_snapshot()
             .into_iter()
@@ -231,8 +231,10 @@ impl PtyTerminal {
             .collect()
     }
 
-    /// The marks with current grid lines and, for `CommandEnd`, the measured
-    /// command duration. GC + drift adjustment as in [`Self::command_marks`].
+    /// The OSC 133 marks with their *current* grid line (negative =
+    /// scrollback), oldest first, and for `CommandEnd` the measured command
+    /// duration. Marks whose content scrolled past the scrollback floor are
+    /// garbage-collected here.
     pub(super) fn marks_snapshot(&self) -> Vec<MarkView> {
         self.marks_snapshot_locked(&mut self.term.lock())
     }
@@ -370,8 +372,9 @@ impl PtyTerminal {
             .find(|d| d.line == line)
     }
 
-    /// Current grid lines of the PromptStart marks — the Cmd+Up/Cmd+Down
-    /// navigation targets.
+    /// Test-only: current grid lines of the PromptStart marks, the targets
+    /// of [`Self::jump_to_prompt`].
+    #[cfg(test)]
     pub fn prompt_lines(&self) -> Vec<i32> {
         self.command_marks()
             .into_iter()

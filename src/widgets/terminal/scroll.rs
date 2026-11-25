@@ -31,7 +31,9 @@ impl PtyTerminal {
         self.pty_dirty.store(true, Ordering::Release);
     }
 
-    /// The viewport-top grid line: what a prompt jump navigates from.
+    /// Test-only: the viewport-top grid line, what a prompt jump navigates
+    /// from.
+    #[cfg(test)]
     pub fn viewport_top_line(&self) -> i32 {
         -(self.term.lock().grid().display_offset() as i32)
     }
