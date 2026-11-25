@@ -821,20 +821,14 @@ impl App {
     /// Cmd+Opt+Up / Cmd+Opt+Down in the terminal: scroll the previous / next
     /// OSC 133 prompt mark to the top of the pane.
     pub(super) fn terminal_prompt_jump(&mut self, forward: bool) {
-        let prompts = self.terminal().prompt_lines();
-        let top = self.terminal().viewport_top_line();
-        let Some(target) = crate::widgets::terminal::pick_prompt_jump(&prompts, top, forward)
-        else {
-            self.status = String::from(if prompts.is_empty() {
-                "No command marks yet (shell integration needs a zsh prompt)"
-            } else if forward {
-                "No next command"
-            } else {
-                "No previous command"
-            });
-            return;
+        use crate::widgets::terminal::PromptJump;
+        let message = match self.terminal_mut().jump_to_prompt(forward) {
+            PromptJump::Jumped => return,
+            PromptJump::NoMarks => "No command marks yet (shell integration needs a zsh prompt)",
+            PromptJump::NoneThatWay if forward => "No next command",
+            PromptJump::NoneThatWay => "No previous command",
         };
-        self.terminal_mut().scroll_line_to_top(target);
+        self.status = String::from(message);
     }
 
     /// The most recent finished command in the active pane, for the

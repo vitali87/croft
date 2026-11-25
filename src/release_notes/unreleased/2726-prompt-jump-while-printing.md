@@ -1,0 +1,1 @@
+fix: Cmd+Opt+Up and Cmd+Opt+Down in the terminal now land exactly on the previous or next command while output is still printing. Before, a line arriving mid-press could leave the view a few lines off the command, or make Cmd+Opt+Down at the last command show no message (#2726).
