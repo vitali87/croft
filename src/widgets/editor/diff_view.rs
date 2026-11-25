@@ -1714,18 +1714,16 @@ impl Editor {
             return false;
         };
         let replacement = crate::merge::resolution_lines(&self.lines, &block, res);
-        self.pin_on_edit();
-        self.push_undo(EditKind::Replace);
-        self.clear_selection();
-        self.lines
-            .splice(block.ours_start..=block.theirs_end, replacement);
-        if self.lines.is_empty() {
-            self.lines.push(String::new());
-        }
-        self.cursor_row = block.ours_start.min(self.lines.len() - 1);
-        self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
-        self.mark_buffer_changed();
-        self.recompute_highlights();
+        self.undoable_edit(EditKind::Replace, |this| {
+            this.clear_selection();
+            this.lines
+                .splice(block.ours_start..=block.theirs_end, replacement);
+            if this.lines.is_empty() {
+                this.lines.push(String::new());
+            }
+            this.cursor_row = block.ours_start.min(this.lines.len() - 1);
+            this.cursor_col = this.cursor_col.min(this.line_char_len(this.cursor_row));
+        });
         true
     }
 
@@ -1737,17 +1735,15 @@ impl Editor {
     pub fn splice_result_rows(&mut self, start: usize, end: usize, replacement: Vec<String>) {
         let start = start.min(self.lines.len());
         let end = end.clamp(start, self.lines.len());
-        self.pin_on_edit();
-        self.push_undo(EditKind::Replace);
-        self.clear_selection();
-        self.lines.splice(start..end, replacement);
-        if self.lines.is_empty() {
-            self.lines.push(String::new());
-        }
-        self.cursor_row = start.min(self.lines.len() - 1);
-        self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
-        self.mark_buffer_changed();
-        self.recompute_highlights();
+        self.undoable_edit(EditKind::Replace, |this| {
+            this.clear_selection();
+            this.lines.splice(start..end, replacement);
+            if this.lines.is_empty() {
+                this.lines.push(String::new());
+            }
+            this.cursor_row = start.min(this.lines.len() - 1);
+            this.cursor_col = this.cursor_col.min(this.line_char_len(this.cursor_row));
+        });
     }
 
     /// A read-only view of `path` as it was at some commit (#371): `text` is

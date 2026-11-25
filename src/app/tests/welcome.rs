@@ -1427,8 +1427,9 @@ fn the_whole_tour_takes_enter_only_and_leaves_nothing_behind() {
             {
                 opened.push(path);
             }
-            let dirty: Vec<_> = std::iter::once(&app.editor)
-                .chain(app.editor_layout.inactive_groups())
+            let dirty: Vec<_> = app
+                .editor_layout
+                .all_groups(&app.editor)
                 .flat_map(|g| g.editors.iter())
                 .filter(|e| e.dirty)
                 .filter_map(|e| e.path.clone())
@@ -1455,8 +1456,9 @@ fn the_whole_tour_takes_enter_only_and_leaves_nothing_behind() {
         );
         assert!(!scratch.exists(), "the sample project is gone");
         assert_eq!(app.workspace_root(), tmp.path());
-        let left: Vec<_> = std::iter::once(&app.editor)
-            .chain(app.editor_layout.inactive_groups())
+        let left: Vec<_> = app
+            .editor_layout
+            .all_groups(&app.editor)
             .flat_map(|g| g.editors.iter())
             .filter_map(|e| e.path.clone())
             .filter(|p| p.starts_with(&scratch))
@@ -1565,8 +1567,9 @@ fn leaving_the_tour_closes_the_samples_tabs_even_edited_ones() {
             .unwrap();
         assert!(app.tour.is_none());
         assert!(!scratch.exists());
-        let left: Vec<_> = std::iter::once(&app.editor)
-            .chain(app.editor_layout.inactive_groups())
+        let left: Vec<_> = app
+            .editor_layout
+            .all_groups(&app.editor)
             .flat_map(|g| g.editors.iter())
             .filter_map(|e| e.path.clone())
             .filter(|p| p.starts_with(&scratch))

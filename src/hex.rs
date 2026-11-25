@@ -104,6 +104,12 @@ pub struct HexView {
     /// Filesystem write permission, probed at open/refresh: typing into
     /// a read-only file refuses up front instead of failing at save.
     pub read_only: bool,
+    /// Why the file opened here instead of in the viewer its kind gets,
+    /// when that viewer declined it (#2711): an archive past its listing
+    /// cap, a gzip past its decompressed cap. Kept with the view, so every
+    /// way back to this tab can still say why, whatever the status line
+    /// has said since.
+    pub routed_because: Option<String>,
     undo: Vec<(u64, Option<u8>)>,
     redo: Vec<(u64, Option<u8>)>,
     window_start: u64,
@@ -129,6 +135,7 @@ impl HexView {
             pending_nibble: None,
             ascii_focus: false,
             read_only,
+            routed_because: None,
             undo: Vec::new(),
             redo: Vec::new(),
             window_start: 0,

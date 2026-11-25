@@ -488,12 +488,20 @@ pub fn inline_image_protocol_in(
 
 /// The inline-image protocol this croft writes with, from the terminal's
 /// environment: `TERM_PROGRAM`, `TERM` and `CROFT_INLINE_IMAGES`, then
-/// `CROFT_FORCE_INLINE_IMAGES` for a terminal that advertises none.
+/// `CROFT_FORCE_INLINE_IMAGES` for a terminal that advertises none. Read
+/// once per process: croft sets none of them while it runs, and frames ask
+/// for this many times a second.
 pub fn detect_inline_image_protocol() -> InlineImageProtocol {
     #[cfg(test)]
     if PLAIN_HOST_FRAMES.with(std::cell::Cell::get) {
         return InlineImageProtocol::None;
     }
+    static PROTOCOL: std::sync::OnceLock<InlineImageProtocol> = std::sync::OnceLock::new();
+    *PROTOCOL.get_or_init(read_inline_image_protocol)
+}
+
+/// [`detect_inline_image_protocol`]'s answer, read from the environment.
+fn read_inline_image_protocol() -> InlineImageProtocol {
     let term_program = std::env::var("TERM_PROGRAM").ok();
     let term = std::env::var("TERM").ok();
     let protocol = inline_image_protocol_in(
@@ -717,11 +725,19 @@ pub fn is_tmux_env(term: Option<&str>, tmux_var: Option<&str>) -> bool {
 /// background: iTerm2 or WezTerm by `TERM_PROGRAM`, or any terminal with
 /// `CROFT_FORCE_INLINE_IMAGES` set. Under it a frame leaves the canvas to
 /// the session background instead of painting it.
+/// Read once per process, as [`detect_inline_image_protocol`] is.
 pub fn detect_iterm2_inline_support() -> bool {
     #[cfg(test)]
     if PLAIN_HOST_FRAMES.with(std::cell::Cell::get) {
         return false;
     }
+    static SUPPORT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORT.get_or_init(read_iterm2_inline_support)
+}
+
+/// [`detect_iterm2_inline_support`]'s answer, read from the environment
+/// once per process, as [`detect_inline_image_protocol`] is.
+fn read_iterm2_inline_support() -> bool {
     if force_inline_images(std::env::var("CROFT_FORCE_INLINE_IMAGES").ok().as_deref()) {
         return true;
     }
@@ -746,10 +762,18 @@ thread_local! {
     pub static PLAIN_HOST_FRAMES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Whether croft runs inside tmux (or GNU screen), which must be told to pass
+/// a picture through to the terminal around it. Read from the environment the
+/// first time it is asked and kept (#2062): croft never changes `TERM` or
+/// `TMUX` while it runs, so every later answer would be the same, and the
+/// pictures built on background threads get the same answer as the rest.
 pub fn detect_tmux() -> bool {
-    let term = std::env::var("TERM").ok();
-    let tmux = std::env::var("TMUX").ok();
-    is_tmux_env(term.as_deref(), tmux.as_deref())
+    static INSIDE_TMUX: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *INSIDE_TMUX.get_or_init(|| {
+        let term = std::env::var("TERM").ok();
+        let tmux = std::env::var("TMUX").ok();
+        is_tmux_env(term.as_deref(), tmux.as_deref())
+    })
 }
 
 /// Bake an opaque PNG that exactly fills `(canvas_w_px, canvas_h_px)`. The
@@ -1438,6 +1462,29 @@ mod tests {
         assert!(!is_iterm2_term_program(None));
     }
 
+    /// The answers kept for the process are the environment's: each read
+    /// again from it gives the same, on this thread and another.
+    #[test]
+    fn the_kept_answers_are_the_environments() {
+        let kept = (
+            detect_inline_image_protocol(),
+            detect_iterm2_inline_support(),
+        );
+        assert_eq!(
+            kept,
+            (read_inline_image_protocol(), read_iterm2_inline_support())
+        );
+        let other = std::thread::spawn(|| {
+            (
+                detect_inline_image_protocol(),
+                detect_iterm2_inline_support(),
+            )
+        })
+        .join()
+        .unwrap();
+        assert_eq!(other, kept);
+    }
+
     /// A thread drawing as a plain terminal gets no image protocol and no
     /// iTerm2 session background, whatever the environment says, and the
     /// switch is its own: another thread still reads the environment.
@@ -1496,6 +1543,18 @@ mod tests {
     #[test]
     fn screen_term_is_tmux_like() {
         assert!(is_tmux_env(Some("screen-256color"), None));
+    }
+
+    /// #2062: the tmux answer is the environment's, and the same each time it
+    /// is asked, so pictures built anywhere in croft are wrapped alike.
+    #[test]
+    fn the_tmux_answer_is_the_environments_every_time() {
+        let from_env = is_tmux_env(
+            std::env::var("TERM").ok().as_deref(),
+            std::env::var("TMUX").ok().as_deref(),
+        );
+        assert_eq!(detect_tmux(), from_env);
+        assert_eq!(detect_tmux(), from_env);
     }
 
     #[test]

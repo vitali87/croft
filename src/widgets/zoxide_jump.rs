@@ -19,6 +19,8 @@ use ratatui::{
 };
 use std::path::{Path, PathBuf};
 
+use crate::widgets::picker_colours;
+use crate::widgets::picker_query;
 use crate::zoxide::InstallState;
 
 pub struct ZoxideJump {
@@ -133,18 +135,6 @@ impl ZoxideJump {
         Self::default()
     }
 
-    fn char_count(&self) -> usize {
-        self.query.chars().count()
-    }
-
-    fn byte_offset(&self, char_idx: usize) -> usize {
-        self.query
-            .char_indices()
-            .nth(char_idx)
-            .map(|(b, _)| b)
-            .unwrap_or(self.query.len())
-    }
-
     /// Whether the popup is asking `[y/N]` rather than taking a query: the
     /// install offer when zoxide is missing, or the hook offer (#926).
     pub fn asks_yes_no(&self) -> bool {
@@ -197,34 +187,23 @@ impl ZoxideJump {
     }
 
     pub fn push_char(&mut self, c: char) {
-        let at = self.byte_offset(self.cursor);
-        self.query.insert(at, c);
-        self.cursor += 1;
+        picker_query::insert(&mut self.query, &mut self.cursor, c);
     }
 
     pub fn pop_char(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let at = self.byte_offset(self.cursor - 1);
-        self.query.remove(at);
-        self.cursor -= 1;
+        picker_query::backspace(&mut self.query, &mut self.cursor);
     }
 
     pub fn delete_char(&mut self) {
-        if self.cursor >= self.char_count() {
-            return;
-        }
-        let at = self.byte_offset(self.cursor);
-        self.query.remove(at);
+        picker_query::delete(&mut self.query, self.cursor);
     }
 
     pub fn move_cursor_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
+        picker_query::left(&mut self.cursor);
     }
 
     pub fn move_cursor_right(&mut self) {
-        self.cursor = (self.cursor + 1).min(self.char_count());
+        picker_query::right(&self.query, &mut self.cursor);
     }
 
     pub fn move_cursor_home(&mut self) {
@@ -232,7 +211,7 @@ impl ZoxideJump {
     }
 
     pub fn move_cursor_end(&mut self) {
-        self.cursor = self.char_count();
+        picker_query::end(&self.query, &mut self.cursor);
     }
 
     pub fn select_next(&mut self) {
@@ -323,9 +302,9 @@ pub fn render_zoxide_jump(
     );
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))))
+        .border_style(Style::default().fg(theme.ui(picker_colours::BORDER)))
         .title(title.clone())
-        .style(Style::default().bg(theme.ui(Color::Rgb(0x16, 0x18, 0x1f))));
+        .style(Style::default().bg(theme.ui(picker_colours::BODY)));
     let inner = Rect {
         x: rect.x + 1,
         y: rect.y + 1,
@@ -342,7 +321,7 @@ pub fn render_zoxide_jump(
         let (r, g, b) = crate::gradient::POPUP_SEL_BG;
         Color::Rgb(r, g, b)
     } else {
-        theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e))
+        theme.ui(picker_colours::SELECTION)
     };
     let tones = crate::widgets::surface::tones(theme);
 
@@ -351,11 +330,11 @@ pub fn render_zoxide_jump(
     }
 
     let query_style = Style::default()
-        .fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
+        .fg(theme.ui(picker_colours::TEXT))
         .add_modifier(Modifier::BOLD);
     let caret_style = Style::default()
-        .fg(theme.ui(Color::Rgb(0x16, 0x18, 0x1f)))
-        .bg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
+        .fg(theme.ui(picker_colours::BODY))
+        .bg(theme.ui(picker_colours::TEXT))
         .add_modifier(Modifier::SLOW_BLINK);
     let cursor = jump.cursor.min(jump.query.chars().count());
     let before: String = jump.query.chars().take(cursor).collect();
@@ -363,10 +342,7 @@ pub fn render_zoxide_jump(
     let after: String = jump.query.chars().skip(cursor + 1).collect();
     let caret_glyph = if at.is_empty() { String::from(" ") } else { at };
     let prompt_line = Line::from(vec![
-        Span::styled(
-            "> ",
-            Style::default().fg(theme.ui(Color::Rgb(0x88, 0xc0, 0xd0))),
-        ),
+        Span::styled("> ", Style::default().fg(theme.ui(picker_colours::PROMPT))),
         Span::styled(before, query_style),
         Span::styled(caret_glyph, caret_style),
         Span::styled(after, query_style),
@@ -469,12 +445,12 @@ pub fn render_zoxide_jump(
         let empty = if jump.query.trim().is_empty() {
             Line::from(Span::styled(
                 "  (no directories in the zoxide database yet)",
-                Style::default().fg(theme.ui(Color::Rgb(0x7a, 0x82, 0x90))),
+                Style::default().fg(theme.ui(picker_colours::DIM)),
             ))
         } else {
             Line::from(Span::styled(
                 format!("  No matches for '{}'", jump.query),
-                Style::default().fg(theme.ui(Color::Rgb(0x7a, 0x82, 0x90))),
+                Style::default().fg(theme.ui(picker_colours::DIM)),
             ))
         };
         Widget::render(Paragraph::new(empty), list_rect, buf);
@@ -489,7 +465,7 @@ pub fn render_zoxide_jump(
         let row_style = match tones {
             Some(t) => Style::default().fg(if is_selected { t.strong() } else { t.text() }),
             None if is_selected => Style::default().bg(sel_bg).fg(theme.ui(Color::White)),
-            None => Style::default().fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4))),
+            None => Style::default().fg(theme.ui(picker_colours::TEXT)),
         };
         let prefix = if is_selected && tones.is_none() {
             "> "

@@ -1,0 +1,689 @@
+# Every git call the git module makes: src/git/recorded_calls.rs. Rewrite with CROFT_BLESS=1 after a change meant to move one.
+## repo_toplevel
+git -C <repo>/dir rev-parse --show-toplevel
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## status::query
+git -C <repo> rev-parse --show-toplevel
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> symbolic-ref --short HEAD
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> status --porcelain -z --untracked-files=all
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr nowhere | croft's session
+git -C <repo> rev-parse --show-prefix
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> rev-parse --symbolic-full-name @{u}
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> rev-list --left-right --count HEAD...@{u}
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> rev-parse HEAD
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> rev-parse --git-path MERGE_MSG --git-path SQUASH_MSG
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> config --path commit.template
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> rev-parse --git-path rebase-merge --git-path rebase-apply --git-path MERGE_HEAD --git-path CHERRY_PICK_HEAD --git-path REVERT_HEAD --git-path BISECT_LOG
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> ls-files -z --others --ignored --directory --exclude-standard
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr nowhere | croft's session
+## query_changes
+git -C <repo> rev-parse --show-toplevel
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> status --porcelain --untracked-files=all
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -c diff.autoRefreshIndex=false -C <repo> diff --cached --numstat -z
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -c diff.autoRefreshIndex=false -C <repo> diff --numstat -z
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## is_ignored
+git -C <repo> check-ignore -z --stdin
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin pipe | stdout pipe | stderr nowhere | croft's session
+## child_repos
+## worktree_fingerprint
+git -C <repo> rev-parse HEAD
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> symbolic-ref -q HEAD
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> ls-files -s -z
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> status --porcelain=v1 -z --untracked-files=all
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> rev-parse --show-toplevel
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## current_branch
+git -C <repo> symbolic-ref --quiet --short HEAD
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## head_is_on_upstream
+git -C <repo> merge-base --is-ancestor HEAD @{u}
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## unpublished_branch
+git -C <repo> symbolic-ref --short HEAD
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> rev-parse --abbrev-ref --symbolic-full-name @{u}
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## repo_operation
+git -C <repo> rev-parse --git-path rebase-merge --git-path rebase-apply --git-path MERGE_HEAD --git-path CHERRY_PICK_HEAD --git-path REVERT_HEAD --git-path BISECT_LOG
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## diff_staged
+git -C <repo> diff --no-color --no-ext-diff --staged
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## merge_base
+git -C <repo> merge-base HEAD feature
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## diff_against_branch
+git -C <repo> merge-base HEAD feature
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> diff --no-color --no-ext-diff 2f68ccfe2a228cc5375a4a21e14ae93d5d5d4180
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## diff_previous_commit
+git -C <repo> diff --no-color --no-ext-diff HEAD~1
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## is_submodule
+git -C <repo> --literal-pathspecs ls-files --stage -- a.txt
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> --literal-pathspecs ls-tree HEAD -- a.txt
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## submodule_diff
+git -C <repo> -c color.ui=never --literal-pathspecs diff --submodule=log HEAD -- a.txt
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> -c color.ui=never --literal-pathspecs diff --submodule=diff HEAD -- a.txt
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## path_filter
+git -C <repo> check-attr filter -- a.txt
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> config --get-regexp '^filter\.unspecified\.(clean|smudge|process)$'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## read_file_at_head
+git -C <repo> check-attr filter -- a.txt
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> config --get-regexp '^filter\.unspecified\.(clean|smudge|process)$'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> show HEAD:a.txt
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## read_bytes_at_head
+git -C <repo> check-attr filter -- a.txt
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> config --get-regexp '^filter\.unspecified\.(clean|smudge|process)$'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> show HEAD:a.txt
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## read_file_at_rev
+git -C <repo> check-attr filter -- a.txt
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> config --get-regexp '^filter\.unspecified\.(clean|smudge|process)$'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> show v1:./a.txt
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## read_file_at_stage
+git -C <repo> check-attr filter -- a.txt
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> config --get-regexp '^filter\.unspecified\.(clean|smudge|process)$'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> show :2:a.txt
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## remerge_diff3
+git -C <repo> check-attr filter -- a.txt
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> config --get-regexp '^filter\.unspecified\.(clean|smudge|process)$'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> show :2:a.txt
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## status::query with changes
+git -C <repo> rev-parse --show-toplevel
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> symbolic-ref --short HEAD
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> status --porcelain -z --untracked-files=all
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr nowhere | croft's session
+git -C <repo> rev-parse --show-prefix
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> rev-parse --symbolic-full-name @{u}
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> rev-list --left-right --count HEAD...@{u}
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> rev-parse HEAD
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> rev-parse --git-path MERGE_MSG --git-path SQUASH_MSG
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> config --path commit.template
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> rev-parse --git-path rebase-merge --git-path rebase-apply --git-path MERGE_HEAD --git-path CHERRY_PICK_HEAD --git-path REVERT_HEAD --git-path BISECT_LOG
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> ls-files -z --others --ignored --directory --exclude-standard
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr nowhere | croft's session
+## query_changes with changes
+git -C <repo> rev-parse --show-toplevel
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> status --porcelain --untracked-files=all
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -c diff.autoRefreshIndex=false -C <repo> diff --cached --numstat -z
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -c diff.autoRefreshIndex=false -C <repo> diff --numstat -z
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## file_history
+git -C <repo> log --follow -n10 '--format=%h%s%an%ct' -- a.txt
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## show_commit_file_diff
+git -C <repo> rev-parse --show-toplevel --show-prefix
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> check-attr filter -- a.txt
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> config --get-regexp '^filter\.unspecified\.(clean|smudge|process)$'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> show --no-color --no-ext-diff c59cbc2d25b7cff77ef7bcd3426317cfc363251d -- a.txt
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## follow_names
+git -C <repo> log --follow --first-parent -n10 --name-only --relative --format=%x1e%H -- a.txt
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## show_commit
+git -C <repo> show --no-color --no-ext-diff --stat --patch c59cbc2d25b7cff77ef7bcd3426317cfc363251d
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## commit_graph
+git -C <repo> log --branches --tags HEAD --topo-order -n50 '--format=%H%h%P%D%s%an%ct'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## branch_history
+git -C <repo> log --first-parent HEAD -n50 '--format=%H%h%P%D%s%an%ct'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## branch_history_range
+git -C <repo> log --first-parent main..feature -n50 '--format=%H%h%P%D%s%an%ct'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## tree_paths
+git -C <repo> ls-tree -r -t -z HEAD
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr nowhere | croft's session
+## commit_message
+git -C <repo> log -1 --format=%B c59cbc2d25b7cff77ef7bcd3426317cfc363251d
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## commit_card
+git -C <repo> log -1 --no-show-signature '--format=%an <%ae>%n%ad (%ar)%ncommit %h%n%n%B' c59cbc2d25b7cff77ef7bcd3426317cfc363251d
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## blame
+git -C <repo> blame --porcelain -- a.txt
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## read_file_at_head of a filtered file
+git -C <repo> check-attr filter -- data.dat
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> cat-file --filters HEAD:data.dat
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## read_file_at_rev of a filtered file
+git -C <repo> check-attr filter -- data.dat
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> cat-file --filters 5c56933ed89ba6b159f9d26831a1e8433c7ce3bb:./data.dat
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## show_commit_file_diff of a filtered file
+git -C <repo> rev-parse --show-toplevel --show-prefix
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> check-attr filter -- data.dat
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> check-attr filter -- data.dat
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> cat-file --filters 5c56933ed89ba6b159f9d26831a1e8433c7ce3bb:./data.dat
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> check-attr filter -- data.dat
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> cat-file --filters 5c56933ed89ba6b159f9d26831a1e8433c7ce3bb:./data.dat
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> check-attr filter -- data.dat
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> cat-file --filters 5c56933ed89ba6b159f9d26831a1e8433c7ce3bb^:./data.dat
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> show --no-color --no-ext-diff -s 5c56933ed89ba6b159f9d26831a1e8433c7ce3bb
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## stage_path
+git -C <repo> diff --no-relative --name-only --diff-filter=U -z
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> --literal-pathspecs add -- a.txt
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## unstage_path
+git -C <repo> --literal-pathspecs reset -q HEAD -- a.txt
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## stage_paths
+git -C <repo> diff --no-relative --name-only --diff-filter=U -z
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> --literal-pathspecs add -- a.txt d.txt
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## unstage_paths
+git -C <repo> --literal-pathspecs reset -q HEAD -- a.txt d.txt
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## discard_path untracked
+## discard_path
+git -C <repo> --literal-pathspecs ls-files --stage -- a.txt
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> --literal-pathspecs ls-tree HEAD -- a.txt
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> --literal-pathspecs checkout -- a.txt
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## discard_path staged
+git -C <repo> --literal-pathspecs ls-files --stage -- b.txt
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> --literal-pathspecs ls-tree HEAD -- b.txt
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> --literal-pathspecs checkout HEAD -- b.txt
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## apply_patch
+git -C <repo> check-attr filter -- a.txt
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> config --get-regexp '^filter\.unspecified\.(clean|smudge|process)$'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> check-attr filter -- a.txt
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> config --get-regexp '^filter\.unspecified\.(clean|smudge|process)$'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> hash-object --stdin --path=a.txt
+    in croft's folder | env unchanged | stdin pipe | stdout pipe | stderr nowhere | croft's session
+git -C <repo> hash-object --stdin --no-filters
+    in croft's folder | env unchanged | stdin pipe | stdout pipe | stderr nowhere | croft's session
+git -C <repo> apply --whitespace=nowarn -
+    in croft's folder | env unchanged | stdin pipe | stdout pipe | stderr pipe | croft's session
+## apply_patch cached
+git -C <repo> check-attr filter -- a.txt
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> config --get-regexp '^filter\.unspecified\.(clean|smudge|process)$'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> check-attr filter -- a.txt
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> config --get-regexp '^filter\.unspecified\.(clean|smudge|process)$'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> hash-object --stdin --path=a.txt
+    in croft's folder | env unchanged | stdin pipe | stdout pipe | stderr nowhere | croft's session
+git -C <repo> hash-object --stdin --no-filters
+    in croft's folder | env unchanged | stdin pipe | stdout pipe | stderr nowhere | croft's session
+git -C <repo> apply --whitespace=nowarn --cached -
+    in croft's folder | env unchanged | stdin pipe | stdout pipe | stderr pipe | croft's session
+## apply_patch cached reverse
+git -C <repo> check-attr filter -- a.txt
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> config --get-regexp '^filter\.unspecified\.(clean|smudge|process)$'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> check-attr filter -- a.txt
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> config --get-regexp '^filter\.unspecified\.(clean|smudge|process)$'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> hash-object --stdin --path=a.txt
+    in croft's folder | env unchanged | stdin pipe | stdout pipe | stderr nowhere | croft's session
+git -C <repo> hash-object --stdin --no-filters
+    in croft's folder | env unchanged | stdin pipe | stdout pipe | stderr nowhere | croft's session
+git -C <repo> apply --whitespace=nowarn --cached -R -
+    in croft's folder | env unchanged | stdin pipe | stdout pipe | stderr pipe | croft's session
+## stage_all
+git -C <repo> diff --no-relative --name-only --diff-filter=U -z
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> add -A
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## unstage_all
+git -C <repo> reset -q HEAD
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## commit
+git -C <repo> diff --no-relative --name-only --diff-filter=U -z
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> diff --cached --quiet --no-relative --ignore-submodules=none --no-ext-diff
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> commit -am 'all of it'
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## commit_staged
+git -C <repo> commit -m 'staged only'
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## commit_amend
+git -C <repo> commit --amend -m 'staged, amended'
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## commit_amend_no_edit
+git -C <repo> commit --amend --no-edit
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## undo_last_commit
+git -C <repo> rev-parse --git-path MERGE_HEAD --git-path rebase-merge --git-path rebase-apply --git-path CHERRY_PICK_HEAD --git-path REVERT_HEAD
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> log -1 --format=%B HEAD
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> rev-parse --verify -q HEAD~1
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> reset --soft HEAD~1
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## unmerged_paths
+git -C <repo> diff --no-relative --name-only --diff-filter=U -z
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## refuse_unmerged
+git -C <repo> diff --no-relative --name-only --diff-filter=U -z
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## discard_all_tracked
+git -C <repo> checkout -- .
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## cherry_pick
+git -C <repo> cherry-pick 9d6b52ba72720e034a8b9fd526a54a87f6a6662f
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## revert_commit
+git -C <repo> revert --no-edit c59cbc2d25b7cff77ef7bcd3426317cfc363251d
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## create_tag_at
+git -C <repo> tag t2 2f68ccfe2a228cc5375a4a21e14ae93d5d5d4180
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## checkout_detached
+git -C <repo> switch --detach 2f68ccfe2a228cc5375a4a21e14ae93d5d5d4180
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## checkout_branch
+git -C <repo> switch main
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 LANGUAGE=en | stdin nowhere | stdout pipe | stderr pipe | own session
+## reset_to mixed
+git -C <repo> reset -q --mixed c59cbc2d25b7cff77ef7bcd3426317cfc363251d
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## reset_to hard
+git -C <repo> reset -q --hard c59cbc2d25b7cff77ef7bcd3426317cfc363251d
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## remove_path
+git -C <repo> --literal-pathspecs rm -q -f -- dir/c.txt
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## default_branch
+git -C <repo> symbolic-ref --short refs/remotes/origin/HEAD
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> rev-parse --verify --quiet main
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## list_branches
+git -C <repo> for-each-ref --sort=-committerdate '--format=%(refname:short)%09%(HEAD)' refs/heads
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> for-each-ref --sort=-committerdate '--format=%(refname)%09%(symref)' refs/remotes
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> remote
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## create_branch
+git -C <repo> switch -c topic
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## rename_branch
+git -C <repo> branch -m topic-renamed
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## checkout_branch back
+git -C <repo> switch main
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 LANGUAGE=en | stdin nowhere | stdout pipe | stderr pipe | own session
+## create_branch_from
+git -C <repo> switch -c from-v1 v1
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## checkout_branch main
+git -C <repo> switch main
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 LANGUAGE=en | stdin nowhere | stdout pipe | stderr pipe | own session
+## track_remote_branch
+git -C <repo> switch -c feature-local --track origin/feature
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 LANGUAGE=en | stdin nowhere | stdout pipe | stderr pipe | own session
+## checkout_branch main again
+git -C <repo> switch main
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 LANGUAGE=en | stdin nowhere | stdout pipe | stderr pipe | own session
+## delete_branch
+git -C <repo> branch -d topic-renamed
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## merge_branch
+git -C <repo> merge feature
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## rebase_branch
+git -C <repo> rebase feature
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## tag_remote
+git -C <repo> config --get remote.pushDefault
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> remote
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## list_tags
+git -C <repo> tag --sort=-creatordate
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## create_tag
+git -C <repo> tag -a v2 -m 'second release'
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## push_tags
+git -C <repo> push origin --tags
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## list_remote_tags
+git -C <repo> ls-remote --tags --refs origin
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## delete_remote_tag
+git -C <repo> push origin --delete refs/tags/v2
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## delete_tag
+git -C <repo> tag -d v2
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## stash_push
+git -C <repo> stash push -m 'first stash'
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## list_stashes
+git -C <repo> stash list -m --name-only --format=%x1e%gd%x1f%cr%x1f%P%x1f%gs
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## show_stash
+git -C <repo> stash show --no-color --no-ext-diff --stat --patch --include-untracked stash@{0}
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## stash_apply
+git -C <repo> stash apply stash@{0}
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## stash_oid
+git -C <repo> rev-parse --verify --quiet stash@{0}
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## stash_drop_oid
+git -C <repo> stash list --format=%H
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> stash drop stash@{0}
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## stash_push_untracked
+git -C <repo> stash push -u
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## stash_pop
+git -C <repo> stash pop
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## stash_push_staged
+git -C <repo> stash push --staged -m 'staged stash'
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## stash_pop_at
+git -C <repo> stash pop stash@{0}
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## stash_push again
+git -C <repo> stash push
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## stash_oid again
+git -C <repo> rev-parse --verify --quiet stash@{0}
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## stash_pop_oid
+git -C <repo> stash list --format=%H
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> stash pop stash@{0}
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## list_remotes
+git -C <repo> remote -v
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## add_remote
+git -C <repo> remote add other <origin>
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## remove_remote
+git -C <repo> remote remove other
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## fetch_all
+git -C <repo> fetch --all --prune
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## push_current_branch
+git -C <repo> push
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## pull_current_branch
+git -C <repo> pull
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## pull_rebase
+git -C <repo> pull --rebase
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## push_force
+git -C <repo> push --force-with-lease
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## push_to_remote
+git -C <repo> push origin
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## unpublished_branch on a new branch
+git -C <repo> symbolic-ref --short HEAD
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> rev-parse --abbrev-ref --symbolic-full-name @{u}
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## push_or_publish
+git -C <repo> symbolic-ref --short HEAD
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> rev-parse --abbrev-ref --symbolic-full-name @{u}
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> config --get remote.pushDefault
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> remote
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> push -u origin unpushed
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## publish_branch
+git -C <repo> config --get remote.pushDefault
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> remote
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> push -u origin to-publish
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## clone_into
+git -C <tmp> clone -- <origin> origin
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## share_link commit
+git -C <repo> rev-parse --show-toplevel
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> symbolic-ref --quiet --short HEAD
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> remote
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> config --get branch.main.remote
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> remote get-url origin
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> cat-file -e HEAD:a.txt
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> rev-parse HEAD
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> branch -r --contains 026b5f946a738084ed76fc3c9022a23db49aad44 --list 'origin/*'
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## share_link branch
+git -C <repo> rev-parse --show-toplevel
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> symbolic-ref --quiet --short HEAD
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> remote
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> config --get branch.main.remote
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> remote get-url origin
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> cat-file -e HEAD:a.txt
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> config --get branch.main.merge
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> rev-parse --verify --quiet refs/remotes/origin/main
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> merge-base --is-ancestor HEAD refs/remotes/origin/main
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## add_worktree_lane
+git -C <repo> symbolic-ref --quiet --short HEAD
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> worktree add -b agent/lane-one <repo>-lane-one
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## lane_removal_block
+git -C <repo>-lane-one status --porcelain --ignored
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## worktree_head
+git -C <repo>-lane-one rev-parse HEAD
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## pr_worktree_keep_reason
+git -C <repo>-lane-one status --porcelain --ignored
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo>-lane-one rev-parse HEAD
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## remove_worktree_lane
+git -C <repo>-lane-one worktree remove <repo>-lane-one
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## pr_worktree_path
+## remote_for_slug
+git -C <repo> remote -v
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## checkout_pr_worktree
+git -C <repo> fetch --quiet origin refs/pull/7/head
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+git -C <repo> rev-parse FETCH_HEAD
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> worktree add --detach <tmp>/pr-7 9d6b52ba72720e034a8b9fd526a54a87f6a6662f
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## checkout_pr_worktree when the pull request moved
+git -C <repo> fetch --quiet origin refs/pull/7/head
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+git -C <repo> rev-parse FETCH_HEAD
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> worktree list --porcelain
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <tmp>/pr-7 rev-parse HEAD
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <tmp>/pr-7 status --porcelain --ignored
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <tmp>/pr-7 checkout --quiet --detach c59cbc2d25b7cff77ef7bcd3426317cfc363251d
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## merge_branch that conflicts
+git -C <repo> merge clash
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## repo_operation during a merge
+git -C <repo> rev-parse --git-path rebase-merge --git-path rebase-apply --git-path MERGE_HEAD --git-path CHERRY_PICK_HEAD --git-path REVERT_HEAD --git-path BISECT_LOG
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## unmerged_paths during a merge
+git -C <repo> diff --no-relative --name-only --diff-filter=U -z
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## read_file_at_stage during a merge
+git -C <repo> check-attr filter -- a.txt
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> config --get-regexp '^filter\.unspecified\.(clean|smudge|process)$'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> show :3:a.txt
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## remerge_diff3 during a merge
+git -C <repo> check-attr filter -- a.txt
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> config --get-regexp '^filter\.unspecified\.(clean|smudge|process)$'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> show :2:a.txt
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> check-attr filter -- a.txt
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> config --get-regexp '^filter\.unspecified\.(clean|smudge|process)$'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> show :1:a.txt
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> check-attr filter -- a.txt
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> config --get-regexp '^filter\.unspecified\.(clean|smudge|process)$'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> show :3:a.txt
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> merge-file -p -q --diff3 <scratch>/ours <scratch>/base <scratch>/theirs
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## refuse_unmerged during a merge
+git -C <repo> diff --no-relative --name-only --diff-filter=U -z
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## stage_path with conflict markers
+git -C <repo> diff --no-relative --name-only --diff-filter=U -z
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> rev-parse --show-toplevel
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+git -C <repo> --literal-pathspecs diff --check --no-color -- a.txt
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## continue_operation of a merge
+## abort_operation of a merge
+git -C <repo> merge --abort
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## cherry_pick that conflicts
+git -C <repo> cherry-pick dbd60bfc8ef6764dee4571a9bb422c2599b7c96c
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## repo_operation during a cherry-pick
+git -C <repo> rev-parse --git-path rebase-merge --git-path rebase-apply --git-path MERGE_HEAD --git-path CHERRY_PICK_HEAD --git-path REVERT_HEAD --git-path BISECT_LOG
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## continue_operation of a cherry-pick
+git -C <repo> cherry-pick --continue
+    in croft's folder | env GIT_EDITOR=true GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## cherry_pick that conflicts again
+git -C <repo> cherry-pick dbd60bfc8ef6764dee4571a9bb422c2599b7c96c
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## skip_operation of a cherry-pick
+git -C <repo> cherry-pick --skip
+    in croft's folder | env GIT_EDITOR=true GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## bisect_mark good
+git -C <repo> bisect good
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## bisect_mark bad
+git -C <repo> bisect bad
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session
+## repo_operation during a bisect
+git -C <repo> rev-parse --git-path rebase-merge --git-path rebase-apply --git-path MERGE_HEAD --git-path CHERRY_PICK_HEAD --git-path REVERT_HEAD --git-path BISECT_LOG
+    in croft's folder | env GIT_OPTIONAL_LOCKS=0 | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## abort_operation of a bisect
+git -C <repo> bisect reset
+    in croft's folder | env GIT_TERMINAL_PROMPT=0 | stdin nowhere | stdout pipe | stderr pipe | own session

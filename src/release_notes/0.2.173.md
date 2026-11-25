@@ -1,0 +1,1 @@
+fix: On iTerm2 and Sixel terminals, pictures no longer draw over the terminal's Find bar, tooltips and the other small pop-ups that open next to what they belong to: a picture waits while something is drawn over it, and comes back when it closes.

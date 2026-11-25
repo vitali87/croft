@@ -1,0 +1,1 @@
+fix: On iTerm2 and Sixel terminals, pictures no longer draw over pop-ups: an image, PDF, terminal or Markdown picture, the minimap and the sidebar illustrations now wait while the agent's edit approval, any confirm dialog, the New File / Rename prompt, the connect dialog or Settings is open, as they already did for the pickers.

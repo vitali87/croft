@@ -85,15 +85,13 @@ impl App {
         // Assign the theme before re-highlighting: the rebuilds below (the
         // markdown preview in particular) read `ed.theme`, and the per-frame
         // push in render would hand it over one frame too late.
-        for ed in &mut self.editor.editors {
+        for ed in self
+            .editor_layout
+            .all_groups_mut(&mut self.editor)
+            .flat_map(|g| g.editors.iter_mut())
+        {
             ed.theme = theme;
             ed.rehighlight_for_theme();
-        }
-        for group in self.editor_layout.inactive_groups_mut() {
-            for ed in &mut group.editors {
-                ed.theme = theme;
-                ed.rehighlight_for_theme();
-            }
         }
         // Refresh the per-pane gradient-border flag for the new theme so the
         // focused box switches its highlight style on the very next frame.
@@ -646,24 +644,20 @@ impl App {
     pub(super) fn open_shortcuts_modal(&mut self) {
         if self.shortcuts_modal.is_none() {
             self.shortcuts_modal = Some(crate::widgets::shortcuts::ShortcutsModal::default());
-            self.overlays.shortcuts_clear.request();
+            self.overlays.popup_clear.request();
             self.status = String::from("Shortcuts: Esc to close");
         }
     }
 
     pub(super) fn close_shortcuts_modal(&mut self) {
         if self.shortcuts_modal.take().is_some() {
-            self.overlays.shortcuts_clear.request();
+            self.overlays.popup_clear.request();
             self.overlays.activity.mark_dirty();
             self.overlays.welcome.mark_dirty();
             self.overlays.hero.mark_dirty();
             self.invalidate_editor_image_layouts();
             self.status.clear();
         }
-    }
-
-    pub fn consume_shortcuts_image_clear(&mut self) -> bool {
-        self.overlays.shortcuts_clear.consume()
     }
 
     /// Open one of the JSON config files in the editor, creating it seeded with
@@ -1189,8 +1183,9 @@ impl App {
                 && e.language() == crate::highlight::lang_for_path(path))
             .then(|| path.clone())
         };
-        let following: Vec<PathBuf> = std::iter::once(&self.editor)
-            .chain(self.editor_layout.inactive_groups())
+        let following: Vec<PathBuf> = self
+            .editor_layout
+            .all_groups(&self.editor)
             .flat_map(|g| g.editors.iter())
             .filter_map(picked)
             .collect();
@@ -1228,8 +1223,9 @@ impl App {
             self.rebuild_problems();
             self.refresh_problems_badge();
         }
-        for e in std::iter::once(&mut self.editor)
-            .chain(self.editor_layout.inactive_groups_mut())
+        for e in self
+            .editor_layout
+            .all_groups_mut(&mut self.editor)
             .flat_map(|g| g.editors.iter_mut())
         {
             let Some(path) = e.path.clone().filter(|p| following.contains(p)) else {
@@ -1432,10 +1428,7 @@ impl App {
             || hint_overrides(&old_languages) != hint_overrides(&self.language_prefs)
         {
             let (langs, global) = (&self.language_prefs, self.inlay_hints_enabled);
-            if !inlay_hints_on_in(langs, global, editor_scope_id(&self.editor)) {
-                self.editor.clear_inlay_hints();
-            }
-            for group in self.editor_layout.inactive_groups_mut() {
+            for group in self.editor_layout.all_groups_mut(&mut self.editor) {
                 if !inlay_hints_on_in(langs, global, editor_scope_id(group)) {
                     group.clear_inlay_hints();
                 }

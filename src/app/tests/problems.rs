@@ -270,7 +270,6 @@ fn sync_markdown_lint_covers_inactive_split_groups() {
     let held_inactive = app
         .editor_layout
         .inactive_groups()
-        .into_iter()
         .flat_map(|g| g.editors.iter())
         .any(|e| e.path.as_deref() == Some(file.as_path()));
     assert!(held_inactive, "the inactive group holds doc.md");

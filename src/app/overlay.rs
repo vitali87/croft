@@ -413,14 +413,12 @@ impl ActivityOverlay {
 
 #[derive(Default)]
 pub struct OverlayManager {
-    pub shortcuts_clear: ClearLatch,
-    pub file_finder_clear: ClearLatch,
-    pub command_palette_clear: ClearLatch,
-    pub process_picker_clear: ClearLatch,
-    pub zoxide_jump_clear: ClearLatch,
-    pub branch_picker_clear: ClearLatch,
-    pub input_prompt_clear: ClearLatch,
-    pub list_picker_clear: ClearLatch,
+    /// Set when a pop-up that pictures must make way for opens or closes:
+    /// F1, Quick Open, the palette and both symbol pickers, the process,
+    /// directory and branch pickers, the input prompt and the list picker.
+    /// The main loop only asks whether any of them fired, so one latch
+    /// serves them all.
+    pub popup_clear: ClearLatch,
     /// Inline-image overlay state, one slot per editor split column
     /// (`[0]` = left pane, `[1]` = right pane). When the editor is not
     /// split only `[0]` is used and `[1]` stays disabled. Keyed by

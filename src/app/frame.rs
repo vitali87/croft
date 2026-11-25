@@ -236,6 +236,16 @@ impl App {
     /// it can re-Show the caret after the OSC-1337 image emit only when the
     /// editor would have shown it this frame.
     pub(super) fn cursor_should_be_visible(&self) -> bool {
+        // The connect dialog places its own caret in its field whenever it
+        // has one, as `render_connect_dialog` does: put that one back, not
+        // a pane's (#2669 review).
+        if self
+            .connect_dialog
+            .as_ref()
+            .is_some_and(|d| d.cursor_screen_pos().is_some())
+        {
+            return self.cursor_visible_phase();
+        }
         if self.context_menu.is_some() || self.prompt.is_some() || !self.cursor_visible_phase() {
             return false;
         }
@@ -244,10 +254,9 @@ impl App {
         if self.quick_input_owns_caret() {
             return self.quick_input_caret().is_some();
         }
-        // A list picker (View Bookmarks, Quick Fix, ...) is the thing being
-        // typed into; the editor's caret behind it would only point at text it
-        // is not about to edit.
-        if self.list_picker.is_some() {
+        // Any other pop-up has the keys: a pane's caret behind it would only
+        // point at text it is not about to edit (#2669).
+        if self.popup_open() {
             return false;
         }
         let editor_caret = if self.editor.diff.is_some() {
@@ -283,7 +292,8 @@ impl App {
     /// picker or an input prompt) has the terminal's caret: on a `surfaces`
     /// theme, which draws no caret block in the query, the caret goes there
     /// and no pane's caret blinks through the card. A boxed theme paints its
-    /// own caret and keeps its caret rules as they were.
+    /// own caret block in the query; no pane's caret shows there either
+    /// (#2669).
     pub(super) fn quick_input_owns_caret(&self) -> bool {
         self.theme.surfaces().is_some()
             && (self.command_palette.is_some()
@@ -413,15 +423,23 @@ impl App {
     }
 
     /// Render the frame the terminal is sent: [`Self::render`], with every
-    /// colour fitted to the terminal's depth (#1433).
+    /// colour fitted to the terminal's depth (#1433), and no underline
+    /// colour for a terminal that would misread one (#2661).
     pub(super) fn render_for_terminal(&mut self, frame: &mut ratatui::Frame) {
         self.render(frame);
         self.color_depth.fit_buffer(frame.buffer_mut());
+        if !self.underline_colors {
+            crate::color_depth::drop_underline_colors(frame.buffer_mut());
+        }
     }
 
     pub(super) fn render(&mut self, frame: &mut ratatui::Frame) {
         // Set again by the welcome panel when it paints the button.
         self.welcome_tour_button = Rect::default();
+        self.picture_cover.start_frame();
+        // Where the editor tab's tooltip goes, once the focused group is
+        // known; it is drawn with the other pop-ups (#2663).
+        let mut tab_tooltip_area: Option<Rect> = None;
         let size = frame.area();
         self.last_frame_area = size;
         if let Some(menu) = self.context_menu.as_mut() {
@@ -788,10 +806,10 @@ impl App {
             // mirroring the terminal pane buttons' hover affordance.
             let pointer = self.pointer_cell;
             self.editor.hover_pointer = pointer;
-            // A modal quick input takes the keyboard without moving focus
-            // (no focus sync runs when one opens), so the editor learns each
-            // frame to drop its accent marks while one is up.
-            self.editor.overlay_has_keyboard = self.modal_overlay_open();
+            // A pop-up takes the keyboard without moving focus (no focus
+            // sync runs when one opens), so the editor learns each frame to
+            // drop its accent marks while one is up (#2679).
+            self.editor.overlay_has_keyboard = self.popup_open();
             // Without an inline-image protocol an image tab draws itself in
             // half blocks (#1591).
             let cell_images = !self.inline_images_enabled();
@@ -1019,12 +1037,7 @@ impl App {
                     .filter(|(i, _)| *i != active_idx)
                     .map(|(_, r)| *r)
                     .collect();
-                for (group, rect) in self
-                    .editor_layout
-                    .inactive_groups_mut()
-                    .into_iter()
-                    .zip(inactive_rects)
-                {
+                for (group, rect) in self.editor_layout.inactive_groups_mut().zip(inactive_rects) {
                     group.hover_pointer = pointer;
                     group.set_tab_reserved_right(reserve(rect));
                     frame.render_widget(group, rect);
@@ -1127,11 +1140,15 @@ impl App {
                     frame.render_widget(popup_ref, area);
                 }
             }
+            // Placed here, where the focused group is known, and drawn with
+            // the other pop-ups once the pictures' cells are noted: drawn
+            // here, a tooltip over an image's first rows counted as part of
+            // the picture, which was then sent over it (Codex, #2664).
             if let Some(popup) = self.tab_tooltip.as_mut() {
                 popup.theme = self.theme;
                 let area = popup.area_for(focused_area);
                 if area.width > 0 && area.height > 0 {
-                    frame.render_widget(&*popup, area);
+                    tab_tooltip_area = Some(area);
                 }
             }
             // Layout-control icons at the top-right of the editor tab strip.
@@ -2324,6 +2341,22 @@ impl App {
             );
         }
 
+        // Terminal-pane inline image: sync after the panes have painted so
+        // last_inner and the scroll offset are this frame's (all gating —
+        // hidden panel, alt screen, off-screen anchor — is inside).
+        self.update_terminal_image_overlay();
+        self.update_markdown_image_overlay();
+        // The shell's grey history suggestion is part of its typed line, so
+        // it is drawn with the panes, under every pop-up (#2667).
+        self.paint_terminal_suggestion(frame);
+        // Every picture's place is known now and nothing is drawn over the
+        // panes yet: what lies under each picture is noted, to compare with
+        // the finished frame (#2663).
+        self.note_pictures_before_popups(frame.buffer_mut());
+        if let (Some(area), Some(popup)) = (tab_tooltip_area, self.tab_tooltip.as_ref()) {
+            frame.render_widget(popup, area);
+        }
+
         // Overlays render last so they sit on top of everything else. The port
         // toast goes first so modals/menus paint above it.
         //
@@ -2365,11 +2398,6 @@ impl App {
         self.render_run_block_confirm(frame);
         self.render_unsaved_confirm(frame);
         self.render_lossy_save_confirm(frame);
-        // Terminal-pane inline image: sync after the panes have painted so
-        // last_inner and the scroll offset are this frame's (all gating —
-        // hidden panel, alt screen, off-screen anchor — is inside).
-        self.update_terminal_image_overlay();
-        self.update_markdown_image_overlay();
         self.render_editor_find(frame);
         self.render_terminal_find(frame);
         self.render_file_finder(frame);
@@ -2427,8 +2455,10 @@ impl App {
         // composite over the tooltip; re-emitting the box last wins the cell.
         self.ui_tooltip_area = tooltip_area;
 
-        self.paint_terminal_suggestion(frame);
         self.render_screencast(frame, main_area);
+        // The last of the frame's drawing: a picture whose cells changed
+        // since the note above has a pop-up over it, and waits (#2663).
+        self.note_pictures_after_popups(frame.buffer_mut());
 
         // A quick input owns the caret while it is open on a `surfaces`
         // theme: its query's, and no pane's caret blinking through the card.
@@ -2442,17 +2472,18 @@ impl App {
             frame.set_cursor_position((cx, cy));
         }
 
-        // Show the host terminal's hardware caret only when the editor is
-        // focused and has no modal overlay. The DECSCUSR style is set to
-        // BlinkingBar at startup, so the terminal blinks a thin vertical
-        // line over the cursor cell without replacing its character.
-        if self.focus == Pane::Editor
-            && !quick_input
-            && self.context_menu.is_none()
-            && self.prompt.is_none()
-            && self.list_picker.is_none()
-            && self.cursor_visible_phase()
-        {
+        // A pane's caret shows only while no pop-up or right-click menu is
+        // open: an open one has the keys, and a caret blinking through it
+        // would point at text it is not about to edit (#2669). The quick
+        // inputs, the New File box and the list picker are pop-ups too.
+        let pane_caret =
+            self.context_menu.is_none() && !self.popup_open() && self.cursor_visible_phase();
+
+        // Show the host terminal's hardware caret when the editor is focused.
+        // The DECSCUSR style is set to BlinkingBar at startup, so the
+        // terminal blinks a thin vertical line over the cursor cell without
+        // replacing its character.
+        if self.focus == Pane::Editor && pane_caret {
             let pos = if self.editor.diff.is_some() {
                 self.editor.diff_caret_screen_pos()
             } else {
@@ -2469,10 +2500,7 @@ impl App {
         // flat with no native caret cell.
         if self.focus == Pane::Tree
             && self.sidebar_view == SidebarView::SourceControl
-            && !quick_input
-            && self.context_menu.is_none()
-            && self.prompt.is_none()
-            && self.cursor_visible_phase()
+            && pane_caret
             && let Some((cx, cy)) = self.source_control.cursor_screen_pos()
         {
             frame.set_cursor_position((cx, cy));
@@ -2484,20 +2512,14 @@ impl App {
         // caret at all (Extensions).
         if self.focus == Pane::Tree
             && self.sidebar_view == SidebarView::Search
-            && !quick_input
-            && self.context_menu.is_none()
-            && self.prompt.is_none()
-            && self.cursor_visible_phase()
+            && pane_caret
             && let Some((cx, cy)) = self.search.cursor_screen_pos()
         {
             frame.set_cursor_position((cx, cy));
         }
         if self.focus == Pane::Tree
             && self.sidebar_view == SidebarView::Extensions
-            && !quick_input
-            && self.context_menu.is_none()
-            && self.prompt.is_none()
-            && self.cursor_visible_phase()
+            && pane_caret
             && let Some((cx, cy)) = self.extensions.cursor_screen_pos()
         {
             frame.set_cursor_position((cx, cy));
@@ -2540,6 +2562,92 @@ impl App {
                 status,
                 ..Default::default()
             };
+        }
+        // The pickers read like the palette: their title and the selected
+        // row (#2670). Without these a reader heard the pane behind.
+        let picker = |focus: &str, item: Option<String>| Snapshot {
+            focus: tr(focus),
+            item,
+            status: status.clone(),
+            ..Default::default()
+        };
+        // Named for what Enter does with it (#2670 review): the same picker
+        // checks out, deletes, merges, rebases onto or branches from.
+        if let Some(p) = &self.branch_picker {
+            use super::scm::BranchPurpose;
+            use crate::widgets::branch_picker::BranchAction;
+            let title = match self.branch_purpose {
+                BranchPurpose::Checkout => "Checkout / Create Branch",
+                BranchPurpose::CreateFrom => "Create Branch from",
+                BranchPurpose::Delete => "Delete Branch",
+                BranchPurpose::Merge => "Merge Branch",
+                BranchPurpose::Rebase => "Rebase onto Branch",
+            };
+            let item = if self.branch_purpose == BranchPurpose::Checkout {
+                p.selected_action().map(|a| match a {
+                    BranchAction::Checkout(name) | BranchAction::Track { name, .. } => name,
+                    BranchAction::Create(name) => format!("{} {name}", tr("Create branch")),
+                })
+            } else {
+                // The others act on an existing branch only.
+                Some(
+                    p.selected_existing_branch()
+                        .unwrap_or_else(|| tr("Choose an existing branch")),
+                )
+            };
+            return picker(title, item);
+        }
+        if let Some(p) = &self.command_history_popup {
+            return picker("Command History", p.selected_entry().map(|e| e.cmd.clone()));
+        }
+        if let Some(j) = &self.zoxide_jump {
+            // Asking whether to install zoxide or add its hook: the question,
+            // whose last line holds the keys.
+            let item = if j.asks_yes_no() {
+                let asked = if j.available {
+                    crate::widgets::zoxide_jump::hook_offer_message(
+                        j.hook_offer.as_deref().unwrap_or_default(),
+                    )
+                } else {
+                    crate::widgets::zoxide_jump::unavailable_message(j)
+                };
+                Some(asked.split_whitespace().collect::<Vec<_>>().join(" "))
+            } else {
+                j.selected_path().map(|p| p.display().to_string())
+            };
+            return picker("Jump to Directory", item);
+        }
+        if let Some(p) = &self.process_picker {
+            return picker(
+                "Attach to Python Process",
+                p.selected_target().map(|t| t.label.clone()),
+            );
+        }
+        // Where each match is, so two `new`s in two files sound different
+        // (#2670 review).
+        if let Some(p) = &self.workspace_symbols {
+            let item = p.selected_item().map(|i| {
+                let path = i.path.strip_prefix(&p.root).unwrap_or(&i.path);
+                let mut said = i.name.clone();
+                if let Some(c) = &i.container {
+                    said.push_str(&format!(", {} {c}", tr("in")));
+                }
+                format!("{said}, {}:{}", path.display(), i.line + 1)
+            });
+            return picker("Go to Symbol in Workspace", item);
+        }
+        // `:42` jumps to a line: say so, not the symbol last selected
+        // (#2670 review).
+        if let Some(p) = &self.go_to_symbol {
+            let item = if p.is_line_mode() {
+                Some(match p.line_target() {
+                    Some(n) => format!("{} {n}", tr("Go to line")),
+                    None => tr("Type a line number"),
+                })
+            } else {
+                p.selected_name().map(String::from)
+            };
+            return picker("Go to Symbol", item);
         }
         if let Some(p) = &self.command_palette {
             return Snapshot {
@@ -2640,7 +2748,8 @@ impl App {
     /// what. Without this a confirmation was silent, so a reader heard
     /// nothing after Ctrl+W and could not know that D throws edits away.
     /// Topmost first, in the order they are drawn; a new dialog that waits
-    /// for a key belongs here too.
+    /// for a key belongs here too, and a test opens every pop-up to check
+    /// one is read (#2670).
     pub(super) fn modal_a11y(&self) -> Option<(String, String)> {
         let tr = |s: &str| crate::i18n::tr(s).into_owned();
         // The title, and its sentences joined for speech: a full stop
@@ -2715,6 +2824,43 @@ impl App {
             };
             return Some((title, tr(actions)));
         }
+        // Connecting to a host (#2670): what it is doing or asking, and the
+        // keys for that step. What is typed, a password among it, is left to
+        // the reader's echo.
+        if let Some(d) = &self.connect_dialog {
+            let title = format!("{} {}", tr("Connect to"), d.host);
+            let mut body = vec![d.status_line.clone()];
+            // What failed, and what a yes to the slow fallback installs: the
+            // dialog draws both (#2670 review).
+            body.extend(d.error.clone());
+            if matches!(
+                d.phase,
+                crate::widgets::connect_dialog::DialogPhase::AwaitingFallbackConfirmation
+            ) {
+                body.extend(d.notes.iter().cloned());
+            }
+            if d.phase.awaits_input() {
+                body.push(d.prompt_text.clone());
+            }
+            let keys = if d.phase.is_terminal() {
+                "Enter or Escape, close"
+            } else if d.phase.awaits_input() {
+                "Type the answer. Enter, send. Escape, cancel"
+            } else {
+                "Escape, cancel. L, show the log"
+            };
+            return Some(said(&title, &body, &[tr(keys)]));
+        }
+        // F1 reads the shortcut at the top of the list, so each scroll is
+        // heard (#2670 review).
+        if let Some(modal) = &self.shortcuts_modal {
+            let row = modal.spoken_row().unwrap_or_default();
+            return Some(said(
+                "Keyboard Shortcuts",
+                &[row],
+                &[tr("Arrows, scroll. Escape or F1, close")],
+            ));
+        }
         // The field's own instruction ("Remote URL") is read with the keys,
         // so a prompt replaced by the next step under the same title is
         // still heard; what is typed is left to the reader's echo.
@@ -2788,6 +2934,33 @@ impl App {
                 &[yes_no("Y, yes, run")],
             ));
         }
+        if let Some(payload) = &self.pending_terminal_paste {
+            let lines = super::terminal_panes::pasted_lines(payload);
+            let n = lines.len();
+            let shown: Vec<String> = lines
+                .iter()
+                .take(3)
+                .map(|l| String::from_utf8_lossy(l).into_owned())
+                .collect();
+            return Some(said(
+                &format!(
+                    "{} {n} {}",
+                    tr("Paste"),
+                    tr(if n == 1 {
+                        "line into the terminal?"
+                    } else {
+                        "lines into the terminal?"
+                    })
+                ),
+                &[
+                    tr("Each line break is an Enter here, so the lines run as they land"),
+                    shown.join("; "),
+                ],
+                &[tr(
+                    "Y or Enter, paste. L, paste as one line. N or Escape, cancel",
+                )],
+            ));
+        }
         if self.pending_broadcast_enable {
             let receiving = self
                 .terminals
@@ -2850,6 +3023,16 @@ impl App {
                     format!("C, {verb} Anyway"),
                     tr("Escape, cancel"),
                 ],
+            ));
+        }
+        if let Some(drop) = &self.pending_stash_drop {
+            return Some(said(
+                "Drop stash?",
+                &[
+                    drop.label.clone(),
+                    tr("This permanently deletes the stash."),
+                ],
+                &[yes_no("Y, yes, drop it")],
             ));
         }
         if self.pending_discard_all {
@@ -3158,12 +3341,11 @@ impl App {
         if self.cursor_should_be_visible() {
             return;
         }
+        // The shell's cursor only while nothing covers it: under a pop-up
+        // the reader belongs on what the pop-up says (#2673 review).
         if self.focus == Pane::Terminal
-            && self.prompt.is_none()
+            && !self.popup_open()
             && self.context_menu.is_none()
-            && self.command_palette.is_none()
-            && self.file_finder.is_none()
-            && self.list_picker.is_none()
             && let Some(pos) = self
                 .terminals
                 .get(self.active_terminal)

@@ -305,6 +305,27 @@ pub struct LogView {
     /// The body rect the last frame painted, for mouse hit-testing. Frame
     /// truth: the renderer writes it, the mouse path reads it.
     pub last_body: ratatui::layout::Rect,
+    /// The file this view reads when it exists only for this view, such as
+    /// the decompressed copy of a `.gz` (#2675): it goes with the view.
+    owned_copy: Option<OwnedCopy>,
+}
+
+/// A file made for one view to read, deleted when that view is dropped
+/// (#2675): closing the tab, opening something else in it, or quitting
+/// leaves nothing behind in the temp folder. Built before the file is
+/// written, so a write that fails partway deletes what it wrote.
+pub struct OwnedCopy(PathBuf);
+
+impl OwnedCopy {
+    pub fn new(path: PathBuf) -> Self {
+        Self(path)
+    }
+}
+
+impl Drop for OwnedCopy {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// One increment of the index from the background pass (#394).
@@ -368,6 +389,12 @@ impl Indexer {
 }
 
 impl LogView {
+    /// Hand this view the file it reads, to delete when the view goes
+    /// (#2675).
+    pub fn own_copy(&mut self, copy: OwnedCopy) {
+        self.owned_copy = Some(copy);
+    }
+
     /// Index `path`'s line offsets without reading its contents into memory.
     ///
     /// The first [`HEAD_INDEX_BYTES`] are indexed before this returns; a file
@@ -396,6 +423,7 @@ impl LogView {
             selection: None,
             dragging: false,
             last_body: ratatui::layout::Rect::default(),
+            owned_copy: None,
         };
         // The head pass: synchronous, so the first screens never paint off
         // an empty index and a short file needs no thread at all.

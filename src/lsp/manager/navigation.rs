@@ -111,26 +111,26 @@ impl LspManager {
     }
 
     pub fn drain_definition(&self) -> Option<DefinitionResult> {
-        self.def_rx.try_recv().ok()
+        self.replies.definition.try_recv().ok()
     }
 
     /// Test hook: deliver a definition reply as if a server had answered.
     #[cfg(test)]
     pub fn push_definition_for_test(&self, result: DefinitionResult) {
-        let _ = self.jump_test_tx.0.send(result);
+        let _ = self.reply_test_tx.definition.send(result);
     }
 
     /// Test hook: deliver a declaration reply as if a server had answered.
     #[cfg(test)]
     pub fn push_declaration_for_test(&self, result: DeclarationResult) {
-        let _ = self.jump_test_tx.1.send(result);
+        let _ = self.reply_test_tx.declaration.send(result);
     }
 
     /// Test hook: deliver a type definition reply as if a server had
     /// answered.
     #[cfg(test)]
     pub fn push_type_definition_for_test(&self, result: TypeDefinitionResult) {
-        let _ = self.jump_test_tx.2.send(result);
+        let _ = self.reply_test_tx.type_definition.send(result);
     }
 
     pub fn request_declaration(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
@@ -143,7 +143,7 @@ impl LspManager {
     }
 
     pub fn drain_declaration(&self) -> Option<DeclarationResult> {
-        self.decl_rx.try_recv().ok()
+        self.replies.declaration.try_recv().ok()
     }
 
     pub fn request_type_definition(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
@@ -156,7 +156,7 @@ impl LspManager {
     }
 
     pub fn drain_type_definition(&self) -> Option<TypeDefinitionResult> {
-        self.type_def_rx.try_recv().ok()
+        self.replies.type_definition.try_recv().ok()
     }
 
     pub fn request_implementation(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
@@ -169,7 +169,7 @@ impl LspManager {
     }
 
     pub fn drain_implementation(&self) -> Option<ImplementationResult> {
-        self.impl_rx.try_recv().ok()
+        self.replies.implementation.try_recv().ok()
     }
 
     pub fn request_references(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
@@ -182,7 +182,7 @@ impl LspManager {
     }
 
     pub fn drain_references(&self) -> Option<ReferencesResult> {
-        self.ref_rx.try_recv().ok()
+        self.replies.references.try_recv().ok()
     }
 
     /// Fire a call-hierarchy expansion (callers when `incoming`, callees
@@ -205,7 +205,7 @@ impl LspManager {
     }
 
     pub fn drain_call_hierarchy(&self) -> Option<CallHierarchyResult> {
-        self.calls_rx.try_recv().ok()
+        self.replies.call_hierarchy.try_recv().ok()
     }
 
     /// The supertypes or subtypes of the type at a position (#613); the

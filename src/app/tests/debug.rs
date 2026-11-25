@@ -154,7 +154,7 @@ fn run_debug_icon_clears_when_a_paused_session_takes_over_the_panel() {
     // A paused session now owns the panel: render draws the tree, not the icon.
     app.run_debug.last_icon_cell = None;
 
-    app.flush_run_debug_icon_overlay();
+    app.flush_run_debug_icon_overlay(&ratatui::buffer::Buffer::empty(app.last_frame_area));
 
     assert!(
         app.consume_run_debug_image_clear(),
@@ -380,7 +380,7 @@ fn leaving_run_debug_after_emitting_the_icon_arms_a_one_shot_terminal_clear() {
         .set_image("\x1b]1337;File=...\x07".to_string());
     app.set_sidebar_view(SidebarView::RunDebug);
     app.run_debug.last_icon_cell = Some((10, 5));
-    app.flush_run_debug_icon_overlay();
+    app.flush_run_debug_icon_overlay(&ratatui::buffer::Buffer::empty(app.last_frame_area));
     assert!(
         app.overlays.run_debug.was_emitted(),
         "test setup: the flush must record the emit position"
@@ -413,7 +413,7 @@ fn flush_run_debug_icon_overlay_is_silent_when_panel_is_not_visible() {
         .set_image("\x1b]1337;File=...\x07".to_string());
     app.set_sidebar_view(SidebarView::RunDebug);
     app.run_debug.last_icon_cell = Some((10, 5));
-    app.flush_run_debug_icon_overlay();
+    app.flush_run_debug_icon_overlay(&ratatui::buffer::Buffer::empty(app.last_frame_area));
     assert_eq!(app.overlays.run_debug.last_emitted(), Some((10, 5)));
     // Switch away.
     app.set_sidebar_view(SidebarView::Explorer);
@@ -421,7 +421,7 @@ fn flush_run_debug_icon_overlay_is_silent_when_panel_is_not_visible() {
     // nothing (we can only assert the bookkeeping side effect here;
     // the absence of stdout writes is asserted indirectly by the
     // function returning early before the write_all call).
-    app.flush_run_debug_icon_overlay();
+    app.flush_run_debug_icon_overlay(&ratatui::buffer::Buffer::empty(app.last_frame_area));
     assert_eq!(
         app.overlays.run_debug.last_emitted(),
         None,
@@ -446,12 +446,12 @@ fn run_debug_icon_moving_within_a_visible_panel_arms_a_one_shot_terminal_clear()
         .set_image("\x1b]1337;File=...\x07".to_string());
     app.set_sidebar_view(SidebarView::RunDebug);
     app.run_debug.last_icon_cell = Some((10, 5));
-    app.flush_run_debug_icon_overlay();
+    app.flush_run_debug_icon_overlay(&ratatui::buffer::Buffer::empty(app.last_frame_area));
     assert_eq!(app.overlays.run_debug.last_emitted(), Some((10, 5)));
     // A resize / pane-drag recenters the icon to a new cell while the panel
     // is still the active, visible Run-Debug view.
     app.run_debug.last_icon_cell = Some((3, 2));
-    app.flush_run_debug_icon_overlay();
+    app.flush_run_debug_icon_overlay(&ratatui::buffer::Buffer::empty(app.last_frame_area));
     assert!(
         app.consume_run_debug_image_clear(),
         "an icon that moved within the visible panel must arm one terminal.clear() to evict the stale image cells",
@@ -509,7 +509,7 @@ fn click_on_run_debug_icon_switches_sidebar_to_run_debug() {
     let backend = ratatui::backend::TestBackend::new(80, 30);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
-    let run = app.sidebar_areas.run_debug_icon;
+    let run = app.sidebar_areas.activity_icons[ActivityIcon::RunDebug];
     assert!(run.height > 0, "run-debug icon must be laid out");
     app.handle_mouse(crossterm::event::MouseEvent {
         kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),

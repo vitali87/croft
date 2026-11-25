@@ -392,6 +392,16 @@ pub fn exec_args(dc: &DevContainer, container: &str, argv: &[String], tty: bool)
                 out.push(var.into());
             }
         }
+        // The croft inside draws into this terminal but cannot see the
+        // variables that name it (#2661).
+        let underline =
+            crate::color_depth::underline_colors_supported(|name| std::env::var(name).ok());
+        out.push("-e".into());
+        out.push(format!(
+            "{}={}",
+            crate::color_depth::UNDERLINE_COLORS_ENV,
+            if underline { "1" } else { "0" }
+        ));
     }
     if let Some(user) = &dc.remote_user {
         out.push("-u".into());
@@ -710,6 +720,15 @@ mod tests {
 
         let exec = exec_args(&dc, "c1", &["ls".into()], false);
         assert_eq!(exec, vec!["exec", "-w", "/workspaces/proj", "c1", "ls"]);
+        // #2661: the croft started in the container is told whether this
+        // terminal reads underline colours.
+        let tty = exec_args(&dc, "c1", &["croft".into()], true).join(" ");
+        let told = if crate::color_depth::underline_colors_supported(|n| std::env::var(n).ok()) {
+            "-e CROFT_UNDERLINE_COLORS=1"
+        } else {
+            "-e CROFT_UNDERLINE_COLORS=0"
+        };
+        assert!(tty.contains(told), "{tty}");
     }
 
     /// #1110: the label's hash is of the container the config makes, so a

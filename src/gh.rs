@@ -6,7 +6,7 @@
 //! of "No such file or directory (os error 2)".
 
 use std::path::Path;
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{ExitStatus, Stdio};
 
 /// Why `gh` could not run when it is not installed.
 pub const MISSING: &str = "the GitHub CLI (gh) is not installed; install it from https://cli.github.com, then run gh auth login";
@@ -51,7 +51,7 @@ const TOKEN_VARS: [&str; 4] = [
 
 /// Whether `program`, run with `args` and its output thrown away, exits 0.
 fn succeeds(program: &str, args: &[&str]) -> Result<bool, String> {
-    let mut cmd = Command::new(program);
+    let mut cmd = crate::proc::command(program);
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -90,7 +90,7 @@ pub fn check_ready(program: &str) -> Result<(), String> {
 /// says is logged in is enough here, and a PR on one that is not fails
 /// later with gh's own message.
 fn any_host_signed_in(program: &str) -> Result<bool, String> {
-    let mut cmd = Command::new(program);
+    let mut cmd = crate::proc::command(program);
     cmd.args(["auth", "status"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -105,6 +105,7 @@ fn any_host_signed_in(program: &str) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn a_missing_gh_says_how_to_get_it() {

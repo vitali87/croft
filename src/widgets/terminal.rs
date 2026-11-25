@@ -42,8 +42,8 @@ use backend::*;
 use captures::*;
 use clock::*;
 pub use commands::CommandDecoration;
+pub use commands::PromptJump;
 pub use commands::human_duration;
-pub use commands::pick_prompt_jump;
 use commands::*;
 pub use images::SIXEL_HOST;
 use images::*;
@@ -61,6 +61,7 @@ pub use processes::process_cmdline;
 pub use processes::process_name;
 use processes::*;
 pub(crate) use scroll::resize_term;
+use scroll::scroll_line_to_top;
 #[cfg(test)]
 use scroll::*;
 pub use selection::Selection;
@@ -390,7 +391,7 @@ pub struct PtyTerminal {
     clipboard_store: Arc<std::sync::Mutex<Option<String>>>,
     /// OSC 133 semantic prompt marks recorded by the reader thread, in
     /// arrival order. Positions are stored as `(grid line, history size)`
-    /// at record time; [`Self::command_marks`] translates to current grid
+    /// at record time; [`Self::marks_snapshot`] translates to current grid
     /// lines (content scrolls into history as output arrives, so a stored
     /// line drifts by exactly the history growth since recording).
     marks: Arc<std::sync::Mutex<Vec<StoredMark>>>,

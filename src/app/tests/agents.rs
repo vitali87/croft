@@ -2437,7 +2437,11 @@ fn closing_a_lane_refuses_while_a_tab_in_it_has_unsaved_edits_in_any_group() {
     assert!(lane_file.exists(), "the worktree stays");
     assert!(app.roots.iter().any(|r| r == lane), "and its folder");
     assert_eq!(app.terminals.len(), 2, "and its pane");
-    let tab = app.editor_layout.inactive_groups()[0]
+    let tab = app
+        .editor_layout
+        .inactive_groups()
+        .next()
+        .unwrap()
         .editors
         .iter()
         .find(|e| e.path.as_deref() == Some(lane_file.as_path()))
@@ -2494,12 +2498,12 @@ fn closing_a_lane_closes_its_saved_tabs_in_every_group() {
     app.editor.open_pinned(&lane.join("seed.txt")).unwrap();
     app.split_editor();
     app.editor.open_pinned(&main_file).unwrap();
-    assert_eq!(app.editor_layout.inactive_groups().len(), 1);
+    assert_eq!(app.editor_layout.inactive_groups().count(), 1);
     app.active_scm_root = lane.clone();
     app.close_worktree_lane();
     assert!(!lane.exists(), "the worktree is gone: {}", app.status);
     assert!(
-        app.editor_layout.inactive_groups().is_empty(),
+        app.editor_layout.inactive_groups().next().is_none(),
         "the group that showed only the lane folded away"
     );
     let open: Vec<PathBuf> = app
@@ -3475,7 +3479,7 @@ fn an_agent_edit_proposal_opens_the_popup_and_enter_answers_the_hook() {
     };
     writeln!(hook, "{}", serde_json::to_string(&req).unwrap()).unwrap();
     assert!(app.drain_hook_requests());
-    assert!(app.modal_overlay_open());
+    assert!(app.popup_open());
     // A proposal the hook has stopped waiting for leaves with the popup.
     app.approvals[0].arrived -= crate::agent_hook::ANSWER_WINDOW;
     assert!(app.drain_hook_requests());

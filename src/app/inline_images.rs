@@ -2,6 +2,7 @@
 //! and clearing each picture every frame (the activity-bar icons included), the
 //! editor, terminal and Markdown overlays, and the minimap.
 
+use super::popups::PictureSpot;
 use super::*;
 
 pub(super) const FALLBACK_CELL_PIXEL: (u32, u32) = (10, 20);
@@ -210,6 +211,18 @@ pub(super) fn rgba_to_png(rgba: Vec<u8>, w: u32, h: u32) -> Option<Vec<u8>> {
 }
 
 impl App {
+    /// A picture's escape sequence as the terminal must receive it, in the
+    /// picture protocol croft detected: wrapped for tmux to pass through when
+    /// croft runs inside tmux. The pictures built on the UI thread all go
+    /// through here (#2062).
+    pub(super) fn wrap_for_terminal(&self, raw: String) -> String {
+        crate::iterm2_inline::maybe_tmux_wrap(
+            self.inline_protocol,
+            crate::iterm2_inline::detect_tmux(),
+            raw,
+        )
+    }
+
     /// Detect inline-image support via env vars only — no stdin queries, no
     /// raw-mode contention. Queries the terminal cell pixel size via
     /// crossterm's `window_size` (TIOCGWINSZ ioctl, no stdin involvement).
@@ -413,16 +426,12 @@ impl App {
             self.overlays.ssh.set_image(card);
         }
         // The activity-bar count badges ride the same overlay machinery; rebuild
-        // them against the freshly-baked icons / new background or cell size. The
-        // Explorer badge's per-frame refresh is count-gated, so force a rebuild
-        // here by invalidating its cached count first.
-        self.refresh_scm_change_badge();
-        self.explorer_unsaved_count = usize::MAX;
-        self.refresh_explorer_unsaved_badge();
-        self.remote_ports_count = usize::MAX;
-        self.refresh_remote_ports_badge();
-        self.testing_badge_count = usize::MAX;
-        self.refresh_testing_badge();
+        // them against the freshly-baked icons / new background or cell size.
+        // Their refresh is count-gated, so invalidate each first.
+        for badge in &mut self.activity_badges {
+            badge.invalidate();
+        }
+        self.refresh_activity_badges();
         self.problems_badge_count = usize::MAX;
         self.refresh_problems_badge();
     }
@@ -484,24 +493,38 @@ impl App {
                 encode(src, ki::IconState::Hovered, icon_ink, off_y_bias, id)?,
             ))
         };
-        // The sponsor heart (#1940) wears its own pink, and is never selected,
-        // so it bakes only its resting and hovered states. It shares the gear's
+        // One icon's pictures, from its source in the table. The view icons
+        // sit centered and the gear bottom-aligns (`gear_off_y_bias`). The
+        // sponsor heart (#1940) wears its own pink and is never selected, so
+        // it bakes only its resting and hovered states; it shares the gear's
         // bias so the two keep the view icons' spacing between them.
-        let sponsor_imgs = (|| {
-            let heart = |state| {
-                encode(
-                    ki::SPONSOR_HEART_SRC_SVG,
-                    state,
-                    sponsor_ink,
-                    gear_off_y_bias,
-                    ki::KITTY_ID_SPONSOR,
-                )
+        let bake_icon = |icon: ActivityIcon| -> Option<ActivityIconImages> {
+            let (src, id) = icon.picture();
+            if icon == ActivityIcon::Sponsor {
+                let heart = |state| encode(src, state, sponsor_ink, gear_off_y_bias, id);
+                return Some(ActivityIconImages {
+                    active: None,
+                    inactive: heart(ki::IconState::Inactive)?,
+                    hovered: heart(ki::IconState::Hovered)?,
+                });
+            }
+            let off_y_bias = if icon == ActivityIcon::Settings {
+                gear_off_y_bias
+            } else {
+                0
             };
-            Some((
-                heart(ki::IconState::Inactive)?,
-                heart(ki::IconState::Hovered)?,
-            ))
-        })();
+            let (active, inactive, hovered) = bake(src, off_y_bias, id)?;
+            Some(ActivityIconImages {
+                active: Some(active),
+                inactive,
+                hovered,
+            })
+        };
+        let icons = ActivityIcon::ALL
+            .into_iter()
+            .map(bake_icon)
+            .collect::<Option<Vec<_>>>()
+            .and_then(|icons| icons.try_into().ok());
         // Customize Layout toolbar icons: baked OPAQUE on the editor bg at the
         // 4×2-cell box so they paint IN FRONT of the container's top line
         // (the line sits behind the icon's solid background). `Inactive` is the
@@ -551,79 +574,26 @@ impl App {
                 bake_layout_pair(ki::LAYOUT_CUSTOMIZE_SRC_SVG, ki::KITTY_ID_LAYOUT_CUSTOMIZE)?;
             Some((so, soh, sf, sfh, po, poh, pf, pfh, cu, cuh))
         })();
-        let activity = if let (
-            Some((ea, ei, eh)),
-            Some((sa, si, sh)),
-            Some((sca, sci, sch)),
-            Some((ra, ri, rh)),
-            Some((rda, rdi, rdh)),
-            Some((exta, exti, exth)),
-            Some((tsta, tsti, tsth)),
-            Some((cqa, cqi, cqh)),
-            Some((spi, sph)),
-            Some((gea, gei, geh)),
-            Some((lso, lsoh, lsf, lsfh, lpo, lpoh, lpf, lpfh, lcu, lcuh)),
-        ) = (
-            bake(ki::EXPLORER_SRC_SVG, 0, ki::KITTY_ID_EXPLORER),
-            bake(ki::SEARCH_SRC_SVG, 0, ki::KITTY_ID_SEARCH),
-            bake(ki::SOURCE_CONTROL_SRC_SVG, 0, ki::KITTY_ID_SOURCE_CONTROL),
-            bake(ki::REMOTE_SRC_SVG, 0, ki::KITTY_ID_REMOTE),
-            bake(ki::RUN_DEBUG_SRC_SVG, 0, ki::KITTY_ID_RUN_DEBUG_BAR),
-            bake(ki::EXTENSIONS_SRC_SVG, 0, ki::KITTY_ID_EXTENSIONS),
-            bake(ki::TESTING_SRC_SVG, 0, ki::KITTY_ID_TESTING),
-            bake(ki::CODEQL_SRC_SVG, 0, ki::KITTY_ID_CODEQL),
-            sponsor_imgs,
-            bake(
-                ki::SETTINGS_GEAR_SRC_SVG,
-                gear_off_y_bias,
-                ki::KITTY_ID_SETTINGS,
-            ),
-            layout_imgs,
-        ) {
-            Some(ActivityBarImages {
-                explorer_active: ea,
-                explorer_inactive: ei,
-                explorer_hovered: eh,
-                search_active: sa,
-                search_inactive: si,
-                search_hovered: sh,
-                source_control_active: sca,
-                source_control_inactive: sci,
-                source_control_hovered: sch,
-                remote_active: ra,
-                remote_inactive: ri,
-                remote_hovered: rh,
-                run_debug_active: rda,
-                run_debug_inactive: rdi,
-                run_debug_hovered: rdh,
-                extensions_active: exta,
-                extensions_inactive: exti,
-                extensions_hovered: exth,
-                testing_active: tsta,
-                testing_inactive: tsti,
-                testing_hovered: tsth,
-                codeql_active: cqa,
-                codeql_inactive: cqi,
-                codeql_hovered: cqh,
-                sponsor_inactive: spi,
-                sponsor_hovered: sph,
-                settings_active: gea,
-                settings_inactive: gei,
-                settings_hovered: geh,
-                layout_sidebar_on: lso,
-                layout_sidebar_on_hover: lsoh,
-                layout_sidebar_off: lsf,
-                layout_sidebar_off_hover: lsfh,
-                layout_panel_on: lpo,
-                layout_panel_on_hover: lpoh,
-                layout_panel_off: lpf,
-                layout_panel_off_hover: lpfh,
-                layout_customize: lcu,
-                layout_customize_hover: lcuh,
-            })
-        } else {
-            None
-        };
+        let activity =
+            if let (Some(icons), Some((lso, lsoh, lsf, lsfh, lpo, lpoh, lpf, lpfh, lcu, lcuh))) =
+                (icons, layout_imgs)
+            {
+                Some(ActivityBarImages {
+                    icons,
+                    layout_sidebar_on: lso,
+                    layout_sidebar_on_hover: lsoh,
+                    layout_sidebar_off: lsf,
+                    layout_sidebar_off_hover: lsfh,
+                    layout_panel_on: lpo,
+                    layout_panel_on_hover: lpoh,
+                    layout_panel_off: lpf,
+                    layout_panel_off_hover: lpfh,
+                    layout_customize: lcu,
+                    layout_customize_hover: lcuh,
+                })
+            } else {
+                None
+            };
         // Run-and-Debug headline icon: the same debug-alt PNG used in the
         // activity bar, fitted to the panel's icon block (RUN_DEBUG_ICON_CELLS_W
         // cells wide × RUN_DEBUG_ICON_CELLS_H cells tall) and tinted at icon-
@@ -721,9 +691,8 @@ impl App {
         self.overlays.run_debug.clear_emitted();
     }
 
-    pub fn flush_run_debug_icon_overlay(&mut self) {
-        use std::io::Write;
-        if self.modal_overlay_open() {
+    pub fn flush_run_debug_icon_overlay(&mut self, drawn: &ratatui::buffer::Buffer) {
+        if self.picture_waits(PictureSpot::RunDebugIcon) {
             return;
         }
         let panel_visible = self.show_tree
@@ -768,19 +737,16 @@ impl App {
             width: crate::widgets::run_debug::RUN_DEBUG_ICON_CELLS_W,
             height: crate::widgets::run_debug::RUN_DEBUG_ICON_CELLS_H,
         };
-        if !self.chrome_image_due("run_debug", &osc, at) {
+        if !self.chrome_image_due("run_debug", &osc, at, drawn) {
             return;
         }
-        let mut out = stdout();
-        let cursor_on = self.cursor_should_be_visible();
-        let _ = write!(out, "\x1b[?25l\x1b[s");
-        let _ = write!(out, "\x1b[{};{}H", cy + 1, cx + 1);
-        let _ = out.write_all(osc.as_bytes());
-        let _ = write!(out, "\x1b[u");
-        if cursor_on {
-            let _ = write!(out, "\x1b[?25h");
-        }
-        let _ = out.flush();
+        write_inline_image(
+            &mut stdout(),
+            cx,
+            cy,
+            osc.as_bytes(),
+            self.cursor_should_be_visible(),
+        );
         self.overlays.run_debug.mark_emitted_at((cx, cy));
     }
 
@@ -798,11 +764,11 @@ impl App {
     /// Emit the PROBLEMS-tab orange circle as an OSC-1337/Kitty inline image at
     /// the cell `paint_panel_tabs` recorded this frame, re-emitted every frame
     /// (like the activity-bar badges) so heavy SGR traffic can't evict it.
-    /// Clears when the panel strip is hidden, the count is zero, or a modal owns
-    /// the screen; arms a one-shot clear when the anchor moves so no ghost stacks.
-    pub fn flush_problems_badge_overlay(&mut self) {
-        use std::io::Write;
-        if self.modal_overlay_open() {
+    /// Clears when the panel strip is hidden or the count is zero, and waits
+    /// while a pop-up is open; arms a one-shot clear when the anchor moves so
+    /// no ghost stacks.
+    pub fn flush_problems_badge_overlay(&mut self, drawn: &ratatui::buffer::Buffer) {
+        if self.picture_waits(PictureSpot::ProblemsBadge) {
             return;
         }
         let Some((cx, cy)) = self.problems_badge_cell.filter(|_| self.show_terminal) else {
@@ -829,19 +795,16 @@ impl App {
             width: crate::iterm2_inline::count_badge_cells_w(self.problems_badge_count),
             height: 1,
         };
-        if !self.chrome_image_due("problems_badge", &osc, at) {
+        if !self.chrome_image_due("problems_badge", &osc, at, drawn) {
             return;
         }
-        let mut out = stdout();
-        let cursor_on = self.cursor_should_be_visible();
-        let _ = write!(out, "\x1b[?25l\x1b[s");
-        let _ = write!(out, "\x1b[{};{}H", cy + 1, cx + 1);
-        let _ = out.write_all(osc.as_bytes());
-        let _ = write!(out, "\x1b[u");
-        if cursor_on {
-            let _ = write!(out, "\x1b[?25h");
-        }
-        let _ = out.flush();
+        write_inline_image(
+            &mut stdout(),
+            cx,
+            cy,
+            osc.as_bytes(),
+            self.cursor_should_be_visible(),
+        );
         self.overlays.problems_badge.mark_emitted_at((cx, cy));
     }
 
@@ -851,9 +814,8 @@ impl App {
     /// terminal can't render inline images. Called from the post-draw
     /// flush each frame so iTerm2 keeps the image painted even after
     /// surrounding cells redraw.
-    pub fn flush_no_repo_hero_overlay(&mut self) {
-        use std::io::Write;
-        if self.modal_overlay_open() {
+    pub fn flush_no_repo_hero_overlay(&mut self, drawn: &ratatui::buffer::Buffer) {
+        if self.picture_waits(PictureSpot::SourceControlHero) {
             return;
         }
         let panel_visible = self.show_tree
@@ -902,49 +864,35 @@ impl App {
                 crate::iterm2_inline::KITTY_ID_HERO,
                 crate::iterm2_inline::KITTY_Z_BELOW_TEXT_AND_BG,
             ) {
-                let osc = crate::iterm2_inline::maybe_tmux_wrap(
-                    protocol,
-                    crate::iterm2_inline::detect_tmux(),
-                    raw,
-                );
+                let osc = self.wrap_for_terminal(raw);
                 self.overlays.hero.set(osc, desired);
             }
         }
         let Some(osc) = self.overlays.hero.image().map(str::to_owned) else {
             return;
         };
-        if !self.chrome_image_due("hero", &osc, hero) {
+        if !self.chrome_image_due("hero", &osc, hero, drawn) {
             return;
         }
-        let mut out = stdout();
-        let cursor_on = self.cursor_should_be_visible();
-        let _ = write!(out, "\x1b[?25l\x1b[s");
-        let _ = write!(out, "\x1b[{};{}H", hero.y + 1, hero.x + 1);
-        let _ = out.write_all(osc.as_bytes());
-        let _ = write!(out, "\x1b[u");
-        if cursor_on {
-            let _ = write!(out, "\x1b[?25h");
-        }
-        let _ = out.flush();
+        write_inline_image(
+            &mut stdout(),
+            hero.x,
+            hero.y,
+            osc.as_bytes(),
+            self.cursor_should_be_visible(),
+        );
         self.overlays.hero.mark_emitted();
     }
 
     /// Emit the OSC-1337 SSH-empty-state illustration at the cell the
     /// remote panel reserved on its most recent render. When the panel
-    /// is no longer the active view (or has hosts, or the shortcuts
-    /// modal is open), this arms a one-shot terminal.clear() via
+    /// is no longer the active view (or has hosts, or a pop-up is
+    /// open), this arms a one-shot terminal.clear() via
     /// `consume_ssh_empty_state_image_clear()` so iTerm2 evicts the
     /// cached image cells — otherwise the illustration ghosts onto
     /// whatever view (Explorer / Search / …) replaces it.
-    pub fn flush_ssh_empty_state_overlay(&mut self) {
-        use std::io::Write;
-        let should_show = self.shortcuts_modal.is_none()
-            && self.file_finder.is_none()
-            && self.zoxide_jump.is_none()
-            && self.command_history_popup.is_none()
-            && self.branch_picker.is_none()
-            && self.input_prompt.is_none()
-            && self.list_picker.is_none()
+    pub fn flush_ssh_empty_state_overlay(&mut self, drawn: &ratatui::buffer::Buffer) {
+        let should_show = !self.picture_waits(PictureSpot::SshIllustration)
             && self.show_tree
             && self.sidebar_view == SidebarView::Remote
             && self.remote.targets.is_empty();
@@ -964,20 +912,23 @@ impl App {
             width: crate::widgets::remote::SSH_EMPTY_STATE_CELLS_W,
             height: crate::widgets::remote::SSH_EMPTY_STATE_CELLS_H,
         };
-        if self.update_card_covers(at) || !self.chrome_image_due("ssh", &osc, at) {
+        if self.update_card_covers(at) || !self.chrome_image_due("ssh", &osc, at, drawn) {
             return;
         }
-        let mut out = stdout();
-        let cursor_on = self.cursor_should_be_visible();
-        let _ = write!(out, "\x1b[?25l\x1b[s");
-        let _ = write!(out, "\x1b[{};{}H", cy + 1, cx + 1);
-        let _ = out.write_all(osc.as_bytes());
-        let _ = write!(out, "\x1b[u");
-        if cursor_on {
-            let _ = write!(out, "\x1b[?25h");
-        }
-        let _ = out.flush();
+        write_inline_image(
+            &mut stdout(),
+            cx,
+            cy,
+            osc.as_bytes(),
+            self.cursor_should_be_visible(),
+        );
         self.overlays.ssh.mark_displayed();
+    }
+
+    /// Whether a pop-up that pictures make way for opened or closed since
+    /// the last check (see [`super::overlay::OverlayManager::popup_clear`]).
+    pub fn consume_popup_image_clear(&mut self) -> bool {
+        self.overlays.popup_clear.consume()
     }
 
     /// One-shot consumer paired with `flush_ssh_empty_state_overlay`. The
@@ -1135,104 +1086,16 @@ impl App {
         let Some(images) = self.overlays.activity.images() else {
             return Vec::new();
         };
-        let exp_block = self.sidebar_areas.explorer_icon;
-        let sea_block = self.sidebar_areas.search_icon;
-        let scm_block = self.sidebar_areas.source_control_icon;
-        let rem_block = self.sidebar_areas.remote_icon;
-        let rdb_block = self.sidebar_areas.run_debug_icon;
-        let ext_block = self.sidebar_areas.extensions_icon;
-        let tst_block = self.sidebar_areas.testing_icon;
-        // Optional: absent while CodeQL is disabled, so not part of the
-        // all-or-nothing readiness below.
-        let cql_block = self.sidebar_areas.codeql_icon;
+        let icons = self.sidebar_areas.activity_icons;
         // The activity bar is all-or-nothing: emit its icons only when every
-        // block is laid out (a partial bar would look broken). When it's hidden
-        // (Customize Layout / Zen) the blocks are zero-width and skipped, but
-        // the layout toolbar icons below still emit independently.
-        let activity_ready = exp_block.width > 0
-            && sea_block.width > 0
-            && scm_block.width > 0
-            && rem_block.width > 0
-            && rdb_block.width > 0
-            && ext_block.width > 0
-            && tst_block.width > 0;
-        // Three-way per icon: the selected view shows the active (pilled)
-        // variant; otherwise the pointer-hovered icon brightens (no pill); the
-        // rest stay muted. Selected always wins over hovered.
-        let hov = self.hovered_activity_icon;
-        let exp_state = if self.activity_view_active(SidebarView::Explorer) {
-            &images.explorer_active
-        } else if hov == Some(ActivityIcon::Explorer) {
-            &images.explorer_hovered
-        } else {
-            &images.explorer_inactive
-        };
-        let sea_state = if self.activity_view_active(SidebarView::Search) {
-            &images.search_active
-        } else if hov == Some(ActivityIcon::Search) {
-            &images.search_hovered
-        } else {
-            &images.search_inactive
-        };
-        let scm_state = if self.activity_view_active(SidebarView::SourceControl) {
-            &images.source_control_active
-        } else if hov == Some(ActivityIcon::SourceControl) {
-            &images.source_control_hovered
-        } else {
-            &images.source_control_inactive
-        };
-        let rem_state = if self.activity_view_active(SidebarView::Remote) {
-            &images.remote_active
-        } else if hov == Some(ActivityIcon::Remote) {
-            &images.remote_hovered
-        } else {
-            &images.remote_inactive
-        };
-        let rdb_state = if self.activity_view_active(SidebarView::RunDebug) {
-            &images.run_debug_active
-        } else if hov == Some(ActivityIcon::RunDebug) {
-            &images.run_debug_hovered
-        } else {
-            &images.run_debug_inactive
-        };
-        let ext_state = if self.activity_view_active(SidebarView::Extensions) {
-            &images.extensions_active
-        } else if hov == Some(ActivityIcon::Extensions) {
-            &images.extensions_hovered
-        } else {
-            &images.extensions_inactive
-        };
-        let tst_state = if self.activity_view_active(SidebarView::Testing) {
-            &images.testing_active
-        } else if hov == Some(ActivityIcon::Testing) {
-            &images.testing_hovered
-        } else {
-            &images.testing_inactive
-        };
-        let cql_state = if self.activity_view_active(SidebarView::CodeQL) {
-            &images.codeql_active
-        } else if hov == Some(ActivityIcon::CodeQL) {
-            &images.codeql_hovered
-        } else {
-            &images.codeql_inactive
-        };
-        // The heart and the gear are bottom-anchored and may be absent on a
-        // short bar (empty block). The heart is never selected; the gear
-        // reads "active" while its menu/picker is open.
-        let spo_block = self.sidebar_areas.sponsor_icon;
-        let spo_state = if hov == Some(ActivityIcon::Sponsor) {
-            &images.sponsor_hovered
-        } else {
-            &images.sponsor_inactive
-        };
-        let set_block = self.sidebar_areas.settings_icon;
-        let set_state = if self.settings_menu_active() {
-            &images.settings_active
-        } else if hov == Some(ActivityIcon::Settings) {
-            &images.settings_hovered
-        } else {
-            &images.settings_inactive
-        };
+        // icon that is always there is laid out (a partial bar would look
+        // broken). When it's hidden (Customize Layout / Zen) the blocks are
+        // zero-width and skipped, but the layout toolbar icons below still
+        // emit independently.
+        let activity_ready = ActivityIcon::ALL
+            .into_iter()
+            .filter(|icon| !icon.optional())
+            .all(|icon| icons[icon].width > 0);
         // The shortcuts modal and file finder are centered over the editor
         // column, not the far-left activity bar, so the icons stay visible
         // beside them. Suppress an icon only when its block actually
@@ -1257,87 +1120,20 @@ impl App {
         };
         let mut blocks: Vec<(Rect, &str)> = Vec::new();
         if activity_ready {
-            blocks.extend_from_slice(&[
-                (exp_block, exp_state.as_str()),
-                (sea_block, sea_state.as_str()),
-                (scm_block, scm_state.as_str()),
-                (rem_block, rem_state.as_str()),
-                (rdb_block, rdb_state.as_str()),
-                (ext_block, ext_state.as_str()),
-                (tst_block, tst_state.as_str()),
-            ]);
-            if cql_block.width > 0 {
-                blocks.push((cql_block, cql_state.as_str()));
+            for icon in ActivityIcon::ALL {
+                if icons[icon].width > 0 {
+                    blocks.push((icons[icon], self.activity_icon_picture(images, icon)));
+                }
             }
-            if spo_block.width > 0 {
-                blocks.push((spo_block, spo_state.as_str()));
-            }
-            if set_block.width > 0 {
-                blocks.push((set_block, set_state.as_str()));
-            }
-            // Change-count badge over the SCM icon's bottom-right corner. Pushed
-            // after the SCM icon so the iTerm2 path (last writer wins each cell)
-            // paints it on top; the Kitty path baked it at z=1 for the same
-            // effect. Dropping it from the list when the count hits zero shifts
-            // the emit positions, which arms the overlay's move-detection clear.
-            if let Some(badge) = self.scm_change_badge.as_deref() {
-                let bw = crate::iterm2_inline::count_badge_cells_w(self.scm_change_badge_count);
-                let bx = scm_block.x + scm_block.width.saturating_sub(bw);
-                let by = scm_block.y + scm_block.height.saturating_sub(1);
-                blocks.push((
-                    Rect {
-                        x: bx,
-                        y: by,
-                        width: bw,
-                        height: 1,
-                    },
-                    badge,
-                ));
-            }
-            // Same badge over the Explorer icon for the unsaved-file count.
-            if let Some(badge) = self.explorer_unsaved_badge.as_deref() {
-                let bw = crate::iterm2_inline::count_badge_cells_w(self.explorer_unsaved_count);
-                let bx = exp_block.x + exp_block.width.saturating_sub(bw);
-                let by = exp_block.y + exp_block.height.saturating_sub(1);
-                blocks.push((
-                    Rect {
-                        x: bx,
-                        y: by,
-                        width: bw,
-                        height: 1,
-                    },
-                    badge,
-                ));
-            }
-            // And over the Remote icon for the forwarded-ports count.
-            if let Some(badge) = self.remote_ports_badge.as_deref() {
-                let bw = crate::iterm2_inline::count_badge_cells_w(self.remote_ports_count);
-                let bx = rem_block.x + rem_block.width.saturating_sub(bw);
-                let by = rem_block.y + rem_block.height.saturating_sub(1);
-                blocks.push((
-                    Rect {
-                        x: bx,
-                        y: by,
-                        width: bw,
-                        height: 1,
-                    },
-                    badge,
-                ));
-            }
-            // And the failing-test count over the Testing (beaker) icon.
-            if let Some(badge) = self.testing_badge.as_deref() {
-                let bw = crate::iterm2_inline::count_badge_cells_w(self.testing_badge_count);
-                let bx = tst_block.x + tst_block.width.saturating_sub(bw);
-                let by = tst_block.y + tst_block.height.saturating_sub(1);
-                blocks.push((
-                    Rect {
-                        x: bx,
-                        y: by,
-                        width: bw,
-                        height: 1,
-                    },
-                    badge,
-                ));
+            // Each count badge over its icon's bottom-right corner, pushed after
+            // every icon so the iTerm2 path (last writer wins each cell) paints
+            // it on top; the Kitty path baked it at z=1 for the same effect.
+            // Dropping one from the list when its count hits zero shifts the
+            // emit positions, which arms the overlay's move-detection clear.
+            for icon in ActivityIcon::ALL {
+                if let Some(badge) = self.activity_badges[icon as usize].placed(icons[icon]) {
+                    blocks.push(badge);
+                }
             }
         }
         // Customize Layout toolbar icons (top-right of the editor / welcome).
@@ -1377,6 +1173,22 @@ impl App {
             .filter(|(block, _)| block.width > 0 && visible(*block))
             .map(|(block, state)| ((block.x, block.y), state))
             .collect()
+    }
+
+    /// The picture `icon` shows this frame, three ways: selected (with its
+    /// pill), else brightened under the pointer, else at rest. Selected
+    /// always wins over hovered.
+    fn activity_icon_picture<'a>(
+        &self,
+        images: &'a ActivityBarImages,
+        icon: ActivityIcon,
+    ) -> &'a str {
+        let pictures = &images.icons[icon as usize];
+        match &pictures.active {
+            Some(active) if self.activity_icon_selected(icon) => active,
+            _ if self.hovered_activity_icon == Some(icon) => &pictures.hovered,
+            _ => &pictures.inactive,
+        }
     }
 
     /// True while the activity-bar gear's menu or theme picker is open, so the
@@ -1595,11 +1407,7 @@ impl App {
                 crate::iterm2_inline::KITTY_Z_BELOW_TEXT_AND_BG,
             )
         {
-            let osc = crate::iterm2_inline::maybe_tmux_wrap(
-                self.inline_protocol,
-                crate::iterm2_inline::detect_tmux(),
-                raw,
-            );
+            let osc = self.wrap_for_terminal(raw);
             self.overlays.editor[side].set(osc, desired);
         }
     }
@@ -1620,18 +1428,7 @@ impl App {
     }
 
     pub fn editor_image_payload(&self, side: usize) -> Option<(&str, &EditorImageLayout)> {
-        if self.shortcuts_modal.is_some()
-            || self.file_finder.is_some()
-            || self.command_palette.is_some()
-            || self.go_to_symbol.is_some()
-            || self.workspace_symbols.is_some()
-            || self.process_picker.is_some()
-            || self.zoxide_jump.is_some()
-            || self.command_history_popup.is_some()
-            || self.branch_picker.is_some()
-            || self.input_prompt.is_some()
-            || self.list_picker.is_some()
-        {
+        if self.picture_waits(PictureSpot::Editor(side)) {
             return None;
         }
         self.overlays.editor[side].payload()
@@ -1766,11 +1563,7 @@ impl App {
                 crate::iterm2_inline::KITTY_Z_BELOW_TEXT_AND_BG,
             )
         {
-            let osc = crate::iterm2_inline::maybe_tmux_wrap(
-                self.inline_protocol,
-                crate::iterm2_inline::detect_tmux(),
-                raw,
-            );
+            let osc = self.wrap_for_terminal(raw);
             self.overlays.terminal_image.set(osc, desired);
         }
     }
@@ -1792,21 +1585,10 @@ impl App {
         self.overlays.markdown_image.mark_displayed();
     }
 
-    /// The markdown-preview image escape to flush this frame; same modal
-    /// gate as the terminal pane picture.
+    /// The markdown-preview image escape to flush this frame; held back
+    /// under a pop-up, as the terminal pane picture is.
     pub fn markdown_image_payload(&self) -> Option<(&str, &MarkdownImageLayout)> {
-        if self.shortcuts_modal.is_some()
-            || self.file_finder.is_some()
-            || self.command_palette.is_some()
-            || self.go_to_symbol.is_some()
-            || self.workspace_symbols.is_some()
-            || self.process_picker.is_some()
-            || self.zoxide_jump.is_some()
-            || self.command_history_popup.is_some()
-            || self.branch_picker.is_some()
-            || self.input_prompt.is_some()
-            || self.list_picker.is_some()
-        {
+        if self.picture_waits(PictureSpot::Markdown) {
             return None;
         }
         self.overlays.markdown_image.payload()
@@ -1922,11 +1704,7 @@ impl App {
                 crate::iterm2_inline::KITTY_Z_BELOW_TEXT_AND_BG,
             )
         {
-            let osc = crate::iterm2_inline::maybe_tmux_wrap(
-                self.inline_protocol,
-                crate::iterm2_inline::detect_tmux(),
-                raw,
-            );
+            let osc = self.wrap_for_terminal(raw);
             self.overlays.markdown_image.set(osc, desired);
         }
     }
@@ -1936,21 +1714,11 @@ impl App {
         self.overlays.terminal_image.consume_clear()
     }
 
-    /// The pane image escape to flush this frame, gated off while any modal
-    /// popup is up so the picture never paints over it.
+    /// The pane image escape to flush this frame, held back while a pop-up
+    /// is open ([`Self::pictures_held_back`]) so the picture never paints
+    /// over it.
     pub fn terminal_image_payload(&self) -> Option<(&str, &TerminalImageLayout)> {
-        if self.shortcuts_modal.is_some()
-            || self.file_finder.is_some()
-            || self.command_palette.is_some()
-            || self.go_to_symbol.is_some()
-            || self.workspace_symbols.is_some()
-            || self.process_picker.is_some()
-            || self.zoxide_jump.is_some()
-            || self.command_history_popup.is_some()
-            || self.branch_picker.is_some()
-            || self.input_prompt.is_some()
-            || self.list_picker.is_some()
-        {
+        if self.picture_waits(PictureSpot::Terminal) {
             return None;
         }
         self.overlays.terminal_image.payload()
@@ -2146,11 +1914,7 @@ impl App {
             false,
             crate::iterm2_inline::KITTY_ID_MINIMAP,
         ) {
-            let osc = crate::iterm2_inline::maybe_tmux_wrap(
-                self.inline_protocol,
-                crate::iterm2_inline::detect_tmux(),
-                raw,
-            );
+            let osc = self.wrap_for_terminal(raw);
             self.overlays.minimap.set(osc, desired);
         }
     }
@@ -2366,19 +2130,7 @@ impl App {
     }
 
     pub fn minimap_image_payload(&self) -> Option<(&str, &MinimapLayout)> {
-        if self.shortcuts_modal.is_some()
-            || self.file_finder.is_some()
-            || self.command_palette.is_some()
-            || self.go_to_symbol.is_some()
-            || self.workspace_symbols.is_some()
-            || self.process_picker.is_some()
-            || self.zoxide_jump.is_some()
-            || self.command_history_popup.is_some()
-            || self.branch_picker.is_some()
-            || self.input_prompt.is_some()
-            || self.list_picker.is_some()
-            || self.menu_covers(self.minimap_img_rect)
-        {
+        if self.picture_waits(PictureSpot::Minimap) || self.menu_covers(self.minimap_img_rect) {
             return None;
         }
         self.overlays.minimap.payload()
@@ -2451,6 +2203,45 @@ impl App {
             target_dir: self.tree.root.clone(),
         });
     }
+}
+
+/// Send one inline picture straight to the terminal, after ratatui's diff
+/// (ratatui cannot draw one): a batch of one for [`write_inline_images`].
+/// `payload` is the picture's escape sequence, borrowed: a picture can be
+/// megabytes.
+pub(super) fn write_inline_image(
+    out: &mut impl std::io::Write,
+    cell_x: u16,
+    cell_y: u16,
+    payload: &[u8],
+    cursor_on: bool,
+) {
+    write_inline_images(out, [(cell_x, cell_y, payload)], cursor_on);
+}
+
+/// Send inline pictures straight to the terminal, after ratatui's diff
+/// (ratatui cannot draw one), inside one caret guard: the caret is hidden
+/// and its place saved, each picture is written from its cell (`x`, `y`),
+/// and the caret goes back where it was, shown again only when `cursor_on`
+/// says it should be. Every picture croft sends goes out through here --
+/// one at a time through [`write_inline_image`], or the activity bar's
+/// icons and badges together -- so this guard is written once (#2062). An
+/// empty batch still sends the guard, as the activity bar always did.
+pub(super) fn write_inline_images<'a>(
+    out: &mut impl std::io::Write,
+    pictures: impl IntoIterator<Item = (u16, u16, &'a [u8])>,
+    cursor_on: bool,
+) {
+    let _ = write!(out, "\x1b[?25l\x1b[s");
+    for (cell_x, cell_y, payload) in pictures {
+        let _ = write!(out, "\x1b[{};{}H", cell_y + 1, cell_x + 1);
+        let _ = out.write_all(payload);
+    }
+    let _ = write!(out, "\x1b[u");
+    if cursor_on {
+        let _ = write!(out, "\x1b[?25h");
+    }
+    let _ = out.flush();
 }
 
 /// The SGR prefix (reset + truecolor fg/bg) for one ratatui cell, used when
@@ -2555,43 +2346,40 @@ impl App {
         }
     }
 
-    /// Keep the buffer ratatui just drew for [`Self::chrome_image_due`], on
-    /// the terminals it reads it for: every one but Kitty's protocol, which
-    /// keeps pictures on a layer of their own. On Kitty (Ghostty, kitty) the
-    /// copy was a whole screen of cells cloned after every frame and never
-    /// read, so none is kept there.
-    pub(super) fn keep_drawn_buffer(&mut self, drawn: &ratatui::buffer::Buffer) {
-        if self.inline_protocol == crate::iterm2_inline::InlineImageProtocol::Kitty {
-            self.drawn_buffer = None;
-            return;
-        }
-        match self.drawn_buffer.as_mut() {
-            // Into the cells of the last copy, so a frame reuses them
-            // rather than allocating a screen's worth anew.
-            Some(kept) => {
-                kept.area = drawn.area;
-                kept.content.clone_from(&drawn.content);
-            }
-            None => self.drawn_buffer = Some(drawn.clone()),
-        }
+    /// Send the small chrome pictures due this frame (the Run and Debug
+    /// icon, the PROBLEMS badge, the source-control and SSH illustrations),
+    /// then forget the ones not on screen. `drawn` is the frame ratatui just
+    /// drew, read in place for the cells around each picture: nothing copies
+    /// it (#2062).
+    pub(super) fn flush_chrome_images(&mut self, drawn: &ratatui::buffer::Buffer) {
+        self.flush_run_debug_icon_overlay(drawn);
+        self.flush_problems_badge_overlay(drawn);
+        self.flush_no_repo_hero_overlay(drawn);
+        self.flush_ssh_empty_state_overlay(drawn);
+        self.end_chrome_flush();
     }
 
     /// Whether a small chrome image must be sent this frame (#682). These
     /// used to go out after every redraw, so a keystroke re-sent each one
     /// over SSH. Now one goes out when it is new, changed or moved, and on
-    /// iTerm2 and Sixel also when the cells around it were repainted (iTerm2
-    /// evicts an image under neighbouring traffic, and a cell-buffer picture
-    /// is erased by writes into it). Kitty keeps images on their own layer.
-    pub(super) fn chrome_image_due(&mut self, key: &'static str, image: &str, at: Rect) -> bool {
+    /// iTerm2 and Sixel also when the cells around it were repainted in
+    /// `drawn`, the frame ratatui just drew (iTerm2 evicts an image under
+    /// neighbouring traffic, and a cell-buffer picture is erased by writes
+    /// into it). Kitty keeps images on their own layer.
+    pub(super) fn chrome_image_due(
+        &mut self,
+        key: &'static str,
+        image: &str,
+        at: Rect,
+        drawn: &ratatui::buffer::Buffer,
+    ) -> bool {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         image.hash(&mut h);
         (at.x, at.y, at.width, at.height).hash(&mut h);
-        if self.inline_protocol != crate::iterm2_inline::InlineImageProtocol::Kitty
-            && let Some(buf) = &self.drawn_buffer
-        {
+        if self.inline_protocol != crate::iterm2_inline::InlineImageProtocol::Kitty {
             cells_fingerprint(
-                buf,
+                drawn,
                 at.x.saturating_sub(1),
                 at.y.saturating_sub(1),
                 at.width.saturating_add(2),

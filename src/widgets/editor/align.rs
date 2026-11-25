@@ -113,7 +113,7 @@ impl Editor {
         }
     }
 
-    /// Align Line Last Cursors (`Ctrl+Alt+Shift+A`): spaces at the start of
+    /// Align Line Last Cursors (`Ctrl+Alt+L`): spaces at the start of
     /// every affected line until the right-most selection end of all of them
     /// lines up — whole lines shift right, as the extension does.
     pub fn align_line_last_cursors(&mut self) -> bool {

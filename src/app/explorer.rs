@@ -3,6 +3,7 @@
 //! .code-workspace files, re-rooting, file watching and outside changes, zoxide jump.
 
 use super::*;
+use crate::widgets::picker_rows::{PickerMouse, answer_mouse};
 
 /// The toggleable sub-views stacked inside the Explorer side panel, mirroring
 /// VS Code's "Views and More Actions" (⋯) menu on the EXPLORER header. Ordered
@@ -384,8 +385,9 @@ impl App {
     /// exist yet; its appearing is a change like any other.
     pub(super) fn polled_open_file_paths(&self) -> Vec<PathBuf> {
         let mut paths = self.open_tab_paths();
-        let wal = std::iter::once(&self.editor)
-            .chain(self.editor_layout.inactive_groups())
+        let wal = self
+            .editor_layout
+            .all_groups(&self.editor)
             .flat_map(|g| g.editors.iter())
             .filter(|e| {
                 e.sheet
@@ -405,8 +407,8 @@ impl App {
     /// stats these, so a background tab in a dir that carries no watch still
     /// sees an external write.
     pub(super) fn open_tab_paths(&self) -> Vec<PathBuf> {
-        std::iter::once(&self.editor)
-            .chain(self.editor_layout.inactive_groups())
+        self.editor_layout
+            .all_groups(&self.editor)
             .flat_map(|g| g.editors.iter())
             .filter_map(|e| e.path.clone())
             .collect()
@@ -1614,10 +1616,6 @@ impl App {
         };
     }
 
-    pub fn consume_zoxide_jump_image_clear(&mut self) -> bool {
-        self.overlays.zoxide_jump_clear.consume()
-    }
-
     /// Open the zoxide jump popup and seed it with the full frecency list
     /// (`zoxide query -l`), so it shows the user's top directories before
     /// they type anything — like pressing `j<Tab>` in the shell.
@@ -1655,14 +1653,14 @@ impl App {
             zoxide_jump_status(&jump)
         };
         self.zoxide_jump = Some(jump);
-        self.overlays.zoxide_jump_clear.request();
+        self.overlays.popup_clear.request();
         self.status = status;
     }
 
     pub(super) fn close_zoxide_jump(&mut self) {
         self.zoxide_add_folder = false;
         if self.zoxide_jump.take().is_some() {
-            self.overlays.zoxide_jump_clear.request();
+            self.overlays.popup_clear.request();
             self.overlays.activity.mark_dirty();
             self.overlays.welcome.mark_dirty();
             self.overlays.hero.mark_dirty();
@@ -1855,31 +1853,10 @@ impl App {
         let Some(jump) = self.zoxide_jump.as_mut() else {
             return;
         };
-        let inside = rect_contains(jump.last_rect, m.column, m.row);
-        match m.kind {
-            MouseEventKind::ScrollDown => {
-                for _ in 0..3 {
-                    jump.select_next();
-                }
-            }
-            MouseEventKind::ScrollUp => {
-                for _ in 0..3 {
-                    jump.select_prev();
-                }
-            }
-            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
-                if !inside =>
-            {
-                self.close_zoxide_jump();
-            }
-            // Click a row to jump to it, the way VS Code's quick-pick behaves.
-            MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(idx) = jump.row_index_at(m.row) {
-                    jump.selected = idx;
-                    self.apply_zoxide_jump_selection();
-                }
-            }
-            _ => {}
+        match answer_mouse(jump, m) {
+            PickerMouse::Close => self.close_zoxide_jump(),
+            PickerMouse::Accept => self.apply_zoxide_jump_selection(),
+            PickerMouse::Stay => {}
         }
     }
 
@@ -2592,8 +2569,7 @@ impl App {
     /// not just the focused one: a tab in the other split kept the old path,
     /// raised a disk conflict, and a save brought the old file back.
     pub(super) fn rename_open_path_everywhere(&mut self, old: &Path, new: &Path) {
-        self.editor.rename_open_path(old, new);
-        for group in self.editor_layout.inactive_groups_mut() {
+        for group in self.editor_layout.all_groups_mut(&mut self.editor) {
             group.rename_open_path(old, new);
         }
     }
@@ -2628,8 +2604,7 @@ impl App {
                 // edits away while the trash only held the saved copy.
                 let mut kept = 0;
                 for path in &paths {
-                    kept += self.editor.close_clean_tabs_under(path);
-                    for group in self.editor_layout.inactive_groups_mut() {
+                    for group in self.editor_layout.all_groups_mut(&mut self.editor) {
                         kept += group.close_clean_tabs_under(path);
                     }
                 }

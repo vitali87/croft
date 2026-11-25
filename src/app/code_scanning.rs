@@ -57,7 +57,6 @@ impl App {
         let inactive: Vec<&crate::widgets::editor::Editor> = self
             .editor_layout
             .inactive_groups()
-            .into_iter()
             .flat_map(|g| g.editors.iter())
             .collect();
         let mut signature: Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)> = self
@@ -108,7 +107,6 @@ impl App {
             .chain(
                 self.editor_layout
                     .inactive_groups()
-                    .into_iter()
                     .flat_map(|g| g.editors.iter()),
             )
             .filter_map(|t| t.sarif.as_ref())
@@ -164,15 +162,7 @@ impl App {
             touched.insert(target);
         }
         for path in touched {
-            let merged = self.merged_diagnostics(&path);
-            if self.editor.path.as_deref() == Some(path.as_path()) {
-                self.editor.apply_diagnostics(path.clone(), merged.clone());
-            }
-            for group in self.editor_layout.inactive_groups_mut() {
-                if group.path.as_deref() == Some(path.as_path()) {
-                    group.apply_diagnostics(path.clone(), merged.clone());
-                }
-            }
+            self.show_merged_diagnostics(&path);
         }
         self.rebuild_problems();
         self.refresh_problems_badge();

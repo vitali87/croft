@@ -115,11 +115,7 @@ impl App {
             if u.ranges.is_empty() {
                 continue;
             }
-            if self.editor.path.as_deref() == Some(u.path.as_path()) {
-                self.editor.set_lsp_folds(u.ranges.clone());
-                changed = true;
-            }
-            for group in self.editor_layout.inactive_groups_mut() {
+            for group in self.editor_layout.all_groups_mut(&mut self.editor) {
                 if group.path.as_deref() == Some(u.path.as_path()) {
                     group.set_lsp_folds(u.ranges.clone());
                     changed = true;

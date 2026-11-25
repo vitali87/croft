@@ -960,12 +960,25 @@ fn typing_in_a_large_file_does_not_reparse_its_outline_on_the_ui_thread() {
         app.editor.insert_char(c);
     }
     note_edit_for_outline(&mut app);
+    // What an inline re-parse would cost, measured here and now, so the
+    // check below holds on a busy machine: a fixed 250 ms failed on a CI
+    // runner, where the buffer's copy for the worker alone took about that
+    // long in this unoptimised build (#2672).
+    let path = app.editor.path.clone().unwrap();
+    let started = std::time::Instant::now();
+    let parsed = crate::outline_syntax::symbols_for_lines(&path, &app.editor.lines);
+    let parse = started.elapsed();
+    assert!(
+        parsed.iter().any(|s| s.name == "added"),
+        "the reference parse sees the edit"
+    );
     let started = std::time::Instant::now();
     app.sync_outline();
     let took = started.elapsed();
     assert!(
-        took < std::time::Duration::from_millis(250),
-        "a keystroke's outline sync took {took:?}"
+        took * 2 < parse,
+        "a keystroke's outline sync took {took:?}, against {parse:?} for one parse: \
+         the parse ran on the UI thread"
     );
     assert!(
         app.outline.symbols().iter().any(|s| s.name == "f59999"),
@@ -1672,7 +1685,10 @@ fn a_file_open_in_two_splits_keeps_one_set_of_bookmarks() {
         "the new split starts from the file's marks"
     );
     let other = |app: &App| {
-        app.editor_layout.inactive_groups()[0]
+        app.editor_layout
+            .inactive_groups()
+            .next()
+            .unwrap()
             .editors
             .iter()
             .find(|e| e.path.as_deref() == Some(a.as_path()))
@@ -1730,7 +1746,11 @@ fn a_mark_shared_between_two_splits_lands_on_its_line_in_each() {
     app.editor.cursor_row = 2;
     app.toggle_bookmark();
     assert_eq!(app.editor.bookmarked_lines(), vec![2, 3]);
-    let first = app.editor_layout.inactive_groups()[0]
+    let first = app
+        .editor_layout
+        .inactive_groups()
+        .next()
+        .unwrap()
         .editors
         .iter()
         .find(|e| e.path.as_deref() == Some(a.as_path()))
@@ -3022,18 +3042,26 @@ fn one_symbols_tabs_in_two_groups_keep_a_single_file_tab() {
     };
     let i = file_tab(&app.editor);
     app.editor.close_tab(i);
-    let other = &mut app.editor_layout.inactive_groups_mut()[0];
+    let other = &mut app.editor_layout.inactive_groups_mut().next().unwrap();
     let i = file_tab(other);
     other.close_tab(i);
     assert_eq!(app.editor.editors.len(), 1);
-    assert_eq!(app.editor_layout.inactive_groups()[0].editors.len(), 1);
+    assert_eq!(
+        app.editor_layout
+            .inactive_groups()
+            .next()
+            .unwrap()
+            .editors
+            .len(),
+        1
+    );
     app.focus_pane(Pane::Editor);
     app.handle_key(key(KeyCode::Char('a'), KeyModifiers::SUPER))
         .unwrap();
     app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
         .unwrap();
     assert!(
-        app.editor_layout.inactive_groups().is_empty(),
+        app.editor_layout.inactive_groups().next().is_none(),
         "the other copy closed and its group folded away"
     );
     assert_eq!(app.editor.editors.len(), 1);
@@ -3566,4 +3594,105 @@ fn a_new_breadcrumb_picker_starts_unfiltered() {
     assert_eq!(crumb_picker_labels(&app).len(), 1);
     app.open_breadcrumb_picker(0);
     assert_eq!(crumb_picker_labels(&app).len(), 2, "the old text is gone");
+}
+
+/// #2062, a guard before the LSP reply mailbox (card 7): F12 and Alt+F12
+/// share one definition reply channel. A reply to the peek request opens the
+/// peek popup and leaves the caret where it was; a reply to the F12 request
+/// jumps.
+#[test]
+fn a_peek_definition_reply_opens_the_peek_popup_instead_of_jumping() {
+    use crate::lsp::manager::DefinitionResult;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = jump_app(tmp.path());
+    let path = app.editor.path.clone().unwrap();
+    let caret = (app.editor.cursor_row, app.editor.cursor_col);
+    app.handle_key(key(KeyCode::F(12), KeyModifiers::ALT))
+        .unwrap();
+    let peek = app
+        .peek_definition_request_id
+        .expect("Alt+F12 sent a peek request");
+    assert_eq!(app.definition_request_id, None, "and no jump request");
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .push_definition_for_test(DefinitionResult {
+            request_id: peek,
+            target: Some((path.clone(), 0, 0)),
+        });
+    assert!(app.drain_lsp_definition());
+    assert!(app.peek_popup.is_some(), "the peek reply opens the popup");
+    assert_eq!(
+        (app.editor.cursor_row, app.editor.cursor_col),
+        caret,
+        "and does not move the caret"
+    );
+    assert_eq!(app.peek_definition_request_id, None);
+
+    app.peek_popup = None;
+    app.peek_target = None;
+    app.request_definition_at_cursor();
+    let jump = app.definition_request_id.expect("F12 sent a request");
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .push_definition_for_test(DefinitionResult {
+            request_id: jump,
+            target: Some((path, 0, 0)),
+        });
+    assert!(app.drain_lsp_definition());
+    assert!(app.peek_popup.is_none(), "an F12 reply opens no popup");
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 0));
+}
+
+/// #2062, a guard before the LSP reply mailbox (card 7): a caret resting on
+/// one spot asks for its highlights once, after the idle wait, and not again
+/// on every tick, whether or not the reply has come back.
+#[test]
+fn a_resting_caret_asks_for_its_highlights_once() {
+    use crate::lsp::manager::{DocumentHighlightsResult, OccurrenceItem};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = jump_app(tmp.path());
+    app.tick_occurrences();
+    assert!(
+        app.occurrences_request.is_none(),
+        "nothing is asked before the caret has rested"
+    );
+    app.occ_observed_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    app.tick_occurrences();
+    let id = app
+        .occurrences_request
+        .as_ref()
+        .map(|r| r.id)
+        .expect("one request once the caret has rested");
+    for _ in 0..20 {
+        app.tick_occurrences();
+    }
+    assert_eq!(
+        app.occurrences_request.as_ref().map(|r| r.id),
+        Some(id),
+        "no second request while the reply is out"
+    );
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .push_document_highlights_for_test(DocumentHighlightsResult {
+            request_id: id,
+            items: vec![OccurrenceItem {
+                start_line: 1,
+                start_char: 14,
+                end_line: 1,
+                end_char: 28,
+                write: false,
+            }],
+        });
+    assert!(app.drain_lsp_document_highlights(), "the reply paints");
+    for _ in 0..20 {
+        app.tick_occurrences();
+    }
+    assert_eq!(
+        app.occurrences_request.as_ref().map(|r| r.id),
+        Some(id),
+        "and none after it, while the caret stays put"
+    );
 }

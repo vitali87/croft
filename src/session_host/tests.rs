@@ -2296,3 +2296,43 @@ fn the_host_version_sidecar_round_trips_and_rejects_junk() {
     std::fs::write(host_version_path(&socket), "not a version").unwrap();
     assert_eq!(read_host_version(&host_version_path(&socket)), None);
 }
+
+/// #2661: clients attach from different terminals over a session's life,
+/// so the inner croft is told to draw underline colours, and each client's
+/// [`ScreenWriter`] removes them for a terminal that cannot read them.
+#[test]
+fn the_inner_croft_draws_underline_colours_for_every_client() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("s.mux.sock");
+    let server = spawn_test_server_with(
+        socket.clone(),
+        vec![
+            String::from("/bin/sh"),
+            String::from("-c"),
+            String::from(
+                "while :; do printf 'UL=%s.' \"$CROFT_UNDERLINE_COLORS\"; sleep 0.05; done",
+            ),
+        ],
+    );
+    wait_alive(&socket);
+    let mut client = TestClient::connect(&socket, "owner", 80, 24);
+    client.read_until(|f| matches!(f, Frame::Bytes(b) if b.windows(5).any(|w| w == b"UL=1.")));
+    drop(client);
+    drop(server);
+}
+
+/// #2661: a client whose terminal cannot read underline colours gets the
+/// session's bytes without them; one that can gets them untouched.
+#[test]
+fn a_client_removes_underline_colours_only_for_a_terminal_that_cannot_read_them() {
+    let frame: &[u8] = b"\x1b[4m\x1b[58;5;8mtab\x1b[24m\x1b[59m text";
+    let mut plain = Vec::new();
+    let mut writer = ScreenWriter::new(false);
+    for half in frame.chunks(7) {
+        writer.write(&mut plain, half).unwrap();
+    }
+    assert_eq!(plain, b"\x1b[4mtab\x1b[24m\x1b[59m text");
+    let mut rich = Vec::new();
+    ScreenWriter::new(true).write(&mut rich, frame).unwrap();
+    assert_eq!(rich, frame);
+}

@@ -68,6 +68,15 @@ pub(super) enum Transport {
 }
 
 impl Pilot {
+    /// Test seam: the claude child's process id (a local seat has none).
+    #[cfg(test)]
+    pub(crate) fn child_id(&self) -> Option<u32> {
+        match &self.transport {
+            Transport::Claude { guard, .. } => Some(guard.0.id()),
+            Transport::Local { .. } => None,
+        }
+    }
+
     /// The conversation is gone (claude's stdout hit EOF). A local seat has
     /// no child to lose: endpoint failures surface per turn instead.
     pub(crate) fn reader_finished(&self) -> bool {

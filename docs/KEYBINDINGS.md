@@ -443,6 +443,7 @@ Not supported yet: transforms such as `${TM_FILENAME/(.*)\\..+$/$1/}`, a picker 
 | Type | Live `.gitignore`-aware workspace search as you type, with no cap on matches. Unsaved buffers are searched too. The caption counts every occurrence ("4 results in 2 files") |
 | Click `Aa` / `ab` / `.*` (inset at the right of the search field) | Toggle case-sensitive / whole-word / regex; active toggles show an accent chip |
 | `Alt`+`C` / `Alt`+`W` / `Alt`+`R` | Same toggles from any Search input (palette: "Search: Toggle Match Case" / "Toggle Match Whole Word" / "Toggle Use Regular Expression"). On macOS the terminal must send Option as Alt |
+| `Alt`+`P` | Toggle Preserve Case for Replace: a match's capitalisation carries over to its replacement (palette: "Search: Toggle Preserve Case") |
 | Click the header refresh icon | Re-run the current query |
 | Click the header clear icon | Clear the search query and results |
 | Click the left chevron (`▸`/`▾`), or `Ctrl`/`Cmd`+`Shift`+`H` from anywhere | Expand / collapse the Replace row (the chord only opens it). While a replacement is typed, each result row previews the match crossed out beside its replacement |
@@ -570,7 +571,7 @@ Not supported yet: transforms such as `${TM_FILENAME/(.*)\\..+$/$1/}`, a picker 
 | `Alt`+`↑` / `Alt`+`↓` | Move the current line (or selected block) up / down, carrying the cursor and selection |
 | `Shift`+`Alt`+`↑` / `↓` | Copy the current line (or selected block) up / down (palette: Copy Line Up / Down). Command ids: `copy_line_up` / `copy_line_down` |
 | `Cmd`/`Ctrl`+`Opt`+`↑` / `↓` | Add a cursor above / below the current one (multi-cursor) |
-| `Cmd`/`Ctrl`+`Shift`+`Opt`+arrows / `PageUp` / `PageDown` | Column (box) selection, like `Shift`+`Opt`+drag: grow the box one row, one column or one screen, with one selection per row |
+| `Cmd`/`Ctrl`+`Shift`+`Opt`+`↑`/`↓`/`←`/`→` / `PageUp` / `PageDown` | Column (box) selection, like `Shift`+`Opt`+drag: grow the box one row, one column or one screen, with one selection per row |
 | View: Toggle Column Selection Mode (palette) | While on, plain `Shift`+arrows and `Shift`+`PageUp` / `PageDown` grow a column selection; the status bar shows "Column Selection" beside Ln/Col |
 | `Insert` | Switch between Insert and Overwrite typing for all tabs: in Overwrite a character replaces the one under the caret. The status bar shows ⎁ and the caret becomes a block |
 | `Cmd`+`/` / `Ctrl`+`/` | Toggle line comment for the current line or every line the selection touches |
@@ -578,7 +579,7 @@ Not supported yet: transforms such as `${TM_FILENAME/(.*)\\..+$/$1/}`, a picker 
 | `Alt`+`A` | Align Cursors: pad every caret's selection with spaces so that selections in one column start at the same column and are all as long as the longest, then leave them so (also Command Palette "Align Cursors"; with fewer than two carets it does nothing) |
 | `Alt`+`F` | Align Cursors (Pad Front): the same padding, all at the front, so the selected text right-aligns into one column |
 | `Ctrl`+`Alt`+`A` | Align Cursors Using Tabs: the same alignment with tabs, snapped to the buffer's own tab stops (the indent width from `.editorconfig`, detection or the status bar, not a fixed four) |
-| `Ctrl`+`Alt`+`Shift`+`A` | Align Line Last Cursors: pad the front of each affected line so the right-most selection end of every line lands in one column |
+| `Ctrl`+`Alt`+`L` | Align Line Last Cursors: pad the front of each affected line so the right-most selection end of every line lands in one column |
 | `Alt`+`Z` | Toggle soft word wrap for this file, until the file is reopened |
 | `Alt`+`O` | C/C++: Switch Header/Source: open the header of the C, C++ or Objective-C source, or the source of the header. Command id: `switch_header_source` |
 | `Cmd`/`Ctrl`+`Shift`+`V` | Markdown: Toggle Preview: switch the active Markdown tab between source and rendered view; arrows / PgUp / PgDn / Home / End / wheel scroll it |
@@ -589,15 +590,22 @@ Not supported yet: transforms such as `${TM_FILENAME/(.*)\\..+$/$1/}`, a picker 
 | `Cmd`+`Opt`+`Shift`+`T` | Convert Indentation to Tabs: replace each leading run of one tab width of spaces with a tab, leaving any remainder |
 | `Cmd`+`Opt`+`Shift`+`N` | Trim Final Newlines: drop trailing blank lines at the end of the file (always keeping at least one line) |
 | `Cmd`+`Opt`+`Shift`+`J` | Join Lines: collapse the selected lines (or the current line with the next) into one, single-spaced |
-| `Cmd`+`Opt`+`Shift`+`U` / `L` / `C` | Transform the selection (or the word under the cursor) to Uppercase / Lowercase / Title Case |
+| `Cmd`+`Opt`+`Shift`+`U` / `L` | Transform the selection (or the word under the cursor) to Uppercase / Lowercase |
+| Command Palette "Transform to Title Case" | Capitalise each word of the selection (or the word under the cursor). It has no chord, as in VS Code: `Cmd`+`Opt`+`Shift`+`C` is Copy Relative Path |
 | Command Palette "Transform to Snake Case" / "Camel Case" / "Pascal Case" / "Kebab Case" | Rewrite each identifier in the selection (or the word under each caret) as `user_name` / `userName` / `UserName` / `user-name` |
 | `Cmd`+`Opt`+`Shift`+`A` / `D` | Sort the selected lines (or the whole file) Ascending / Descending |
 | `Cmd`+`Opt`+`Shift`+`W` | Trim Trailing Whitespace: strip trailing spaces and tabs from every line |
+| `Cmd`+`Opt`+`=` / `Cmd`+`Opt`+`-` | Increment / decrement the number under the cursor (`+` works for `=`) |
+| `Cmd`+`Opt`+`Shift`+`E` | Emmet: Expand Abbreviation: in a markup file, expand the abbreviation before the cursor |
 | `Cmd`+`Opt`+`Shift`+`F` | Format Document: reformat the buffer through the language server, as one undo step. In a Prettier project, JS/TS, JSON, CSS, HTML, Markdown and YAML use the project's Prettier |
 | `Cmd`+`K` `Cmd`+`F` | Format Selection: reformat only the selected span through the language server, as one undo step. Needs a selection |
 | Command Palette "Change Color Presentation" | With the caret on a color value (marked by a `■` swatch): pick an alternative spelling (`#rrggbb`, `rgb()`, `hsl()`, …); applied as one undo step |
 | Command Palette "Preferences: Toggle Format on Type" | Off by default. On, typing one of the language server's trigger characters (rust-analyzer: `=`, `.`, `>`, `{`) formats at the caret. Also in Settings |
 | `Cmd+K` `F` | Toggle Format on Save: `Cmd+S` formats through the language server before writing (off by default) |
+| `Cmd`+`Opt`+`Shift`+`K` | Bookmarks: toggle a bookmark on the cursor's line |
+| `Cmd`+`Opt`+`.` / `Cmd`+`Opt`+`,` | Bookmarks: jump to the next / previous bookmark, wrapping around the file |
+| `Cmd`+`Opt`+`Shift`+`B` | Bookmarks: clear every bookmark in the file |
+| `Cmd+K` `Cmd+M` | Bookmarks: list every bookmark; `Enter` jumps to one |
 | Click a breadcrumb | Breadcrumbs: a folder or file crumb lists that folder, a symbol crumb lists the symbols beside it; Enter opens or jumps. Type to filter, Backspace widens, Esc clears then closes |
 | `Cmd+Shift+.` / `Ctrl+Shift+.` | View: Focus and Select Breadcrumbs: the last crumb's list; Left / Right move to the neighbouring crumb's list |
 | Click a sticky-scroll header | Jump to that pinned scope header's line (class, function) |
@@ -608,6 +616,7 @@ Not supported yet: transforms such as `${TM_FILENAME/(.*)\\..+$/$1/}`, a picker 
 | Click a line number | Select that line; drag down or up the line numbers to select whole lines |
 | `Ctrl`+`C` / `Cmd`+`C` | Copy the selection to the system clipboard |
 | `Cmd`+`Opt`+`C` / `Ctrl`+`Opt`+`C` | Copy Path: copy the active file's absolute path to the system clipboard (also on the editor tab right-click menu) |
+| `Cmd`+`Opt`+`Shift`+`C` / `Ctrl`+`Opt`+`Shift`+`C` | Copy Relative Path: copy the active file's path relative to the workspace root |
 | `Ctrl`+`X` / `Cmd`+`X` | Cut the selection |
 | `Ctrl`+`V` / `Cmd`+`V` | Paste at the cursor (replaces any selection) |
 | `Ctrl`+`Z` / `Cmd`+`Z` | Undo (typing bursts coalesce; backspace, paste, cut, replace are each one step) |
@@ -1346,7 +1355,8 @@ When the line carries a `path:line` that resolves to an existing file, that file
 | `⌘⌥⇧S` / `⌘⌥⇧T` | Convert Indentation to Spaces / Tabs |
 | `⌘⌥⇧N` | Trim Final Newlines |
 | `⌘⌥⇧J` | Join Lines |
-| `⌘⌥⇧U` / `⌘⌥⇧L` / `⌘⌥⇧C` | Transform to Uppercase / Lowercase / Title Case |
+| `⌘⌥⇧U` / `⌘⌥⇧L` | Transform to Uppercase / Lowercase |
+| `⌘⌥⇧C` | Copy Relative Path |
 | `⌘⌥⇧A` / `⌘⌥⇧D` | Sort Lines Ascending / Descending |
 | `⌘⌥⇧W` | Trim Trailing Whitespace |
 | `⌘⌥⇧F` | Format Document |

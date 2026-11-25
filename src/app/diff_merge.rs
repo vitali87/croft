@@ -647,8 +647,8 @@ impl App {
     /// (#1572): a split shows the same file in several groups, and the dirty
     /// copy may sit in an inactive one while the active group's is clean.
     pub(super) fn unsaved_text_in_any_group(&self, path: &Path) -> Option<String> {
-        std::iter::once(&self.editor)
-            .chain(self.editor_layout.inactive_groups())
+        self.editor_layout
+            .all_groups(&self.editor)
             .find_map(|group| group.unsaved_text_of(path))
     }
 
@@ -707,9 +707,7 @@ impl App {
         // background tab or split must not touch the view the reader is on.
         let active_ptr: *const crate::widgets::editor::Editor = &*self.editor;
         let mut active_changed = false;
-        for group in
-            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut())
-        {
+        for group in self.editor_layout.all_groups_mut(&mut self.editor) {
             for ed in &mut group.editors {
                 let Some(old) = ed.diff.as_ref() else {
                     continue;
@@ -1413,8 +1411,7 @@ impl App {
     /// the focused tab alone would leave a split showing blanks beside it.
     pub(super) fn sync_provenance(&mut self) {
         let root = self.history_root.clone();
-        let groups =
-            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut());
+        let groups = self.editor_layout.all_groups_mut(&mut self.editor);
         for ed in groups.flat_map(|g| g.editors.iter_mut()) {
             Self::sync_provenance_for(&root, ed);
         }
@@ -1539,7 +1536,7 @@ impl App {
     pub(super) fn keep_unsaved_buffers_in_history(&mut self, paths: &[PathBuf]) -> usize {
         let millis = now_millis();
         let mut buffers: Vec<(PathBuf, Vec<u8>)> = Vec::new();
-        let groups = std::iter::once(&self.editor).chain(self.editor_layout.inactive_groups());
+        let groups = self.editor_layout.all_groups(&self.editor);
         for tab in groups.flat_map(|g| g.iter_tabs()) {
             let Some(path) = tab.path.as_ref().filter(|p| paths.contains(p)) else {
                 continue;

@@ -2455,16 +2455,13 @@ impl App {
         path: &Path,
         mut f: impl FnMut(&mut crate::widgets::editor::Editor),
     ) {
-        for tab in self.editor.editors.iter_mut() {
+        for tab in self
+            .editor_layout
+            .all_groups_mut(&mut self.editor)
+            .flat_map(|g| g.editors.iter_mut())
+        {
             if tab.path.as_deref() == Some(path) {
                 f(tab);
-            }
-        }
-        for group in self.editor_layout.inactive_groups_mut() {
-            for tab in group.editors.iter_mut() {
-                if tab.path.as_deref() == Some(path) {
-                    f(tab);
-                }
             }
         }
     }

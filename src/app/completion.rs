@@ -340,7 +340,6 @@ impl App {
                 .chain(
                     self.editor_layout
                         .inactive_groups()
-                        .into_iter()
                         .flat_map(|g| g.editors.iter()),
                 )
                 .filter(|e| current_path.is_none() || e.path.as_deref() != current_path)

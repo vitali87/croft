@@ -70,7 +70,7 @@ impl LspManager {
         &mut self,
     ) -> std_mpsc::Sender<CompletionResult> {
         let (tx, rx) = std_mpsc::channel();
-        self.completion_rx = rx;
+        self.replies.completion = rx;
         tx
     }
 }
@@ -545,53 +545,11 @@ while True:
 /// A `ManagedClient` wrapping `client`, advertising workspace diagnostics
 /// and nothing else — the shape `workspace_pull_targets` filters over.
 fn managed_client_for_pull_test(client: LspClient) -> ManagedClient {
-    ManagedClient {
-        name: String::from("mute-pull"),
-        client: Arc::new(TokioMutex::new(client)),
+    let support = ServerSupport {
         supports_workspace_diagnostics: true,
-        diagnostic_identifier: None,
-        diagnostic_result_ids: Arc::new(TokioMutex::new(DiagnosticResultIds::default())),
-        diagnostic_pull_stalled: Arc::new(AtomicBool::new(false)),
-        save_notify: SaveNotify::Never,
-        supports_document_diagnostics: false,
-        document_pull_stalled: Arc::new(AtomicBool::new(false)),
-        prepare_rename_stalled: Arc::new(AtomicBool::new(false)),
-        document_pull_generations: Arc::new(StdMutex::new(HashMap::new())),
-        supports_completion: false,
-        completion_triggers: String::new(),
-        supports_signature_help: false,
-        supports_hover: false,
-        supports_definition: false,
-        supports_document_symbol: false,
-        supports_declaration: false,
-        supports_type_definition: false,
-        supports_implementation: false,
-        supports_references: false,
-        supports_document_highlight: false,
-        supports_linked_editing: false,
-        supports_inline_completion: false,
-        supports_selection_range: false,
-        supports_call_hierarchy: false,
-        supports_type_hierarchy: false,
-        supports_workspace_symbols: false,
-        supports_rename: false,
-        supports_prepare_rename: false,
-        supports_formatting: false,
-        on_type_triggers: None,
-        supports_range_formatting: false,
-        supports_code_action: false,
-        semantic_legend: None,
-        semantic_supports_range: false,
-        supports_inlay_hints: false,
-        supports_document_link: false,
-        supports_code_lens: false,
-        code_lens_resolve: false,
-        server_commands: Arc::new(Vec::new()),
-        supports_folding_range: false,
-        supports_document_color: false,
-        will_rename: None,
-        did_rename: None,
-    }
+        ..server_support(&ServerCapabilities::default(), false)
+    };
+    ManagedClient::new(String::from("mute-pull"), client, support)
 }
 
 /// A pull already QUEUED when the server is retired must issue nothing
@@ -5974,4 +5932,191 @@ fn symbols_already_in_file_order_and_flat_replies_are_unchanged() {
         .map(|s| s.name)
         .collect();
     assert_eq!(names, ["a", "b"]);
+}
+
+/// #2062: whole-document and as-you-type formatting share one reply type, so
+/// only their names keep them apart in the reply bundles. Each reply reaches
+/// its own drain and never the other's.
+#[test]
+fn each_formatting_reply_reaches_its_own_drain() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let manager = LspManager::new(tmp.path().to_path_buf()).expect("manager");
+    let reply = |request_id| FormatResult {
+        request_id,
+        path: PathBuf::from("demo.rs"),
+        edits: None,
+        unsupported: false,
+        server: None,
+    };
+    manager.reply_test_tx.formatting.send(reply(1)).unwrap();
+    manager
+        .reply_test_tx
+        .on_type_formatting
+        .send(reply(2))
+        .unwrap();
+    assert_eq!(manager.drain_formatting().map(|r| r.request_id), Some(1));
+    assert_eq!(
+        manager.drain_on_type_formatting().map(|r| r.request_id),
+        Some(2)
+    );
+    assert!(manager.drain_formatting().is_none());
+    assert!(manager.drain_on_type_formatting().is_none());
+}
+
+/// Every yes-or-no answer in a [`ServerSupport`], by name, so a table test
+/// can say which one is wrong.
+fn support_flags(s: &ServerSupport) -> Vec<(&'static str, bool)> {
+    vec![
+        ("completion", s.supports_completion),
+        ("signature help", s.supports_signature_help),
+        ("workspace diagnostics", s.supports_workspace_diagnostics),
+        ("document diagnostics", s.supports_document_diagnostics),
+        ("hover", s.supports_hover),
+        ("definition", s.supports_definition),
+        ("document symbol", s.supports_document_symbol),
+        ("declaration", s.supports_declaration),
+        ("type definition", s.supports_type_definition),
+        ("implementation", s.supports_implementation),
+        ("references", s.supports_references),
+        ("document highlight", s.supports_document_highlight),
+        ("linked editing", s.supports_linked_editing),
+        ("inline completion", s.supports_inline_completion),
+        ("selection range", s.supports_selection_range),
+        ("call hierarchy", s.supports_call_hierarchy),
+        ("type hierarchy", s.supports_type_hierarchy),
+        ("workspace symbols", s.supports_workspace_symbols),
+        ("rename", s.supports_rename),
+        ("prepare rename", s.supports_prepare_rename),
+        ("formatting", s.supports_formatting),
+        ("range formatting", s.supports_range_formatting),
+        ("code action", s.supports_code_action),
+        ("semantic tokens range", s.semantic_supports_range),
+        ("inlay hints", s.supports_inlay_hints),
+        ("document link", s.supports_document_link),
+        ("code lens", s.supports_code_lens),
+        ("code lens resolve", s.code_lens_resolve),
+        ("folding range", s.supports_folding_range),
+        ("document color", s.supports_document_color),
+    ]
+}
+
+fn support_of(caps: serde_json::Value, type_hierarchy: bool) -> ServerSupport {
+    let caps: ServerCapabilities = serde_json::from_value(caps).expect("capabilities");
+    server_support(&caps, type_hierarchy)
+}
+
+/// #2062: a server that advertises nothing is asked for nothing.
+#[test]
+fn a_server_that_advertises_nothing_supports_nothing() {
+    let support = support_of(serde_json::json!({}), false);
+    for (name, on) in support_flags(&support) {
+        assert!(!on, "{name} must be off");
+    }
+    assert_eq!(support.completion_triggers, "");
+    assert_eq!(support.diagnostic_identifier, None);
+    assert_eq!(support.save_notify, SaveNotify::Never);
+    assert_eq!(support.on_type_triggers, None);
+    assert!(support.semantic_legend.is_none());
+    assert!(support.server_commands.is_empty());
+    assert!(support.will_rename.is_none() && support.did_rename.is_none());
+}
+
+/// #2062: each advertised capability turns on its own answer, so no two are
+/// wired to the same provider.
+#[test]
+fn each_advertised_capability_turns_on_its_own_answer() {
+    let rs_files = serde_json::json!({"filters": [{"pattern": {"glob": "**/*.rs"}}]});
+    let support = support_of(
+        serde_json::json!({
+            "completionProvider": {"triggerCharacters": [".", "->", ":"]},
+            "signatureHelpProvider": {"triggerCharacters": ["("]},
+            "diagnosticProvider": {
+                "identifier": "lint",
+                "interFileDependencies": false,
+                "workspaceDiagnostics": true
+            },
+            "textDocumentSync": {"openClose": true, "change": 2, "save": {"includeText": true}},
+            "hoverProvider": true,
+            "definitionProvider": true,
+            "documentSymbolProvider": true,
+            "declarationProvider": true,
+            "typeDefinitionProvider": true,
+            "implementationProvider": true,
+            "referencesProvider": true,
+            "documentHighlightProvider": true,
+            "linkedEditingRangeProvider": true,
+            "inlineCompletionProvider": true,
+            "selectionRangeProvider": true,
+            "callHierarchyProvider": true,
+            "workspaceSymbolProvider": true,
+            "renameProvider": {"prepareProvider": true},
+            "documentFormattingProvider": true,
+            "documentOnTypeFormattingProvider": {
+                "firstTriggerCharacter": "}",
+                "moreTriggerCharacter": [";", ")"]
+            },
+            "documentRangeFormattingProvider": true,
+            "codeActionProvider": true,
+            "semanticTokensProvider": {
+                "legend": {"tokenTypes": ["function", "variable"], "tokenModifiers": []},
+                "full": true,
+                "range": true
+            },
+            "inlayHintProvider": true,
+            "documentLinkProvider": {},
+            "codeLensProvider": {"resolveProvider": true},
+            "executeCommandProvider": {"commands": ["croft.fix"]},
+            "foldingRangeProvider": true,
+            "colorProvider": true,
+            "workspace": {"fileOperations": {"willRename": rs_files, "didRename": rs_files}}
+        }),
+        true,
+    );
+    for (name, on) in support_flags(&support) {
+        assert!(on, "{name} must be on");
+    }
+    assert_eq!(support.completion_triggers, ".:");
+    assert_eq!(support.diagnostic_identifier.as_deref(), Some("lint"));
+    assert_eq!(support.save_notify, SaveNotify::WithText);
+    assert_eq!(support.on_type_triggers.as_deref(), Some("};)"));
+    assert_eq!(
+        support.semantic_legend.as_deref().map(Vec::as_slice),
+        Some(["function".to_string(), "variable".to_string()].as_slice())
+    );
+    assert_eq!(support.server_commands.as_slice(), ["croft.fix"]);
+    assert!(support.will_rename.is_some() && support.did_rename.is_some());
+}
+
+/// #2062: a provider sent as a bare `false` is unsupported, not present: the
+/// misreading that sent `textDocument/declaration` to vtsls.
+#[test]
+fn a_provider_sent_as_false_is_unsupported() {
+    let support = support_of(
+        serde_json::json!({
+            "hoverProvider": false,
+            "definitionProvider": false,
+            "documentSymbolProvider": false,
+            "declarationProvider": false,
+            "typeDefinitionProvider": false,
+            "implementationProvider": false,
+            "referencesProvider": false,
+            "documentHighlightProvider": false,
+            "linkedEditingRangeProvider": false,
+            "inlineCompletionProvider": false,
+            "selectionRangeProvider": false,
+            "callHierarchyProvider": false,
+            "workspaceSymbolProvider": false,
+            "renameProvider": false,
+            "documentFormattingProvider": false,
+            "documentRangeFormattingProvider": false,
+            "codeActionProvider": false,
+            "inlayHintProvider": false,
+            "foldingRangeProvider": false,
+            "colorProvider": false
+        }),
+        false,
+    );
+    for (name, on) in support_flags(&support) {
+        assert!(!on, "{name} must be off");
+    }
 }

@@ -201,7 +201,7 @@ fn ssh_empty_state_overlay_arms_image_clear_when_user_switches_off_remote_view()
     // Simulate the post-emit state without actually writing OSC bytes.
     app.overlays.ssh.set_displayed(true);
     app.set_sidebar_view(SidebarView::Explorer);
-    app.flush_ssh_empty_state_overlay();
+    app.flush_ssh_empty_state_overlay(&ratatui::buffer::Buffer::empty(app.last_frame_area));
     assert!(
         app.consume_ssh_empty_state_image_clear(),
         "leaving the Remote view after the illustration was painted must arm one terminal.clear() so iTerm2 evicts the cached image cells — otherwise the server-rack PNG ghosts onto the Explorer tree the user just clicked to"
@@ -217,7 +217,7 @@ fn ssh_empty_state_overlay_arms_image_clear_when_modal_opens_on_top() {
     app.overlays.ssh.set_displayed(true);
     app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE))
         .unwrap();
-    app.flush_ssh_empty_state_overlay();
+    app.flush_ssh_empty_state_overlay(&ratatui::buffer::Buffer::empty(app.last_frame_area));
     assert!(
         app.consume_ssh_empty_state_image_clear(),
         "F1 opening the shortcuts modal over the SSH empty state must arm an image-clear so the illustration doesn't bleed through the modal text"

@@ -339,6 +339,44 @@ pub(super) fn build_line_spans<'a>(
     out
 }
 
+/// What every visual row shares in one frame of [`Editor::render`]: the
+/// text area and where the gutter and the text sit in it, and the
+/// frame-wide facts the row painters read.
+struct RowFrame<'a> {
+    /// The editor's text area: the gutter starts at its left edge.
+    inner: Rect,
+    /// Every visual row this frame draws, top to bottom.
+    visual_rows: &'a [VisRow],
+    /// The line-number column with its sign margin, before the change lane.
+    gutter_width: u16,
+    /// The screen column the text starts at, right of the gutter.
+    text_x: u16,
+    /// The text's width right of the gutter.
+    text_width: u16,
+    /// Lines wrap: a long line takes several visual rows.
+    wrap: bool,
+    /// The primary selection, start before end, when it covers any text.
+    sel_norm: Option<((usize, usize), (usize, usize))>,
+    /// The selected text whose other occurrences are highlighted, when the
+    /// selection asks for that.
+    occ_needle: Option<String>,
+    /// The two brackets matched at the caret, in the focused editor.
+    bracket_pair: Option<(BPos, BPos)>,
+    /// Columns between indentation guides.
+    guide_step: usize,
+    /// The caret block's guide as (column, first line, last line), when
+    /// the focused editor shows guides.
+    active_guide: Option<(usize, usize, usize)>,
+    /// The guides' colour.
+    guide_fg: Color,
+    /// The active guide's colour.
+    guide_active_fg: Color,
+    /// The theme draws `surfaces`: a quieter gutter.
+    surfaces: bool,
+    /// The pointer is over the gutter, which shows every fold chevron.
+    gutter_hovered: bool,
+}
+
 impl Widget for &mut Editor {
     fn render(self, area: Rect, buf: &mut Buffer) {
         self.clamp_to_symbol_view();
@@ -864,6 +902,24 @@ impl Widget for &mut Editor {
                 && py >= inner.y
                 && py < inner.y + inner.height
         });
+        // What every row shares this frame.
+        let frame = RowFrame {
+            inner,
+            visual_rows: &visual_rows,
+            gutter_width,
+            text_x,
+            text_width,
+            wrap,
+            sel_norm,
+            occ_needle,
+            bracket_pair,
+            guide_step,
+            active_guide,
+            guide_fg,
+            guide_active_fg,
+            surfaces,
+            gutter_hovered,
+        };
         // Each text row's geometry, refilled per row (#873).
         let mut row_cells = RowCells::default();
 
@@ -898,911 +954,14 @@ impl Widget for &mut Editor {
                 }
                 VisRow::Text { line, start, end } => (line, start, end),
             };
-            // Current-line highlight (VS Code `editor.lineHighlightBackground`,
-            // #248): a whisper of the accent behind every visual row of the
-            // cursor's line, gutter through code. Focused editor only, and
-            // hidden while a selection is active so the two washes never stack
-            // — VS Code's `renderLineHighlight` behaves the same. Painted
-            // first: spans that carry their own background (selection, search,
-            // occurrences) patch over it, spans that don't inherit it.
-            if self.focused && line_idx == self.cursor_row && sel_norm.is_none() {
-                buf.set_style(
-                    Rect::new(inner.x, y, gutter_width + 1 + text_width, 1),
-                    Style::default().bg(self.theme.current_line_bg()),
-                );
-            }
-            // The line number shows once per logical line - on its first visual
-            // row; wrapped continuation rows get a blank gutter, like VS Code.
-            if !wrap || row_start == 0 {
-                let line_no = format!(
-                    "{:>width$} ",
-                    self.gutter_number(line_idx)
-                        .map(|n| n.to_string())
-                        .unwrap_or_default(),
-                    width = gutter_width as usize - 1
-                );
-                // Live Run coverage tints the number: green for a statement
-                // that ran, a muted red for one that never did. Otherwise a
-                // caret's line is brighter than the rest (VS Code's
-                // `editorLineNumber.activeForeground`, #1576).
-                let number_fg = match self
-                    .live_run
-                    .as_ref()
-                    .and_then(|v| v.coverage(line_idx, &self.lines[line_idx]))
-                {
-                    Some(crate::live_run::Coverage::Ran) => self.theme.git_added(),
-                    Some(crate::live_run::Coverage::NeverRan) => {
-                        self.theme.ui(Color::Rgb(0xa0, 0x55, 0x55))
-                    }
-                    None if self.is_caret_line(line_idx) => self.theme.line_number_active(),
-                    None => self.theme.line_number_fg(),
-                };
-                let gutter = Line::from(Span::styled(line_no, Style::default().fg(number_fg)));
-                buf.set_line(inner.x, y, &gutter, gutter_width);
-            } else {
-                buf.set_line(
-                    inner.x,
-                    y,
-                    &Line::from(" ".repeat(gutter_width as usize)),
-                    gutter_width,
-                );
-            }
+            self.paint_row_gutter(buf, &frame, y, line_idx, !wrap || row_start == 0);
 
-            // Debugger gutter glyphs, on a logical line's first visual row only:
-            // a yellow stop arrow (▶) takes priority over a red breakpoint dot
-            // (●). Painted in the dedicated glyph margin at the far left
-            // (`inner.x`), VS Code-style, so it never crowds the line number or
-            // the code and the number-to-code gap is untouched.
-            let sign_x = inner.x;
-            let mut sign_taken = false;
-            if (!wrap || row_start == 0)
-                && let Some(path) = self.path.as_deref()
-            {
-                let here = line_idx + 1; // gutter is 1-based
-                let is_stop = self
-                    .stop_line
-                    .as_ref()
-                    .is_some_and(|(p, l)| p == path && *l == here);
-                let is_bp = self
-                    .breakpoints
-                    .get(path)
-                    .is_some_and(|s| s.contains(&here));
-                let is_unverified = self
-                    .unverified_breakpoints
-                    .get(path)
-                    .is_some_and(|s| s.contains(&here));
-                // A hit count is a condition on the pause (#611), so it wears
-                // the conditional diamond too, as in VS Code.
-                let is_conditional = self
-                    .breakpoint_conditions
-                    .get(path)
-                    .is_some_and(|c| c.contains_key(&here))
-                    || self
-                        .breakpoint_hit_conditions
-                        .get(path)
-                        .is_some_and(|h| h.contains_key(&here));
-                let is_logpoint = self
-                    .breakpoint_logs
-                    .get(path)
-                    .is_some_and(|m| m.contains_key(&here));
-                if is_stop {
-                    buf.set_string(
-                        sign_x,
-                        y,
-                        "▶",
-                        Style::default().fg(self.theme.ui(Color::Rgb(0xff, 0xcc, 0x00))),
-                    );
-                    sign_taken = true;
-                } else if is_bp {
-                    // Hollow dimmed ring when the adapter could not bind it; a
-                    // red diamond for a conditional breakpoint; an amber one
-                    // for a logpoint; a solid red dot for a plain, live one.
-                    let (glyph, color) = if is_unverified {
-                        ("○", self.theme.ui(Color::Rgb(0x99, 0x99, 0x99)))
-                    } else if is_conditional {
-                        ("◆", self.theme.ui(Color::Rgb(0xe5, 0x1c, 0x23)))
-                    } else if is_logpoint {
-                        ("◆", self.theme.ui(Color::Rgb(0xe5, 0xc0, 0x7b)))
-                    } else {
-                        ("●", self.theme.ui(Color::Rgb(0xe5, 0x1c, 0x23)))
-                    };
-                    buf.set_string(sign_x, y, glyph, Style::default().fg(color));
-                    sign_taken = true;
-                }
-            }
+            let (line_len, row_width) =
+                self.paint_row_text(buf, &frame, &mut row_cells, y, line_idx, row_start, row_end);
 
-            // AI-stream stop button (croft pair): while a pilot streams into
-            // this file, the row under its caret wears a stop square in the
-            // badge's orange; clicking it (or Cmd+K X) cancels and reverts
-            // the stream. Outranks the test play glyph; the debugger's
-            // glyphs above still win the shared cell.
-            if (!wrap || row_start == 0) && !sign_taken && self.stream_stop_line == Some(line_idx) {
-                buf.set_string(
-                    sign_x,
-                    y,
-                    "■",
-                    Style::default().fg(self.theme.ui(Color::Rgb(0xff, 0x9d, 0x2f))),
-                );
-                sign_taken = true;
-            }
-
-            // Bookmark flag: a reader's own mark, ranked below every debugger
-            // glyph and the AI-stream square (those report machine state and
-            // must never be hidden) but above the test play bead.
-            if (!wrap || row_start == 0) && !sign_taken && self.is_bookmarked(line_idx) {
-                buf.set_string(
-                    sign_x,
-                    y,
-                    "\u{2691}", // ⚑, a plain-Unicode flag: no Nerd Font needed
-                    Style::default().fg(self.theme.ui(Color::Rgb(0x4f, 0xc1, 0xff))),
-                );
-                sign_taken = true;
-            }
-
-            // Testing gutter glyph: the play button beside a test fn's
-            // definition (VS Code's run bead, in its testing green), sharing
-            // the sign cell with the debugger — whose stop arrow and
-            // breakpoint dot both outrank it.
-            if (!wrap || row_start == 0)
-                && !sign_taken
-                && crate::testing::locate::test_fn_on_line(
-                    self.path.as_deref(),
-                    &self.lines,
-                    line_idx,
-                )
-                .is_some()
-            {
-                buf.set_string(
-                    sign_x,
-                    y,
-                    "\u{eb2c}", // cod-play, the Testing panel's run glyph
-                    Style::default().fg(self.theme.ui(Color::Rgb(0x73, 0xc9, 0x91))),
-                );
-            }
-
-            // Fold chevron: on a foldable header's first visual row, in the
-            // second sign-margin column (`sign_x + 1`) so it never collides with
-            // a breakpoint dot at `sign_x`. ▾ = expanded, ▸ = collapsed; the
-            // collapsed one is brighter so hidden content is noticeable. Matches
-            // the gutter's own line numbers. On a `surfaces` theme the
-            // expanded one waits for the caret or the pointer, and the
-            // collapsed one, always shown, wears the muted ink.
-            if (!wrap || row_start == 0) && self.is_foldable(line_idx) {
-                let collapsed = self.folded.contains(&line_idx);
-                let glyph = if collapsed {
-                    let ink = crate::widgets::surface::tones(self.theme)
-                        .map_or_else(|| self.theme.ui(Color::Gray), |t| t.muted());
-                    Some(("▸", ink))
-                } else if !surfaces || gutter_hovered || self.is_caret_line(line_idx) {
-                    Some(("▾", self.theme.line_number_fg()))
-                } else {
-                    None
-                };
-                if let Some((glyph, color)) = glyph {
-                    buf.set_string(sign_x + 1, y, glyph, Style::default().fg(color));
-                }
-            }
-
-            // Git gutter: a thin coloured bar in the spacer cell between the
-            // line number and the code (VS Code's dirty-diff lane), on a
-            // logical line's first visual row only. Colour carries add/mod/del.
-            // ponytail: one heavy bar in three colours; the bar's column also
-            // shows deletions, which VS Code renders as a small triangle — fine
-            // as a first cut, the colour already disambiguates.
-            if (!wrap || row_start == 0)
-                && let Some(mark) = self.git_marks.get(&line_idx)
-            {
-                let color = match mark {
-                    GitMark::Added => self.theme.git_added(),
-                    GitMark::Modified => self.theme.git_modified(),
-                    GitMark::Deleted => self.theme.git_deleted(),
-                };
-                // ┃ heavy vertical; ▎ left quarter block on a `surfaces`
-                // theme, a crisp stripe on the cell edge rather than a line
-                // through its middle.
-                let bar = if surfaces { "\u{258e}" } else { "\u{2503}" };
-                buf.set_string(inner.x + gutter_width, y, bar, Style::default().fg(color));
-            }
-            // Coverage lens (#263): the same lane, painted over the git bar
-            // while a coverage report is shown. Green run, red never run,
-            // amber run with a branch missed; dimmed once the file changed
-            // after the run. `Coverage: Clear` gives the lane back to git.
-            if (!wrap || row_start == 0)
-                && let Some(lens) = self.coverage.as_ref()
-                && let Some(cov) = lens.lines.get(&line_idx)
-            {
-                use crate::testing::coverage::LineCov;
-                let (rgb, glyph) = match cov {
-                    LineCov::Covered => ((0x4e, 0xc9, 0x7a), "\u{258c}"),
-                    LineCov::Uncovered => ((0xe0, 0x55, 0x55), "\u{258c}"),
-                    LineCov::Partial => ((0xe0, 0xb0, 0x40), "\u{2596}"),
-                };
-                let (r, g, b) = if lens.stale {
-                    (rgb.0 / 2, rgb.1 / 2, rgb.2 / 2)
-                } else {
-                    rgb
-                };
-                buf.set_string(
-                    inner.x + gutter_width,
-                    y,
-                    glyph,
-                    Style::default().fg(self.theme.ui(Color::Rgb(r, g, b))),
-                );
-            }
-            // Provenance overlay (#349): the same lane, a thinner bar in the
-            // seat's hue, painted over the git bar while the lens is on
-            // because the user asked who typed the line, not whether it
-            // differs from HEAD. A line with no record paints nothing: an
-            // unknown line is never guessed at.
-            if self.provenance_overlay
-                && (!wrap || row_start == 0)
-                && let Some(seat) = self.provenance.seat(line_idx)
-            {
-                let (r, g, b) = seat.hue();
-                // ▎ left one-quarter block; ▏ one-eighth on a `surfaces`
-                // theme, whose change bar already takes the quarter block.
-                let bar = if surfaces { "\u{258f}" } else { "\u{258e}" };
-                buf.set_string(
-                    inner.x + gutter_width,
-                    y,
-                    bar,
-                    Style::default().fg(self.theme.ui(Color::Rgb(r, g, b))),
-                );
-            }
-
-            // Per-row window: the segment [row_start, row_end). For non-wrap
-            // this is exactly the horizontally-scrolled view; for wrap it is
-            // one folded segment. The overlay painters treat `row_start` as
-            // the scroll offset and `row_width` as the text width, so the
-            // same code paints both modes.
-            let raw = &self.lines[line_idx];
-            let line_len = self.line_char_len(line_idx);
-            let byte_start = byte_index_of_char(raw, row_start);
-            let byte_end = byte_index_of_char(raw, row_end);
-            // A wrapped row's width in CELLS, which is what the painters clip
-            // by: its char count cut a row of wide characters in half.
-            let row_origin = self.row_origin(raw, row_start);
-            let row_width = {
-                let cells: usize = cells_from(&raw[byte_start..byte_end], row_origin);
-                cells.max(row_end - row_start).min(text_width as usize) as u16
-            };
-            let visible_raw = &raw[byte_start..byte_end];
-            let seg_bytes = byte_end - byte_start;
-            let empty: Vec<HiSpan> = Vec::new();
-            let line_spans = self.highlights.get(line_idx).unwrap_or(&empty);
-            // Paint the LSP semantic overlay over the tree-sitter base so
-            // resolved symbols (parameters, etc.) win wherever the server
-            // has an opinion, syntax fills the gaps (the "combined" model).
-            let sem_spans = self.semantic_overlay.get(line_idx).unwrap_or(&empty);
-            let merged = merge_overlay(line_spans, sem_spans);
-            // The row's geometry: its text by display width (#873) and the
-            // inlay hints anchored inside its window, as (anchor col,
-            // display cells) pairs. A hint's label is spliced into the row
-            // BEFORE the character at its anchor; every buffer column at or
-            // past an anchor therefore paints `inlay_cells_before` cells
-            // further right, and each overlay painter below translates its
-            // columns through `row_cells` so highlights, underlines, and
-            // carets stay glued to their glyphs.
-            let hint_cap = row_end.min(line_len);
-            row_cells.fill(
-                visible_raw,
-                row_start,
-                row_origin,
-                self.row_inlay_spans(line_idx)
-                    .iter()
-                    .filter(|(hc, _, _)| *hc >= row_start && *hc <= hint_cap)
-                    .map(|(hc, l, _)| (*hc, l.chars().count())),
+            self.paint_row_overlays(
+                buf, &frame, &row_cells, y, line_idx, row_start, row_end, line_len, row_width,
             );
-            if row_cells.hints.is_empty() {
-                // Shift highlight spans to the row origin and clip them to the
-                // segment so build_line_spans never slices past `visible_raw`.
-                let shifted: Vec<HiSpan> = shift_spans_for_view(&merged, byte_start)
-                    .into_iter()
-                    .filter_map(|sp| sp.clipped(seg_bytes))
-                    .collect();
-                let spans = build_line_spans(visible_raw, &shifted, row_origin);
-                buf.set_line(text_x, y, &Line::from(spans), row_width);
-            } else {
-                // Splice each hint label between the text segments it splits.
-                // Style A (Zed's look): dim italic text, one shade quieter
-                // than comments, no chip background.
-                let hint_style = Style::default()
-                    .fg(self.theme.ignored_fg())
-                    .add_modifier(Modifier::ITALIC);
-                let mut out: Vec<Span> = Vec::new();
-                let mut from = row_start;
-                for (hcol, label, swatch) in self
-                    .row_inlay_spans(line_idx)
-                    .iter()
-                    .filter(|(hc, _, _)| *hc >= row_start && *hc <= hint_cap)
-                {
-                    if *hcol > from {
-                        out.extend(inlay_text_segment(
-                            raw,
-                            &merged,
-                            (row_start, row_origin),
-                            from,
-                            *hcol,
-                        ));
-                    }
-                    // A color swatch paints in ITS color (#254); plain
-                    // hints keep the dim italic Zed look.
-                    let style = match swatch {
-                        Some(c) => Style::default().fg(*c),
-                        None => hint_style,
-                    };
-                    out.push(Span::styled(label.clone(), style));
-                    from = from.max(*hcol);
-                }
-                if row_end > from {
-                    out.extend(inlay_text_segment(
-                        raw,
-                        &merged,
-                        (row_start, row_origin),
-                        from,
-                        row_end,
-                    ));
-                }
-                buf.set_line(text_x, y, &Line::from(out), row_width);
-            }
-
-            // Bracket-pair colorization (#131): recolour each bracket cell by
-            // its nesting depth (red for an unmatched closer). A foreground
-            // override on the already-painted glyph, so selection / search /
-            // occurrence layers below still lay their backgrounds over it —
-            // and the find layer, painted later, wins outright like it does
-            // over syntax colours. Columns translate through inlay cells and
-            // the row window like every painter; wrap continuation segments
-            // participate (brackets live anywhere in the line, unlike the
-            // leading-whitespace guides).
-            if self.show_bracket_colors
-                && let Some(cols) = self.bracket_colors.get(line_idx)
-            {
-                for &(c, ci) in cols {
-                    let c = c as usize;
-                    if c < row_start {
-                        continue;
-                    }
-                    let fg = if ci == UNEXPECTED_BRACKET {
-                        self.theme.bracket_unexpected_fg()
-                    } else {
-                        self.theme.bracket_pair_color(usize::from(ci))
-                    };
-                    if !paint_row_cells(buf, text_x, y, row_width, &row_cells, c, |s| s.fg(fg)) {
-                        break;
-                    }
-                }
-            }
-
-            // Inline color-literal decorations (VS Code's
-            // `naumovs.color-highlight`, filling the "no colour-swatch
-            // decorations" gap): tint each recognized `#hex` / `rgb()` /
-            // `hsl()` literal's own cells with its parsed color, choosing a
-            // black or white foreground for legibility. Painted after
-            // bracket colorization so a color literal's own brackets (e.g.
-            // `rgb(...)`) still read against the tint, and before the
-            // overlays below (selection, search) so those still win over it.
-            if self.show_color_swatches
-                && let Some(hits) = self.color_swatches.get(line_idx)
-            {
-                for &(start_c, end_c, bg, fg) in hits {
-                    if end_c <= row_start {
-                        continue;
-                    }
-                    let from = start_c.max(row_start);
-                    for c in from..end_c {
-                        let tint = |s: Style| s.bg(bg).fg(fg);
-                        if !paint_row_cells(buf, text_x, y, row_width, &row_cells, c, tint) {
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // Indentation guides (VS Code `editor.guides.indentation`): a dim
-            // │ at each indent-unit column of the line's leading whitespace,
-            // with the cursor block's guide highlighted. Painted into blank
-            // cells only, right after the text, so text always wins and the
-            // overlays below (selection band, conflict tints) lay their
-            // backgrounds over the glyph. A wrap continuation row carries no
-            // leading whitespace, so only a line's first segment draws guides;
-            // in the flat path `row_start` is the horizontal scroll and
-            // translates the columns like every other painter here.
-            if self.show_indent_guides && (!wrap || row_start == 0) {
-                let (guide_width, guide_src) = self.guide_indent(line_idx);
-                // A blank line's guides sit where its neighbour's indentation
-                // is drawn, tabs and all, not one cell per level.
-                let src_cells;
-                let geometry = if guide_src == line_idx {
-                    &row_cells
-                } else {
-                    src_cells = RowCells::of_line_at(
-                        &self.lines[guide_src],
-                        row_start,
-                        self.row_origin(&self.lines[guide_src], row_start),
-                    );
-                    &src_cells
-                };
-                for c in (0..guide_width).step_by(guide_step) {
-                    if c < row_start {
-                        continue;
-                    }
-                    let col = geometry.cell(c);
-                    if col >= usize::from(row_width) {
-                        break;
-                    }
-                    let cell = &mut buf[(text_x + col as u16, y)];
-                    if cell.symbol() != " " {
-                        continue;
-                    }
-                    let fg = match active_guide {
-                        Some((ac, lo, hi)) if ac == c && (lo..=hi).contains(&line_idx) => {
-                            guide_active_fg
-                        }
-                        _ => guide_fg,
-                    };
-                    cell.set_symbol("\u{2502}");
-                    // Not italic even over a comment: a slanted guide looks
-                    // broken, and the text's modifier is not the guide's.
-                    let style = cell.style().fg(fg).remove_modifier(Modifier::ITALIC);
-                    cell.set_style(style);
-                }
-            }
-
-            // Render whitespace (#133): swap space/tab cells to `·`/`→` in a
-            // dim theme colour — across the whole row in All mode, inside the
-            // primary and secondary-caret selections in Selection mode (the
-            // VS Code default). Painted after the indent guides so the glyph
-            // wins the cell: it reports a real character where the guide only
-            // decorates, and the selection band below touches backgrounds
-            // only, so the glyph rides the band like text does.
-            if self.whitespace_mode != WhitespaceMode::None {
-                let ws_fg = self.theme.whitespace_fg();
-                let mut ws_spans: Vec<(usize, usize)> = Vec::new();
-                match self.whitespace_mode {
-                    WhitespaceMode::All => ws_spans.push((0, line_len)),
-                    WhitespaceMode::Selection => {
-                        if let Some(((sr, sc), (er, ec))) = sel_norm
-                            && line_idx >= sr
-                            && line_idx <= er
-                        {
-                            let s = if line_idx == sr { sc } else { 0 };
-                            let e = if line_idx == er { ec } else { line_len };
-                            if e > s {
-                                ws_spans.push((s, e));
-                            }
-                        }
-                        for caret in &self.carets {
-                            let ((cr0, cc0), (cr1, cc1)) = caret.normalised();
-                            if line_idx >= cr0 && line_idx <= cr1 {
-                                let s = if line_idx == cr0 { cc0 } else { 0 };
-                                let e = if line_idx == cr1 { cc1 } else { line_len };
-                                if e > s {
-                                    ws_spans.push((s, e));
-                                }
-                            }
-                        }
-                    }
-                    WhitespaceMode::None => {}
-                }
-                for (s, e) in ws_spans {
-                    let from = s.max(row_start);
-                    let to = e.min(row_end).min(line_len);
-                    if to <= from {
-                        continue;
-                    }
-                    for (ci, ch) in raw.chars().enumerate().skip(from).take(to - from) {
-                        let glyph = match ch {
-                            ' ' => "\u{b7}",
-                            '\t' => "\u{2192}",
-                            _ => continue,
-                        };
-                        let col = row_cells.cell(ci);
-                        if col >= usize::from(row_width) {
-                            break;
-                        }
-                        let cell = &mut buf[(text_x + col as u16, y)];
-                        cell.set_symbol(glyph);
-                        // The glyph marks whitespace, not comment text.
-                        let style = cell.style().fg(ws_fg).remove_modifier(Modifier::ITALIC);
-                        cell.set_style(style);
-                    }
-                }
-            }
-
-            // Merge-conflict region tints (VS Code's current/incoming
-            // backgrounds), painted right after the text so diagnostics,
-            // search highlights, and the selection all win over them.
-            if let Some(tint) = conflict_row_tint(&self.conflicts, line_idx, self.theme) {
-                paint_full_row_bg(buf, text_x, y, row_width, tint);
-            }
-            // Clickable accept buttons on the conflict header row — VS Code's
-            // merge-conflict CodeLens, drawn after the marker text where the
-            // `<<<<<<<` line is otherwise dead space (#1169). A narrow row
-            // gets the short labels rather than losing buttons. Hit spans are
-            // recorded per frame (cleared at render start) so the rects always
-            // describe the painted frame (#103's invariant).
-            if let Some(block_idx) = self.conflicts.iter().position(|b| b.ours_start == line_idx) {
-                let block = self.conflicts[block_idx];
-                let marker_len = row_cells.text_before(line_len) as u16;
-                // A header that wraps gets them after its last segment only.
-                if marker_len <= row_width {
-                    use crate::merge::Resolution;
-                    let chips = [
-                        AcceptChip::new("Accept Current", "Current", ACCEPT_CURRENT_FILL),
-                        AcceptChip::new("Accept Incoming", "Incoming", ACCEPT_INCOMING_FILL),
-                        AcceptChip::new("Accept Both", "Both", ACCEPT_BOTH_FILL),
-                    ];
-                    let res = [Resolution::Current, Resolution::Incoming, Resolution::Both];
-                    let x0 = text_x + marker_len + 2;
-                    for (i, xs) in
-                        paint_accept_chips(buf, &chips, x0, text_x + row_width, y, self.theme)
-                    {
-                        self.merge_action_spans
-                            .push((y, xs, block.ours_start, res[i]));
-                    }
-                }
-            }
-
-            // LSP diagnostics: underline each problem span in its severity
-            // colour, clipped to the visible row window. VS Code draws a wavy
-            // underline; the crossterm backend exposes only a straight one, so
-            // a coloured straight underline carries the severity instead. The
-            // underline colour is independent of the glyph's foreground, so the
-            // syntax/semantic colour underneath is preserved.
-            let empty_diag: Vec<(usize, usize, crate::lsp::manager::DiagnosticSeverity)> =
-                Vec::new();
-            for &(sc, ec, severity) in self.diagnostic_spans.get(line_idx).unwrap_or(&empty_diag) {
-                let vs = row_cells.cell(sc);
-                // The exclusive end shifts by the hints before its LAST char,
-                // so an underline never swallows a hint anchored right at it.
-                let ve = row_cells.end(ec);
-                if ve > vs {
-                    paint_diagnostic_underline(
-                        buf, text_x, y, row_width, vs, ve, severity, self.theme,
-                    );
-                }
-            }
-            let empty_tags: Vec<(usize, usize, crate::lsp::manager::DiagnosticTags)> = Vec::new();
-            for &(sc, ec, tags) in self
-                .diagnostic_tag_spans
-                .get(line_idx)
-                .unwrap_or(&empty_tags)
-            {
-                let vs = row_cells.cell(sc);
-                let ve = row_cells.end(ec);
-                if ve > vs {
-                    paint_diagnostic_tags(buf, text_x, y, row_width, vs, ve, tags);
-                }
-            }
-
-            // LSP occurrences of the symbol under the caret (word highlight):
-            // painted before the find layer, the selection band, and the
-            // bracket match so all three stay visible on top. The find layer
-            // in particular paints black-on-gold; an occurrence bg over it
-            // left black text on a dark grey (the caret parked on a find
-            // match makes the two layers cover the same cells).
-            for &(occ_row, occ_start, occ_end, occ_write) in &self.occurrences {
-                if occ_row != line_idx {
-                    continue;
-                }
-                let bg = if occ_write {
-                    self.theme.occurrence_write_bg()
-                } else {
-                    self.theme.occurrence_bg()
-                };
-                for c in occ_start.max(row_start)..occ_end {
-                    if !paint_row_cells(buf, text_x, y, row_width, &row_cells, c, |s| s.bg(bg)) {
-                        break;
-                    }
-                }
-            }
-
-            if let Some(term) = self
-                .search_highlight
-                .as_deref()
-                .filter(|_| find_window(self.find_range, line_idx) != Some((0, 0)))
-            {
-                let active_on_line = self
-                    .active_search_match
-                    .filter(|(r, _, _)| *r == line_idx)
-                    .map(|(_, c, l)| (c, l));
-                paint_search_highlight(
-                    buf,
-                    text_x,
-                    y,
-                    row_width,
-                    raw,
-                    term,
-                    self.search_highlight_opts,
-                    &row_cells,
-                    active_on_line,
-                    None,
-                    find_window(self.find_range, line_idx),
-                    self.theme,
-                );
-            }
-
-            if let Some(needle) = occ_needle.as_deref() {
-                paint_selection_occurrences(
-                    buf, text_x, y, row_width, raw, needle, &row_cells, self.theme,
-                );
-            }
-
-            if let Some(((sr, sc), (er, ec))) = sel_norm
-                && line_idx >= sr
-                && line_idx <= er
-            {
-                let sel_start = if line_idx == sr { sc } else { 0 };
-                // For non-final selected rows, paint past the content by one
-                // cell to make the trailing newline visible.
-                let sel_end = if line_idx == er { ec } else { line_len + 1 };
-                let visible_start = row_cells.cell(sel_start);
-                let visible_end = row_cells.end(sel_end);
-                if visible_end > visible_start {
-                    paint_selection_band(
-                        buf,
-                        text_x,
-                        y,
-                        row_width,
-                        visible_start,
-                        visible_end,
-                        self.theme,
-                    );
-                }
-            }
-
-            // Bracket-match highlight: tint the two matched bracket cells that
-            // fall on this visual row, honouring horizontal scroll.
-            if let Some((open, close)) = bracket_pair {
-                for pos in [open, close] {
-                    if pos.0 == line_idx && pos.1 >= row_start {
-                        paint_bracket_match(
-                            buf,
-                            text_x,
-                            y,
-                            row_width,
-                            row_cells.cell(pos.1),
-                            self.theme,
-                        );
-                    }
-                }
-            }
-
-            // Secondary multi-cursor carets ("Change All Occurrences"): paint
-            // each one's selection band and a software block cursor at its
-            // head. The primary cursor is the hardware caret; these blocks
-            // mark the extra cursors so the user sees every edit point.
-            for caret in &self.carets {
-                let ((cr0, cc0), (cr1, cc1)) = caret.normalised();
-                if line_idx >= cr0 && line_idx <= cr1 {
-                    let cs = if line_idx == cr0 { cc0 } else { 0 };
-                    let ce = if line_idx == cr1 { cc1 } else { line_len + 1 };
-                    let vs = row_cells.cell(cs);
-                    let ve = row_cells.end(ce);
-                    if ve > vs {
-                        paint_selection_band(buf, text_x, y, row_width, vs, ve, self.theme);
-                    }
-                }
-                // Only paint the block on the visual row that holds the caret.
-                let c = caret.head.1;
-                let on_row = caret.head.0 == line_idx
-                    && c >= row_start
-                    && (c < row_end || (c == row_end && row_end == line_len));
-                if on_row {
-                    // `caret`, not `cell`: a caret AT a hint's anchor sits
-                    // left of the hint, inside its own band.
-                    paint_block_cursor(buf, text_x, y, row_width, row_cells.caret(c), self.theme);
-                }
-            }
-
-            // Collaborators' ghost carets (multiplayer): the same block shape
-            // as secondary carets, in each participant's color. The local
-            // hardware caret is painted by the terminal after drawing, so it
-            // always sits above these.
-            for &(gr, gc, color) in &self.ghost_carets {
-                let on_row = gr == line_idx
-                    && gc >= row_start
-                    && (gc < row_end || (gc == row_end && row_end == line_len));
-                if on_row {
-                    paint_ghost_caret(buf, text_x, y, row_width, row_cells.caret(gc), color);
-                }
-            }
-
-            // GitLens-style inline blame: a dim italic annotation trailing the
-            // cursor's line, on its last visual segment, in the focused editor
-            // only. Painted last so no overlay covers it, and clipped to the
-            // pane's right edge.
-            if self.focused
-                && line_idx == self.cursor_row
-                && row_end >= line_len
-                && !self.inline_values.contains_key(&line_idx)
-                && self.live_note(line_idx).is_none()
-                && self.lenses_on_line(line_idx).is_empty()
-                && self.live_ghost().is_none()
-                && let Some(note) = self.current_line_blame_annotation()
-            {
-                let text_cols = row_cells.cell(line_len);
-                let start_x = text_x + text_cols as u16 + 2;
-                let right = inner.x + inner.width;
-                if start_x < right {
-                    let avail = (right - start_x) as usize;
-                    let shown: String = note.chars().take(avail).collect();
-                    buf.set_string(
-                        start_x,
-                        y,
-                        &shown,
-                        Style::default()
-                            .fg(self.theme.ignored_fg())
-                            .add_modifier(Modifier::ITALIC),
-                    );
-                    // Hover and click reach the commit it names (#1556);
-                    // `Uncommitted changes` has none to show.
-                    if let Some(LineBlame::Commit(c)) = self.cursor_line_blame() {
-                        let hash = c.hash.clone();
-                        let w = unicode_width::UnicodeWidthStr::width(shown.as_str()) as u16;
-                        self.blame_span = Some((y, start_x..(start_x + w).min(right), hash));
-                    }
-                }
-            }
-
-            // Debugger inline values (#135): the "name = value" trailer for a
-            // stopped session, on the line's last visual segment like the
-            // blame above (which yields to it on the cursor line — while
-            // stepping, state beats history). Clipped to the pane edge.
-            if row_end >= line_len
-                && let Some(note) = self.inline_values.get(&line_idx)
-            {
-                let text_cols = row_cells.cell(line_len);
-                let start_x = text_x + text_cols as u16 + 2;
-                let right = inner.x + inner.width;
-                if start_x < right {
-                    let avail = (right - start_x) as usize;
-                    let shown: String = note.chars().take(avail).collect();
-                    buf.set_string(
-                        start_x,
-                        y,
-                        &shown,
-                        Style::default()
-                            .fg(self.theme.ignored_fg())
-                            .add_modifier(Modifier::ITALIC),
-                    );
-                }
-            }
-
-            // A language server's replacement strikes through the columns it
-            // takes the place of, and its text stands one cell clear of them.
-            let replaces = self
-                .live_ghost_full()
-                .and_then(|g| g.replaces.clone())
-                .filter(|_| self.focused && line_idx == self.cursor_row);
-            if let Some(r) = &replaces {
-                let (vs, ve) = (row_cells.cell(r.start), row_cells.end(r.end));
-                if ve > vs {
-                    let struck = crate::lsp::manager::DiagnosticTags {
-                        unnecessary: true,
-                        deprecated: true,
-                    };
-                    paint_diagnostic_tags(buf, text_x, y, row_width, vs, ve, struck);
-                }
-            }
-
-            // Inline suggestion (#607): the first line as ghost text right at
-            // the caret (suggestions are only asked for at a line's end); the
-            // rest hang below as `VisRow::Ghost` rows (#1625), and only lines
-            // that found no row are counted here. It owns the line's tail, so
-            // the trailers below stand aside.
-            let ghost_here = self.focused
-                && line_idx == self.cursor_row
-                && row_end >= line_len
-                && self.live_ghost().is_some();
-            if ghost_here && let Some(text) = self.live_ghost() {
-                let text_cols = row_cells.cell(line_len) + usize::from(replaces.is_some());
-                let x = text_x + text_cols as u16;
-                let right = inner.x + inner.width;
-                if x < right {
-                    let first = text.split('\n').next().unwrap_or("");
-                    let shown_rows = visual_rows
-                        .iter()
-                        .filter(|r| matches!(r, VisRow::Ghost { .. }))
-                        .count();
-                    let more = text.split('\n').count() - 1 - shown_rows;
-                    let shown = if more > 0 {
-                        format!(
-                            "{first}  (+{more} line{})",
-                            if more == 1 { "" } else { "s" }
-                        )
-                    } else {
-                        first.to_string()
-                    };
-                    let clipped: String = shown.chars().take((right - x) as usize).collect();
-                    buf.set_string(
-                        x,
-                        y,
-                        &clipped,
-                        Style::default()
-                            .fg(self.theme.ignored_fg())
-                            .add_modifier(Modifier::ITALIC),
-                    );
-                }
-            }
-
-            // Code lenses (#608): the server's "3 references | Run" at the end
-            // of the symbol's line, clickable, yielding to the debugger's and
-            // Live Run's trailers, which describe this very run.
-            if row_end >= line_len
-                && !ghost_here
-                && !self.inline_values.contains_key(&line_idx)
-                && self.live_note(line_idx).is_none()
-            {
-                let lenses = self.lenses_on_line(line_idx);
-                if !lenses.is_empty() {
-                    let text_cols = row_cells.cell(line_len);
-                    let mut x = text_x + text_cols as u16 + 2;
-                    let right = inner.x + inner.width;
-                    let style = Style::default()
-                        .fg(self.theme.ignored_fg())
-                        .add_modifier(Modifier::UNDERLINED);
-                    for (n, idx) in lenses.into_iter().enumerate() {
-                        if n > 0 && x + 3 < right {
-                            buf.set_string(
-                                x,
-                                y,
-                                " | ",
-                                Style::default().fg(self.theme.ignored_fg()),
-                            );
-                            x += 3;
-                        }
-                        if x >= right {
-                            break;
-                        }
-                        let title = &self.code_lenses[idx].title;
-                        let shown: String = title.chars().take((right - x) as usize).collect();
-                        let w = unicode_width::UnicodeWidthStr::width(shown.as_str()) as u16;
-                        buf.set_string(x, y, &shown, style);
-                        self.code_lens_spans.push((y, x..x + w, idx));
-                        x += w;
-                    }
-                }
-            }
-
-            // Live Run trailer: what this line did on the last run, painted
-            // where the debugger's values go and yielding to them, since a
-            // paused session is the more specific answer.
-            if row_end >= line_len
-                && !ghost_here
-                && !self.inline_values.contains_key(&line_idx)
-                && let Some(note) = self.live_note(line_idx)
-            {
-                let text_cols = row_cells.cell(line_len);
-                let mut x = text_x + text_cols as u16 + 2;
-                let right = inner.x + inner.width;
-                for (text, kind) in note {
-                    if x >= right {
-                        break;
-                    }
-                    let color = match kind {
-                        crate::live_run::Kind::Value => self.theme.ignored_fg(),
-                        crate::live_run::Kind::Output => {
-                            self.theme.ui(Color::Rgb(0x3b, 0x9e, 0xff))
-                        }
-                        crate::live_run::Kind::Error => self.theme.ui(Color::Rgb(0xf1, 0x4c, 0x4c)),
-                        crate::live_run::Kind::Timeout => {
-                            self.theme.ui(Color::Rgb(0xcc, 0xa7, 0x00))
-                        }
-                    };
-                    let avail = (right - x) as usize;
-                    let shown: String = text.chars().take(avail).collect();
-                    let width = unicode_width::UnicodeWidthStr::width(shown.as_str()) as u16;
-                    buf.set_string(
-                        x,
-                        y,
-                        &shown,
-                        Style::default().fg(color).add_modifier(Modifier::ITALIC),
-                    );
-                    x = x.saturating_add(width + 2);
-                }
-            }
 
             // The cursor itself is drawn by the host terminal as a hardware
             // caret (DECSCUSR `BlinkingBar`); App calls
@@ -1984,6 +1143,924 @@ impl Widget for &mut Editor {
 }
 
 impl Editor {
+    /// Paint the gutter of one visual row at screen row `y` showing
+    /// `line_idx`: the current-line wash, the line number, the sign cell, the
+    /// fold chevron and the change lane. `first_row` is whether this is the
+    /// line's first visual row, the only one that carries its number and
+    /// glyphs when the line wraps.
+    fn paint_row_gutter(
+        &self,
+        buf: &mut Buffer,
+        frame: &RowFrame<'_>,
+        y: u16,
+        line_idx: usize,
+        first_row: bool,
+    ) {
+        // Current-line highlight (VS Code `editor.lineHighlightBackground`,
+        // #248): a whisper of the accent behind every visual row of the
+        // cursor's line, gutter through code. Focused editor only, and
+        // hidden while a selection is active so the two washes never stack
+        // — VS Code's `renderLineHighlight` behaves the same. Painted
+        // first: spans that carry their own background (selection, search,
+        // occurrences) patch over it, spans that don't inherit it.
+        if self.focused && line_idx == self.cursor_row && frame.sel_norm.is_none() {
+            buf.set_style(
+                Rect::new(
+                    frame.inner.x,
+                    y,
+                    frame.gutter_width + 1 + frame.text_width,
+                    1,
+                ),
+                Style::default().bg(self.theme.current_line_bg()),
+            );
+        }
+        // The line number shows once per logical line - on its first visual
+        // row; wrapped continuation rows get a blank gutter, like VS Code.
+        if first_row {
+            let line_no = format!(
+                "{:>width$} ",
+                self.gutter_number(line_idx)
+                    .map(|n| n.to_string())
+                    .unwrap_or_default(),
+                width = frame.gutter_width as usize - 1
+            );
+            // Live Run coverage tints the number: green for a statement
+            // that ran, a muted red for one that never did. Otherwise a
+            // caret's line is brighter than the rest (VS Code's
+            // `editorLineNumber.activeForeground`, #1576).
+            let number_fg = match self
+                .live_run
+                .as_ref()
+                .and_then(|v| v.coverage(line_idx, &self.lines[line_idx]))
+            {
+                Some(crate::live_run::Coverage::Ran) => self.theme.git_added(),
+                Some(crate::live_run::Coverage::NeverRan) => {
+                    self.theme.ui(Color::Rgb(0xa0, 0x55, 0x55))
+                }
+                None if self.is_caret_line(line_idx) => self.theme.line_number_active(),
+                None => self.theme.line_number_fg(),
+            };
+            let gutter = Line::from(Span::styled(line_no, Style::default().fg(number_fg)));
+            buf.set_line(frame.inner.x, y, &gutter, frame.gutter_width);
+        } else {
+            buf.set_line(
+                frame.inner.x,
+                y,
+                &Line::from(" ".repeat(frame.gutter_width as usize)),
+                frame.gutter_width,
+            );
+        }
+
+        // The sign cell: the dedicated glyph margin at the far left
+        // (`inner.x`), VS Code-style, so a glyph never crowds the line
+        // number or the code. One glyph, on a logical line's first visual
+        // row, chosen by `sign_glyph`, the rule a click answers by too.
+        let sign_x = frame.inner.x;
+        if let Some(glyph) = first_row.then(|| self.sign_glyph(line_idx)).flatten() {
+            let (symbol, color) = match glyph {
+                // The debugger's yellow stop arrow.
+                SignGlyph::Stop => ("▶", Color::Rgb(0xff, 0xcc, 0x00)),
+                // Hollow dimmed ring when the adapter could not bind it;
+                // a red diamond for a conditional breakpoint; an amber
+                // one for a logpoint; a solid red dot for a plain one.
+                SignGlyph::Breakpoint(BreakpointMark::Unverified) => {
+                    ("○", Color::Rgb(0x99, 0x99, 0x99))
+                }
+                SignGlyph::Breakpoint(BreakpointMark::Conditional) => {
+                    ("◆", Color::Rgb(0xe5, 0x1c, 0x23))
+                }
+                SignGlyph::Breakpoint(BreakpointMark::Logpoint) => {
+                    ("◆", Color::Rgb(0xe5, 0xc0, 0x7b))
+                }
+                SignGlyph::Breakpoint(BreakpointMark::Plain) => ("●", Color::Rgb(0xe5, 0x1c, 0x23)),
+                // AI-stream stop button (croft pair): while a pilot
+                // streams into this file, the row under its caret wears
+                // a stop square in the badge's orange; clicking it (or
+                // Cmd+K X) cancels and reverts the stream.
+                SignGlyph::StreamStop => ("■", Color::Rgb(0xff, 0x9d, 0x2f)),
+                // ⚑, a plain-Unicode flag: no Nerd Font needed.
+                SignGlyph::Bookmark => ("\u{2691}", Color::Rgb(0x4f, 0xc1, 0xff)),
+                // The play button beside a test fn's definition, VS
+                // Code's run bead in its testing green: cod-play, the
+                // Testing panel's run glyph.
+                SignGlyph::TestPlay(_) => ("\u{eb2c}", Color::Rgb(0x73, 0xc9, 0x91)),
+            };
+            buf.set_string(sign_x, y, symbol, Style::default().fg(self.theme.ui(color)));
+        }
+
+        // Fold chevron: on a foldable header's first visual row, in the
+        // second sign-margin column (`sign_x + 1`) so it never collides with
+        // a breakpoint dot at `sign_x`. ▾ = expanded, ▸ = collapsed; the
+        // collapsed one is brighter so hidden content is noticeable. Matches
+        // the gutter's own line numbers. On a `surfaces` theme the
+        // expanded one waits for the caret or the pointer, and the
+        // collapsed one, always shown, wears the muted ink.
+        if first_row && self.is_foldable(line_idx) {
+            let collapsed = self.folded.contains(&line_idx);
+            let glyph = if collapsed {
+                let ink = crate::widgets::surface::tones(self.theme)
+                    .map_or_else(|| self.theme.ui(Color::Gray), |t| t.muted());
+                Some(("▸", ink))
+            } else if !frame.surfaces || frame.gutter_hovered || self.is_caret_line(line_idx) {
+                Some(("▾", self.theme.line_number_fg()))
+            } else {
+                None
+            };
+            if let Some((glyph, color)) = glyph {
+                buf.set_string(sign_x + 1, y, glyph, Style::default().fg(color));
+            }
+        }
+
+        // Git gutter: a thin coloured bar in the spacer cell between the
+        // line number and the code (VS Code's dirty-diff lane), on a
+        // logical line's first visual row only. Colour carries add/mod/del.
+        // ponytail: one heavy bar in three colours; the bar's column also
+        // shows deletions, which VS Code renders as a small triangle — fine
+        // as a first cut, the colour already disambiguates.
+        if first_row && let Some(mark) = self.git_marks.get(&line_idx) {
+            let color = match mark {
+                GitMark::Added => self.theme.git_added(),
+                GitMark::Modified => self.theme.git_modified(),
+                GitMark::Deleted => self.theme.git_deleted(),
+            };
+            // ┃ heavy vertical; ▎ left quarter block on a `surfaces`
+            // theme, a crisp stripe on the cell edge rather than a line
+            // through its middle.
+            let bar = if frame.surfaces {
+                "\u{258e}"
+            } else {
+                "\u{2503}"
+            };
+            buf.set_string(
+                frame.inner.x + frame.gutter_width,
+                y,
+                bar,
+                Style::default().fg(color),
+            );
+        }
+        // Coverage lens (#263): the same lane, painted over the git bar
+        // while a coverage report is shown. Green run, red never run,
+        // amber run with a branch missed; dimmed once the file changed
+        // after the run. `Coverage: Clear` gives the lane back to git.
+        if first_row
+            && let Some(lens) = self.coverage.as_ref()
+            && let Some(cov) = lens.lines.get(&line_idx)
+        {
+            use crate::testing::coverage::LineCov;
+            let (rgb, glyph) = match cov {
+                LineCov::Covered => ((0x4e, 0xc9, 0x7a), "\u{258c}"),
+                LineCov::Uncovered => ((0xe0, 0x55, 0x55), "\u{258c}"),
+                LineCov::Partial => ((0xe0, 0xb0, 0x40), "\u{2596}"),
+            };
+            let (r, g, b) = if lens.stale {
+                (rgb.0 / 2, rgb.1 / 2, rgb.2 / 2)
+            } else {
+                rgb
+            };
+            buf.set_string(
+                frame.inner.x + frame.gutter_width,
+                y,
+                glyph,
+                Style::default().fg(self.theme.ui(Color::Rgb(r, g, b))),
+            );
+        }
+        // Provenance overlay (#349): the same lane, a thinner bar in the
+        // seat's hue, painted over the git bar while the lens is on
+        // because the user asked who typed the line, not whether it
+        // differs from HEAD. A line with no record paints nothing: an
+        // unknown line is never guessed at.
+        if self.provenance_overlay
+            && first_row
+            && let Some(seat) = self.provenance.seat(line_idx)
+        {
+            let (r, g, b) = seat.hue();
+            // ▎ left one-quarter block; ▏ one-eighth on a `surfaces`
+            // theme, whose change bar already takes the quarter block.
+            let bar = if frame.surfaces {
+                "\u{258f}"
+            } else {
+                "\u{258e}"
+            };
+            buf.set_string(
+                frame.inner.x + frame.gutter_width,
+                y,
+                bar,
+                Style::default().fg(self.theme.ui(Color::Rgb(r, g, b))),
+            );
+        }
+    }
+
+    /// Paint the text of one visual row at screen row `y`: the segment
+    /// `[row_start, row_end)` of `line_idx` with its syntax and semantic
+    /// colours and inlay hints, then bracket colours, colour swatches,
+    /// indentation guides and whitespace marks. Fills `row_cells` with the
+    /// row's geometry for the overlays painted after it, and returns the
+    /// line's length in characters and the row's width in cells.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_row_text(
+        &self,
+        buf: &mut Buffer,
+        frame: &RowFrame<'_>,
+        row_cells: &mut RowCells,
+        y: u16,
+        line_idx: usize,
+        row_start: usize,
+        row_end: usize,
+    ) -> (usize, u16) {
+        // Per-row window: the segment [row_start, row_end). For non-wrap
+        // this is exactly the horizontally-scrolled view; for wrap it is
+        // one folded segment. The overlay painters treat `row_start` as
+        // the scroll offset and `row_width` as the text width, so the
+        // same code paints both modes.
+        let raw = &self.lines[line_idx];
+        let line_len = self.line_char_len(line_idx);
+        let byte_start = byte_index_of_char(raw, row_start);
+        let byte_end = byte_index_of_char(raw, row_end);
+        // A wrapped row's width in CELLS, which is what the painters clip
+        // by: its char count cut a row of wide characters in half.
+        let row_origin = self.row_origin(raw, row_start);
+        let row_width = {
+            let cells: usize = cells_from(&raw[byte_start..byte_end], row_origin);
+            cells
+                .max(row_end - row_start)
+                .min(frame.text_width as usize) as u16
+        };
+        let visible_raw = &raw[byte_start..byte_end];
+        let seg_bytes = byte_end - byte_start;
+        let empty: Vec<HiSpan> = Vec::new();
+        let line_spans = self.highlights.get(line_idx).unwrap_or(&empty);
+        // Paint the LSP semantic overlay over the tree-sitter base so
+        // resolved symbols (parameters, etc.) win wherever the server
+        // has an opinion, syntax fills the gaps (the "combined" model).
+        let sem_spans = self.semantic_overlay.get(line_idx).unwrap_or(&empty);
+        let merged = merge_overlay(line_spans, sem_spans);
+        // The row's geometry: its text by display width (#873) and the
+        // inlay hints anchored inside its window, as (anchor col,
+        // display cells) pairs. A hint's label is spliced into the row
+        // BEFORE the character at its anchor; every buffer column at or
+        // past an anchor therefore paints `inlay_cells_before` cells
+        // further right, and each overlay painter below translates its
+        // columns through `row_cells` so highlights, underlines, and
+        // carets stay glued to their glyphs.
+        let hint_cap = row_end.min(line_len);
+        row_cells.fill(
+            visible_raw,
+            row_start,
+            row_origin,
+            self.row_inlay_spans(line_idx)
+                .iter()
+                .filter(|(hc, _, _)| *hc >= row_start && *hc <= hint_cap)
+                .map(|(hc, l, _)| (*hc, l.chars().count())),
+        );
+        if row_cells.hints.is_empty() {
+            // Shift highlight spans to the row origin and clip them to the
+            // segment so build_line_spans never slices past `visible_raw`.
+            let shifted: Vec<HiSpan> = shift_spans_for_view(&merged, byte_start)
+                .into_iter()
+                .filter_map(|sp| sp.clipped(seg_bytes))
+                .collect();
+            let spans = build_line_spans(visible_raw, &shifted, row_origin);
+            buf.set_line(frame.text_x, y, &Line::from(spans), row_width);
+        } else {
+            // Splice each hint label between the text segments it splits.
+            // Style A (Zed's look): dim italic text, one shade quieter
+            // than comments, no chip background.
+            let hint_style = Style::default()
+                .fg(self.theme.ignored_fg())
+                .add_modifier(Modifier::ITALIC);
+            let mut out: Vec<Span> = Vec::new();
+            let mut from = row_start;
+            for (hcol, label, swatch) in self
+                .row_inlay_spans(line_idx)
+                .iter()
+                .filter(|(hc, _, _)| *hc >= row_start && *hc <= hint_cap)
+            {
+                if *hcol > from {
+                    out.extend(inlay_text_segment(
+                        raw,
+                        &merged,
+                        (row_start, row_origin),
+                        from,
+                        *hcol,
+                    ));
+                }
+                // A color swatch paints in ITS color (#254); plain
+                // hints keep the dim italic Zed look.
+                let style = match swatch {
+                    Some(c) => Style::default().fg(*c),
+                    None => hint_style,
+                };
+                out.push(Span::styled(label.clone(), style));
+                from = from.max(*hcol);
+            }
+            if row_end > from {
+                out.extend(inlay_text_segment(
+                    raw,
+                    &merged,
+                    (row_start, row_origin),
+                    from,
+                    row_end,
+                ));
+            }
+            buf.set_line(frame.text_x, y, &Line::from(out), row_width);
+        }
+
+        // Bracket-pair colorization (#131): recolour each bracket cell by
+        // its nesting depth (red for an unmatched closer). A foreground
+        // override on the already-painted glyph, so selection / search /
+        // occurrence layers below still lay their backgrounds over it —
+        // and the find layer, painted later, wins outright like it does
+        // over syntax colours. Columns translate through inlay cells and
+        // the row window like every painter; wrap continuation segments
+        // participate (brackets live anywhere in the line, unlike the
+        // leading-whitespace guides).
+        if self.show_bracket_colors
+            && let Some(cols) = self.bracket_colors.get(line_idx)
+        {
+            for &(c, ci) in cols {
+                let c = c as usize;
+                if c < row_start {
+                    continue;
+                }
+                let fg = if ci == UNEXPECTED_BRACKET {
+                    self.theme.bracket_unexpected_fg()
+                } else {
+                    self.theme.bracket_pair_color(usize::from(ci))
+                };
+                if !paint_row_cells(buf, frame.text_x, y, row_width, row_cells, c, |s| s.fg(fg)) {
+                    break;
+                }
+            }
+        }
+
+        // Inline color-literal decorations (VS Code's
+        // `naumovs.color-highlight`, filling the "no colour-swatch
+        // decorations" gap): tint each recognized `#hex` / `rgb()` /
+        // `hsl()` literal's own cells with its parsed color, choosing a
+        // black or white foreground for legibility. Painted after
+        // bracket colorization so a color literal's own brackets (e.g.
+        // `rgb(...)`) still read against the tint, and before the
+        // overlays below (selection, search) so those still win over it.
+        if self.show_color_swatches
+            && let Some(hits) = self.color_swatches.get(line_idx)
+        {
+            for &(start_c, end_c, bg, fg) in hits {
+                if end_c <= row_start {
+                    continue;
+                }
+                let from = start_c.max(row_start);
+                for c in from..end_c {
+                    let tint = |s: Style| s.bg(bg).fg(fg);
+                    if !paint_row_cells(buf, frame.text_x, y, row_width, row_cells, c, tint) {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Indentation guides (VS Code `editor.guides.indentation`): a dim
+        // │ at each indent-unit column of the line's leading whitespace,
+        // with the cursor block's guide highlighted. Painted into blank
+        // cells only, right after the text, so text always wins and the
+        // overlays below (selection band, conflict tints) lay their
+        // backgrounds over the glyph. A wrap continuation row carries no
+        // leading whitespace, so only a line's first segment draws guides;
+        // in the flat path `row_start` is the horizontal scroll and
+        // translates the columns like every other painter here.
+        if self.show_indent_guides && (!frame.wrap || row_start == 0) {
+            let (guide_width, guide_src) = self.guide_indent(line_idx);
+            // A blank line's guides sit where its neighbour's indentation
+            // is drawn, tabs and all, not one cell per level.
+            let src_cells;
+            let geometry = if guide_src == line_idx {
+                &*row_cells
+            } else {
+                src_cells = RowCells::of_line_at(
+                    &self.lines[guide_src],
+                    row_start,
+                    self.row_origin(&self.lines[guide_src], row_start),
+                );
+                &src_cells
+            };
+            for c in (0..guide_width).step_by(frame.guide_step) {
+                if c < row_start {
+                    continue;
+                }
+                let col = geometry.cell(c);
+                if col >= usize::from(row_width) {
+                    break;
+                }
+                let cell = &mut buf[(frame.text_x + col as u16, y)];
+                if cell.symbol() != " " {
+                    continue;
+                }
+                let fg = match frame.active_guide {
+                    Some((ac, lo, hi)) if ac == c && (lo..=hi).contains(&line_idx) => {
+                        frame.guide_active_fg
+                    }
+                    _ => frame.guide_fg,
+                };
+                cell.set_symbol("\u{2502}");
+                // Not italic even over a comment: a slanted guide looks
+                // broken, and the text's modifier is not the guide's.
+                let style = cell.style().fg(fg).remove_modifier(Modifier::ITALIC);
+                cell.set_style(style);
+            }
+        }
+
+        // Render whitespace (#133): swap space/tab cells to `·`/`→` in a
+        // dim theme colour — across the whole row in All mode, inside the
+        // primary and secondary-caret selections in Selection mode (the
+        // VS Code default). Painted after the indent guides so the glyph
+        // wins the cell: it reports a real character where the guide only
+        // decorates, and the selection band below touches backgrounds
+        // only, so the glyph rides the band like text does.
+        if self.whitespace_mode != WhitespaceMode::None {
+            let ws_fg = self.theme.whitespace_fg();
+            let mut ws_spans: Vec<(usize, usize)> = Vec::new();
+            match self.whitespace_mode {
+                WhitespaceMode::All => ws_spans.push((0, line_len)),
+                WhitespaceMode::Selection => {
+                    if let Some(((sr, sc), (er, ec))) = frame.sel_norm
+                        && line_idx >= sr
+                        && line_idx <= er
+                    {
+                        let s = if line_idx == sr { sc } else { 0 };
+                        let e = if line_idx == er { ec } else { line_len };
+                        if e > s {
+                            ws_spans.push((s, e));
+                        }
+                    }
+                    for caret in &self.carets {
+                        let ((cr0, cc0), (cr1, cc1)) = caret.normalised();
+                        if line_idx >= cr0 && line_idx <= cr1 {
+                            let s = if line_idx == cr0 { cc0 } else { 0 };
+                            let e = if line_idx == cr1 { cc1 } else { line_len };
+                            if e > s {
+                                ws_spans.push((s, e));
+                            }
+                        }
+                    }
+                }
+                WhitespaceMode::None => {}
+            }
+            for (s, e) in ws_spans {
+                let from = s.max(row_start);
+                let to = e.min(row_end).min(line_len);
+                if to <= from {
+                    continue;
+                }
+                for (ci, ch) in raw.chars().enumerate().skip(from).take(to - from) {
+                    let glyph = match ch {
+                        ' ' => "\u{b7}",
+                        '\t' => "\u{2192}",
+                        _ => continue,
+                    };
+                    let col = row_cells.cell(ci);
+                    if col >= usize::from(row_width) {
+                        break;
+                    }
+                    let cell = &mut buf[(frame.text_x + col as u16, y)];
+                    cell.set_symbol(glyph);
+                    // The glyph marks whitespace, not comment text.
+                    let style = cell.style().fg(ws_fg).remove_modifier(Modifier::ITALIC);
+                    cell.set_style(style);
+                }
+            }
+        }
+        (line_len, row_width)
+    }
+
+    /// Paint everything laid over one visual row's text at screen row `y`:
+    /// merge-conflict tints and accept buttons, diagnostics, occurrence,
+    /// find and selection highlights, the bracket match, extra and
+    /// collaborators' carets, inline blame, debugger inline values, a
+    /// server's replacement, the inline suggestion, code lenses and Live
+    /// Run's trailer. `row_cells` is the row's geometry as
+    /// [`Self::paint_row_text`] filled it, `line_len` the line's length and
+    /// `row_width` the row's width in cells. Records where this frame drew
+    /// the clickable blame and code lens spans.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_row_overlays(
+        &mut self,
+        buf: &mut Buffer,
+        frame: &RowFrame<'_>,
+        row_cells: &RowCells,
+        y: u16,
+        line_idx: usize,
+        row_start: usize,
+        row_end: usize,
+        line_len: usize,
+        row_width: u16,
+    ) {
+        let raw = &self.lines[line_idx];
+        // Merge-conflict region tints (VS Code's current/incoming
+        // backgrounds), painted right after the text so diagnostics,
+        // search highlights, and the selection all win over them.
+        if let Some(tint) = conflict_row_tint(&self.conflicts, line_idx, self.theme) {
+            paint_full_row_bg(buf, frame.text_x, y, row_width, tint);
+        }
+        // Clickable accept buttons on the conflict header row — VS Code's
+        // merge-conflict CodeLens, drawn after the marker text where the
+        // `<<<<<<<` line is otherwise dead space (#1169). A narrow row
+        // gets the short labels rather than losing buttons. Hit spans are
+        // recorded per frame (cleared at render start) so the rects always
+        // describe the painted frame (#103's invariant).
+        if let Some(block_idx) = self.conflicts.iter().position(|b| b.ours_start == line_idx) {
+            let block = self.conflicts[block_idx];
+            let marker_len = row_cells.text_before(line_len) as u16;
+            // A header that wraps gets them after its last segment only.
+            if marker_len <= row_width {
+                use crate::merge::Resolution;
+                let chips = [
+                    AcceptChip::new("Accept Current", "Current", ACCEPT_CURRENT_FILL),
+                    AcceptChip::new("Accept Incoming", "Incoming", ACCEPT_INCOMING_FILL),
+                    AcceptChip::new("Accept Both", "Both", ACCEPT_BOTH_FILL),
+                ];
+                let res = [Resolution::Current, Resolution::Incoming, Resolution::Both];
+                let x0 = frame.text_x + marker_len + 2;
+                for (i, xs) in
+                    paint_accept_chips(buf, &chips, x0, frame.text_x + row_width, y, self.theme)
+                {
+                    self.merge_action_spans
+                        .push((y, xs, block.ours_start, res[i]));
+                }
+            }
+        }
+
+        // LSP diagnostics: underline each problem span in its severity
+        // colour, clipped to the visible row window. VS Code draws a wavy
+        // underline; the crossterm backend exposes only a straight one, so
+        // a coloured straight underline carries the severity instead. The
+        // underline colour is independent of the glyph's foreground, so the
+        // syntax/semantic colour underneath is preserved.
+        let empty_diag: Vec<(usize, usize, crate::lsp::manager::DiagnosticSeverity)> = Vec::new();
+        for &(sc, ec, severity) in self.diagnostic_spans.get(line_idx).unwrap_or(&empty_diag) {
+            let vs = row_cells.cell(sc);
+            // The exclusive end shifts by the hints before its LAST char,
+            // so an underline never swallows a hint anchored right at it.
+            let ve = row_cells.end(ec);
+            if ve > vs {
+                paint_diagnostic_underline(
+                    buf,
+                    frame.text_x,
+                    y,
+                    row_width,
+                    vs,
+                    ve,
+                    severity,
+                    self.theme,
+                );
+            }
+        }
+        let empty_tags: Vec<(usize, usize, crate::lsp::manager::DiagnosticTags)> = Vec::new();
+        for &(sc, ec, tags) in self
+            .diagnostic_tag_spans
+            .get(line_idx)
+            .unwrap_or(&empty_tags)
+        {
+            let vs = row_cells.cell(sc);
+            let ve = row_cells.end(ec);
+            if ve > vs {
+                paint_diagnostic_tags(buf, frame.text_x, y, row_width, vs, ve, tags);
+            }
+        }
+
+        // LSP occurrences of the symbol under the caret (word highlight):
+        // painted before the find layer, the selection band, and the
+        // bracket match so all three stay visible on top. The find layer
+        // in particular paints black-on-gold; an occurrence bg over it
+        // left black text on a dark grey (the caret parked on a find
+        // match makes the two layers cover the same cells).
+        for &(occ_row, occ_start, occ_end, occ_write) in &self.occurrences {
+            if occ_row != line_idx {
+                continue;
+            }
+            let bg = if occ_write {
+                self.theme.occurrence_write_bg()
+            } else {
+                self.theme.occurrence_bg()
+            };
+            for c in occ_start.max(row_start)..occ_end {
+                if !paint_row_cells(buf, frame.text_x, y, row_width, row_cells, c, |s| s.bg(bg)) {
+                    break;
+                }
+            }
+        }
+
+        if let Some(term) = self
+            .search_highlight
+            .as_deref()
+            .filter(|_| find_window(self.find_range, line_idx) != Some((0, 0)))
+        {
+            let active_on_line = self
+                .active_search_match
+                .filter(|(r, _, _)| *r == line_idx)
+                .map(|(_, c, l)| (c, l));
+            paint_search_highlight(
+                buf,
+                frame.text_x,
+                y,
+                row_width,
+                raw,
+                term,
+                self.search_highlight_opts,
+                row_cells,
+                active_on_line,
+                None,
+                find_window(self.find_range, line_idx),
+                self.theme,
+            );
+        }
+
+        if let Some(needle) = frame.occ_needle.as_deref() {
+            paint_selection_occurrences(
+                buf,
+                frame.text_x,
+                y,
+                row_width,
+                raw,
+                needle,
+                row_cells,
+                self.theme,
+            );
+        }
+
+        if let Some(((sr, sc), (er, ec))) = frame.sel_norm
+            && line_idx >= sr
+            && line_idx <= er
+        {
+            let sel_start = if line_idx == sr { sc } else { 0 };
+            // For non-final selected rows, paint past the content by one
+            // cell to make the trailing newline visible.
+            let sel_end = if line_idx == er { ec } else { line_len + 1 };
+            let visible_start = row_cells.cell(sel_start);
+            let visible_end = row_cells.end(sel_end);
+            if visible_end > visible_start {
+                paint_selection_band(
+                    buf,
+                    frame.text_x,
+                    y,
+                    row_width,
+                    visible_start,
+                    visible_end,
+                    self.theme,
+                );
+            }
+        }
+
+        // Bracket-match highlight: tint the two matched bracket cells that
+        // fall on this visual row, honouring horizontal scroll.
+        if let Some((open, close)) = frame.bracket_pair {
+            for pos in [open, close] {
+                if pos.0 == line_idx && pos.1 >= row_start {
+                    paint_bracket_match(
+                        buf,
+                        frame.text_x,
+                        y,
+                        row_width,
+                        row_cells.cell(pos.1),
+                        self.theme,
+                    );
+                }
+            }
+        }
+
+        // Secondary multi-cursor carets ("Change All Occurrences"): paint
+        // each one's selection band and a software block cursor at its
+        // head. The primary cursor is the hardware caret; these blocks
+        // mark the extra cursors so the user sees every edit point.
+        for caret in &self.carets {
+            let ((cr0, cc0), (cr1, cc1)) = caret.normalised();
+            if line_idx >= cr0 && line_idx <= cr1 {
+                let cs = if line_idx == cr0 { cc0 } else { 0 };
+                let ce = if line_idx == cr1 { cc1 } else { line_len + 1 };
+                let vs = row_cells.cell(cs);
+                let ve = row_cells.end(ce);
+                if ve > vs {
+                    paint_selection_band(buf, frame.text_x, y, row_width, vs, ve, self.theme);
+                }
+            }
+            // Only paint the block on the visual row that holds the caret.
+            let c = caret.head.1;
+            let on_row = caret.head.0 == line_idx
+                && c >= row_start
+                && (c < row_end || (c == row_end && row_end == line_len));
+            if on_row {
+                // `caret`, not `cell`: a caret AT a hint's anchor sits
+                // left of the hint, inside its own band.
+                paint_block_cursor(
+                    buf,
+                    frame.text_x,
+                    y,
+                    row_width,
+                    row_cells.caret(c),
+                    self.theme,
+                );
+            }
+        }
+
+        // Collaborators' ghost carets (multiplayer): the same block shape
+        // as secondary carets, in each participant's color. The local
+        // hardware caret is painted by the terminal after drawing, so it
+        // always sits above these.
+        for &(gr, gc, color) in &self.ghost_carets {
+            let on_row = gr == line_idx
+                && gc >= row_start
+                && (gc < row_end || (gc == row_end && row_end == line_len));
+            if on_row {
+                paint_ghost_caret(buf, frame.text_x, y, row_width, row_cells.caret(gc), color);
+            }
+        }
+
+        // GitLens-style inline blame: a dim italic annotation trailing the
+        // cursor's line, on its last visual segment, in the focused editor
+        // only. Painted last so no overlay covers it, and clipped to the
+        // pane's right edge.
+        if self.focused
+            && line_idx == self.cursor_row
+            && row_end >= line_len
+            && !self.inline_values.contains_key(&line_idx)
+            && self.live_note(line_idx).is_none()
+            && self.lenses_on_line(line_idx).is_empty()
+            && self.live_ghost().is_none()
+            && let Some(note) = self.current_line_blame_annotation()
+        {
+            let text_cols = row_cells.cell(line_len);
+            let start_x = frame.text_x + text_cols as u16 + 2;
+            let right = frame.inner.x + frame.inner.width;
+            if start_x < right {
+                let avail = (right - start_x) as usize;
+                let shown: String = note.chars().take(avail).collect();
+                buf.set_string(
+                    start_x,
+                    y,
+                    &shown,
+                    Style::default()
+                        .fg(self.theme.ignored_fg())
+                        .add_modifier(Modifier::ITALIC),
+                );
+                // Hover and click reach the commit it names (#1556);
+                // `Uncommitted changes` has none to show.
+                if let Some(LineBlame::Commit(c)) = self.cursor_line_blame() {
+                    let hash = c.hash.clone();
+                    let w = unicode_width::UnicodeWidthStr::width(shown.as_str()) as u16;
+                    self.blame_span = Some((y, start_x..(start_x + w).min(right), hash));
+                }
+            }
+        }
+
+        // Debugger inline values (#135): the "name = value" trailer for a
+        // stopped session, on the line's last visual segment like the
+        // blame above (which yields to it on the cursor line — while
+        // stepping, state beats history). Clipped to the pane edge.
+        if row_end >= line_len
+            && let Some(note) = self.inline_values.get(&line_idx)
+        {
+            let text_cols = row_cells.cell(line_len);
+            let start_x = frame.text_x + text_cols as u16 + 2;
+            let right = frame.inner.x + frame.inner.width;
+            if start_x < right {
+                let avail = (right - start_x) as usize;
+                let shown: String = note.chars().take(avail).collect();
+                buf.set_string(
+                    start_x,
+                    y,
+                    &shown,
+                    Style::default()
+                        .fg(self.theme.ignored_fg())
+                        .add_modifier(Modifier::ITALIC),
+                );
+            }
+        }
+
+        // A language server's replacement strikes through the columns it
+        // takes the place of, and its text stands one cell clear of them.
+        let replaces = self
+            .live_ghost_full()
+            .and_then(|g| g.replaces.clone())
+            .filter(|_| self.focused && line_idx == self.cursor_row);
+        if let Some(r) = &replaces {
+            let (vs, ve) = (row_cells.cell(r.start), row_cells.end(r.end));
+            if ve > vs {
+                let struck = crate::lsp::manager::DiagnosticTags {
+                    unnecessary: true,
+                    deprecated: true,
+                };
+                paint_diagnostic_tags(buf, frame.text_x, y, row_width, vs, ve, struck);
+            }
+        }
+
+        // Inline suggestion (#607): the first line as ghost text right at
+        // the caret (suggestions are only asked for at a line's end); the
+        // rest hang below as `VisRow::Ghost` rows (#1625), and only lines
+        // that found no row are counted here. It owns the line's tail, so
+        // the trailers below stand aside.
+        let ghost_here = self.focused
+            && line_idx == self.cursor_row
+            && row_end >= line_len
+            && self.live_ghost().is_some();
+        if ghost_here && let Some(text) = self.live_ghost() {
+            let text_cols = row_cells.cell(line_len) + usize::from(replaces.is_some());
+            let x = frame.text_x + text_cols as u16;
+            let right = frame.inner.x + frame.inner.width;
+            if x < right {
+                let first = text.split('\n').next().unwrap_or("");
+                let shown_rows = frame
+                    .visual_rows
+                    .iter()
+                    .filter(|r| matches!(r, VisRow::Ghost { .. }))
+                    .count();
+                let more = text.split('\n').count() - 1 - shown_rows;
+                let shown = if more > 0 {
+                    format!(
+                        "{first}  (+{more} line{})",
+                        if more == 1 { "" } else { "s" }
+                    )
+                } else {
+                    first.to_string()
+                };
+                let clipped: String = shown.chars().take((right - x) as usize).collect();
+                buf.set_string(
+                    x,
+                    y,
+                    &clipped,
+                    Style::default()
+                        .fg(self.theme.ignored_fg())
+                        .add_modifier(Modifier::ITALIC),
+                );
+            }
+        }
+
+        // Code lenses (#608): the server's "3 references | Run" at the end
+        // of the symbol's line, clickable, yielding to the debugger's and
+        // Live Run's trailers, which describe this very run.
+        if row_end >= line_len
+            && !ghost_here
+            && !self.inline_values.contains_key(&line_idx)
+            && self.live_note(line_idx).is_none()
+        {
+            let lenses = self.lenses_on_line(line_idx);
+            if !lenses.is_empty() {
+                let text_cols = row_cells.cell(line_len);
+                let mut x = frame.text_x + text_cols as u16 + 2;
+                let right = frame.inner.x + frame.inner.width;
+                let style = Style::default()
+                    .fg(self.theme.ignored_fg())
+                    .add_modifier(Modifier::UNDERLINED);
+                for (n, idx) in lenses.into_iter().enumerate() {
+                    if n > 0 && x + 3 < right {
+                        buf.set_string(x, y, " | ", Style::default().fg(self.theme.ignored_fg()));
+                        x += 3;
+                    }
+                    if x >= right {
+                        break;
+                    }
+                    let title = &self.code_lenses[idx].title;
+                    let shown: String = title.chars().take((right - x) as usize).collect();
+                    let w = unicode_width::UnicodeWidthStr::width(shown.as_str()) as u16;
+                    buf.set_string(x, y, &shown, style);
+                    self.code_lens_spans.push((y, x..x + w, idx));
+                    x += w;
+                }
+            }
+        }
+
+        // Live Run trailer: what this line did on the last run, painted
+        // where the debugger's values go and yielding to them, since a
+        // paused session is the more specific answer.
+        if row_end >= line_len
+            && !ghost_here
+            && !self.inline_values.contains_key(&line_idx)
+            && let Some(note) = self.live_note(line_idx)
+        {
+            let text_cols = row_cells.cell(line_len);
+            let mut x = frame.text_x + text_cols as u16 + 2;
+            let right = frame.inner.x + frame.inner.width;
+            for (text, kind) in note {
+                if x >= right {
+                    break;
+                }
+                let color = match kind {
+                    crate::live_run::Kind::Value => self.theme.ignored_fg(),
+                    crate::live_run::Kind::Output => self.theme.ui(Color::Rgb(0x3b, 0x9e, 0xff)),
+                    crate::live_run::Kind::Error => self.theme.ui(Color::Rgb(0xf1, 0x4c, 0x4c)),
+                    crate::live_run::Kind::Timeout => self.theme.ui(Color::Rgb(0xcc, 0xa7, 0x00)),
+                };
+                let avail = (right - x) as usize;
+                let shown: String = text.chars().take(avail).collect();
+                let width = unicode_width::UnicodeWidthStr::width(shown.as_str()) as u16;
+                buf.set_string(
+                    x,
+                    y,
+                    &shown,
+                    Style::default().fg(color).add_modifier(Modifier::ITALIC),
+                );
+                x = x.saturating_add(width + 2);
+            }
+        }
+    }
+
     /// Paint logical line `line_idx`'s syntax/semantic-highlighted text at row
     /// `y` from column 0 (no horizontal scroll), clipped to `width`. Used by
     /// the sticky-scroll bar to render pinned scope headers. Assumes the row

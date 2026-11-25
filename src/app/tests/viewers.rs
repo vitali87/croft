@@ -4080,3 +4080,197 @@ tool = "now"
         app.status
     );
 }
+
+/// #2062: every inline picture sent on its own goes out through one writer,
+/// which sends exactly the bytes each of the nine copies it replaced sent: the
+/// caret hidden and its place saved, a move to the picture's cell (row then
+/// column, each counted from 1), the picture, the caret put back where it
+/// was, and the caret shown again only when it should be visible.
+#[test]
+fn an_inline_picture_goes_out_inside_the_caret_guard() {
+    let mut shown = Vec::new();
+    write_inline_image(&mut shown, 4, 2, b"PICTURE", true);
+    assert_eq!(
+        shown,
+        b"\x1b[?25l\x1b[s\x1b[3;5HPICTURE\x1b[u\x1b[?25h".to_vec()
+    );
+    let mut hidden = Vec::new();
+    write_inline_image(&mut hidden, 0, 0, b"PICTURE", false);
+    assert_eq!(hidden, b"\x1b[?25l\x1b[s\x1b[1;1HPICTURE\x1b[u".to_vec());
+    let mut far = Vec::new();
+    write_inline_image(&mut far, 239, 66, b"", true);
+    assert_eq!(far, b"\x1b[?25l\x1b[s\x1b[67;240H\x1b[u\x1b[?25h".to_vec());
+}
+
+/// #2062: the activity bar's icons and badges go out through the same
+/// writer, together inside one caret guard (one hide-and-save before the
+/// first, one restore after the last), exactly as its own copy sent them; a
+/// batch with nothing on screen still sends the guard, as that copy did; and
+/// one picture on its own is the same bytes as a batch of one.
+#[test]
+fn the_activity_bar_pictures_share_one_caret_guard() {
+    let mut icons = Vec::new();
+    write_inline_images(
+        &mut icons,
+        [
+            (0, 1, &b"FILES"[..]),
+            (0, 3, &b"SEARCH"[..]),
+            (2, 3, &b"7"[..]),
+        ],
+        false,
+    );
+    assert_eq!(
+        icons,
+        b"\x1b[?25l\x1b[s\x1b[2;1HFILES\x1b[4;1HSEARCH\x1b[4;3H7\x1b[u".to_vec()
+    );
+    let mut none = Vec::new();
+    write_inline_images(&mut none, [], true);
+    assert_eq!(none, b"\x1b[?25l\x1b[s\x1b[u\x1b[?25h".to_vec());
+    let mut one = Vec::new();
+    write_inline_image(&mut one, 5, 9, b"PICTURE", true);
+    let mut batch_of_one = Vec::new();
+    write_inline_images(&mut batch_of_one, [(5, 9, &b"PICTURE"[..])], true);
+    assert_eq!(one, batch_of_one);
+}
+
+/// #2062: every activity-bar icon's pictures come out of the icon table
+/// exactly as the per-icon code baked them: its own picture and Kitty id,
+/// the view icons centered, the gear and the heart lower, the heart in its
+/// own ink and with no selected picture.
+#[test]
+fn every_activity_icon_bakes_as_it_did_before_the_table() {
+    use crate::iterm2_inline as ki;
+    let input = ChromeBakeInput {
+        protocol: ki::InlineImageProtocol::Kitty,
+        cell: (8, 16),
+        is_tmux: false,
+        icon_bg: ::image::Rgba([30, 30, 30, 255]),
+        icon_ink: ki::IconInk::default(),
+        sponsor_ink: ki::IconInk::new((200, 60, 120), (230, 90, 150), (0, 0, 0)),
+    };
+    let images = App::bake_chrome_images(&input)
+        .activity
+        .expect("the activity icons bake");
+    let (w, h) = (ACTIVITY_BAR_WIDTH, ACTIVITY_ICON_HEIGHT);
+    let canvas = (8 * u32::from(w), 16 * u32::from(h));
+    let lower = i64::from(canvas.1);
+    let picture = |src: &[u8], state: ki::IconState, ink: ki::IconInk, bias: i64, id: u32| {
+        let png =
+            ki::compose_icon_svg(src, canvas.0, canvas.1, state, ink, input.icon_bg, bias).unwrap();
+        let raw = ki::build_inline_image(input.protocol, &png, w, h, false, id).unwrap();
+        ki::maybe_tmux_wrap(input.protocol, false, raw)
+    };
+    // The recipe each icon had before the table: picture, offset, Kitty id.
+    let before = [
+        (ki::EXPLORER_SRC_SVG, 0, ki::KITTY_ID_EXPLORER),
+        (ki::SEARCH_SRC_SVG, 0, ki::KITTY_ID_SEARCH),
+        (ki::SOURCE_CONTROL_SRC_SVG, 0, ki::KITTY_ID_SOURCE_CONTROL),
+        (ki::REMOTE_SRC_SVG, 0, ki::KITTY_ID_REMOTE),
+        (ki::RUN_DEBUG_SRC_SVG, 0, ki::KITTY_ID_RUN_DEBUG_BAR),
+        (ki::EXTENSIONS_SRC_SVG, 0, ki::KITTY_ID_EXTENSIONS),
+        (ki::TESTING_SRC_SVG, 0, ki::KITTY_ID_TESTING),
+        (ki::CODEQL_SRC_SVG, 0, ki::KITTY_ID_CODEQL),
+        (ki::SPONSOR_HEART_SRC_SVG, lower, ki::KITTY_ID_SPONSOR),
+        (ki::SETTINGS_GEAR_SRC_SVG, lower, ki::KITTY_ID_SETTINGS),
+    ];
+    for (icon, (src, bias, id)) in ActivityIcon::ALL.into_iter().zip(before) {
+        let ink = if icon == ActivityIcon::Sponsor {
+            input.sponsor_ink
+        } else {
+            input.icon_ink
+        };
+        let baked = &images.icons[icon as usize];
+        let active = (icon != ActivityIcon::Sponsor)
+            .then(|| picture(src, ki::IconState::Active, ink, bias, id));
+        assert_eq!(baked.active, active, "{icon:?} selected");
+        assert_eq!(
+            baked.inactive,
+            picture(src, ki::IconState::Inactive, ink, bias, id),
+            "{icon:?} at rest"
+        );
+        assert_eq!(
+            baked.hovered,
+            picture(src, ki::IconState::Hovered, ink, bias, id),
+            "{icon:?} hovered"
+        );
+    }
+}
+
+/// A tab with two views filled fails the test-only check (#2062), even in a
+/// group without focus, and the check runs on every key: the hex view and
+/// the rendered log here sit on one tab of the group the split left behind.
+#[test]
+#[should_panic(expected = "shows 2 views at once: hex, log")]
+fn two_views_on_one_tab_fail_the_check_in_any_group() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("notes.txt");
+    std::fs::write(&f, "one\ntwo\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.split_editor();
+    let left = app
+        .editor_layout
+        .inactive_groups_mut()
+        .next()
+        .expect("staging: the split leaves one group without focus");
+    left.hex = Some(crate::hex::HexView::open(&f).unwrap());
+    left.log = Some(crate::log_view::LogView::open(&f).unwrap());
+
+    let _ = app.handle_key(key(KeyCode::Down, KeyModifiers::NONE));
+}
+
+/// A zip past the listing cap opens as hex, and the status says why (#2711),
+/// whichever way it was opened: Quick Open and `croft <file>` from croft's
+/// terminal wrote their own "Opened big.zip" over the reason the Explorer
+/// shows.
+#[test]
+fn every_open_route_says_why_a_file_landed_in_hex() {
+    let tmp = tempfile::tempdir().unwrap();
+    let big = tmp.path().join("big.zip");
+    std::fs::write(&big, b"").unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&big)
+        .unwrap()
+        .set_len(crate::archive::ZIP_LIST_CAP + 1)
+        .unwrap();
+    let why = "in the hex viewer: Archive open failed: zip too large to list";
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let _ = app.apply_view_request(&big);
+    assert!(app.editor.hex.is_some(), "staging: the zip opens as hex");
+    assert!(app.status.contains(why), "croft <file>: {:?}", app.status);
+    // Asking again only switches to the tab, whose status line has moved on
+    // since (a hex save or undo writes there): the reason still comes back.
+    app.editor.status = String::from("No pending byte edits");
+    let _ = app.apply_view_request(&big);
+    assert!(
+        app.status.contains(why),
+        "croft <file> again: {:?}",
+        app.status
+    );
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER))
+        .unwrap();
+    type_keys(&mut app, "big.zip");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.editor.hex.is_some(), "staging: the zip opens as hex");
+    assert!(app.status.contains(why), "Quick Open: {:?}", app.status);
+
+    // A line hint is for text: the reason wins over it too.
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER))
+        .unwrap();
+    type_keys(&mut app, "big.zip:1");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.editor.hex.is_some(), "staging: the zip opens as hex");
+    assert!(
+        app.status.contains(why),
+        "Quick Open big.zip:1: {:?}",
+        app.status
+    );
+}

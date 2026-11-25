@@ -237,7 +237,7 @@ fn git_in(dir: &str, args: &[&str]) -> Option<String> {
     // (without a worktree) makes git treat `-C`'s dir as the toplevel, which
     // would satisfy the guard in `probe_drift` by construction while HEAD
     // answers from the foreign repo — guaranteed false drift.
-    let out = std::process::Command::new("git")
+    let out = crate::proc::command("git")
         .arg("-C")
         .arg(dir)
         .env_remove("GIT_DIR")

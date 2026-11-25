@@ -46,8 +46,9 @@ impl App {
         // group's first: a file held only in another group stays open with
         // its unsaved text, so a rename computed for it fits the buffer it
         // lands in, not the disk (#915).
-        let tabs = std::iter::once(&self.editor)
-            .chain(self.editor_layout.inactive_groups())
+        let tabs = self
+            .editor_layout
+            .all_groups(&self.editor)
             .flat_map(|group| {
                 let active = group.active_index();
                 let active_path = group.path.as_ref().filter(|_| !group.has_non_text_view());
@@ -203,11 +204,7 @@ impl App {
         // server `range` reply can't blank the off-screen colours, and the
         // identical `full` reply repaints to the same pixels (no snap).
         for (path, legend, data) in cache_hits {
-            if self.editor.path.as_deref() == Some(path.as_path()) {
-                self.editor
-                    .apply_semantic_tokens(path.clone(), data.clone(), legend.clone(), true);
-            }
-            for group in self.editor_layout.inactive_groups_mut() {
+            for group in self.editor_layout.all_groups_mut(&mut self.editor) {
                 if group.path.as_deref() == Some(path.as_path()) {
                     group.apply_semantic_tokens(path.clone(), data.clone(), legend.clone(), true);
                 }

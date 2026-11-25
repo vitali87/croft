@@ -2718,7 +2718,15 @@ fn a_prepare_rename_verdict_routes_to_the_prompt_status_or_fallback() {
         target,
     };
     let arm = |app: &mut App| {
-        app.prepare_rename_request = Some((4, path.clone(), 1, 9, app.editor.edit_seq));
+        app.prepare_rename_request = Some(CaretRequest {
+            id: 4,
+            at: CaretSpot {
+                path: path.clone(),
+                row: 1,
+                col: 9,
+                seq: app.editor.edit_seq,
+            },
+        });
         app.prompt = None;
         app.status = String::from("Preparing rename…");
     };
@@ -3117,7 +3125,11 @@ fn an_on_type_reply_applies_only_while_its_buffer_and_tab_are_unmoved() {
     );
 
     // Armed and everything matches.
-    app.on_type_request = Some((7, app.editor.edit_seq, a.clone()));
+    app.on_type_request = Some(FileRequest {
+        id: 7,
+        path: a.clone(),
+        seq: app.editor.edit_seq,
+    });
     assert_eq!(
         app.on_type_reply_disposition(&reply(7, &a)),
         OnTypeReply::Apply
@@ -3135,7 +3147,11 @@ fn an_on_type_reply_applies_only_while_its_buffer_and_tab_are_unmoved() {
     );
 
     // Buffer moved since the request.
-    app.on_type_request = Some((7, app.editor.edit_seq.wrapping_sub(1), a.clone()));
+    app.on_type_request = Some(FileRequest {
+        id: 7,
+        path: a.clone(),
+        seq: app.editor.edit_seq.wrapping_sub(1),
+    });
     assert_eq!(
         app.on_type_reply_disposition(&reply(7, &a)),
         OnTypeReply::Stale,
@@ -3143,7 +3159,11 @@ fn an_on_type_reply_applies_only_while_its_buffer_and_tab_are_unmoved() {
     );
 
     // Reply is for a different file than the one requested.
-    app.on_type_request = Some((7, app.editor.edit_seq, a.clone()));
+    app.on_type_request = Some(FileRequest {
+        id: 7,
+        path: a.clone(),
+        seq: app.editor.edit_seq,
+    });
     assert_eq!(
         app.on_type_reply_disposition(&reply(7, &b)),
         OnTypeReply::Stale,
@@ -3153,7 +3173,11 @@ fn an_on_type_reply_applies_only_while_its_buffer_and_tab_are_unmoved() {
     // The requested tab is no longer active: edit_seq is per-tab, so the
     // counter alone would compare two unrelated buffers.
     app.editor.open_pinned(&b).unwrap();
-    app.on_type_request = Some((7, app.editor.edit_seq, a.clone()));
+    app.on_type_request = Some(FileRequest {
+        id: 7,
+        path: a.clone(),
+        seq: app.editor.edit_seq,
+    });
     assert_eq!(
         app.on_type_reply_disposition(&reply(7, &a)),
         OnTypeReply::Stale,
@@ -5718,4 +5742,77 @@ fn a_reask_reply_that_installs_no_popup_keeps_the_shown_items_request_point() {
     assert!(app.completion_popup.is_some(), "the older items stay open");
     app.handle_completion_popup_key(key(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(app.editor.lines[0], "f(PRESS) {", "the `)` stays");
+}
+
+/// #2062: `take_reply` keeps exactly what the five drains it replaced kept,
+/// for every sequence of up to four replies to three request ids, with no
+/// request, the first or the second still waited on. Each reply carries its
+/// place in the sequence, so keeping the wrong match shows.
+#[test]
+fn take_reply_keeps_what_the_old_drain_loops_kept() {
+    use crate::app::language_servers::take_reply;
+    // Declaration and type definition, verbatim but for names.
+    fn old_jump_loop(pending: &mut Option<u64>, replies: &[(u64, usize)]) -> Option<usize> {
+        let mut queue = replies.iter().copied();
+        let mut drain = move || queue.next();
+        let mut reply = None;
+        while let Some(result) = drain() {
+            if Some(result.0) == *pending {
+                reply = Some(result.1);
+            }
+        }
+        let place = reply?;
+        *pending = None;
+        Some(place)
+    }
+    // Rename, formatting and code actions, verbatim but for names.
+    fn old_arrived_loop(pending: &mut Option<u64>, replies: &[(u64, usize)]) -> Option<usize> {
+        let mut arrived = false;
+        let mut place = usize::MAX;
+        let mut queue = replies.iter().copied();
+        let mut drain = move || queue.next();
+        while let Some(result) = drain() {
+            if Some(result.0) != *pending {
+                continue;
+            }
+            arrived = true;
+            place = result.1;
+        }
+        if !arrived {
+            return None;
+        }
+        *pending = None;
+        Some(place)
+    }
+    let mut sequences: Vec<Vec<u64>> = vec![Vec::new()];
+    let mut shorter = sequences.clone();
+    for _ in 0..4 {
+        shorter = shorter
+            .iter()
+            .flat_map(|s| {
+                (1..=3).map(move |id| {
+                    let mut longer = s.clone();
+                    longer.push(id);
+                    longer
+                })
+            })
+            .collect();
+        sequences.extend(shorter.iter().cloned());
+    }
+    assert_eq!(sequences.len(), 1 + 3 + 9 + 27 + 81);
+    for waiting in [None, Some(1), Some(2)] {
+        for ids in &sequences {
+            let replies: Vec<(u64, usize)> = ids.iter().copied().zip(0..).collect();
+            let mut queue = replies.iter().copied();
+            let mut pending = waiting;
+            let got = take_reply(&mut pending, || queue.next(), |r| r.0).map(|r| r.1);
+            assert!(queue.next().is_none(), "every reply is drained: {ids:?}");
+            for old in [old_jump_loop, old_arrived_loop] {
+                let mut old_pending = waiting;
+                let kept = old(&mut old_pending, &replies);
+                assert_eq!(got, kept, "{ids:?} waiting on {waiting:?}");
+                assert_eq!(pending, old_pending, "{ids:?} waiting on {waiting:?}");
+            }
+        }
+    }
 }
