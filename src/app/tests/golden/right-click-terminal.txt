@@ -1,0 +1,59 @@
+== a lone terminal
+opens at (98, 24), Panel, keyed, row 0 lit
+New File goes in <ws>
+  Paste  =>  TerminalPaste
+  Rename Terminal  =>  RenameTerminal(0)
+  Clear  =>  ClearTerminal(0)
+  Split Terminal  =>  SplitTerminal
+  Quick Select  =>  TerminalQuickSelect
+  Copy Mode  =>  TerminalCopyMode
+  Command History  =>  TerminalCommandHistory
+  Open Scrollback in Editor  =>  OpenScrollbackInEditor
+keys: Terminal
+active pane 0
+== the middle of three terminals
+opens at (98, 24), Panel, keyed, row 0 lit
+New File goes in <ws>
+  Paste  =>  TerminalPaste
+  Rename Terminal  =>  RenameTerminal(1)
+  Clear  =>  ClearTerminal(1)
+  Split Terminal  =>  SplitTerminal
+  Kill Terminal  =>  KillTerminal(1)
+  Quick Select  =>  TerminalQuickSelect
+  Copy Mode  =>  TerminalCopyMode
+  Command History  =>  TerminalCommandHistory
+  Open Scrollback in Editor  =>  OpenScrollbackInEditor
+  Maximize Terminal  =>  ToggleMaximizeTerminal(1)
+  Collapse Terminal  =>  ToggleCollapseTerminal(1)
+  Broadcast Input  =>  ToggleBroadcastInput
+keys: Terminal
+active pane 1
+== the middle of three terminals, broadcasting
+opens at (98, 24), Panel, keyed, row 0 lit
+New File goes in <ws>
+  Paste  =>  TerminalPaste
+  Rename Terminal  =>  RenameTerminal(1)
+  Clear  =>  ClearTerminal(1)
+  Split Terminal  =>  SplitTerminal
+  Kill Terminal  =>  KillTerminal(1)
+  Quick Select  =>  TerminalQuickSelect
+  Copy Mode  =>  TerminalCopyMode
+  Command History  =>  TerminalCommandHistory
+  Open Scrollback in Editor  =>  OpenScrollbackInEditor
+  Maximize Terminal  =>  ToggleMaximizeTerminal(1)
+  Collapse Terminal  =>  ToggleCollapseTerminal(1)
+  Stop Broadcast Input  =>  ToggleBroadcastInput
+  Exclude from Broadcast  =>  ToggleBroadcastExclusion
+keys: Terminal
+active pane 1
+== a folded terminal's strip
+opens at (36, 21), Panel, keyed, row 0 lit
+New File goes in <ws>
+  Rename Terminal  =>  RenameTerminal(0)
+  Clear  =>  ClearTerminal(0)
+  Kill Terminal  =>  KillTerminal(0)
+  Maximize Terminal  =>  ToggleMaximizeTerminal(0)
+  Expand Terminal  =>  ToggleCollapseTerminal(0)
+  Broadcast Input  =>  ToggleBroadcastInput
+keys: Terminal
+active pane 1

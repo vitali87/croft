@@ -1,0 +1,20 @@
+== the gutter of line 3
+opens at (37, 5), Panel, keyed, row 0 lit
+New File goes in <ws>
+  Toggle Bookmark  =>  ToggleBookmarkAt { line: 3 }
+  Next Bookmark  =>  NextBookmark
+  Previous Bookmark  =>  PreviousBookmark
+  Add Breakpoint  =>  ToggleBreakpointAt { line: 3 }
+  Add Conditional Breakpoint…  =>  EditBreakpointConditionAt { line: 3 }
+  Add Logpoint  =>  EditLogpointAt { line: 3 }
+keys: Editor
+== the gutter of line 3, with a conditional logpoint
+opens at (37, 5), Panel, keyed, row 0 lit
+New File goes in <ws>
+  Toggle Bookmark  =>  ToggleBookmarkAt { line: 3 }
+  Next Bookmark  =>  NextBookmark
+  Previous Bookmark  =>  PreviousBookmark
+  Remove Breakpoint  =>  ToggleBreakpointAt { line: 3 }
+  Edit Condition…  =>  EditBreakpointConditionAt { line: 3 }
+  Edit Logpoint  =>  EditLogpointAt { line: 3 }
+keys: Editor

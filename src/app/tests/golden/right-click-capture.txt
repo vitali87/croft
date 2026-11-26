@@ -1,0 +1,6 @@
+== the second CAPTURES row
+opens at (36, 28), Panel, keyed, row 0 lit
+New File goes in <ws>
+  Ask Navigator About This Line  =>  AskNavigatorAboutCapture
+keys: Editor
+picked capture Some("Test failed")

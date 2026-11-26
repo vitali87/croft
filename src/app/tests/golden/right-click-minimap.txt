@@ -1,0 +1,8 @@
+== the minimap strip
+opens at (155, 5), Panel, keyed, row 0 lit
+New File goes in <ws>
+  ✓ Minimap  =>  ToggleMinimap
+  Side >
+      Left  =>  SetMinimapSide(Left)
+    ✓ Right  =>  SetMinimapSide(Right)
+keys: Tree

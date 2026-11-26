@@ -1,0 +1,17 @@
+== a COMMITS row
+opens at (8, 37), Panel, keyed, row 0 lit
+New File goes in <ws>
+  Cherry-Pick  =>  CommitAction { action: CherryPick, hash: "<id>", short: "<id>" }
+  Revert  =>  CommitAction { action: Revert, hash: "<id>", short: "<id>" }
+  ---
+  Checkout (Detached)  =>  CommitAction { action: CheckoutDetached, hash: "<id>", short: "<id>" }
+  Create Branch Here...  =>  CommitAction { action: CreateBranch, hash: "<id>", short: "<id>" }
+  Create Tag Here...  =>  CommitAction { action: CreateTag, hash: "<id>", short: "<id>" }
+  Reset Current Branch to Here >
+    Soft (keep changes staged)  =>  CommitAction { action: Reset(Soft), hash: "<id>", short: "<id>" }
+    Mixed (keep changes unstaged)  =>  CommitAction { action: Reset(Mixed), hash: "<id>", short: "<id>" }
+    Hard (discard changes)  =>  CommitAction { action: Reset(Hard), hash: "<id>", short: "<id>" }
+  ---
+  Copy Commit Hash  =>  CommitAction { action: CopyHash, hash: "<id>", short: "<id>" }
+  Copy Commit Message  =>  CommitAction { action: CopyMessage, hash: "<id>", short: "<id>" }
+keys: Tree

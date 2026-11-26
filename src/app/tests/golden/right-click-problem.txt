@@ -1,0 +1,5 @@
+== a PROBLEMS row
+opens at (66, 28), Panel, keyed, row 0 lit
+New File goes in <ws>
+  Fix with Navigator  =>  FixProblemWithNavigator { path: "<ws>/hello.rs", item: ProblemItem { line: 2, col: 3, col_utf16: true, severity: Warning, message: "function `f2` is never used", source: "rustc", code: None, related: [] } }
+keys: Editor

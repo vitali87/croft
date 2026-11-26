@@ -1,0 +1,83 @@
+== the first tab
+opens at (36, 0), Panel, keyed, row 0 lit
+New File goes in <ws>
+  Close  =>  CloseTab(0)
+  Close Others  =>  CloseOtherTabs(0)
+  Close to the Right  =>  CloseTabsToRight(0)
+  Close Saved  =>  CloseSavedTabs
+  Close All  =>  CloseAllTabs
+  Copy Path  =>  CopyTabPath("<ws>/a.rs")
+  Copy Relative Path  =>  CopyTabRelativePath("<ws>/a.rs")
+  Reveal in Explorer View  =>  RevealInExplorer("<ws>/a.rs")
+  Pin  =>  ToggleTabPin(0)
+  Split Right  =>  SplitEditor
+  Split & Move >
+    Split Up  =>  SplitEditorUp
+    Split Down  =>  SplitEditorDown
+    Split Left  =>  SplitEditorLeft
+    Split Right  =>  SplitEditor
+    ---
+    Move Above  =>  MoveEditorUp
+    Move Below  =>  MoveEditorDown
+    Move Left  =>  MoveEditorLeft
+    Move Right  =>  MoveEditorRight
+    ---
+    Split in Group  =>  SplitInGroup
+  Move into New Window  =>  MoveIntoNewWindow(0)
+  Copy into New Window  =>  CopyIntoNewWindow(0)
+keys: Editor
+== the middle tab
+opens at (46, 0), Panel, keyed, row 0 lit
+New File goes in <ws>
+  Close  =>  CloseTab(1)
+  Close Others  =>  CloseOtherTabs(1)
+  Close to the Right  =>  CloseTabsToRight(1)
+  Close Saved  =>  CloseSavedTabs
+  Close All  =>  CloseAllTabs
+  Copy Path  =>  CopyTabPath("<ws>/b.rs")
+  Copy Relative Path  =>  CopyTabRelativePath("<ws>/b.rs")
+  Reveal in Explorer View  =>  RevealInExplorer("<ws>/b.rs")
+  Pin  =>  ToggleTabPin(1)
+  Split Right  =>  SplitEditor
+  Split & Move >
+    Split Up  =>  SplitEditorUp
+    Split Down  =>  SplitEditorDown
+    Split Left  =>  SplitEditorLeft
+    Split Right  =>  SplitEditor
+    ---
+    Move Above  =>  MoveEditorUp
+    Move Below  =>  MoveEditorDown
+    Move Left  =>  MoveEditorLeft
+    Move Right  =>  MoveEditorRight
+    ---
+    Split in Group  =>  SplitInGroup
+  Move into New Window  =>  MoveIntoNewWindow(1)
+  Copy into New Window  =>  CopyIntoNewWindow(1)
+keys: Editor
+== the last tab
+opens at (56, 0), Panel, keyed, row 0 lit
+New File goes in <ws>
+  Close  =>  CloseTab(2)
+  Close Others  =>  CloseOtherTabs(2)
+  Close Saved  =>  CloseSavedTabs
+  Close All  =>  CloseAllTabs
+  Copy Path  =>  CopyTabPath("<ws>/c.rs")
+  Copy Relative Path  =>  CopyTabRelativePath("<ws>/c.rs")
+  Reveal in Explorer View  =>  RevealInExplorer("<ws>/c.rs")
+  Pin  =>  ToggleTabPin(2)
+  Split Right  =>  SplitEditor
+  Split & Move >
+    Split Up  =>  SplitEditorUp
+    Split Down  =>  SplitEditorDown
+    Split Left  =>  SplitEditorLeft
+    Split Right  =>  SplitEditor
+    ---
+    Move Above  =>  MoveEditorUp
+    Move Below  =>  MoveEditorDown
+    Move Left  =>  MoveEditorLeft
+    Move Right  =>  MoveEditorRight
+    ---
+    Split in Group  =>  SplitInGroup
+  Move into New Window  =>  MoveIntoNewWindow(2)
+  Copy into New Window  =>  CopyIntoNewWindow(2)
+keys: Editor

@@ -726,29 +726,6 @@ fn git_state(root: &Path) -> String {
     parts.join(",")
 }
 
-/// `text` with every word that reads as a commit id (7 to 40 lowercase hex
-/// digits, letters among them or not) as `<id>`: a commit's id changes with
-/// the clock.
-fn no_commit_ids(text: &str) -> String {
-    let id = |w: &str| {
-        (7..=40).contains(&w.len())
-            && w.bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    };
-    let mut out = String::new();
-    let mut word = String::new();
-    for c in text.chars().map(Some).chain([None]) {
-        if let Some(c) = c.filter(char::is_ascii_alphanumeric) {
-            word.push(c);
-            continue;
-        }
-        out.push_str(if id(&word) { "<id>" } else { &word });
-        word.clear();
-        out.extend(c);
-    }
-    out
-}
-
 /// What a key can change that a user sees or acts on next.
 fn fingerprint(app: &App, root: &Path) -> Seen {
     // Read from the disk and git once: they are the same for both passes.
