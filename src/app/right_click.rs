@@ -2,9 +2,12 @@
 //! each of those things opens. [`App::right_click_target`] names the item
 //! under the pointer; [`App::open_context_menu`] builds that item's menu at
 //! a spot and gives its pane the keys. Kept apart so the keyboard can name
-//! the item another way and open the very same menu.
+//! the item another way and open the very same menu:
+//! [`App::show_context_menu`] (Shift+F10, the Menu key) names what has the
+//! keys.
 
 use super::*;
+use crate::widgets::source_control::KeyStop;
 
 /// The item a right-click opens a menu for, with what its menu is built
 /// from.
@@ -281,6 +284,125 @@ impl App {
             MenuTarget::Explorer(node_idx) => self.open_explorer_menu(node_idx, at),
             MenuTarget::Gutter(line0) => self.open_gutter_menu(line0, at),
             MenuTarget::Text { row, col } => self.open_text_menu(row, col, at),
+        }
+    }
+
+    /// Show Context Menu (Shift+F10, the Menu key; #2739): the right-click
+    /// menu of what has the keys, opened just below it, as in VS Code.
+    /// Where what has the keys has no right-click menu, nothing opens.
+    pub(super) fn show_context_menu(&mut self) {
+        if let Some((target, at)) = self.keyboard_menu_target() {
+            self.open_context_menu(target, at);
+        }
+    }
+
+    /// What the keys are on, named as a right-click names it, and where its
+    /// menu opens: below the caret, the selected Explorer row, the picked
+    /// COMMITS row or the selected capture; at the active terminal pane's
+    /// cursor; under the first problem shown.
+    fn keyboard_menu_target(&mut self) -> Option<(MenuTarget, (u16, u16))> {
+        match self.focus {
+            Pane::Editor => self.caret_menu_target(),
+            Pane::Tree => self.sidebar_menu_target(),
+            Pane::Terminal => self.panel_menu_target(),
+        }
+    }
+
+    /// The text's menu at the caret, for an open text tab (a diff, sheet or
+    /// picture has none, as for a right-click).
+    fn caret_menu_target(&mut self) -> Option<(MenuTarget, (u16, u16))> {
+        let editor = &mut self.editor;
+        if editor.tab_count() == 0
+            || editor.diff.is_some()
+            || editor.sheet.is_some()
+            || editor.image.is_some()
+        {
+            return None;
+        }
+        editor.ensure_cursor_col_visible();
+        let inner = editor.last_inner;
+        let at = editor
+            .cursor_screen_pos()
+            .map(|(x, y)| (x, y.saturating_add(1)))
+            .unwrap_or((inner.x + editor.last_gutter_width + 1, inner.y));
+        let target = MenuTarget::Text {
+            row: editor.cursor_row,
+            col: editor.cursor_col,
+        };
+        Some((target, at))
+    }
+
+    /// The Explorer's selected row (the workspace's menu in an empty
+    /// tree), or the picked commit while COMMITS has the keys.
+    fn sidebar_menu_target(&self) -> Option<(MenuTarget, (u16, u16))> {
+        if !self.show_tree {
+            return None;
+        }
+        match self.sidebar_view {
+            SidebarView::Explorer => {
+                let area = self.tree.last_area;
+                let Some(last) = self.tree.nodes.len().checked_sub(1) else {
+                    return Some((MenuTarget::Explorer(None), (area.x + 2, area.y + 1)));
+                };
+                let idx = self.tree.selected.min(last);
+                let y = row_drawn(area, |y| self.tree.node_at_y(y) == Some(idx));
+                Some((
+                    MenuTarget::Explorer(Some(idx)),
+                    (area.x + 2, y.saturating_add(1)),
+                ))
+            }
+            SidebarView::SourceControl if self.source_control.keys == KeyStop::Commits => {
+                let row = self.commit_graph.selected_row()?;
+                let commit = self.commit_graph.selected_commit()?.clone();
+                let area = self.commit_graph.last_area;
+                let y = row_drawn(area, |y| self.commit_graph.row_index_at(y) == Some(row));
+                Some((
+                    MenuTarget::Commit(commit),
+                    (area.x + 2, y.saturating_add(1)),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// The active terminal pane, the selected capture or the first problem
+    /// shown, by the bottom panel's tab.
+    fn panel_menu_target(&self) -> Option<(MenuTarget, (u16, u16))> {
+        if !self.show_terminal {
+            return None;
+        }
+        match self.bottom_panel_tab {
+            BottomPanelTab::Terminal => {
+                let idx = self.active_terminal;
+                let pane = self.terminals.get(idx)?;
+                let inner = pane.last_inner;
+                let at = pane
+                    .screen_cursor()
+                    .map(|(x, y)| (x, y.saturating_add(1)))
+                    .unwrap_or((inner.x + 1, inner.y + 1));
+                Some((MenuTarget::Terminal(idx), at))
+            }
+            BottomPanelTab::Captures => {
+                let idx = self.captures.selected_index()?;
+                let area = self.captures.last_area;
+                let at = self
+                    .captures
+                    .row_rect(idx)
+                    .map_or((area.x + 2, area.y + 1), |r| {
+                        (r.x + 2, r.y.saturating_add(1))
+                    });
+                Some((MenuTarget::Capture(idx), at))
+            }
+            BottomPanelTab::Problems => {
+                let area = self.problems.last_area;
+                let (y, (path, item)) = (area.y..area.y + area.height)
+                    .find_map(|y| self.problems.diagnostic_at(y).map(|hit| (y, hit)))?;
+                Some((
+                    MenuTarget::Problem { path, item },
+                    (area.x + 2, y.saturating_add(1)),
+                ))
+            }
+            _ => None,
         }
     }
 
@@ -668,4 +790,12 @@ impl App {
         ));
         self.context_menu = Some(menu);
     }
+}
+
+/// The first row of `area` where `drawn` holds, or the area's top when none
+/// does (an item scrolled off): where a keyboard-opened menu hangs from.
+fn row_drawn(area: Rect, drawn: impl Fn(u16) -> bool) -> u16 {
+    (area.y..area.y + area.height)
+        .find(|&y| drawn(y))
+        .unwrap_or(area.y)
 }

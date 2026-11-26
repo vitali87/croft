@@ -238,7 +238,7 @@ editor | ctrl+shift+l | caret=4:13 sel=4:8-4:13 carets=1:35-1:40,5:7-5:12,6:19-6
 editor | ctrl+shift+m | focus=panel panel=Problems
 editor | ctrl+shift+n | -
 editor | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-editor | ctrl+shift+p | status="Command Palette: 395 commands — Esc to close" +palette("" @0 > "Move Line Up")
+editor | ctrl+shift+p | status="Command Palette: 396 commands — Esc to close" +palette("" @0 > "Move Line Up")
 editor | ctrl+shift+pagedown | status="Move: the editor is already the last tab"
 editor | ctrl+shift+pageup | status="Move: the editor is already the first tab"
 editor | ctrl+shift+r | focus=side side=Remote
@@ -291,6 +291,7 @@ editor | shift+cmd+\ | caret=8:0
 editor | shift+cmd+t | focus=panel
 editor | shift+down | caret=5:8 sel=4:8-5:8
 editor | shift+end | caret=4:26 sel=4:8-4:26
+editor | shift+f10 | +menu("Go to Definition" > "Go to Definition")
 editor | shift+f11 | -
 editor | shift+f12 | -
 editor | shift+f4 | status="No navigator comments in this file"
@@ -508,7 +509,7 @@ selection | ctrl+shift+l | carets=1:35-1:40,5:7-5:12,6:19-6:24 status="Selected 
 selection | ctrl+shift+m | focus=panel panel=Problems
 selection | ctrl+shift+n | -
 selection | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-selection | ctrl+shift+p | status="Command Palette: 395 commands — Esc to close" +palette("" @0 > "Move Line Up")
+selection | ctrl+shift+p | status="Command Palette: 396 commands — Esc to close" +palette("" @0 > "Move Line Up")
 selection | ctrl+shift+pagedown | status="Move: the editor is already the last tab"
 selection | ctrl+shift+pageup | status="Move: the editor is already the first tab"
 selection | ctrl+shift+r | focus=side side=Remote
@@ -561,6 +562,7 @@ selection | shift+cmd+\ | caret=8:0 sel=-
 selection | shift+cmd+t | focus=panel
 selection | shift+down | caret=5:13 sel=4:8-5:13
 selection | shift+end | caret=4:26 sel=4:8-4:26
+selection | shift+f10 | +menu("Go to Definition" > "Go to Definition")
 selection | shift+f11 | -
 selection | shift+f12 | -
 selection | shift+f4 | status="No navigator comments in this file"
@@ -778,7 +780,7 @@ explorer | ctrl+shift+l | -
 explorer | ctrl+shift+m | focus=panel panel=Problems
 explorer | ctrl+shift+n | +prompt("New Folder in ." "")
 explorer | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-explorer | ctrl+shift+p | status="Command Palette: 395 commands — Esc to close" +palette("" @0 > "Move Line Up")
+explorer | ctrl+shift+p | status="Command Palette: 396 commands — Esc to close" +palette("" @0 > "Move Line Up")
 explorer | ctrl+shift+pagedown | tree=./+,.vscode/,docs/,main.rs > main.rs marked=.,.vscode,docs,main.rs
 explorer | ctrl+shift+pageup | tree=./+,.vscode/,docs/,main.rs > . marked=.
 explorer | ctrl+shift+r | side=Remote
@@ -830,6 +832,7 @@ explorer | shift+cmd+\ | -
 explorer | shift+cmd+t | focus=panel
 explorer | shift+down | -
 explorer | shift+end | tree=./+,.vscode/,docs/,main.rs > main.rs marked=.,.vscode,docs,main.rs
+explorer | shift+f10 | +menu("New File" > "New File")
 explorer | shift+f11 | -
 explorer | shift+f12 | -
 explorer | shift+f4 | -
@@ -1047,7 +1050,7 @@ terminal | ctrl+shift+l | typed=0:"\u{c}"
 terminal | ctrl+shift+m | panel=Problems
 terminal | ctrl+shift+n | typed=0:"\u{e}"
 terminal | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-terminal | ctrl+shift+p | status="Command Palette: 395 commands — Esc to close" +palette("" @0 > "Move Line Up")
+terminal | ctrl+shift+p | status="Command Palette: 396 commands — Esc to close" +palette("" @0 > "Move Line Up")
 terminal | ctrl+shift+pagedown | -
 terminal | ctrl+shift+pageup | -
 terminal | ctrl+shift+r | focus=side side=Remote
@@ -1100,6 +1103,7 @@ terminal | shift+cmd+\ | typed=0:"\\"
 terminal | shift+cmd+t | -
 terminal | shift+down | typed=0:"\u{1b}[1;2B"
 terminal | shift+end | -
+terminal | shift+f10 | +menu("Paste" > "Paste")
 terminal | shift+f11 | -
 terminal | shift+f12 | typed=0:"\u{1b}[24;2~"
 terminal | shift+f4 | typed=0:"\u{1b}[1;2S"
@@ -1317,7 +1321,7 @@ search | ctrl+shift+l | status="Search: unhandled Ctrl+L"
 search | ctrl+shift+m | focus=panel panel=Problems search="total" hits=4@0
 search | ctrl+shift+n | status="Search: unhandled Ctrl+N"
 search | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-search | ctrl+shift+p | status="Command Palette: 395 commands — Esc to close" +palette("" @0 > "Move Line Up")
+search | ctrl+shift+p | status="Command Palette: 396 commands — Esc to close" +palette("" @0 > "Move Line Up")
 search | ctrl+shift+pagedown | -
 search | ctrl+shift+pageup | -
 search | ctrl+shift+r | side=Remote search="total" hits=4@0
@@ -1370,6 +1374,7 @@ search | shift+cmd+\ | status="Search: unhandled Cmd+\\"
 search | shift+cmd+t | focus=panel search="total" hits=4@0
 search | shift+down | search="total" @Query:5 hits=4@1
 search | shift+end | -
+search | shift+f10 | -
 search | shift+f11 | -
 search | shift+f12 | -
 search | shift+f4 | -
@@ -1587,7 +1592,7 @@ scm | ctrl+shift+l | -
 scm | ctrl+shift+m | focus=panel panel=Problems scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
 scm | ctrl+shift+n | -
 scm | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-scm | ctrl+shift+p | status="Command Palette: 395 commands — Esc to close" +palette("" @0 > "Move Line Up")
+scm | ctrl+shift+p | status="Command Palette: 396 commands — Esc to close" +palette("" @0 > "Move Line Up")
 scm | ctrl+shift+pagedown | -
 scm | ctrl+shift+pageup | -
 scm | ctrl+shift+r | side=Remote scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
@@ -1640,6 +1645,7 @@ scm | shift+cmd+\ | -
 scm | shift+cmd+t | focus=panel scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
 scm | shift+down | scm="Ship it"@7 +focus +list sel=0 multi=0 StagedModified:docs/notes.md Untracked:todo.txt
 scm | shift+end | -
+scm | shift+f10 | -
 scm | shift+f11 | -
 scm | shift+f12 | -
 scm | shift+f4 | -
@@ -1913,6 +1919,7 @@ palette | shift+cmd+\ | -
 palette | shift+cmd+t | -
 palette | shift+down | ~palette("" @0 > "Move Line Down")
 palette | shift+end | -
+palette | shift+f10 | -
 palette | shift+f11 | -
 palette | shift+f12 | -
 palette | shift+f4 | -
@@ -2186,6 +2193,7 @@ confirm | shift+cmd+\ | -
 confirm | shift+cmd+t | -
 confirm | shift+down | -
 confirm | shift+end | -
+confirm | shift+f10 | -
 confirm | shift+f11 | -
 confirm | shift+f12 | -
 confirm | shift+f4 | -

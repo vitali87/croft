@@ -87,6 +87,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_command_palette_key",
             },
             ShortcutEntry {
+                keys: "Shift+F10",
+                description: "Open the right-click menu of what has the keys (the Menu key too)",
+                handler: "is_show_context_menu_key",
+            },
+            ShortcutEntry {
                 keys: "Cmd/Ctrl+Shift+O",
                 description: "Go to Symbol in Editor: fuzzy-jump to a symbol (or `:` then a line number)",
                 handler: "is_go_to_symbol_key",

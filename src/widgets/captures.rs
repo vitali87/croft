@@ -154,6 +154,19 @@ impl CapturesPanel {
         self.entries.get(self.selected)
     }
 
+    /// The selected entry's index, while there is one.
+    pub fn selected_index(&self) -> Option<usize> {
+        (self.selected < self.entries.len()).then_some(self.selected)
+    }
+
+    /// Where entry `idx`'s row was drawn, if it was.
+    pub fn row_rect(&self, idx: usize) -> Option<Rect> {
+        self.row_rects
+            .iter()
+            .find(|&&(_, i)| i == idx)
+            .map(|&(r, _)| r)
+    }
+
     pub fn move_selection(&mut self, delta: i32) {
         if self.entries.is_empty() {
             return;

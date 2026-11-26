@@ -15,6 +15,10 @@
 //!
 //! Linux only, like the screen goldens: on macOS the tab and Explorer
 //! menus offer Reveal in Finder too, so its files would be others.
+//!
+//! The keyboard opens the same menus (Show Context Menu: Shift+F10, the
+//! Menu key). Its tests below right-click an item, then press the key on
+//! the same item, and want the same menu, opened just below the item.
 
 use super::*;
 use crossterm::event::{MouseButton, MouseEventKind};
@@ -157,8 +161,14 @@ fn the_commit_menu() {
             .commit_at(y)
             .is_some_and(|c| c.summary == "add b")
     });
+    let commit = app.commit_graph.commit_at(y).cloned().unwrap();
     right_click(&mut app, area.x + 4, y);
-    check("right-click-commit", &written(&app, "a COMMITS row"), p);
+    // The commit's own ids, by value: `core.abbrev` can make the short one
+    // as few as 4 digits, which `no_commit_ids` leaves alone.
+    let text = written(&app, "a COMMITS row")
+        .replace(&commit.hash, "<id>")
+        .replace(&commit.short_hash, "<id>");
+    check("right-click-commit", &text, p);
 }
 
 #[test]
@@ -513,4 +523,259 @@ fn the_editor_menus() {
     right_click(&mut app, x, y);
     text.push_str(&written(&app, "the text, a word selected"));
     check("right-click-editor", &text, tmp.path());
+}
+
+/// `written` without where the menu opens, which a key and a click give
+/// differently.
+fn wherever(text: &str) -> String {
+    text.lines()
+        .map(|line| match line.strip_prefix("opens at ") {
+            Some(rest) => format!("opens {}", rest.split_once("), ").map_or(rest, |(_, r)| r)),
+            None => line.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn shift_f10(app: &mut App) {
+    app.handle_key(key(KeyCode::F(10), KeyModifiers::SHIFT))
+        .unwrap();
+}
+
+/// Right-click at `(x, y)`, then close the menu and press Shift+F10: the
+/// two menus, as `written` gives them under `spot` without their spots.
+fn clicked_then_keyed(app: &mut App, x: u16, y: u16, spot: &str) -> (String, String) {
+    let focus = app.focus;
+    right_click(app, x, y);
+    let clicked = wherever(&written(app, spot));
+    app.context_menu = None;
+    app.focus_pane(focus);
+    shift_f10(app);
+    (clicked, wherever(&written(app, spot)))
+}
+
+fn opened_at(app: &App) -> (u16, u16) {
+    app.context_menu.as_ref().expect("a menu is open").origin
+}
+
+fn text_app() -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("main.rs");
+    std::fs::write(&f, "fn main() {\n    let total = 1;\n}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 5;
+    draw(&mut app, W, H);
+    (tmp, app)
+}
+
+/// #2739: Shift+F10 in the editor opens the text's menu for the caret,
+/// just below it: the menu a right-click on the caret's cell opens.
+#[test]
+fn shift_f10_in_the_editor_opens_the_text_menu_below_the_caret() {
+    let (_tmp, mut app) = text_app();
+    let (x, y) = app.editor.cursor_screen_pos().expect("the caret is drawn");
+    let (clicked, keyed) = clicked_then_keyed(&mut app, x, y, "the caret");
+    assert!(
+        keyed.contains("GoToDefinitionAt { row: 1, col: 5 }"),
+        "{keyed}"
+    );
+    assert_eq!(keyed, clicked);
+    assert_eq!(opened_at(&app), (x, y + 1), "just below the caret");
+}
+
+/// #2739: the Menu key, as a terminal on the modern keyboard protocol
+/// reports it, opens the same menu.
+#[test]
+fn the_menu_key_opens_the_same_menu() {
+    let (_tmp, mut app) = text_app();
+    shift_f10(&mut app);
+    let by_shift_f10 = written(&app, "the caret");
+    app.context_menu = None;
+    app.handle_key(key(KeyCode::Menu, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.context_menu.is_some(), "the Menu key opened a menu");
+    assert_eq!(written(&app, "the caret"), by_shift_f10);
+}
+
+/// #2739: Shift+F10 was Step Over. It opens the menu now and goes no
+/// further; bare F10 still steps (`is_run_to_cursor_key` and the step-over
+/// arm come after it).
+#[test]
+fn shift_f10_no_longer_steps_over() {
+    let (_tmp, mut app) = text_app();
+    assert!(!is_show_context_menu_key(key(
+        KeyCode::F(10),
+        KeyModifiers::NONE
+    )));
+    assert!(!is_show_context_menu_key(key(
+        KeyCode::F(10),
+        KeyModifiers::CONTROL
+    )));
+    shift_f10(&mut app);
+    assert!(app.context_menu.is_some(), "Shift+F10 opened the menu");
+}
+
+/// #2739: in the Explorer, the selected row's menu.
+#[test]
+fn shift_f10_in_the_explorer_opens_the_selected_rows_menu() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir(root.join("src")).unwrap();
+    std::fs::write(root.join("README.md"), "# hi\n").unwrap();
+    let mut app = App::new(root.to_path_buf()).unwrap();
+    app.sidebar_view = SidebarView::Explorer;
+    app.show_tree = true;
+    app.focus_pane(Pane::Tree);
+    let idx = app
+        .tree
+        .nodes
+        .iter()
+        .position(|n| n.path == root.join("README.md"))
+        .unwrap();
+    app.tree.select_replace(idx);
+    draw(&mut app, W, H);
+    let area = app.tree.last_area;
+    let y = row_where(area, |y| app.tree.node_at_y(y) == Some(idx));
+    let (clicked, keyed) = clicked_then_keyed(&mut app, area.x + 3, y, "README.md");
+    assert!(
+        keyed.contains("Rename(\"") && keyed.contains("README.md"),
+        "{keyed}"
+    );
+    assert_eq!(keyed, clicked);
+    assert_eq!(opened_at(&app).1, y + 1, "just below the row");
+}
+
+/// #2739: with COMMITS holding the keys, the picked commit's menu.
+#[test]
+fn shift_f10_in_commits_opens_the_picked_commits_menu() {
+    let tmp = make_committed_repo();
+    let p = tmp.path();
+    std::fs::write(p.join("b.txt"), "b\n").unwrap();
+    assert!(git_succeeds(p, &["add", "."]) && git_succeeds(p, &["commit", "-qm", "add b"]));
+    let mut app = App::new(p.to_path_buf()).unwrap();
+    app.sidebar_view = SidebarView::SourceControl;
+    app.show_tree = true;
+    app.source_control.status.in_repo = true;
+    app.commit_graph
+        .set_rows(crate::widgets::commit_graph::layout_graph(
+            crate::git::commit_graph(p, 100),
+        ));
+    app.focus_pane(Pane::Tree);
+    app.source_control.keys = crate::widgets::source_control::KeyStop::Commits;
+    app.commit_graph.select(1);
+    draw(&mut app, W, H);
+    let area = app.commit_graph.last_area;
+    let y = row_where(area, |y| app.commit_graph.row_index_at(y) == Some(1));
+    let (clicked, keyed) = clicked_then_keyed(&mut app, area.x + 4, y, "the picked commit");
+    assert!(keyed.contains("Cherry-Pick"), "{keyed}");
+    assert_eq!(keyed, clicked);
+    assert_eq!(opened_at(&app).1, y + 1, "just below the row");
+}
+
+/// #2739: in a terminal, the active pane's menu, at its cursor.
+#[test]
+fn shift_f10_in_a_terminal_opens_the_panes_menu() {
+    let (_tmp, mut app, _term) = app_with_terminal_panes(2);
+    app.bottom_panel_tab = BottomPanelTab::Terminal;
+    app.active_terminal = 1;
+    app.focus_pane(Pane::Terminal);
+    draw(&mut app, 160, 30);
+    let area = app.terminals[1].last_area;
+    let (clicked, keyed) = clicked_then_keyed(
+        &mut app,
+        area.x + area.width / 2,
+        area.y + area.height / 2,
+        "the active pane",
+    );
+    assert!(keyed.contains("RenameTerminal(1)"), "{keyed}");
+    assert_eq!(keyed, clicked);
+}
+
+/// #2739: in CAPTURES, the selected capture's menu.
+#[test]
+fn shift_f10_in_captures_opens_the_selected_captures_menu() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for message in ["Build failed", "Test failed"] {
+        app.captures.push(crate::widgets::captures::CapturedLine {
+            pane: "zsh".into(),
+            shell_pid: None,
+            message: message.into(),
+            line: format!("error: {message}"),
+            anchor: None,
+        });
+    }
+    app.bottom_panel_tab = BottomPanelTab::Captures;
+    app.focus_pane(Pane::Terminal);
+    app.captures.select_index(0);
+    draw(&mut app, W, H);
+    let r = app
+        .captures
+        .row_rect(0)
+        .expect("the first capture is drawn");
+    let (clicked, keyed) = clicked_then_keyed(&mut app, r.x + 2, r.y, "the selected capture");
+    assert!(keyed.contains("AskNavigatorAboutCapture"), "{keyed}");
+    assert_eq!(keyed, clicked);
+    assert_eq!(
+        app.captures.selected_entry().map(|c| c.message.as_str()),
+        Some("Build failed")
+    );
+    assert_eq!(opened_at(&app).1, r.y + 1, "just below the row");
+}
+
+/// #2739: in PROBLEMS, which has no keyboard row yet, the first problem
+/// shown.
+#[test]
+fn shift_f10_in_problems_opens_the_first_problems_menu() {
+    use crate::lsp::manager::{Diagnostic, DiagnosticSeverity};
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("hello.rs");
+    std::fs::write(&file, "fn f0() {}\nfn f1() {}\nfn f2() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let warning = |line: u32, message: &str| Diagnostic {
+        start_line: line,
+        start_char: 3,
+        end_line: line,
+        end_char: 5,
+        severity: DiagnosticSeverity::Warning,
+        message: message.into(),
+        tags: Default::default(),
+        code: None,
+        origin: None,
+    };
+    let mut by_server = std::collections::HashMap::new();
+    by_server.insert(
+        String::from("rustc"),
+        vec![
+            warning(1, "`f1` is never used"),
+            warning(2, "`f2` is never used"),
+        ],
+    );
+    app.lsp_diagnostics.insert(file.clone(), by_server);
+    app.rebuild_problems();
+    app.bottom_panel_tab = BottomPanelTab::Problems;
+    app.focus_pane(Pane::Terminal);
+    draw(&mut app, W, H);
+    let list = app.problems.last_area;
+    let y = row_where(list, |y| app.problems.diagnostic_at(y).is_some());
+    let (clicked, keyed) = clicked_then_keyed(&mut app, list.x + 30, y, "the first problem");
+    assert!(keyed.contains("f1"), "{keyed}");
+    assert_eq!(keyed, clicked);
+}
+
+/// #2739: where what has the keys has no right-click menu (the Search
+/// view), Shift+F10 opens nothing.
+#[test]
+fn shift_f10_opens_nothing_where_nothing_has_a_menu() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_view = SidebarView::Search;
+    app.show_tree = true;
+    app.focus_pane(Pane::Tree);
+    draw(&mut app, W, H);
+    shift_f10(&mut app);
+    assert!(app.context_menu.is_none());
 }
