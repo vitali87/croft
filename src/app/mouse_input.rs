@@ -2732,9 +2732,19 @@ impl App {
                     }
                     if let Some(root) = self.source_control.click_repository(m.column, m.row) {
                         // Pin the panel to the clicked repository (#161);
-                        // the next cross-folder focus releases it.
-                        self.scm_pin = Some(root.clone());
-                        self.seed_active_scm(root);
+                        // the next cross-folder focus releases it. Its row
+                        // takes the keys, as a click on a change does for
+                        // the change list (#871).
+                        let row = self
+                            .source_control
+                            .repositories
+                            .iter()
+                            .position(|r| r.workspace_root == root);
+                        self.pin_scm_repository(root);
+                        if let Some(row) = row {
+                            self.source_control.keys = KeyStop::Repositories;
+                            self.source_control.repo_cursor = row;
+                        }
                         return;
                     }
                     if self.source_control.click_more(m.column, m.row) {
@@ -2763,10 +2773,15 @@ impl App {
                         return;
                     }
                     // A click anywhere else in the view takes the keys from
-                    // COMMITS (#871): to the message box, or to the change
-                    // list when the click lands on one of its rows.
-                    if self.source_control.keys == KeyStop::Commits {
+                    // COMMITS and REPOSITORIES (#871): to the message box (or
+                    // the card, with no repository), or to the change list
+                    // when the click lands on one of its rows.
+                    if matches!(
+                        self.source_control.keys,
+                        KeyStop::Commits | KeyStop::Repositories
+                    ) {
                         self.source_control.keys = KeyStop::Message;
+                        self.source_control.settle_keys();
                     }
                     if self.source_control.click_input(m.column, m.row) {
                         self.source_control.keys = KeyStop::Message;

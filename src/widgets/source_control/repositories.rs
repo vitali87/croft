@@ -16,10 +16,49 @@ pub struct RepoRow {
 }
 
 impl SourceControlPanel {
+    /// Replace the overview's rows; the keys leave REPOSITORIES when it
+    /// hides, and its keyboard row stays on the list.
+    pub fn set_repositories(&mut self, rows: Vec<RepoRow>) {
+        self.repositories = rows;
+        self.settle_keys();
+    }
+
+    /// How many REPOSITORIES rows the last frame drew. A short panel draws
+    /// only the first few, and the keyboard reaches only those, as the mouse
+    /// does: a row it cannot see is never the one Enter opens.
+    pub(super) fn drawn_repo_rows(&self) -> usize {
+        self.repo_row_areas.len().min(self.repositories.len())
+    }
+
+    /// REPOSITORIES takes the keys (#871), on the shown repository's row, or
+    /// on the last drawn row when that one is below the panel's bottom.
+    pub fn focus_repositories(&mut self) {
+        self.keys = KeyStop::Repositories;
+        let shown = self.repositories.iter().position(|r| r.active).unwrap_or(0);
+        self.repo_cursor = shown.min(self.drawn_repo_rows().saturating_sub(1));
+    }
+
+    /// Move REPOSITORIES' keyboard row `delta` rows, stopping at the first
+    /// and at the last drawn.
+    pub fn move_repo_cursor(&mut self, delta: isize) {
+        let last = self.drawn_repo_rows().saturating_sub(1);
+        self.repo_cursor = self.repo_cursor.saturating_add_signed(delta).min(last);
+    }
+
+    /// The repository on REPOSITORIES' keyboard row, if that row was drawn.
+    pub fn repo_under_cursor(&self) -> Option<&RepoRow> {
+        (self.repo_cursor < self.drawn_repo_rows())
+            .then(|| self.repositories.get(self.repo_cursor))
+            .flatten()
+    }
+
     /// Paint the multi-root REPOSITORIES overview (#161) starting at `y`,
     /// returning the y below it (unchanged when hidden). One row per
-    /// repository: label, branch (dim), change count (right-aligned),
-    /// the ACTIVE repository's row on the selection background.
+    /// repository: label, branch (dim), change count (right-aligned), the
+    /// shown repository's label in bold. The selection background sits on
+    /// the shown repository's row, or on the keyboard's row while
+    /// REPOSITORIES has the keys (#871), and wears the focus colour only
+    /// then, as the change list's does.
     pub(super) fn render_repositories_section(
         &mut self,
         inner: Rect,
@@ -48,10 +87,16 @@ impl SourceControlPanel {
                 .add_modifier(Modifier::BOLD),
         );
         y += 1;
-        for row in &self.repositories {
+        let has_keys = self.keys == KeyStop::Repositories;
+        for (i, row) in self.repositories.iter().enumerate() {
             if y >= bottom {
                 break;
             }
+            let picked = if has_keys {
+                i == self.repo_cursor
+            } else {
+                row.active
+            };
             let rect = Rect {
                 x: inner.x,
                 y,
@@ -71,7 +116,7 @@ impl SourceControlPanel {
                         .set_symbol(" ")
                         .set_style(Style::default().bg(t.chrome()));
                 }
-                if row.active {
+                if picked {
                     crate::widgets::surface::paint_selected_row(
                         buf,
                         Rect {
@@ -81,7 +126,7 @@ impl SourceControlPanel {
                         },
                         t,
                         t.chrome,
-                        self.focused,
+                        self.focused && has_keys,
                     );
                 } else if hovered {
                     buf.set_style(rect, Style::default().bg(t.hover_on(t.chrome)));
@@ -119,7 +164,7 @@ impl SourceControlPanel {
             }
             let hover_bg =
                 crate::widgets::hover::row_hover_bg(rect, self.hover_pointer, self.theme);
-            let (bg, fg) = if row.active {
+            let (bg, fg) = if picked {
                 (self.theme.selection(), self.theme.ui(Color::White))
             } else if let Some(h) = hover_bg {
                 (h, self.theme.ui(Color::Gray))
