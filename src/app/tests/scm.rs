@@ -3209,6 +3209,50 @@ fn a_waiting_command_holds_while_a_discard_asks_first() {
     assert_eq!(asking(&app).as_deref(), Some("scratch.txt"));
 }
 
+/// #871 (review of #2732): a command whose read is in flight when a discard
+/// in the change list starts asking does not land behind the question. Its
+/// Discard replaced the file the question was about, so yes deleted the
+/// wrong one; it now reads again once the question is answered.
+#[test]
+fn a_command_reading_when_a_discard_asks_reads_again_after() {
+    use crate::widgets::command_palette::Command;
+    let (tmp, mut app) = scm_with_seed_open();
+    app.run_command(Command::GitDiscardChanges);
+    assert!(
+        app.git_file_lookup.is_some(),
+        "Discard on seed.txt is reading"
+    );
+    let scratch = app
+        .source_control
+        .entries
+        .iter()
+        .position(|e| e.path == "scratch.txt")
+        .expect("scratch.txt is listed");
+    app.request_discard_source_control_entry(scratch);
+    let asking = |app: &App| app.pending_discard.as_ref().map(|p| p.rel_path.clone());
+    for _ in 0..20 {
+        app.drain_git_file_lookup();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(
+        asking(&app).as_deref(),
+        Some("scratch.txt"),
+        "the question stays on its own file"
+    );
+    app.confirm_pending_discard();
+    assert!(
+        !tmp.path().join("scratch.txt").exists(),
+        "yes discarded scratch.txt"
+    );
+    assert_ne!(
+        std::fs::read_to_string(tmp.path().join("seed.txt")).unwrap(),
+        git_stdout_untrimmed(tmp.path(), &["show", "HEAD:seed.txt"]),
+        "seed.txt is untouched"
+    );
+    settle_git_file_commands(&mut app);
+    assert_eq!(asking(&app).as_deref(), Some("seed.txt"));
+}
+
 /// #871: in the list `s` stages the selected row, `u` unstages it and `d`
 /// asks before discarding it, each staying on the file it moved.
 #[test]

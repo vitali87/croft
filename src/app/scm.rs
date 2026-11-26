@@ -1177,6 +1177,18 @@ impl App {
     /// landed: show the fresh list and act on the open file's row. True
     /// when something changed on screen.
     pub(super) fn drain_git_file_lookup(&mut self) -> bool {
+        // A discard asking first holds every command: one whose read is in
+        // flight goes back to the front of the line and reads again once
+        // the question is answered, so it neither replaces the file the
+        // question is about nor acts behind it on what the read saw before
+        // the answer.
+        if self.pending_discard.is_some() {
+            if let Some(lookup) = self.git_file_lookup.take() {
+                self.git_file_queue
+                    .push_front((lookup.command, lookup.path, lookup.folder));
+            }
+            return false;
+        }
         let started = self.start_next_git_file_command();
         let reply = match self.git_file_lookup.as_ref().map(|l| l.job.poll()) {
             None | Some(crate::jobs::Poll::Pending) => return started,
