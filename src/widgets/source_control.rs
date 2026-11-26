@@ -31,6 +31,22 @@ use palette::*;
 use render::*;
 pub use repositories::RepoRow;
 
+/// Source Control's Tab stops (#871), in VS Code's order: Tab steps down
+/// them and round again, Shift+Tab steps back up.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KeyStop {
+    /// The commit message box: typing writes the message.
+    #[default]
+    Message,
+    /// The change list: the arrows move `selected_change`, Enter opens its
+    /// diff. Tab, or Down on the message's last line, steps here; Shift+Tab,
+    /// or Up on the first row, steps back.
+    List,
+    /// COMMITS, below the change list: the arrows pick a commit, Enter
+    /// opens it.
+    Commits,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RowActionAreas {
     pub entry_idx: usize,
@@ -118,11 +134,9 @@ pub struct SourceControlPanel {
     /// The Stage shortcut (Cmd+S) acts on this set; click on an action icon
     /// still acts on just that row.
     pub multi_selection: BTreeSet<usize>,
-    /// The change list holds the keyboard instead of the message box
-    /// (#871), as in VS Code: arrows move `selected_change` and Enter opens
-    /// its diff. Tab, or Down on the message's last line, moves here; Tab,
-    /// or Up on the first row, goes back.
-    pub list_focused: bool,
+    /// Which of the view's Tab stops has the keys (#871): one at a time,
+    /// so only one of them ever draws as focused.
+    pub keys: KeyStop,
     /// Status / error line painted below the button after a commit attempt.
     /// Cleared on the next refresh.
     pub commit_feedback: Option<String>,
@@ -180,7 +194,7 @@ impl SourceControlPanel {
             scroll: 0,
             selected_change: None,
             multi_selection: BTreeSet::new(),
-            list_focused: false,
+            keys: KeyStop::Message,
             commit_feedback: None,
             commit_feedback_is_error: false,
             last_row_actions: None,

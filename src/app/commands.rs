@@ -2199,6 +2199,7 @@ impl App {
             Cmd::GitStageChanges => self.git_file_command(super::scm::GitFileCommand::Stage),
             Cmd::GitUnstageChanges => self.git_file_command(super::scm::GitFileCommand::Unstage),
             Cmd::GitDiscardChanges => self.git_file_command(super::scm::GitFileCommand::Discard),
+            Cmd::GitRefresh => self.refresh_source_control_from_key(),
             Cmd::ToggleTerminalSuggestions => self.toggle_terminal_suggestions(),
             Cmd::ToggleScreenReader => self.toggle_screen_reader(),
             Cmd::OpenKeyboardShortcuts => self.open_keyboard_shortcuts(),

@@ -2,6 +2,7 @@
 //! stale popups on a click.
 
 use super::*;
+use crate::widgets::source_control::KeyStop;
 
 impl App {
     /// [`Self::ui_tooltip_at`], plus the hints whose text is what sits under
@@ -2713,12 +2714,19 @@ impl App {
                             self.graph_scrollbar_drag = true;
                         } else if self.commit_graph.hit_header(m.column, m.row) {
                             self.commit_graph.toggle_collapse();
-                        } else if let Some((hash, short)) = self
-                            .commit_graph
-                            .commit_at(m.row)
-                            .map(|c| (c.hash.clone(), c.short_hash.clone()))
-                        {
-                            self.open_commit_patch(&hash, &short);
+                        } else if let Some(row) = self.commit_graph.row_index_at(m.row) {
+                            // The clicked commit is picked and COMMITS takes
+                            // the keys, as a click on a change row does for
+                            // the change list (#871).
+                            self.source_control.keys = KeyStop::Commits;
+                            self.commit_graph.select(row);
+                            if let Some((hash, short)) = self
+                                .commit_graph
+                                .selected_commit()
+                                .map(|c| (c.hash.clone(), c.short_hash.clone()))
+                            {
+                                self.open_commit_patch(&hash, &short);
+                            }
                         }
                         return;
                     }
@@ -2754,8 +2762,14 @@ impl App {
                         self.commit_source_control();
                         return;
                     }
+                    // A click anywhere else in the view takes the keys from
+                    // COMMITS (#871): to the message box, or to the change
+                    // list when the click lands on one of its rows.
+                    if self.source_control.keys == KeyStop::Commits {
+                        self.source_control.keys = KeyStop::Message;
+                    }
                     if self.source_control.click_input(m.column, m.row) {
-                        self.source_control.list_focused = false;
+                        self.source_control.keys = KeyStop::Message;
                         return;
                     }
                     if self.source_control.click_branch(m.column, m.row) {
@@ -2775,7 +2789,7 @@ impl App {
                         return;
                     }
                     if let Some(idx) = self.source_control.entry_at_y(m.row) {
-                        self.source_control.list_focused = true;
+                        self.source_control.keys = KeyStop::List;
                         self.open_source_control_entry(idx);
                     }
                     return;

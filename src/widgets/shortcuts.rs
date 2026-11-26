@@ -1347,6 +1347,16 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "",
             },
             ShortcutEntry {
+                keys: "Tab / Shift+Tab",
+                description: "Step between the message box, the change list and COMMITS",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "R",
+                description: "In the change list or COMMITS: refresh (Git: Refresh)",
+                handler: "",
+            },
+            ShortcutEntry {
                 keys: "Enter / S / U / D",
                 description: "In the change list: open / stage / unstage / discard the selected file. Git: Open / Stage / Unstage / Discard Changes do it to the open file",
                 handler: "",

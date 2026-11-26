@@ -162,6 +162,13 @@ pub struct CommitGraphPanel {
     pub focus_gradient: bool,
     pub theme: Theme,
     pub focused: bool,
+    /// COMMITS has the keys (#871): set before each draw from Source
+    /// Control's key stop, which holds it. Its selected row then shows the
+    /// focused band.
+    pub has_keys: bool,
+    /// The row the keyboard or a click picked, kept on screen and kept
+    /// across a refresh by its commit.
+    selected: Option<usize>,
     pub hover_pointer: Option<(u16, u16)>,
 
     pub last_area: Rect,
@@ -186,6 +193,8 @@ impl CommitGraphPanel {
             focus_gradient: false,
             theme: Theme::default(),
             focused: false,
+            has_keys: false,
+            selected: None,
             hover_pointer: None,
             last_area: Rect::default(),
             last_scrollbar: Rect::default(),
@@ -205,11 +214,72 @@ impl CommitGraphPanel {
             (Some(a), Some(b)) => a.commit.hash == b.commit.hash,
             _ => false,
         };
+        let picked = self.selected_commit().map(|c| c.hash.clone());
         self.rows = rows;
         self.loaded = true;
         if !same_tip {
             self.scroll = 0;
         }
+        // The picked commit stays picked where it went; a row that left
+        // the history (a reset, a rebase) leaves nothing picked.
+        self.selected =
+            picked.and_then(|hash| self.rows.iter().position(|r| r.commit.hash == hash));
+    }
+
+    /// The commit the keyboard or a click picked.
+    pub fn selected_commit(&self) -> Option<&GraphCommit> {
+        self.selected
+            .and_then(|i| self.rows.get(i))
+            .map(|r| &r.commit)
+    }
+
+    /// Pick row `index` (clamped to the history) and scroll it on screen.
+    pub fn select(&mut self, index: usize) {
+        let Some(last) = self.rows.len().checked_sub(1) else {
+            self.selected = None;
+            return;
+        };
+        let index = index.min(last);
+        self.selected = Some(index);
+        let page = self.page();
+        if index < self.scroll {
+            self.scroll = index;
+        } else if index >= self.scroll + page {
+            self.scroll = index + 1 - page;
+        }
+    }
+
+    /// Move the pick `delta` rows, from the first row when nothing is picked.
+    pub fn move_selection(&mut self, delta: isize) {
+        let to = match self.selected {
+            None => 0,
+            Some(from) => from.saturating_add_signed(delta),
+        };
+        self.select(to);
+    }
+
+    /// How many rows one page moves: the rows the body last showed.
+    pub fn page(&self) -> usize {
+        usize::from(self.viewport_rows.max(1))
+    }
+
+    /// How many commits the history holds.
+    pub fn commit_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// The last history row.
+    pub fn last_row(&self) -> usize {
+        self.rows.len().saturating_sub(1)
+    }
+
+    /// The history row drawn at `y`, if any.
+    pub fn row_index_at(&self, y: u16) -> Option<usize> {
+        if self.collapsed || self.visible_rows == 0 || y < self.first_row_y {
+            return None;
+        }
+        let offset = usize::from(y - self.first_row_y);
+        (offset < usize::from(self.visible_rows)).then_some(self.scroll + offset)
     }
 
     /// Whether a fetched graph has landed since the last [`Self::clear`]
@@ -222,6 +292,7 @@ impl CommitGraphPanel {
         self.rows.clear();
         self.loaded = false;
         self.scroll = 0;
+        self.selected = None;
     }
 
     pub fn toggle_collapse(&mut self) {
@@ -283,14 +354,9 @@ impl CommitGraphPanel {
 
     /// Map a click row to the commit it lands on.
     pub fn commit_at(&self, y: u16) -> Option<&GraphCommit> {
-        if self.collapsed || self.visible_rows == 0 || y < self.first_row_y {
-            return None;
-        }
-        let offset = (y - self.first_row_y) as usize;
-        if offset >= self.visible_rows as usize {
-            return None;
-        }
-        self.rows.get(self.scroll + offset).map(|r| &r.commit)
+        self.row_index_at(y)
+            .and_then(|i| self.rows.get(i))
+            .map(|r| &r.commit)
     }
 }
 
@@ -348,7 +414,9 @@ impl Widget for &mut CommitGraphPanel {
             !self.collapsed,
             "COMMITS",
             Vec::new(),
-            crate::widgets::hover::contains(header_row, self.hover_pointer),
+            // With the keys but no row to pick, the header shows them.
+            crate::widgets::hover::contains(header_row, self.hover_pointer)
+                || (self.has_keys && (self.collapsed || self.rows.is_empty())),
         );
         self.last_header_row = header_y;
         self.last_header_x = inner.x;
@@ -417,7 +485,30 @@ impl Widget for &mut CommitGraphPanel {
                 width: content_w,
                 height: 1,
             };
-            if let Some(bg) =
+            // The picked row: the change list's selected-row anatomy, the
+            // band (greyed while COMMITS has not the keys) on a card, the
+            // list blue on a plain panel.
+            let picked = self.selected == Some(self.scroll + row);
+            let tones = crate::widgets::surface::tones(self.theme);
+            if picked {
+                match tones {
+                    Some(t) => crate::widgets::surface::paint_selected_row(
+                        buf,
+                        Rect {
+                            x: area.x,
+                            width: row_rect.right().saturating_sub(area.x),
+                            ..row_rect
+                        },
+                        t,
+                        t.chrome,
+                        self.focused && self.has_keys,
+                    ),
+                    None => buf.set_style(
+                        row_rect,
+                        Style::default().bg(self.theme.ui(Color::Rgb(0x26, 0x4f, 0x78))),
+                    ),
+                }
+            } else if let Some(bg) =
                 crate::widgets::hover::row_hover_bg(row_rect, self.hover_pointer, self.theme)
             {
                 buf.set_style(row_rect, Style::default().bg(bg));

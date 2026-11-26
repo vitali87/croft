@@ -5,6 +5,7 @@
 use super::*;
 use crate::widgets::confirm_frame::{ConfirmFrame, Inset, draw_confirm, yes_no_keys};
 use crate::widgets::picker_rows::{PickerMouse, answer_mouse};
+use crate::widgets::source_control::KeyStop;
 
 /// The *Git: … Changes* commands that act on one file (#871).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -972,9 +973,10 @@ impl App {
             self.stage_selected_source_control_entries();
             return;
         }
-        if self.source_control.list_focused {
-            self.handle_source_control_list_key(key);
-            return;
+        match self.source_control.keys {
+            KeyStop::Commits => return self.handle_commit_graph_key(key),
+            KeyStop::List => return self.handle_source_control_list_key(key),
+            KeyStop::Message => {}
         }
         if is_clipboard_paste_key(key) {
             if let Some(text) = self.clipboard_text() {
@@ -1035,9 +1037,15 @@ impl App {
                     self.source_control.scroll_down(1);
                 }
             }
+            // Tab steps to the change list, or past an empty one to COMMITS
+            // (#871), so a clean repository still reaches its history.
             KeyCode::Tab => {
-                self.source_control.focus_list();
+                if !self.source_control.focus_list() {
+                    self.focus_commit_graph();
+                }
             }
+            // Shift+Tab goes round the other way, to COMMITS (#871).
+            KeyCode::BackTab => self.focus_commit_graph(),
             // Shift/Alt+Enter start a new message line (the commit body),
             // VS Code's multi-line SCM input; plain Enter commits.
             KeyCode::Enter
@@ -1079,8 +1087,16 @@ impl App {
             .is_some_and(|e| e.kind.section() == crate::git::ChangeSection::Staged);
         let sc = &mut self.source_control;
         match (key.code, selected) {
-            (KeyCode::Tab | KeyCode::BackTab, _) => sc.list_focused = false,
-            (KeyCode::Up, _) => sc.list_focused = sc.move_selection(true),
+            // Source Control's Tab stops, in VS Code's order (#871): the
+            // message box, the change list, COMMITS, and round again.
+            (KeyCode::BackTab, _) => sc.keys = KeyStop::Message,
+            (KeyCode::Tab, _) => self.focus_commit_graph(),
+            (KeyCode::Char('r'), _) => self.refresh_source_control_from_key(),
+            (KeyCode::Up, _) => {
+                if !sc.move_selection(true) {
+                    sc.keys = KeyStop::Message;
+                }
+            }
             (KeyCode::Down, _) => {
                 sc.move_selection(false);
             }
@@ -1107,7 +1123,7 @@ impl App {
     pub(super) fn git_file_command(&mut self, command: GitFileCommand) {
         if self.focus == Pane::Tree
             && self.sidebar_view == SidebarView::SourceControl
-            && self.source_control.list_focused
+            && self.source_control.keys == KeyStop::List
         {
             let key = KeyEvent::new(command.key(), KeyModifiers::NONE);
             self.handle_source_control_list_key(key);
@@ -1281,6 +1297,72 @@ impl App {
             };
         }
         row
+    }
+
+    /// COMMITS takes the keys (#871), its first row picked when none is.
+    pub(super) fn focus_commit_graph(&mut self) {
+        self.source_control.keys = KeyStop::Commits;
+        if self.commit_graph.selected_commit().is_none() {
+            self.commit_graph.select(0);
+        }
+    }
+
+    /// Git: Refresh (`R` in Source Control's lists, #871): what the header's
+    /// refresh button does.
+    pub(super) fn refresh_source_control_from_key(&mut self) {
+        self.refresh_source_control();
+        self.status = String::from("Refreshed Source Control");
+    }
+
+    /// A key while COMMITS has the keys (#871): the arrows, Home / End and
+    /// PageUp / PageDown pick a commit, Enter opens its changes, Left and
+    /// Right collapse and expand the section, R refreshes, and Tab /
+    /// Shift+Tab go on to the message box / back to the change list.
+    pub(super) fn handle_commit_graph_key(&mut self, key: KeyEvent) {
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        {
+            return;
+        }
+        let graph = &mut self.commit_graph;
+        let open = !graph.collapsed;
+        match key.code {
+            KeyCode::Tab => self.source_control.keys = KeyStop::Message,
+            // Back to the change list, or past an empty one to the message.
+            KeyCode::BackTab => {
+                if !self.source_control.focus_list() {
+                    self.source_control.keys = KeyStop::Message;
+                }
+            }
+            KeyCode::Up if open => graph.move_selection(-1),
+            KeyCode::Down if open => graph.move_selection(1),
+            KeyCode::PageUp if open => {
+                let page = graph.page() as isize;
+                graph.move_selection(-page);
+            }
+            KeyCode::PageDown if open => {
+                let page = graph.page() as isize;
+                graph.move_selection(page);
+            }
+            KeyCode::Home if open => graph.select(0),
+            KeyCode::End if open => {
+                let last = graph.last_row();
+                graph.select(last);
+            }
+            KeyCode::Left if open => graph.toggle_collapse(),
+            KeyCode::Right if !open => graph.toggle_collapse(),
+            KeyCode::Enter if open => {
+                if let Some((hash, short)) = graph
+                    .selected_commit()
+                    .map(|c| (c.hash.clone(), c.short_hash.clone()))
+                {
+                    self.open_commit_patch(&hash, &short);
+                }
+            }
+            KeyCode::Char('r' | 'R') => self.refresh_source_control_from_key(),
+            _ => {}
+        }
     }
 
     pub(super) fn refresh_source_control(&mut self) {

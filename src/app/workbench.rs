@@ -1655,7 +1655,7 @@ impl App {
                 self.refresh_source_control();
                 // Opening the view lands in the message box, so typing a
                 // message never stages or discards from the list (#871).
-                self.source_control.list_focused = false;
+                self.source_control.keys = crate::widgets::source_control::KeyStop::Message;
                 self.focus_pane(Pane::Tree);
             }
             SidebarView::Remote => self.focus_pane(Pane::Tree),

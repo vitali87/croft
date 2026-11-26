@@ -750,6 +750,8 @@ impl App {
                             height: graph_h,
                             ..usable_area
                         };
+                        self.commit_graph.has_keys = self.source_control.keys
+                            == crate::widgets::source_control::KeyStop::Commits;
                         frame.render_widget(&mut self.commit_graph, graph_area);
                     } else {
                         self.commit_graph.last_area = Rect::default();
@@ -3205,10 +3207,26 @@ impl App {
     }
 
     /// The Source Control sidebar for screen reader mode (#1295): how many
-    /// changes, and the selected one as `path, what happened to it`.
+    /// changes, and the selected one as `path, what happened to it`. While
+    /// COMMITS has the keys (#871) it reads COMMITS instead: how many
+    /// commits, and the picked one, which Enter opens.
     pub(super) fn source_control_a11y(&self) -> (String, Option<String>) {
         use crate::git::ChangeKind;
         let name = crate::i18n::tr("Source Control").into_owned();
+        if self.source_control.keys == crate::widgets::source_control::KeyStop::Commits {
+            let graph = &self.commit_graph;
+            if graph.collapsed {
+                return (format!("{name}, Commits, collapsed"), None);
+            }
+            let focus = format!(
+                "{name}, Commits, {}",
+                a11y_count(graph.commit_count(), "commit", "commits")
+            );
+            let item = graph
+                .selected_commit()
+                .map(|c| format!("{}, by {}, {}", c.summary, c.author, c.short_hash));
+            return (focus, item);
+        }
         let entries = &self.source_control.entries;
         if entries.is_empty() {
             return (name, None);
