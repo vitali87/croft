@@ -2261,6 +2261,9 @@ impl App {
         // OLD repo's state (or "no repo") even after a Make Root that
         // landed inside a real git tree.
         self.git.set_root(new_root.clone());
+        // Until the new root's status lands, the card the old one may have
+        // left does not take the keys (#871).
+        self.source_control.status_known = false;
         self.refresh_git_status_debounced();
         // Drop the old repo's graph before the refresh (inside
         // refresh_source_control) refetches for the new root; a reply still

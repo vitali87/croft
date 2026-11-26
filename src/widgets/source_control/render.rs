@@ -16,6 +16,8 @@ pub(super) fn badge_color(kind: ChangeKind, theme: crate::theme::Theme) -> Color
 
 impl Widget for &mut SourceControlPanel {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        // Only a stop on screen draws as having the keys (#871).
+        self.settle_keys();
         let focus_blue = self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff));
         // Black theme: the commit-input focus ring wears the muted brand teal
         // instead of the legacy blue (the outer border becomes the gradient).

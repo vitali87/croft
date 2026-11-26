@@ -42,6 +42,9 @@ impl GitRequest {
 pub enum GitResponse {
     Status(GitStatus),
     StatusAndChanges(GitStatus, Vec<ChangeEntry>),
+    /// A `SetRoot` was taken: every answer after this reads the new root,
+    /// and any before it read the old one, so the App drops those (#871).
+    RootSet,
 }
 
 /// Background worker loop. Reads `GitRequest`s from `rx`, coalesces a
@@ -64,6 +67,9 @@ pub fn git_worker_loop(
         let mut pending: Option<GitRequest> = match first {
             GitRequest::SetRoot(p) => {
                 root = p;
+                if tx.send(GitResponse::RootSet).is_err() {
+                    return;
+                }
                 None
             }
             other => Some(other),
@@ -72,6 +78,9 @@ pub fn git_worker_loop(
             match newer {
                 GitRequest::SetRoot(p) => {
                     root = p;
+                    if tx.send(GitResponse::RootSet).is_err() {
+                        return;
+                    }
                 }
                 other => {
                     pending = Some(match pending {

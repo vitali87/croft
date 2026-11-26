@@ -1291,9 +1291,14 @@ fn git_worker_loop_set_root_redirects_subsequent_query_to_the_new_root() {
         .send(GitRequest::SetRoot(p_repo.to_path_buf()))
         .unwrap();
     req_tx.send(GitRequest::Status).unwrap();
-    let resp = resp_rx
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .expect("worker must reply within 10s after SetRoot+Status");
+    let recv = || {
+        resp_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("worker must reply within 10s after SetRoot+Status")
+    };
+    // The worker first says it took the new root (#871), then answers.
+    assert_eq!(recv(), GitResponse::RootSet);
+    let resp = recv();
     match resp {
         GitResponse::Status(status) => {
             assert!(
