@@ -524,6 +524,25 @@ fn the_settings_picker_has_a_vim_mode_row() {
     assert!(app.vim.enabled, "{}", app.status);
 }
 
+/// The Settings hub has an Editor: Multi-Cursor Persistence row that shows
+/// the preference and flips it.
+#[test]
+fn the_settings_picker_has_a_multi_cursor_persist_row() {
+    let (mut app, _t) = vim_app("abc");
+    app.vim.enabled = false;
+    app.multi_cursor_persist = false;
+    app.open_settings_view();
+    let picker = app.list_picker.as_mut().expect("settings open");
+    let row = picker
+        .rows
+        .iter()
+        .position(|r| r.label.starts_with("Editor: Multi-Cursor Persistence: off"))
+        .expect("a Multi-Cursor Persistence row");
+    picker.selected = row;
+    app.confirm_list_picker();
+    assert!(app.multi_cursor_persist, "{}", app.status);
+}
+
 /// #1286 negative: a settings reload that leaves `vim_mode` as it was
 /// (a theme change, say) does not reset the mode the user is in.
 #[test]

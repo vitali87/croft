@@ -581,6 +581,10 @@ Not supported yet: transforms such as `${TM_FILENAME/(.*)\\..+$/$1/}`, a picker 
 | `Insert` | Switch between Insert and Overwrite typing for all tabs: in Overwrite a character replaces the one under the caret. The status bar shows ⎁ and the caret becomes a block |
 | `Cmd`+`/` / `Ctrl`+`/` | Toggle line comment for the current line or every line the selection touches |
 | `Shift`+`Alt`+`A` | Toggle block comment around the selection (languages with a block comment) |
+| `Alt`+`A` | Align Cursors: pad every caret's selection with spaces so that selections in one column start at the same column and are all as long as the longest, then leave them so (also Command Palette "Align Cursors"; with fewer than two carets it does nothing) |
+| `Alt`+`F` | Align Cursors (Pad Front): the same padding, all at the front, so the selected text right-aligns into one column |
+| `Ctrl`+`Alt`+`A` | Align Cursors Using Tabs: the same alignment with tabs, snapped to the buffer's own tab stops (the indent width from `.editorconfig`, detection or the status bar, not a fixed four) |
+| `Ctrl`+`Alt`+`L` | Align Line Last Cursors: pad the front of each affected line so the right-most selection end of every line lands in one column |
 | `Alt`+`Z` | Toggle soft word wrap for this file, until the file is reopened |
 | `Alt`+`O` | C/C++: Switch Header/Source: open the header of the C, C++ or Objective-C source, or the source of the header. Command id: `switch_header_source` |
 | `Cmd`/`Ctrl`+`Shift`+`V` | Markdown: Toggle Preview: switch the active Markdown tab between source and rendered view; arrows / PgUp / PgDn / Home / End / wheel scroll it |

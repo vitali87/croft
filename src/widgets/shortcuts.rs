@@ -452,6 +452,26 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_toggle_block_comment_key",
             },
             ShortcutEntry {
+                keys: "Alt+a",
+                description: "Align Cursors: pad every caret's selection into one column",
+                handler: "is_align_cursors_key",
+            },
+            ShortcutEntry {
+                keys: "Alt+f",
+                description: "Align Cursors (Pad Front): right-align every caret's selection",
+                handler: "is_align_cursors_pad_front_key",
+            },
+            ShortcutEntry {
+                keys: "Ctrl+Alt+a",
+                description: "Align Cursors Using Tabs: align every caret's selection with tabs",
+                handler: "is_align_cursors_using_tabs_key",
+            },
+            ShortcutEntry {
+                keys: "Ctrl+Alt+l",
+                description: "Align Line Last Cursors: line up the end of every affected line",
+                handler: "is_align_line_last_cursors_key",
+            },
+            ShortcutEntry {
                 keys: "Alt+Z",
                 description: "Toggle word wrap for this file",
                 handler: "is_toggle_wrap_key",
