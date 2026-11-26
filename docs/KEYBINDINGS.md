@@ -479,6 +479,7 @@ Not supported yet: transforms such as `${TM_FILENAME/(.*)\\..+$/$1/}`, a picker 
 | Click ✓ Commit | Same as `Enter` |
 | `Tab`, or `Down` on the message's last line | Move to the change list: `Up` / `Down` select, `Enter` opens the diff, `Space` or `S` stages, `U` unstages, `Backspace`, `Delete` or `D` discards (confirms first), `Tab` returns |
 | Command Palette "Git: Commit" / "Git: Push" / "Git: Pull" / "Git: Sync" / "Git: Checkout to…" / "Git: Stash" | The Commit button's and the menus' actions, each bindable in `keybindings.json` |
+| Command Palette "Git: Open Changes" / "Git: Stage Changes" / "Git: Unstage Changes" / "Git: Discard Changes" | Open the diff of, stage, unstage or discard (confirms first) the open file, or a diff tab's file. In the change list they act on the selected row and their keys are the list's own `Enter`, `S`, `U` and `D`. A file with changes in both sections unstages its staged part and stages, opens or discards its unstaged part |
 | Click a change row | Open that file's diff against HEAD in a read-only editor tab, reused on the next click. With unsaved edits, hunk actions ask for a save first |
 | `S` in a diff tab | Stage the change hunk under the cursor (click a row or `F7` to pick it), or only the selected lines when a selection spans rows |
 | `U` in a diff tab | Unstage the change hunk under the cursor, or only the selected lines when a selection spans rows |

@@ -2263,6 +2263,28 @@ commands! {
         title: "Git: Show Commit Actions",
         hint: "Cmd+K Shift+C",
     }
+    /// The open file's changes (#871), or the selected Source Control row's
+    /// while the change list has the keys; its keys are the shortcuts.
+    GitOpenChanges {
+        id: "git_open_changes",
+        title: "Git: Open Changes",
+        hint: "Enter in Source Control",
+    }
+    GitStageChanges {
+        id: "git_stage_changes",
+        title: "Git: Stage Changes",
+        hint: "S in Source Control",
+    }
+    GitUnstageChanges {
+        id: "git_unstage_changes",
+        title: "Git: Unstage Changes",
+        hint: "U in Source Control",
+    }
+    GitDiscardChanges {
+        id: "git_discard_changes",
+        title: "Git: Discard Changes",
+        hint: "D in Source Control",
+    }
     ToggleTerminalSuggestions {
         id: "toggle_terminal_suggestions",
         title: "Terminal: Toggle Command Suggestions",

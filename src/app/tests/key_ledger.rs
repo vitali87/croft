@@ -1896,6 +1896,30 @@ struct ProofPlace {
     commands: &'static [Command],
 }
 
+/// Source Control with its change list focused on the row for `path`, in
+/// the ledger's repository: where the list's own keys act (#871).
+fn scm_list_on(app: &mut App, path: &str) {
+    app.set_sidebar_view(SidebarView::SourceControl);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "git status for Source Control",
+        || {
+            app.drain_git_responses();
+            app.source_control.entries.len() == 2
+        },
+    );
+    app.source_control.list_focused = true;
+    app.source_control.selected_change = app
+        .source_control
+        .entries
+        .iter()
+        .position(|e| e.path == path);
+    assert!(
+        app.source_control.selected_change.is_some(),
+        "{path} has a row"
+    );
+}
+
 /// The places beyond the ledger's own contexts.
 const PROOF_PLACES: &[ProofPlace] = &[
     ProofPlace {
@@ -2074,6 +2098,26 @@ const PROOF_PLACES: &[ProofPlace] = &[
             Command::SearchTogglePreserveCase,
             Command::SearchToggleDetails,
         ],
+    },
+    ProofPlace {
+        context: Context {
+            name: "Source Control's change list on a new file",
+            repo: true,
+            setup: |app| scm_list_on(app, "todo.txt"),
+        },
+        commands: &[
+            Command::GitOpenChanges,
+            Command::GitStageChanges,
+            Command::GitDiscardChanges,
+        ],
+    },
+    ProofPlace {
+        context: Context {
+            name: "Source Control's change list on a staged file",
+            repo: true,
+            setup: |app| scm_list_on(app, "docs/notes.md"),
+        },
+        commands: &[Command::GitUnstageChanges],
     },
 ];
 

@@ -2936,6 +2936,97 @@ fn a_click_outside_the_commit_dropdown_closes_it_and_goes_on() {
     assert_eq!(app.status, "Refreshed Source Control");
 }
 
+/// #871 step 4: Source Control with `seed.txt` modified and `scratch.txt`
+/// new, and `seed.txt` open in the editor with the editor focused.
+fn scm_with_seed_open() -> (tempfile::TempDir, App) {
+    let (tmp, mut app) = scm_with_two_changes();
+    assert!(app.open_file_at_launch(&tmp.path().join("seed.txt")));
+    app.focus_pane(Pane::Editor);
+    (tmp, app)
+}
+
+fn staged_names(tmp: &tempfile::TempDir) -> String {
+    git_stdout(tmp.path(), &["diff", "--cached", "--name-only"])
+}
+
+/// #871 step 4: from the editor, Git: Stage Changes stages the open file
+/// and Git: Unstage Changes unstages it again, leaving the other change
+/// alone, as VS Code's do.
+#[test]
+fn git_stage_and_unstage_changes_act_on_the_open_file() {
+    use crate::widgets::command_palette::Command;
+    let (tmp, mut app) = scm_with_seed_open();
+    app.run_command(Command::GitStageChanges);
+    assert_eq!(staged_names(&tmp).trim(), "seed.txt", "{}", app.status);
+    assert!(wait_for_changes(&mut app, |a| a
+        .source_control
+        .entries
+        .iter()
+        .any(
+            |e| e.path == "seed.txt" && e.kind.section() == crate::git::ChangeSection::Staged
+        )));
+    app.run_command(Command::GitUnstageChanges);
+    assert_eq!(staged_names(&tmp).trim(), "", "{}", app.status);
+    assert!(git_stdout(tmp.path(), &["status", "--porcelain"]).contains("?? scratch.txt"));
+}
+
+/// #871 step 4: from the editor, Git: Discard Changes asks before it
+/// discards the open file, and Git: Open Changes opens its diff.
+#[test]
+fn git_discard_and_open_changes_act_on_the_open_file() {
+    use crate::widgets::command_palette::Command;
+    let (_tmp, mut app) = scm_with_seed_open();
+    app.run_command(Command::GitDiscardChanges);
+    let pending = app.pending_discard.as_ref().expect("Discard asks first");
+    assert_eq!(pending.rel_path, "seed.txt");
+    app.pending_discard = None;
+    app.run_command(Command::GitOpenChanges);
+    let diff = app
+        .editor
+        .diff
+        .as_ref()
+        .expect("Open Changes opens the diff");
+    assert!(diff.right_path.ends_with("seed.txt"));
+}
+
+/// #871 step 4: with the change list focused, the commands do exactly what
+/// the list's own keys do to the selected row, which are their shortcuts.
+#[test]
+fn git_file_commands_act_on_the_selected_row_in_the_change_list() {
+    use crate::widgets::command_palette::Command;
+    let (tmp, mut app) = scm_with_two_changes();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.source_control.list_focused);
+    let scratch = app
+        .source_control
+        .entries
+        .iter()
+        .position(|e| e.path == "scratch.txt")
+        .unwrap();
+    app.source_control.selected_change = Some(scratch);
+    app.run_command(Command::GitStageChanges);
+    assert_eq!(staged_names(&tmp).trim(), "scratch.txt", "{}", app.status);
+}
+
+/// #871 step 4: a file with nothing to stage, or no open file, says so.
+#[test]
+fn git_file_commands_say_why_they_do_nothing() {
+    use crate::widgets::command_palette::Command;
+    let (tmp, mut app) = scm_with_seed_open();
+    app.run_command(Command::GitUnstageChanges);
+    assert_eq!(app.status, "No staged changes in seed.txt");
+    std::fs::write(tmp.path().join("clean.txt"), "same\n").unwrap();
+    assert!(git_succeeds(tmp.path(), &["add", "clean.txt"]));
+    assert!(git_succeeds(tmp.path(), &["commit", "-q", "-m", "clean"]));
+    assert!(app.open_file_at_launch(&tmp.path().join("clean.txt")));
+    app.focus_pane(Pane::Editor);
+    app.run_command(Command::GitStageChanges);
+    assert_eq!(app.status, "No changes in clean.txt");
+    assert_eq!(staged_names(&tmp).trim(), "");
+}
+
 /// #871: in the list `s` stages the selected row, `u` unstages it and `d`
 /// asks before discarding it, each staying on the file it moved.
 #[test]

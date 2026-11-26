@@ -6,6 +6,27 @@ use super::*;
 use crate::widgets::confirm_frame::{ConfirmFrame, Inset, draw_confirm, yes_no_keys};
 use crate::widgets::picker_rows::{PickerMouse, answer_mouse};
 
+/// The *Git: … Changes* commands that act on one file (#871).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum GitFileCommand {
+    Open,
+    Stage,
+    Unstage,
+    Discard,
+}
+
+impl GitFileCommand {
+    /// The change list's own key for it, which is its shortcut.
+    fn key(self) -> KeyCode {
+        match self {
+            GitFileCommand::Open => KeyCode::Enter,
+            GitFileCommand::Stage => KeyCode::Char('s'),
+            GitFileCommand::Unstage => KeyCode::Char('u'),
+            GitFileCommand::Discard => KeyCode::Char('d'),
+        }
+    }
+}
+
 /// Source Control's `⋯` menu laid out (#871): its rows and top column, and
 /// the open fly-out's rows and column.
 pub(super) struct ScmMenuLayout {
@@ -1060,6 +1081,81 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// *Git: Open Changes*, *Stage Changes*, *Unstage Changes* and *Discard
+    /// Changes* (#871). While Source Control's change list has the keys they
+    /// do what its own `Enter`, `S`, `U` and `D` do to the selected row,
+    /// which are their shortcuts; anywhere else they act on the open file
+    /// (a diff tab's file), as VS Code's do. A file with a row in each
+    /// section gives Unstage its Staged row and the others its Changes row.
+    pub(super) fn git_file_command(&mut self, command: GitFileCommand) {
+        if self.focus == Pane::Tree
+            && self.sidebar_view == SidebarView::SourceControl
+            && self.source_control.list_focused
+        {
+            let key = KeyEvent::new(command.key(), KeyModifiers::NONE);
+            self.handle_source_control_list_key(key);
+            return;
+        }
+        let Some(idx) = self.open_file_change_row(command) else {
+            return;
+        };
+        match command {
+            GitFileCommand::Open => self.open_source_control_entry(idx),
+            GitFileCommand::Stage => self.stage_source_control_entry(idx),
+            GitFileCommand::Unstage => self.unstage_source_control_entry(idx),
+            GitFileCommand::Discard => self.request_discard_source_control_entry(idx),
+        }
+    }
+
+    /// The change list's row for the open file that `command` acts on, or
+    /// `None` with the status line saying why.
+    fn open_file_change_row(&mut self, command: GitFileCommand) -> Option<usize> {
+        use crate::git::ChangeSection;
+        let path = self
+            .editor
+            .diff
+            .as_ref()
+            .map(|d| d.right_path.clone())
+            .or_else(|| self.editor.path.clone());
+        let Some(path) = path else {
+            self.status = String::from("No file is open");
+            return None;
+        };
+        let root = self.scm_root();
+        let Some(rel) = path.strip_prefix(&root).ok().map(|r| {
+            r.components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/")
+        }) else {
+            self.status = format!("{} is outside the repository", path.display());
+            return None;
+        };
+        let rows: Vec<(usize, bool)> = self
+            .source_control
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.path == rel)
+            .map(|(i, e)| (i, e.kind.section() == ChangeSection::Staged))
+            .collect();
+        let staged = rows.iter().find(|(_, staged)| *staged).map(|(i, _)| *i);
+        let changed = rows.iter().find(|(_, staged)| !*staged).map(|(i, _)| *i);
+        let row = match command {
+            GitFileCommand::Unstage => staged,
+            GitFileCommand::Stage => changed,
+            GitFileCommand::Open | GitFileCommand::Discard => changed.or(staged),
+        };
+        if row.is_none() {
+            self.status = match (command, rows.is_empty()) {
+                (_, true) => format!("No changes in {rel}"),
+                (GitFileCommand::Unstage, false) => format!("No staged changes in {rel}"),
+                _ => format!("No unstaged changes in {rel}"),
+            };
+        }
+        row
     }
 
     pub(super) fn refresh_source_control(&mut self) {
