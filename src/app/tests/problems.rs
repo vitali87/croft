@@ -1681,3 +1681,75 @@ fn a_watch_batch_gets_the_build_column_conversion() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].1.col, 7, "display column 28 is the `u`, char 7");
 }
+
+/// With the bottom panel hidden, the spot where a PROBLEMS row was drawn is
+/// the editor's: a right-click there opens the editor's menu, not the hidden
+/// problem's.
+#[test]
+fn a_hidden_problems_panel_takes_no_right_click() {
+    use crate::lsp::manager::DiagnosticSeverity;
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("hello.rs");
+    let text: String = (0..60).map(|i| format!("fn f{i}() {{}}\n")).collect();
+    std::fs::write(&file, &text).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    let mut by_server = std::collections::HashMap::new();
+    by_server.insert(
+        String::from("rustc"),
+        vec![crate::lsp::manager::Diagnostic {
+            start_line: 2,
+            start_char: 3,
+            end_line: 2,
+            end_char: 6,
+            severity: DiagnosticSeverity::Warning,
+            message: String::from("function `f2` is never used"),
+            tags: Default::default(),
+            code: None,
+            origin: None,
+        }],
+    );
+    app.lsp_diagnostics.insert(file.clone(), by_server);
+    app.rebuild_problems();
+    app.bottom_panel_tab = BottomPanelTab::Problems;
+    app.focus_pane(Pane::Editor);
+    let _ = draw_buffer(&mut app, 140, 50);
+    let list = app.problems.last_area;
+    // Right of the line numbers the editor draws once it fills the spot.
+    let (x, y) = (list.x + 30, list.y + 2);
+    assert!(
+        app.problems.diagnostic_at(y).is_some(),
+        "a problem row is there"
+    );
+    app.show_terminal = false;
+    let _ = draw_buffer(&mut app, 140, 50);
+    assert!(
+        rect_contains(app.editor.last_area, x, y),
+        "the editor now covers the spot"
+    );
+    app.handle_mouse(mouse(
+        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Right),
+        x,
+        y,
+    ));
+    let labels: Vec<String> = app
+        .context_menu
+        .as_ref()
+        .map(|m| {
+            menu_labels(&m.items)
+                .into_iter()
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        !labels
+            .iter()
+            .any(|l| l.contains("Navigator") && l.contains("Fix")),
+        "the hidden problem's menu opened: {labels:?}"
+    );
+    assert!(
+        labels.iter().any(|l| l.contains("Command Palette")),
+        "the editor's menu opens there: {labels:?}"
+    );
+}

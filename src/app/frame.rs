@@ -1593,6 +1593,13 @@ impl App {
                 t.last_area = Rect::default();
                 t.redacted_on_screen = 0;
             }
+            // The panel's other views likewise: their rows would take the
+            // clicks, hover and right-clicks of the editor that now fills
+            // their cells (#2740).
+            self.problems.last_area = Rect::default();
+            self.output.last_area = Rect::default();
+            self.ports.last_area = Rect::default();
+            self.captures.last_area = Rect::default();
         }
 
         if let Some(s) = self.theme.surfaces() {
