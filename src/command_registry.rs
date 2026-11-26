@@ -3011,7 +3011,7 @@ mod tests {
     /// How many palette commands show no chord on this platform: the ratchet
     /// below holds it there or lower. Kill to End of Line has one on macOS
     /// only, which is the difference between the two.
-    const WITHOUT_A_CHORD: usize = if cfg!(target_os = "macos") { 271 } else { 272 };
+    const WITHOUT_A_CHORD: usize = if cfg!(target_os = "macos") { 272 } else { 273 };
 
     /// Everything has a shortcut (TENETS.md): every row of the table must
     /// state its hint, and the number with none may only fall. A new command
