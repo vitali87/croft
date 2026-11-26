@@ -8796,3 +8796,37 @@ fn a_short_terminal_scrolls_the_commit_dropdown_to_the_keyboards_row() {
         .collect();
     assert!(text.contains("View Changes vs "), "{text:?}");
 }
+
+/// Once Initialize Repository has made the folder a repository, the spot
+/// where its button was is the change list's (or nothing's): a click there
+/// does what is drawn there now, and never runs `git init` again (#2736).
+#[test]
+fn a_click_where_initialize_was_does_not_init_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.txt"), "x\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    let _ = draw_buffer(&mut app, 140, 50);
+    let btn = app.source_control.last_init_repo_button_area;
+    assert!(btn.width > 0, "the card offers Initialize Repository");
+    let (x, y) = (btn.x + btn.width / 2, btn.y + 1);
+    left_click(&mut app, x, y);
+    assert!(tmp.path().join(".git").is_dir(), "status: {}", app.status);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !app.source_control.status.in_repo {
+        let _ = app.drain_git_responses();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Source Control never showed the new repository"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let _ = draw_buffer(&mut app, 140, 50);
+    app.status.clear();
+    left_click(&mut app, x, y);
+    assert!(
+        !app.status.starts_with("Initialized"),
+        "a click where the button was ran git init again: {}",
+        app.status
+    );
+}

@@ -153,8 +153,11 @@ impl Widget for &mut SourceControlPanel {
             self.render_repositories_section(inner, inner.y + 2, buf);
             return;
         }
-        // Repo path: hero is only for the empty state.
+        // Repo path: the hero and the card's buttons are only for the empty
+        // state, and a button area left from its last frame would take a
+        // click meant for what is drawn there now (#2736).
         self.last_hero_area = Rect::default();
+        self.last_init_repo_button_area = Rect::default();
         self.nested_repo_button_areas.clear();
 
         // Row 2: branch row — a green branch glyph plus the branch name.
