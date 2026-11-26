@@ -229,7 +229,10 @@ fn tick_lint_gutters_and_blame(app: &mut App) -> bool {
     app.sync_git_gutters();
     app.sync_blame();
     app.sync_provenance();
-    let blame_changed = app.drain_blame() | app.drain_git_net() | app.drain_git_view();
+    let blame_changed = app.drain_blame()
+        | app.drain_git_net()
+        | app.drain_git_view()
+        | app.drain_git_file_lookup();
     crate::startup_trace::mark("lint, gutters and blame synced");
     markdown_lint_changed || sarif_diagnostics_changed || blame_changed
 }

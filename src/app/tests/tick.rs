@@ -111,6 +111,7 @@ const BACKGROUND_PASS_CALLS: &[&str] = &[
     "app.drain_blame",
     "app.drain_git_net",
     "app.drain_git_view",
+    "app.drain_git_file_lookup",
     "crate::startup_trace::mark",
     "app.sync_outline",
     "app.drain_lsp_document_symbols",
