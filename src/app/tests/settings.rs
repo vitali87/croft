@@ -939,6 +939,7 @@ fn the_unsaved_and_discard_prompts_come_from_the_catalog() {
 
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.pending_discard = Some(PendingDiscard {
+        root: std::path::PathBuf::new(),
         rel_path: String::from("a.txt"),
         untracked: false,
         staged: false,

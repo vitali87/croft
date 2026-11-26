@@ -40,6 +40,7 @@ pub(super) fn open(app: &mut App, p: Popup) -> Option<std::os::unix::net::UnixSt
         }
         Popup::DiscardConfirm => {
             app.pending_discard = Some(PendingDiscard {
+                root: std::path::PathBuf::new(),
                 rel_path: String::from("a.rs"),
                 untracked: false,
                 staged: false,

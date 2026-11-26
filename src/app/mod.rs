@@ -1177,6 +1177,8 @@ struct PendingStashDrop {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingDiscard {
+    /// The repository the discard was asked in, which it acts in.
+    root: PathBuf,
     rel_path: String,
     untracked: bool,
     staged: bool,
@@ -1571,6 +1573,12 @@ pub struct App {
     /// commit diff, a COMMITS patch): a large repo's `git show` or rename
     /// walk froze the editor when run inline. A newer click replaces it.
     git_view_job: Option<std::sync::mpsc::Receiver<GitNetDone>>,
+    /// A *Git: … Changes* command waiting on its read of the repository's
+    /// changes (#871). A newer one replaces it.
+    git_file_lookup: Option<scm::GitFileLookup>,
+    /// *Git: … Changes* commands run while one was reading, each with its
+    /// open file and folder, waiting their turn in order (#871).
+    git_file_queue: std::collections::VecDeque<(scm::GitFileCommand, PathBuf, PathBuf)>,
     /// The `vim_mode` pref as last applied (#1286). A settings reload
     /// changes the live mode only when the pref itself changed, so an
     /// unrelated edit to config.json does not reset the mode in use.
@@ -4335,6 +4343,8 @@ impl App {
             blame_hover: None,
             git_net_job: None,
             git_view_job: None,
+            git_file_lookup: None,
+            git_file_queue: std::collections::VecDeque::new(),
             vim_mode_pref: false,
             inline_blame_enabled: !loaded_prefs.disable_inline_blame,
             provenance_overlay: false,

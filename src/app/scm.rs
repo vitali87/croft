@@ -6,6 +6,40 @@ use super::*;
 use crate::widgets::confirm_frame::{ConfirmFrame, Inset, draw_confirm, yes_no_keys};
 use crate::widgets::picker_rows::{PickerMouse, answer_mouse};
 
+/// The *Git: … Changes* commands that act on one file (#871).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum GitFileCommand {
+    Open,
+    Stage,
+    Unstage,
+    Discard,
+}
+
+/// A *Git: … Changes* command run on the open file, waiting on its own
+/// read of the repository's changes (#871): Source Control's list is only
+/// kept fresh while the view is open, so the command never trusts it.
+pub(super) struct GitFileLookup {
+    command: GitFileCommand,
+    /// The open file, as the editor names it.
+    path: PathBuf,
+    /// The workspace folder whose repository was read: the reply is
+    /// dropped when Source Control has moved to another one meanwhile.
+    folder: PathBuf,
+    job: crate::jobs::Job<(crate::git::GitStatus, Vec<crate::git::ChangeEntry>)>,
+}
+
+impl GitFileCommand {
+    /// The change list's own key for it, which is its shortcut.
+    fn key(self) -> KeyCode {
+        match self {
+            GitFileCommand::Open => KeyCode::Enter,
+            GitFileCommand::Stage => KeyCode::Char('s'),
+            GitFileCommand::Unstage => KeyCode::Char('u'),
+            GitFileCommand::Discard => KeyCode::Char('d'),
+        }
+    }
+}
+
 /// Source Control's `⋯` menu laid out (#871): its rows and top column, and
 /// the open fly-out's rows and column.
 pub(super) struct ScmMenuLayout {
@@ -1062,6 +1096,193 @@ impl App {
         }
     }
 
+    /// *Git: Open Changes*, *Stage Changes*, *Unstage Changes* and *Discard
+    /// Changes* (#871). While Source Control's change list has the keys they
+    /// do what its own `Enter`, `S`, `U` and `D` do to the selected row,
+    /// which are their shortcuts; anywhere else they act on the open file
+    /// (a diff tab's file), as VS Code's do, once a fresh read of the
+    /// repository's changes lands ([`Self::drain_git_file_lookup`]). A file
+    /// with a row in each section gives Unstage its Staged row and the
+    /// others its Changes row.
+    pub(super) fn git_file_command(&mut self, command: GitFileCommand) {
+        if self.focus == Pane::Tree
+            && self.sidebar_view == SidebarView::SourceControl
+            && self.source_control.list_focused
+        {
+            let key = KeyEvent::new(command.key(), KeyModifiers::NONE);
+            self.handle_source_control_list_key(key);
+            return;
+        }
+        let Some(path) = self.open_file_path() else {
+            self.status = String::from("No file is open");
+            return;
+        };
+        let folder = self.active_scm_root.clone();
+        // One at a time, in the order they were run: each reads the changes
+        // after the one before it has acted, so Stage then Unstage sees
+        // what Stage staged. Every command joins the back of the line, and
+        // the line starts its head, so a command run while an earlier one
+        // waits (behind a discard's question, say) never jumps ahead of it.
+        self.git_file_queue.push_back((command, path, folder));
+        self.start_next_git_file_command();
+    }
+
+    /// Read `folder`'s repository's changes off the UI thread for
+    /// `command` on `path`; [`Self::drain_git_file_lookup`] finishes it.
+    fn start_git_file_lookup(&mut self, command: GitFileCommand, path: PathBuf, folder: PathBuf) {
+        let root = self
+            .git_worker_for_root(&folder)
+            .status()
+            .repo_root
+            .clone()
+            .unwrap_or_else(|| folder.clone());
+        let job = crate::jobs::Job::spawn("git-file-command", crate::jobs::Start::Now, move || {
+            (crate::git::query(&root), crate::git::query_changes(&root))
+        });
+        match job {
+            Ok(job) => {
+                self.status = String::from("Git: reading changes\u{2026}");
+                self.git_file_lookup = Some(GitFileLookup {
+                    command,
+                    path,
+                    folder,
+                    job,
+                });
+            }
+            Err(e) => self.status = format!("Could not read the changes: {e}"),
+        }
+    }
+
+    /// The file the open tab shows: a diff tab's file, the old side of a
+    /// deletion (whose new side is `/dev/null`), else the editor's file. A
+    /// deletion's view names its file relative to the repository.
+    fn open_file_path(&self) -> Option<PathBuf> {
+        let diff_file = self.editor.diff.as_ref().map(|d| {
+            if d.right_path == Path::new("/dev/null") {
+                d.left_path.clone()
+            } else {
+                d.right_path.clone()
+            }
+        });
+        let path = diff_file.or_else(|| self.editor.path.clone())?;
+        Some(if path.is_relative() {
+            self.scm_root().join(path)
+        } else {
+            path
+        })
+    }
+
+    /// Finish a *Git: … Changes* command once its read of the changes has
+    /// landed: show the fresh list and act on the open file's row. True
+    /// when something changed on screen.
+    pub(super) fn drain_git_file_lookup(&mut self) -> bool {
+        // A discard asking first holds every command: one whose read is in
+        // flight goes back to the front of the line and reads again once
+        // the question is answered, so it neither replaces the file the
+        // question is about nor acts behind it on what the read saw before
+        // the answer.
+        if self.pending_discard.is_some() {
+            if let Some(lookup) = self.git_file_lookup.take() {
+                self.git_file_queue
+                    .push_front((lookup.command, lookup.path, lookup.folder));
+            }
+            return false;
+        }
+        let started = self.start_next_git_file_command();
+        let reply = match self.git_file_lookup.as_ref().map(|l| l.job.poll()) {
+            None | Some(crate::jobs::Poll::Pending) => return started,
+            Some(crate::jobs::Poll::Done(reply)) => Some(reply),
+            // Its thread crashed, and the crash notice said so.
+            Some(crate::jobs::Poll::Died) => None,
+        };
+        let Some(lookup) = self.git_file_lookup.take() else {
+            return started;
+        };
+        self.finish_git_file_lookup(lookup, reply);
+        self.start_next_git_file_command();
+        true
+    }
+
+    /// Start the next waiting *Git: … Changes* command, unless one is still
+    /// reading or a discard is asking first: a command that ran meanwhile
+    /// would act behind the question, and a second Discard would replace
+    /// the file the open question is about. The queue moves on once the
+    /// question is answered either way. True when one started.
+    fn start_next_git_file_command(&mut self) -> bool {
+        if self.git_file_lookup.is_some() || self.pending_discard.is_some() {
+            return false;
+        }
+        let Some((command, path, folder)) = self.git_file_queue.pop_front() else {
+            return false;
+        };
+        self.start_git_file_lookup(command, path, folder);
+        true
+    }
+
+    /// Act on the open file's row in the changes `reply` read, against the
+    /// repository root that read found: before git's first status lands the
+    /// app's own idea of the root is the workspace folder, which for a
+    /// folder inside a repository is not where git's paths start.
+    fn finish_git_file_lookup(
+        &mut self,
+        lookup: GitFileLookup,
+        reply: Option<(crate::git::GitStatus, Vec<crate::git::ChangeEntry>)>,
+    ) {
+        let Some((status, entries)) = reply else {
+            self.status = String::from("Could not read the changes");
+            return;
+        };
+        if lookup.folder != self.active_scm_root {
+            self.status =
+                String::from("Git: cancelled: Source Control moved to another repository");
+            return;
+        }
+        let root = status.repo_root.clone().unwrap_or(lookup.folder);
+        let Some(rel) = relative_to_repo(&lookup.path, &root) else {
+            self.status = format!("{} is outside the repository", lookup.path.display());
+            return;
+        };
+        self.source_control.set_status(status, entries);
+        let Some(idx) = self.change_row_for(lookup.command, &rel) else {
+            return;
+        };
+        match lookup.command {
+            GitFileCommand::Open => self.open_source_control_entry_in(&root, idx),
+            GitFileCommand::Stage => self.stage_source_control_entry_in(&root, idx),
+            GitFileCommand::Unstage => self.unstage_source_control_entry_in(&root, idx),
+            GitFileCommand::Discard => self.request_discard_source_control_entry_in(&root, idx),
+        }
+    }
+
+    /// The change list's row for `rel` that `command` acts on, or `None`
+    /// with the status line saying why.
+    fn change_row_for(&mut self, command: GitFileCommand, rel: &str) -> Option<usize> {
+        use crate::git::ChangeSection;
+        let rows: Vec<(usize, bool)> = self
+            .source_control
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.path == rel)
+            .map(|(i, e)| (i, e.kind.section() == ChangeSection::Staged))
+            .collect();
+        let staged = rows.iter().find(|(_, staged)| *staged).map(|(i, _)| *i);
+        let changed = rows.iter().find(|(_, staged)| !*staged).map(|(i, _)| *i);
+        let row = match command {
+            GitFileCommand::Unstage => staged,
+            GitFileCommand::Stage => changed,
+            GitFileCommand::Open | GitFileCommand::Discard => changed.or(staged),
+        };
+        if row.is_none() {
+            self.status = match (command, rows.is_empty()) {
+                (_, true) => format!("No changes in {rel}"),
+                (GitFileCommand::Unstage, false) => format!("No staged changes in {rel}"),
+                _ => format!("No unstaged changes in {rel}"),
+            };
+        }
+        row
+    }
+
     pub(super) fn refresh_source_control(&mut self) {
         // Non-blocking: post a StatusAndChanges request and let the worker
         // reply via `git_response_rx`. The panel paints immediately from
@@ -1165,6 +1386,13 @@ impl App {
     /// (Deleted). Selection state on the panel updates so the user can
     /// see which entry the editor is bound to.
     pub fn open_source_control_entry(&mut self, entry_idx: usize) {
+        let root = self.scm_root();
+        self.open_source_control_entry_in(&root, entry_idx);
+    }
+
+    /// [`Self::open_source_control_entry`] for the repository at
+    /// `scm_root`.
+    pub(super) fn open_source_control_entry_in(&mut self, scm_root: &Path, entry_idx: usize) {
         use crate::git::ChangeKind;
         let Some(entry) = self.source_control.entries.get(entry_idx).cloned() else {
             return;
@@ -1172,7 +1400,6 @@ impl App {
         self.source_control.selected_change = Some(entry_idx);
         // Porcelain paths are toplevel-relative (#139): join and HEAD-read
         // against the repo root, never the workspace root.
-        let scm_root = self.scm_root();
         let abs = scm_root.join(&entry.path);
         let opened = match entry.kind {
             // A conflicted entry opens the three-way MERGE EDITOR (#253)
@@ -1213,9 +1440,9 @@ impl App {
             // HEAD:lib` is "bad object"): show what moved in it, read-only,
             // the way a commit's patch opens (#1235).
             ChangeKind::Modified | ChangeKind::StagedModified
-                if crate::git::is_submodule(&scm_root, &entry.path) =>
+                if crate::git::is_submodule(scm_root, &entry.path) =>
             {
-                match crate::git::submodule_diff(&scm_root, &entry.path) {
+                match crate::git::submodule_diff(scm_root, &entry.path) {
                     Ok(text) => {
                         let label = format!("{} (submodule)", entry.path);
                         match self.editor.open_text_buffer(Path::new(&label), &text) {
@@ -1240,7 +1467,7 @@ impl App {
                 // so a windows-1252 or UTF-16 file diffs too (#1242).
                 let enc = self.open_tab_encoding(&abs);
                 let texts =
-                    crate::git::read_bytes_at_head(&scm_root, &entry.path).and_then(|head| {
+                    crate::git::read_bytes_at_head(scm_root, &entry.path).and_then(|head| {
                         let working = std::fs::read(&abs).map_err(|e| e.to_string())?;
                         let decode = |b: &[u8]| crate::widgets::editor::decode_blob(b, enc);
                         decode(&head)
@@ -1297,7 +1524,7 @@ impl App {
                 // blob as a one-sided unified diff so every removed
                 // line is visible in red, matching `git diff` output
                 // for a deletion.
-                match crate::git::read_file_at_head(&scm_root, &entry.path) {
+                match crate::git::read_file_at_head(scm_root, &entry.path) {
                     Ok(head_text) => {
                         let label = std::path::PathBuf::from(&entry.path);
                         match self.editor.open_deleted_diff_with_text(&label, &head_text) {
@@ -1698,13 +1925,19 @@ impl App {
     /// Unstage a single entry by index (the inline "−" icon on a staged
     /// row). Mirror of `stage_source_control_entry`.
     pub fn unstage_source_control_entry(&mut self, entry_idx: usize) {
+        let root = self.scm_root();
+        self.unstage_source_control_entry_in(&root, entry_idx);
+    }
+
+    /// [`Self::unstage_source_control_entry`] in the repository at `root`.
+    pub(super) fn unstage_source_control_entry_in(&mut self, root: &Path, entry_idx: usize) {
         if self.repo_git_busy() {
             return;
         }
         let Some(entry) = self.source_control.entries.get(entry_idx).cloned() else {
             return;
         };
-        match crate::git::unstage_path(&self.scm_root(), &entry.path) {
+        match crate::git::unstage_path(root, &entry.path) {
             Ok(()) => {
                 self.status = format!("Unstaged {}", entry.path);
                 self.active_git_bypass_debounce();
@@ -2968,13 +3201,19 @@ impl App {
     }
 
     pub fn stage_source_control_entry(&mut self, entry_idx: usize) {
+        let root = self.scm_root();
+        self.stage_source_control_entry_in(&root, entry_idx);
+    }
+
+    /// [`Self::stage_source_control_entry`] in the repository at `root`.
+    pub(super) fn stage_source_control_entry_in(&mut self, root: &Path, entry_idx: usize) {
         if self.repo_git_busy() {
             return;
         }
         let Some(entry) = self.source_control.entries.get(entry_idx).cloned() else {
             return;
         };
-        match crate::git::stage_path(&self.scm_root(), &entry.path) {
+        match crate::git::stage_path(root, &entry.path) {
             Ok(()) => {
                 self.status = format!("Staged {}", entry.path);
                 self.active_git_bypass_debounce();
@@ -3109,22 +3348,7 @@ impl App {
     /// `repo/sub` sent `x` for `sub/x`, and every hunk action failed or hit
     /// a same-named file at the top level.
     pub(super) fn repo_relative_path(&self, path: &Path) -> Option<String> {
-        let root = self.scm_root();
-        let rel = match path.strip_prefix(&root) {
-            Ok(rel) => rel.to_path_buf(),
-            Err(_) => path
-                .canonicalize()
-                .ok()?
-                .strip_prefix(root.canonicalize().ok()?)
-                .ok()?
-                .to_path_buf(),
-        };
-        Some(
-            rel.components()
-                .map(|c| c.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("/"),
-        )
+        relative_to_repo(path, &self.scm_root())
     }
 
     /// Stage only the hunk under the diff caret (`git apply --cached`).
@@ -3239,6 +3463,17 @@ impl App {
     }
 
     pub fn request_discard_source_control_entry(&mut self, entry_idx: usize) {
+        let root = self.scm_root();
+        self.request_discard_source_control_entry_in(&root, entry_idx);
+    }
+
+    /// [`Self::request_discard_source_control_entry`] in the repository at
+    /// `root`, which the confirmed discard then acts in.
+    pub(super) fn request_discard_source_control_entry_in(
+        &mut self,
+        root: &Path,
+        entry_idx: usize,
+    ) {
         use crate::git::ChangeKind;
         let Some(entry) = self.source_control.entries.get(entry_idx).cloned() else {
             return;
@@ -3252,6 +3487,7 @@ impl App {
                 | ChangeKind::StagedRenamed
         );
         self.pending_discard = Some(PendingDiscard {
+            root: root.to_path_buf(),
             rel_path: entry.path,
             untracked,
             staged,
@@ -3262,7 +3498,7 @@ impl App {
         let Some(pd) = self.pending_discard.take() else {
             return;
         };
-        match crate::git::discard_path(&self.scm_root(), &pd.rel_path, pd.untracked, pd.staged) {
+        match crate::git::discard_path(&pd.root, &pd.rel_path, pd.untracked, pd.staged) {
             Ok(()) => {
                 self.status = format!("Discarded {}", pd.rel_path);
                 self.active_git_bypass_debounce();
@@ -4162,4 +4398,26 @@ impl App {
             .find(|e| e.diff.is_none() && e.path.as_deref() == Some(path))
             .map_or(encoding_rs::UTF_8, |e| e.encoding)
     }
+}
+
+/// `path` as git names it in the repository at `root`: relative, with `/`
+/// between parts. A workspace opened through a symlink (macOS's `/var` is
+/// `/private/var`) names the file one way and git's root the other, so a
+/// path outside `root` as spelled is retried with both resolved.
+pub(super) fn relative_to_repo(path: &Path, root: &Path) -> Option<String> {
+    let rel = match path.strip_prefix(root) {
+        Ok(rel) => rel.to_path_buf(),
+        Err(_) => path
+            .canonicalize()
+            .ok()?
+            .strip_prefix(root.canonicalize().ok()?)
+            .ok()?
+            .to_path_buf(),
+    };
+    Some(
+        rel.components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
 }

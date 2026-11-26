@@ -238,7 +238,7 @@ editor | ctrl+shift+l | caret=4:13 sel=4:8-4:13 carets=1:35-1:40,5:7-5:12,6:19-6
 editor | ctrl+shift+m | focus=panel panel=Problems
 editor | ctrl+shift+n | -
 editor | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-editor | ctrl+shift+p | status="Command Palette: 389 commands — Esc to close" +palette("" @0 > "Move Line Up")
+editor | ctrl+shift+p | status="Command Palette: 393 commands — Esc to close" +palette("" @0 > "Move Line Up")
 editor | ctrl+shift+pagedown | status="Move: the editor is already the last tab"
 editor | ctrl+shift+pageup | status="Move: the editor is already the first tab"
 editor | ctrl+shift+r | focus=side side=Remote
@@ -259,6 +259,7 @@ editor | ctrl+w | tabs=*untitled text=0L#811c9dc5 caret=0:0 status="Closed tab"
 editor | ctrl+x | -
 editor | ctrl+y y | status="Yanked 1 line" clip="    let total = add(1, 2);\n"
 editor | ctrl+z | status="Nothing to undo"
+editor | d | tabs=*● main.rs text=15L#6c17b2f4 caret=4:9
 editor | delete | tabs=*● main.rs text=15L#39142b54
 editor | down | caret=5:8
 editor | down enter | tabs=*● main.rs text=16L#e5b3b506 caret=6:4
@@ -507,7 +508,7 @@ selection | ctrl+shift+l | carets=1:35-1:40,5:7-5:12,6:19-6:24 status="Selected 
 selection | ctrl+shift+m | focus=panel panel=Problems
 selection | ctrl+shift+n | -
 selection | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-selection | ctrl+shift+p | status="Command Palette: 389 commands — Esc to close" +palette("" @0 > "Move Line Up")
+selection | ctrl+shift+p | status="Command Palette: 393 commands — Esc to close" +palette("" @0 > "Move Line Up")
 selection | ctrl+shift+pagedown | status="Move: the editor is already the last tab"
 selection | ctrl+shift+pageup | status="Move: the editor is already the first tab"
 selection | ctrl+shift+r | focus=side side=Remote
@@ -528,6 +529,7 @@ selection | ctrl+w | tabs=*untitled text=0L#811c9dc5 caret=0:0 sel=- status="Clo
 selection | ctrl+x | tabs=*● main.rs text=15L#bb0bf786 caret=4:8 sel=- status="Cut 5 chars to clipboard" clip="total"
 selection | ctrl+y y | status="Yanked 1 line" clip="    let total = add(1, 2);\n"
 selection | ctrl+z | status="Nothing to undo"
+selection | d | tabs=*● main.rs text=15L#9ccd3884 caret=4:9 sel=-
 selection | delete | tabs=*● main.rs text=15L#bb0bf786 caret=4:8 sel=-
 selection | down | caret=5:13 sel=-
 selection | down enter | tabs=*● main.rs text=16L#922519de caret=6:4 sel=-
@@ -776,7 +778,7 @@ explorer | ctrl+shift+l | -
 explorer | ctrl+shift+m | focus=panel panel=Problems
 explorer | ctrl+shift+n | +prompt("New Folder in ." "")
 explorer | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-explorer | ctrl+shift+p | status="Command Palette: 389 commands — Esc to close" +palette("" @0 > "Move Line Up")
+explorer | ctrl+shift+p | status="Command Palette: 393 commands — Esc to close" +palette("" @0 > "Move Line Up")
 explorer | ctrl+shift+pagedown | tree=./+,.vscode/,docs/,main.rs > main.rs marked=.,.vscode,docs,main.rs
 explorer | ctrl+shift+pageup | tree=./+,.vscode/,docs/,main.rs > . marked=.
 explorer | ctrl+shift+r | side=Remote
@@ -796,6 +798,7 @@ explorer | ctrl+v | status="Explorer clipboard is empty"
 explorer | ctrl+w | -
 explorer | ctrl+x | status="Cut 1 item"
 explorer | ctrl+y y | -
+explorer | d | -
 explorer | delete | +input("Move 'main.rs' to Trash?" "" @0)
 explorer | down | -
 explorer | down enter | focus=editor status="Opened <root>/main.rs"
@@ -1044,7 +1047,7 @@ terminal | ctrl+shift+l | typed=0:"\u{c}"
 terminal | ctrl+shift+m | panel=Problems
 terminal | ctrl+shift+n | typed=0:"\u{e}"
 terminal | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-terminal | ctrl+shift+p | status="Command Palette: 389 commands — Esc to close" +palette("" @0 > "Move Line Up")
+terminal | ctrl+shift+p | status="Command Palette: 393 commands — Esc to close" +palette("" @0 > "Move Line Up")
 terminal | ctrl+shift+pagedown | -
 terminal | ctrl+shift+pageup | -
 terminal | ctrl+shift+r | focus=side side=Remote
@@ -1065,6 +1068,7 @@ terminal | ctrl+w | typed=0:"\u{17}"
 terminal | ctrl+x | typed=0:"\u{18}"
 terminal | ctrl+y y | typed=0:"\u{19}y"
 terminal | ctrl+z | typed=0:"\u{1a}"
+terminal | d | typed=0:"d"
 terminal | delete | typed=0:"\u{1b}[3~"
 terminal | down | typed=0:"\u{1b}[B"
 terminal | down enter | typed=0:"\u{1b}[B\r"
@@ -1313,7 +1317,7 @@ search | ctrl+shift+l | status="Search: unhandled Ctrl+L"
 search | ctrl+shift+m | focus=panel panel=Problems search="total" hits=4@0
 search | ctrl+shift+n | status="Search: unhandled Ctrl+N"
 search | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-search | ctrl+shift+p | status="Command Palette: 389 commands — Esc to close" +palette("" @0 > "Move Line Up")
+search | ctrl+shift+p | status="Command Palette: 393 commands — Esc to close" +palette("" @0 > "Move Line Up")
 search | ctrl+shift+pagedown | -
 search | ctrl+shift+pageup | -
 search | ctrl+shift+r | side=Remote search="total" hits=4@0
@@ -1334,6 +1338,7 @@ search | ctrl+w | status="Search: unhandled Ctrl+w"
 search | ctrl+x | -
 search | ctrl+y y | status="Search: unhandled Ctrl+y" search="totaly" @Query:6 hits=0@0
 search | ctrl+z | status="Search: unhandled Ctrl+z"
+search | d | search="totald" @Query:6 hits=0@0
 search | delete | -
 search | down | search="total" @Query:5 hits=4@1
 search | down enter | focus=editor status="Opened main.rs at line 5" search="total" hits=4@1
@@ -1582,7 +1587,7 @@ scm | ctrl+shift+l | -
 scm | ctrl+shift+m | focus=panel panel=Problems scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
 scm | ctrl+shift+n | -
 scm | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-scm | ctrl+shift+p | status="Command Palette: 389 commands — Esc to close" +palette("" @0 > "Move Line Up")
+scm | ctrl+shift+p | status="Command Palette: 393 commands — Esc to close" +palette("" @0 > "Move Line Up")
 scm | ctrl+shift+pagedown | -
 scm | ctrl+shift+pageup | -
 scm | ctrl+shift+r | side=Remote scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
@@ -1603,6 +1608,7 @@ scm | ctrl+w | -
 scm | ctrl+x | -
 scm | ctrl+y y | scm="Ship ity"@8 +focus StagedModified:docs/notes.md Untracked:todo.txt
 scm | ctrl+z | -
+scm | d | scm="Ship itd"@8 +focus StagedModified:docs/notes.md Untracked:todo.txt
 scm | delete | -
 scm | down | scm="Ship it"@7 +focus +list sel=0 multi=0 StagedModified:docs/notes.md Untracked:todo.txt
 scm | down enter | focus=editor tabs=main.rs,*notes.md (HEAD) ↔ notes.md text=0L#811c9dc5 caret=0:0 scm="Ship it"@7 +list sel=0 multi=0 StagedModified:docs/notes.md Untracked:todo.txt
@@ -1875,6 +1881,7 @@ palette | ctrl+w | -
 palette | ctrl+x | -
 palette | ctrl+y y | ~palette("y" @1 > "View: Toggle Primary Side Bar")
 palette | ctrl+z | -
+palette | d | ~palette("d" @1 > "Delete Line")
 palette | delete | -
 palette | down | ~palette("" @0 > "Move Line Down")
 palette | down enter | tabs=*● main.rs text=15L#1cf61342 caret=5:8 status="" -palette
@@ -2147,6 +2154,7 @@ confirm | ctrl+w | -
 confirm | ctrl+x | -
 confirm | ctrl+y y | -
 confirm | ctrl+z | -
+confirm | d | +quit -unsaved
 confirm | delete | -
 confirm | down | -
 confirm | down enter | tabs=*main.rs files=27L#afbd942b +quit -unsaved

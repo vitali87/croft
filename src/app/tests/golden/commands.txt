@@ -388,85 +388,89 @@
 385 | GitStash | git_stash | Git: Stash |  |  |  |
 386 | GitShowSourceControlActions | git_show_source_control_actions | Git: Show Source Control Actions |  | Cmd+K Shift+A | Ctrl+K Shift+A |
 387 | GitShowCommitActions | git_show_commit_actions | Git: Show Commit Actions |  | Cmd+K Shift+C | Ctrl+K Shift+C |
-388 | ToggleTerminalSuggestions | toggle_terminal_suggestions | Terminal: Toggle Command Suggestions |  |  |  | skips-the-shell
-389 | ToggleScreenReader | toggle_screen_reader | Accessibility: Toggle Screen Reader Mode |  |  |  |
-390 | OpenKeyboardShortcuts | open_keyboard_shortcuts | Preferences: Open Keyboard Shortcuts |  | Cmd+K Cmd+S | Ctrl+K Ctrl+S |
-391 | SwitchProfile | switch_profile | Profiles: Switch Profile |  |  |  |
-392 | ToggleInlineSuggestions | toggle_inline_suggestions | Editor: Toggle Inline Suggestions |  | Cmd+K Shift+G | Ctrl+K Shift+G |
-393 | StepOver | step_over | Debug: Step Over |  | F10 | F10 |
-394 | ContinueDebugging | continue | Debug: Continue |  | F5 | F5 |
-395 | StepInto | step_into | Debug: Step Into |  | F11 | F11 |
-396 | StepOut | step_out | Debug: Step Out |  | Shift+F11 | Shift+F11 |
-397 | StepIntoTarget | step_into_target | Debug: Step Into Target |  |  |  |
-398 | ToggleRaisedExceptions | toggle_raised_exceptions | Debug: Toggle Break on Raised Exceptions |  | Alt+F9 | Alt+F9 |
-399 | AttachPythonProcess | attach_python_process | Debug: Attach to Python Process |  | Ctrl+F5 | Ctrl+F5 |
-400 | RunTask | run_task | Tasks: Run Task |  |  |  |
-401 | RunBuildTask | run_build_task | Tasks: Run Build Task |  | Cmd+Shift+B | Ctrl+Shift+B |
-402 | RerunLastTask | rerun_last_task | Tasks: Rerun Last Task |  |  |  |
-403 | ColorTheme | color_theme | Preferences: Color Theme |  | Cmd+K Cmd+T | Ctrl+K Ctrl+T |
-404 | KeyboardShortcuts | keyboard_shortcuts | Help: Keyboard Shortcuts Reference |  | F1 | F1 |
-405 | UpdateCroft | update_croft | Help: Update croft (Relaunch or Rebuild) |  | Cmd+Shift+F9 | Ctrl+Shift+F9 |
-406 | OpenSettings | open_settings | Preferences: Open Settings |  |  |  |
-407 | OpenSettingsEditor | open_settings_editor | Preferences: Open Settings (UI) |  |  |  |
-408 | OpenSettingsJson | open_settings_json | Preferences: Open Settings (JSON) |  |  |  |
-409 | OpenWorkspaceSettingsJson | open_workspace_settings_json | Preferences: Open Workspace Settings (JSON) |  |  |  |
-410 | OpenWorkspaceSettingsLocalJson | open_workspace_settings_local_json | Preferences: Open Workspace Settings — Local (JSON) |  |  |  |
-411 | OpenKeybindingsJson | open_keybindings_json | Preferences: Open Keyboard Shortcuts (JSON) |  |  |  |
-412 | ConfigureSnippets | configure_snippets | Preferences: Configure User Snippets |  |  |  |
-413 | OpenTriggersJson | open_triggers_json | Preferences: Open Terminal Triggers (JSON) |  |  |  |
-414 | OpenAgentsJson | open_agents_json | Preferences: Open Agent Lanes (JSON) |  |  |  |
-415 | OpenMatchersJson | open_matchers_json | Preferences: Open Problem Matchers (JSON) |  |  |  |
-416 | ToggleTerminalTimestamps | toggle_terminal_timestamps | Terminal: Toggle Timestamps |  |  |  | skips-the-shell
-417 | ToggleLogHighlight | toggle_log_highlight | Log: Toggle Highlighting (tailspin) |  |  |  |
-418 | CollapseTerminalPane | collapse_terminal_pane | Terminal: Collapse Pane |  | Cmd+K [ | Ctrl+K [ | skips-the-shell
-419 | RestoreTerminalPanes | restore_terminal_panes | Terminal: Restore All Collapsed Panes |  | Cmd+K ] | Ctrl+K ] | skips-the-shell
-420 | ToggleSecretRedaction | toggle_secret_redaction | Terminal: Toggle Secret Redaction |  |  |  | skips-the-shell
-421 | RevealRedactedSecrets | reveal_redacted_secrets | Terminal: Reveal Redacted Secrets for 10s |  |  |  | skips-the-shell
-422 | SearchFromTerminal | search_from_terminal | Terminal: Search & Replace from Last grep/rg |  |  |  | skips-the-shell
-423 | SessionParticipants | session_participants | Session: Participants |  | Cmd+K A | Ctrl+K A |
-424 | SessionDetach | session_detach | Session: Detach |  | Cmd+K Shift+Q | Ctrl+K Shift+Q |
-425 | CollabCancelStream | collab_cancel_stream | Collab: Cancel AI Stream |  | Cmd+K X | Ctrl+K X |
-426 | AskNavigator | navigator_ask | Navigator: Ask About Line or Selection |  | Cmd+K Q | Ctrl+K Q |
-427 | AskNavigatorAboutCapture | captures_ask_navigator | Captures: Ask Navigator About This Line |  |  |  |
-428 | OpenWorkspaceOnSshHost | remote_open_workspace_on_ssh_host | Remote: Open Workspace on This Pane's Host |  |  |  |
-429 | ScrubHistory | scm_scrub_history | Source Control: Scrub History |  |  |  |
-430 | DebugInstallDelve | debug_install_delve | Debug: Install Go Debugger (delve) |  |  |  |
-431 | RemoteSyncConfigNow | remote_sync_config_now | Remote: Sync Config Now |  |  |  |
-432 | DropToLocal | drop_to_local | Remote: Drop to Local |  | Cmd+K L | Ctrl+K L |
-433 | StopAutoApprove | agents_stop_auto_approve | Agents: Stop Auto-Approving |  |  |  |
-434 | ScrubOpenHere | scm_scrub_open_here | Source Control: Open Scrubbed File Here |  |  |  |
-435 | ScrubDiffToWorkingTree | scm_scrub_diff_working_tree | Source Control: Diff Scrubbed File to Working Tree |  |  |  |
-436 | FleetRun | terminal_fleet_run | Terminal: Fleet Run |  |  |  | skips-the-shell
-437 | OpenAsSymbolTab | editor_open_symbol_tab | Editor: Open Symbol as Its Own Tab |  | Cmd+K Shift+V | Ctrl+K Shift+V |
-438 | LoadReviewThreads | review_load_threads | Review: Load PR Comments for This File |  |  |  |
-439 | ReviewAddComment | review_add_comment | Review: Add Comment on This Line |  |  |  |
-440 | ReviewSubmit | review_submit | Review: Submit Review |  |  |  |
-441 | ReviewToggleResolved | review_toggle_resolved | Review: Resolve or Unresolve Thread |  |  |  |
-442 | ReviewDiscardPending | review_discard_pending | Review: Discard Pending Comments |  |  |  |
-443 | ExportCommentsToPr | scm_export_comments_to_pr | Source Control: Export Comments to Pull Request |  |  |  |
-444 | NoteAdd | note_add | Notes: Add Note on This Line |  | Cmd+K N | Ctrl+K N |
-445 | NoteDelete | note_delete | Notes: Delete Note |  |  |  |
-446 | ToggleSessionRecording | session_toggle_recording | Session: Record Terminal as Asciicast |  |  |  |
-447 | NewWorktreeLane | agent_new_worktree_lane | Agent: New Worktree Lane |  | Cmd+K Shift+L | Ctrl+K Shift+L |
-448 | ReviewPullRequest | review_pull_request | Source Control: Review Pull Request |  |  |  |
-449 | CloseWorktreeLane | agent_close_worktree_lane | Agent: Close Worktree Lane |  |  |  |
-450 | DiffWorktreeLane | agent_diff_worktree_lane | Agent: Diff Lane Against Its Base |  |  |  |
-451 | MarkAgentLaneReviewed | agents_mark_reviewed | Agents: Mark Changed Files Reviewed |  |  |  |
-452 | ShowAgentLane | agents_show_lane | Agents: Show Changed Files |  |  |  |
-453 | OpenAgentLaneSection | agents_open_lane | Agents: Open Agent Lane |  |  |  |
-454 | MarkAgentFileReviewed | agents_mark_file_reviewed | Agents: Mark This File Reviewed |  |  |  |
-455 | DiffAgentFileSinceReview | agents_diff_since_review | Agents: Diff This File Since Review |  |  |  |
-456 | PickAgentLaneFile | agents_pick_changed_file | Agents: Review a Changed File… |  |  |  |
-457 | FixProblemWithNavigator | problems_fix_navigator | Problems: Fix With Navigator |  |  |  |
-458 | SendHttpRequest | http_send_request | HTTP: Send Request Under Caret |  | Cmd+Enter | Ctrl+Enter |
-459 | CopyHttpRequestAsCurl | http_copy_curl | HTTP: Copy Request as curl |  |  |  |
-460 | SwitchHttpEnvironment | http_switch_environment | HTTP: Switch Environment |  |  |  |
-461 | YieldToNavigator | navigator_yield | Navigator: Yield the Turn |  | Cmd+K Y | Ctrl+K Y |
-462 | ToggleNavigator | navigator_toggle | Navigator: Activate or Deactivate |  |  |  |
-463 | ClearNavigatorNotes | navigator_clear_notes | Navigator: Clear Comments |  |  |  |
-464 | ToggleProactiveNavigator | navigator_toggle_proactive | Navigator: Toggle Proactive Comments |  |  |  |
-465 | NextComment | navigator_next_comment | Navigator: Next Comment |  | F4 | F4 |
-466 | IgnoreComment | navigator_ignore_comment | Navigator: Ignore Comment |  | Shift+F4 | Shift+F4 |
+388 | GitOpenChanges | git_open_changes | Git: Open Changes |  | Enter in Source Control | Enter in Source Control |
+389 | GitStageChanges | git_stage_changes | Git: Stage Changes |  | S in Source Control | S in Source Control |
+390 | GitUnstageChanges | git_unstage_changes | Git: Unstage Changes |  | U in Source Control | U in Source Control |
+391 | GitDiscardChanges | git_discard_changes | Git: Discard Changes |  | D in Source Control | D in Source Control |
+392 | ToggleTerminalSuggestions | toggle_terminal_suggestions | Terminal: Toggle Command Suggestions |  |  |  | skips-the-shell
+393 | ToggleScreenReader | toggle_screen_reader | Accessibility: Toggle Screen Reader Mode |  |  |  |
+394 | OpenKeyboardShortcuts | open_keyboard_shortcuts | Preferences: Open Keyboard Shortcuts |  | Cmd+K Cmd+S | Ctrl+K Ctrl+S |
+395 | SwitchProfile | switch_profile | Profiles: Switch Profile |  |  |  |
+396 | ToggleInlineSuggestions | toggle_inline_suggestions | Editor: Toggle Inline Suggestions |  | Cmd+K Shift+G | Ctrl+K Shift+G |
+397 | StepOver | step_over | Debug: Step Over |  | F10 | F10 |
+398 | ContinueDebugging | continue | Debug: Continue |  | F5 | F5 |
+399 | StepInto | step_into | Debug: Step Into |  | F11 | F11 |
+400 | StepOut | step_out | Debug: Step Out |  | Shift+F11 | Shift+F11 |
+401 | StepIntoTarget | step_into_target | Debug: Step Into Target |  |  |  |
+402 | ToggleRaisedExceptions | toggle_raised_exceptions | Debug: Toggle Break on Raised Exceptions |  | Alt+F9 | Alt+F9 |
+403 | AttachPythonProcess | attach_python_process | Debug: Attach to Python Process |  | Ctrl+F5 | Ctrl+F5 |
+404 | RunTask | run_task | Tasks: Run Task |  |  |  |
+405 | RunBuildTask | run_build_task | Tasks: Run Build Task |  | Cmd+Shift+B | Ctrl+Shift+B |
+406 | RerunLastTask | rerun_last_task | Tasks: Rerun Last Task |  |  |  |
+407 | ColorTheme | color_theme | Preferences: Color Theme |  | Cmd+K Cmd+T | Ctrl+K Ctrl+T |
+408 | KeyboardShortcuts | keyboard_shortcuts | Help: Keyboard Shortcuts Reference |  | F1 | F1 |
+409 | UpdateCroft | update_croft | Help: Update croft (Relaunch or Rebuild) |  | Cmd+Shift+F9 | Ctrl+Shift+F9 |
+410 | OpenSettings | open_settings | Preferences: Open Settings |  |  |  |
+411 | OpenSettingsEditor | open_settings_editor | Preferences: Open Settings (UI) |  |  |  |
+412 | OpenSettingsJson | open_settings_json | Preferences: Open Settings (JSON) |  |  |  |
+413 | OpenWorkspaceSettingsJson | open_workspace_settings_json | Preferences: Open Workspace Settings (JSON) |  |  |  |
+414 | OpenWorkspaceSettingsLocalJson | open_workspace_settings_local_json | Preferences: Open Workspace Settings — Local (JSON) |  |  |  |
+415 | OpenKeybindingsJson | open_keybindings_json | Preferences: Open Keyboard Shortcuts (JSON) |  |  |  |
+416 | ConfigureSnippets | configure_snippets | Preferences: Configure User Snippets |  |  |  |
+417 | OpenTriggersJson | open_triggers_json | Preferences: Open Terminal Triggers (JSON) |  |  |  |
+418 | OpenAgentsJson | open_agents_json | Preferences: Open Agent Lanes (JSON) |  |  |  |
+419 | OpenMatchersJson | open_matchers_json | Preferences: Open Problem Matchers (JSON) |  |  |  |
+420 | ToggleTerminalTimestamps | toggle_terminal_timestamps | Terminal: Toggle Timestamps |  |  |  | skips-the-shell
+421 | ToggleLogHighlight | toggle_log_highlight | Log: Toggle Highlighting (tailspin) |  |  |  |
+422 | CollapseTerminalPane | collapse_terminal_pane | Terminal: Collapse Pane |  | Cmd+K [ | Ctrl+K [ | skips-the-shell
+423 | RestoreTerminalPanes | restore_terminal_panes | Terminal: Restore All Collapsed Panes |  | Cmd+K ] | Ctrl+K ] | skips-the-shell
+424 | ToggleSecretRedaction | toggle_secret_redaction | Terminal: Toggle Secret Redaction |  |  |  | skips-the-shell
+425 | RevealRedactedSecrets | reveal_redacted_secrets | Terminal: Reveal Redacted Secrets for 10s |  |  |  | skips-the-shell
+426 | SearchFromTerminal | search_from_terminal | Terminal: Search & Replace from Last grep/rg |  |  |  | skips-the-shell
+427 | SessionParticipants | session_participants | Session: Participants |  | Cmd+K A | Ctrl+K A |
+428 | SessionDetach | session_detach | Session: Detach |  | Cmd+K Shift+Q | Ctrl+K Shift+Q |
+429 | CollabCancelStream | collab_cancel_stream | Collab: Cancel AI Stream |  | Cmd+K X | Ctrl+K X |
+430 | AskNavigator | navigator_ask | Navigator: Ask About Line or Selection |  | Cmd+K Q | Ctrl+K Q |
+431 | AskNavigatorAboutCapture | captures_ask_navigator | Captures: Ask Navigator About This Line |  |  |  |
+432 | OpenWorkspaceOnSshHost | remote_open_workspace_on_ssh_host | Remote: Open Workspace on This Pane's Host |  |  |  |
+433 | ScrubHistory | scm_scrub_history | Source Control: Scrub History |  |  |  |
+434 | DebugInstallDelve | debug_install_delve | Debug: Install Go Debugger (delve) |  |  |  |
+435 | RemoteSyncConfigNow | remote_sync_config_now | Remote: Sync Config Now |  |  |  |
+436 | DropToLocal | drop_to_local | Remote: Drop to Local |  | Cmd+K L | Ctrl+K L |
+437 | StopAutoApprove | agents_stop_auto_approve | Agents: Stop Auto-Approving |  |  |  |
+438 | ScrubOpenHere | scm_scrub_open_here | Source Control: Open Scrubbed File Here |  |  |  |
+439 | ScrubDiffToWorkingTree | scm_scrub_diff_working_tree | Source Control: Diff Scrubbed File to Working Tree |  |  |  |
+440 | FleetRun | terminal_fleet_run | Terminal: Fleet Run |  |  |  | skips-the-shell
+441 | OpenAsSymbolTab | editor_open_symbol_tab | Editor: Open Symbol as Its Own Tab |  | Cmd+K Shift+V | Ctrl+K Shift+V |
+442 | LoadReviewThreads | review_load_threads | Review: Load PR Comments for This File |  |  |  |
+443 | ReviewAddComment | review_add_comment | Review: Add Comment on This Line |  |  |  |
+444 | ReviewSubmit | review_submit | Review: Submit Review |  |  |  |
+445 | ReviewToggleResolved | review_toggle_resolved | Review: Resolve or Unresolve Thread |  |  |  |
+446 | ReviewDiscardPending | review_discard_pending | Review: Discard Pending Comments |  |  |  |
+447 | ExportCommentsToPr | scm_export_comments_to_pr | Source Control: Export Comments to Pull Request |  |  |  |
+448 | NoteAdd | note_add | Notes: Add Note on This Line |  | Cmd+K N | Ctrl+K N |
+449 | NoteDelete | note_delete | Notes: Delete Note |  |  |  |
+450 | ToggleSessionRecording | session_toggle_recording | Session: Record Terminal as Asciicast |  |  |  |
+451 | NewWorktreeLane | agent_new_worktree_lane | Agent: New Worktree Lane |  | Cmd+K Shift+L | Ctrl+K Shift+L |
+452 | ReviewPullRequest | review_pull_request | Source Control: Review Pull Request |  |  |  |
+453 | CloseWorktreeLane | agent_close_worktree_lane | Agent: Close Worktree Lane |  |  |  |
+454 | DiffWorktreeLane | agent_diff_worktree_lane | Agent: Diff Lane Against Its Base |  |  |  |
+455 | MarkAgentLaneReviewed | agents_mark_reviewed | Agents: Mark Changed Files Reviewed |  |  |  |
+456 | ShowAgentLane | agents_show_lane | Agents: Show Changed Files |  |  |  |
+457 | OpenAgentLaneSection | agents_open_lane | Agents: Open Agent Lane |  |  |  |
+458 | MarkAgentFileReviewed | agents_mark_file_reviewed | Agents: Mark This File Reviewed |  |  |  |
+459 | DiffAgentFileSinceReview | agents_diff_since_review | Agents: Diff This File Since Review |  |  |  |
+460 | PickAgentLaneFile | agents_pick_changed_file | Agents: Review a Changed File… |  |  |  |
+461 | FixProblemWithNavigator | problems_fix_navigator | Problems: Fix With Navigator |  |  |  |
+462 | SendHttpRequest | http_send_request | HTTP: Send Request Under Caret |  | Cmd+Enter | Ctrl+Enter |
+463 | CopyHttpRequestAsCurl | http_copy_curl | HTTP: Copy Request as curl |  |  |  |
+464 | SwitchHttpEnvironment | http_switch_environment | HTTP: Switch Environment |  |  |  |
+465 | YieldToNavigator | navigator_yield | Navigator: Yield the Turn |  | Cmd+K Y | Ctrl+K Y |
+466 | ToggleNavigator | navigator_toggle | Navigator: Activate or Deactivate |  |  |  |
+467 | ClearNavigatorNotes | navigator_clear_notes | Navigator: Clear Comments |  |  |  |
+468 | ToggleProactiveNavigator | navigator_toggle_proactive | Navigator: Toggle Proactive Comments |  |  |  |
+469 | NextComment | navigator_next_comment | Navigator: Next Comment |  | F4 | F4 |
+470 | IgnoreComment | navigator_ignore_comment | Navigator: Ignore Comment |  | Shift+F4 | Shift+F4 |
 # Customize Layout, in the popup's order
 layout | CustomizeLayout
 layout | ToggleActivityBar

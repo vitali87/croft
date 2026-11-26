@@ -1,0 +1,1 @@
+feature: Git: Open Changes, Stage Changes, Unstage Changes and Discard Changes on the Command Palette act on the open file from the editor, as VS Code's do; in Source Control's change list they are its own Enter, S, U and D on the selected row (#871).

@@ -2936,6 +2936,353 @@ fn a_click_outside_the_commit_dropdown_closes_it_and_goes_on() {
     assert_eq!(app.status, "Refreshed Source Control");
 }
 
+/// #871 step 4: Source Control with `seed.txt` modified and `scratch.txt`
+/// new, and `seed.txt` open in the editor with the editor focused.
+fn scm_with_seed_open() -> (tempfile::TempDir, App) {
+    let (tmp, mut app) = scm_with_two_changes();
+    assert!(app.open_file_at_launch(&tmp.path().join("seed.txt")));
+    app.focus_pane(Pane::Editor);
+    (tmp, app)
+}
+
+fn staged_names(tmp: &tempfile::TempDir) -> String {
+    git_stdout(tmp.path(), &["diff", "--cached", "--name-only"])
+}
+
+/// Run a *Git: … Changes* command and wait for its read of the changes to
+/// land and the command to act (#871).
+fn run_git_file_command(app: &mut App, command: crate::widgets::command_palette::Command) {
+    app.run_command(command);
+    settle_git_file_commands(app);
+}
+
+/// Drain the *Git: … Changes* commands until none is reading and none can
+/// start: the queue is empty, or a discard is asking first.
+fn settle_git_file_commands(app: &mut App) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        app.drain_git_file_lookup();
+        let idle = app.git_file_lookup.is_none()
+            && (app.git_file_queue.is_empty() || app.pending_discard.is_some());
+        if idle {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "the read lands");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// #871 step 4: from the editor, Git: Stage Changes stages the open file
+/// and Git: Unstage Changes unstages it again, leaving the other change
+/// alone, as VS Code's do.
+#[test]
+fn git_stage_and_unstage_changes_act_on_the_open_file() {
+    use crate::widgets::command_palette::Command;
+    let (tmp, mut app) = scm_with_seed_open();
+    run_git_file_command(&mut app, Command::GitStageChanges);
+    assert_eq!(staged_names(&tmp).trim(), "seed.txt", "{}", app.status);
+    assert!(wait_for_changes(&mut app, |a| a
+        .source_control
+        .entries
+        .iter()
+        .any(
+            |e| e.path == "seed.txt" && e.kind.section() == crate::git::ChangeSection::Staged
+        )));
+    run_git_file_command(&mut app, Command::GitUnstageChanges);
+    assert_eq!(staged_names(&tmp).trim(), "", "{}", app.status);
+    assert!(git_stdout(tmp.path(), &["status", "--porcelain"]).contains("?? scratch.txt"));
+}
+
+/// #871 step 4: from the editor, Git: Discard Changes asks before it
+/// discards the open file, and Git: Open Changes opens its diff.
+#[test]
+fn git_discard_and_open_changes_act_on_the_open_file() {
+    use crate::widgets::command_palette::Command;
+    let (_tmp, mut app) = scm_with_seed_open();
+    run_git_file_command(&mut app, Command::GitDiscardChanges);
+    let pending = app.pending_discard.as_ref().expect("Discard asks first");
+    assert_eq!(pending.rel_path, "seed.txt");
+    app.pending_discard = None;
+    run_git_file_command(&mut app, Command::GitOpenChanges);
+    let diff = app
+        .editor
+        .diff
+        .as_ref()
+        .expect("Open Changes opens the diff");
+    assert!(diff.right_path.ends_with("seed.txt"));
+}
+
+/// #871 step 4: with the change list focused, the commands do exactly what
+/// the list's own keys do to the selected row, which are their shortcuts.
+#[test]
+fn git_file_commands_act_on_the_selected_row_in_the_change_list() {
+    use crate::widgets::command_palette::Command;
+    let (tmp, mut app) = scm_with_two_changes();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.source_control.list_focused);
+    let scratch = app
+        .source_control
+        .entries
+        .iter()
+        .position(|e| e.path == "scratch.txt")
+        .unwrap();
+    app.source_control.selected_change = Some(scratch);
+    app.run_command(Command::GitStageChanges);
+    assert_eq!(staged_names(&tmp).trim(), "scratch.txt", "{}", app.status);
+}
+
+/// #871 step 4: a file with nothing to stage, or no open file, says so.
+#[test]
+fn git_file_commands_say_why_they_do_nothing() {
+    use crate::widgets::command_palette::Command;
+    let (tmp, mut app) = scm_with_seed_open();
+    run_git_file_command(&mut app, Command::GitUnstageChanges);
+    assert_eq!(app.status, "No staged changes in seed.txt");
+    std::fs::write(tmp.path().join("clean.txt"), "same\n").unwrap();
+    assert!(git_succeeds(tmp.path(), &["add", "clean.txt"]));
+    assert!(git_succeeds(tmp.path(), &["commit", "-q", "-m", "clean"]));
+    assert!(app.open_file_at_launch(&tmp.path().join("clean.txt")));
+    app.focus_pane(Pane::Editor);
+    run_git_file_command(&mut app, Command::GitStageChanges);
+    assert_eq!(app.status, "No changes in clean.txt");
+    assert_eq!(staged_names(&tmp).trim(), "");
+}
+
+/// #871 (review of #2732): the commands read the changes themselves.
+/// Source Control's list loads only while the view is open, so a file
+/// changed before the view was ever opened said "No changes" and stayed
+/// unstaged.
+#[test]
+fn git_file_commands_read_the_changes_before_source_control_opens() {
+    use crate::widgets::command_palette::Command;
+    let tmp = make_committed_repo();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(wait_for_changes(&mut app, |a| a.git.status().in_repo));
+    std::fs::write(tmp.path().join("seed.txt"), b"changed\n").unwrap();
+    assert!(app.open_file_at_launch(&tmp.path().join("seed.txt")));
+    app.focus_pane(Pane::Editor);
+    assert!(
+        app.source_control.entries.is_empty(),
+        "Source Control has not loaded the change"
+    );
+    run_git_file_command(&mut app, Command::GitStageChanges);
+    assert_eq!(staged_names(&tmp).trim(), "seed.txt", "{}", app.status);
+}
+
+/// #871 (review of #2732): a deleted file's view names `/dev/null` as its
+/// new side, which the commands took for the file and called outside the
+/// repository; they act on the deleted file.
+#[test]
+fn git_file_commands_act_on_a_deleted_files_view() {
+    use crate::widgets::command_palette::Command;
+    let tmp = make_committed_repo();
+    std::fs::remove_file(tmp.path().join("seed.txt")).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(wait_for_changes(&mut app, |a| !a
+        .source_control
+        .entries
+        .is_empty()));
+    app.set_sidebar_view(SidebarView::SourceControl);
+    let row = app
+        .source_control
+        .entries
+        .iter()
+        .position(|e| e.path == "seed.txt")
+        .expect("the deletion is listed");
+    app.open_source_control_entry(row);
+    let diff = app.editor.diff.as_ref().expect("the deletion's view");
+    assert_eq!(diff.right_path, Path::new("/dev/null"));
+    app.focus_pane(Pane::Editor);
+    run_git_file_command(&mut app, Command::GitStageChanges);
+    assert_eq!(
+        git_stdout(tmp.path(), &["diff", "--cached", "--name-status"]).trim(),
+        "D\tseed.txt",
+        "{}",
+        app.status
+    );
+}
+
+/// #871 (review of #2732): a workspace opened through a symlink names its
+/// files one way and git names its root the other (macOS's `/var` is
+/// `/private/var`); the commands found every file outside the repository.
+#[cfg(unix)]
+#[test]
+fn git_file_commands_find_the_file_through_a_symlinked_folder() {
+    use crate::widgets::command_palette::Command;
+    let tmp = make_committed_repo();
+    let links = tempfile::tempdir().unwrap();
+    let link = links.path().join("through-a-link");
+    std::os::unix::fs::symlink(tmp.path(), &link).unwrap();
+    std::fs::write(tmp.path().join("seed.txt"), b"changed\n").unwrap();
+    let mut app = App::new(link.clone()).unwrap();
+    assert!(wait_for_changes(&mut app, |a| a.git.status().in_repo));
+    assert!(app.open_file_at_launch(&link.join("seed.txt")));
+    app.focus_pane(Pane::Editor);
+    run_git_file_command(&mut app, Command::GitStageChanges);
+    assert_eq!(staged_names(&tmp).trim(), "seed.txt", "{}", app.status);
+}
+
+/// #871 (review of #2732): before git's first status lands, the app takes the
+/// workspace folder for the repository's root. A folder inside a repository
+/// is not where git's paths start, so the command ran `git add sub/f.txt`
+/// from `sub` and failed; it acts in the repository its own read found.
+#[test]
+fn git_file_commands_act_in_the_repository_their_read_found() {
+    use crate::widgets::command_palette::Command;
+    let tmp = make_committed_repo();
+    let sub = tmp.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::write(sub.join("f.txt"), b"one\n").unwrap();
+    assert!(git_succeeds(tmp.path(), &["add", "sub/f.txt"]));
+    assert!(git_succeeds(tmp.path(), &["commit", "-q", "-m", "sub"]));
+    std::fs::write(sub.join("f.txt"), b"two\n").unwrap();
+    let mut app = App::new(sub.clone()).unwrap();
+    assert!(app.open_file_at_launch(&sub.join("f.txt")));
+    app.focus_pane(Pane::Editor);
+    assert_eq!(
+        app.git.status().repo_root,
+        None,
+        "git's first status has not landed"
+    );
+    run_git_file_command(&mut app, Command::GitStageChanges);
+    assert_eq!(staged_names(&tmp).trim(), "sub/f.txt", "{}", app.status);
+}
+
+/// #871 (review of #2732): a command run while another is still reading the
+/// changes waits its turn; it replaced the first, which never ran.
+#[test]
+fn git_file_commands_run_while_one_is_reading_wait_their_turn() {
+    use crate::widgets::command_palette::Command;
+    let (tmp, mut app) = scm_with_seed_open();
+    app.run_command(Command::GitStageChanges);
+    assert!(
+        app.git_file_lookup.is_some(),
+        "Stage on seed.txt is reading"
+    );
+    assert!(app.open_file_at_launch(&tmp.path().join("scratch.txt")));
+    app.focus_pane(Pane::Editor);
+    run_git_file_command(&mut app, Command::GitStageChanges);
+    let staged = staged_names(&tmp);
+    assert!(
+        staged.contains("seed.txt") && staged.contains("scratch.txt"),
+        "both are staged: {staged:?} ({})",
+        app.status
+    );
+}
+
+/// #871 (review of #2732): a command waiting its turn does not run while a
+/// discard is asking first. A second Discard replaced the question's file,
+/// so answering yes discarded the wrong one; it now asks after the first is
+/// answered.
+#[test]
+fn a_waiting_command_holds_while_a_discard_asks_first() {
+    use crate::widgets::command_palette::Command;
+    let (tmp, mut app) = scm_with_seed_open();
+    app.run_command(Command::GitDiscardChanges);
+    assert!(app.open_file_at_launch(&tmp.path().join("scratch.txt")));
+    app.focus_pane(Pane::Editor);
+    run_git_file_command(&mut app, Command::GitDiscardChanges);
+    let asking = |app: &App| app.pending_discard.as_ref().map(|p| p.rel_path.clone());
+    assert_eq!(asking(&app).as_deref(), Some("seed.txt"));
+    for _ in 0..20 {
+        app.drain_git_file_lookup();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(
+        asking(&app).as_deref(),
+        Some("seed.txt"),
+        "the question stays on its own file"
+    );
+    app.confirm_pending_discard();
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("seed.txt")).unwrap(),
+        git_stdout_untrimmed(tmp.path(), &["show", "HEAD:seed.txt"]),
+        "yes discarded seed.txt"
+    );
+    assert!(
+        tmp.path().join("scratch.txt").exists(),
+        "scratch.txt is kept"
+    );
+    settle_git_file_commands(&mut app);
+    assert_eq!(asking(&app).as_deref(), Some("scratch.txt"));
+}
+
+/// #871 (review of #2732): a command whose read is in flight when a discard
+/// in the change list starts asking does not land behind the question. Its
+/// Discard replaced the file the question was about, so yes deleted the
+/// wrong one; it now reads again once the question is answered.
+#[test]
+fn a_command_reading_when_a_discard_asks_reads_again_after() {
+    use crate::widgets::command_palette::Command;
+    let (tmp, mut app) = scm_with_seed_open();
+    app.run_command(Command::GitDiscardChanges);
+    assert!(
+        app.git_file_lookup.is_some(),
+        "Discard on seed.txt is reading"
+    );
+    let scratch = app
+        .source_control
+        .entries
+        .iter()
+        .position(|e| e.path == "scratch.txt")
+        .expect("scratch.txt is listed");
+    app.request_discard_source_control_entry(scratch);
+    let asking = |app: &App| app.pending_discard.as_ref().map(|p| p.rel_path.clone());
+    for _ in 0..20 {
+        app.drain_git_file_lookup();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(
+        asking(&app).as_deref(),
+        Some("scratch.txt"),
+        "the question stays on its own file"
+    );
+    app.confirm_pending_discard();
+    assert!(
+        !tmp.path().join("scratch.txt").exists(),
+        "yes discarded scratch.txt"
+    );
+    assert_ne!(
+        std::fs::read_to_string(tmp.path().join("seed.txt")).unwrap(),
+        git_stdout_untrimmed(tmp.path(), &["show", "HEAD:seed.txt"]),
+        "seed.txt is untouched"
+    );
+    settle_git_file_commands(&mut app);
+    assert_eq!(asking(&app).as_deref(), Some("seed.txt"));
+}
+
+/// #871 (review of #2732): a command run while an earlier one waits its
+/// turn joins the back of the line. Run between a discard's answer and the
+/// next tick, Unstage started ahead of the Stage set aside for the question,
+/// and the Stage then staged the whole file.
+#[test]
+fn a_command_run_while_one_waits_goes_behind_it() {
+    use crate::widgets::command_palette::Command;
+    let (tmp, mut app) = scm_with_seed_open();
+    app.run_command(Command::GitStageChanges);
+    let scratch = app
+        .source_control
+        .entries
+        .iter()
+        .position(|e| e.path == "scratch.txt")
+        .expect("scratch.txt is listed");
+    app.request_discard_source_control_entry(scratch);
+    app.drain_git_file_lookup();
+    assert!(app.git_file_lookup.is_none(), "Stage is set aside");
+    assert_eq!(app.git_file_queue.len(), 1);
+    app.cancel_pending_discard();
+    app.run_command(Command::GitUnstageChanges);
+    settle_git_file_commands(&mut app);
+    assert_eq!(app.status, "Unstaged seed.txt");
+    assert_eq!(
+        staged_names(&tmp).trim(),
+        "",
+        "Stage ran first, then Unstage"
+    );
+}
+
 /// #871: in the list `s` stages the selected row, `u` unstages it and `d`
 /// asks before discarding it, each staying on the file it moved.
 #[test]
@@ -7656,6 +8003,7 @@ fn discarding_a_submodule_refuses_instead_of_claiming_success() {
     let inner_head = git_stdout_untrimmed(&root.join("lib"), &["rev-parse", "HEAD"]);
     let mut app = App::new(root.clone()).unwrap();
     app.pending_discard = Some(PendingDiscard {
+        root: root.clone(),
         rel_path: "lib".into(),
         untracked: false,
         staged: false,
@@ -7686,6 +8034,7 @@ fn a_plain_file_beside_a_submodule_still_discards() {
     std::fs::write(root.join("a.txt"), "changed\n").unwrap();
     let mut app = App::new(root.clone()).unwrap();
     app.pending_discard = Some(PendingDiscard {
+        root: root.clone(),
         rel_path: "a.txt".into(),
         untracked: false,
         staged: false,
