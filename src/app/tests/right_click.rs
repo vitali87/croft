@@ -161,8 +161,14 @@ fn the_commit_menu() {
             .commit_at(y)
             .is_some_and(|c| c.summary == "add b")
     });
+    let commit = app.commit_graph.commit_at(y).cloned().unwrap();
     right_click(&mut app, area.x + 4, y);
-    check("right-click-commit", &written(&app, "a COMMITS row"), p);
+    // The commit's own ids, by value: `core.abbrev` can make the short one
+    // as few as 4 digits, which `no_commit_ids` leaves alone.
+    let text = written(&app, "a COMMITS row")
+        .replace(&commit.hash, "<id>")
+        .replace(&commit.short_hash, "<id>");
+    check("right-click-commit", &text, p);
 }
 
 #[test]
