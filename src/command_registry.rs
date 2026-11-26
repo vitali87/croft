@@ -2257,6 +2257,12 @@ commands! {
         title: "Git: Show Source Control Actions",
         hint: "Cmd+K Shift+A",
     }
+    /// The Commit button's `▾` dropdown from the keyboard (#871).
+    GitShowCommitActions {
+        id: "git_show_commit_actions",
+        title: "Git: Show Commit Actions",
+        hint: "Cmd+K Shift+C",
+    }
     ToggleTerminalSuggestions {
         id: "toggle_terminal_suggestions",
         title: "Terminal: Toggle Command Suggestions",

@@ -2386,14 +2386,13 @@ impl App {
         self.render_port_toast(frame);
         self.render_update_toast(frame);
         self.render_zen_hint(frame);
-        // Source Control's `⋯` menu hangs from the view's `⋯` pill: with the
-        // view or the pill off screen it closes, so it never takes keys
-        // unseen.
-        if !scm_drawn || self.source_control.header_more_btn.width == 0 {
-            self.close_scm_actions_menu();
+        // Source Control's menus hang from the view's `⋯` pill and the
+        // Commit button's `▾`: with the view or what they hang from off
+        // screen they close, so they never take keys unseen.
+        if !scm_drawn || self.scm_menu_layout().is_none() {
+            self.close_scm_menus();
         }
         self.render_context_menu(frame);
-        self.render_commit_dropdown(frame);
         self.render_prompt(frame);
         self.render_local_open_confirm(frame);
         self.render_discard_confirm(frame);

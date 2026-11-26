@@ -409,12 +409,11 @@ fn painter(p: Popup) -> &'static str {
 /// The painters the frame calls for things that open next to what they
 /// belong to. Pictures yield to these only where they overlap, so they are
 /// not pop-ups in this sense.
-const BESIDE_THEIR_OWNER: [&str; 8] = [
+const BESIDE_THEIR_OWNER: [&str; 7] = [
     "render_port_toast",
     "render_update_toast",
     "render_zen_hint",
     "render_context_menu",
-    "render_commit_dropdown",
     "render_editor_find",
     "render_terminal_find",
     "render_tour_caption",

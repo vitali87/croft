@@ -1325,7 +1325,7 @@ fn source_control_with_a_staged_and_an_unstaged_change() {
 /// unchanged but the message box's caret, hidden while a menu takes the
 /// keys. The `-keys` scenes open the `⋯` menu from the keyboard, which shows
 /// its highlight.
-const SCM_MENU_GOLDENS: [&str; 17] = [
+const SCM_MENU_GOLDENS: [&str; 19] = [
     "scm-menu-plain",
     "scm-menu-plain-commit",
     "scm-menu-plain-changes",
@@ -1343,6 +1343,8 @@ const SCM_MENU_GOLDENS: [&str; 17] = [
     "scm-menu-card-keys-commit",
     "commit-menu-plain",
     "commit-menu-card",
+    "commit-menu-plain-keys",
+    "commit-menu-card-keys",
 ];
 
 /// The `⋯` menu's fly-outs, by the label of their row and the suffix of
@@ -1391,15 +1393,18 @@ fn scm_menu_app(theme: crate::theme::Theme) -> (Fixture, App) {
     assert!(more.width > 0, "the header draws its ⋯ pill");
     press(&mut app, middle(more));
     assert!(
-        app.scm_actions_layout().is_some(),
+        app.scm_menu_layout().is_some(),
         "a click on ⋯ opens the menu"
     );
     (fixture, app)
 }
 
-/// The `⋯` menu's top-level row `i`, as it is laid out now.
+/// The open Source Control menu's top-level row `i`, as it is laid out now:
+/// the `⋯` menu's or the Commit dropdown's.
 fn scm_menu_row(app: &App, i: usize) -> Rect {
-    let layout = app.scm_actions_layout().expect("the ⋯ menu is open");
+    let layout = app
+        .scm_menu_layout()
+        .expect("a Source Control menu is open");
     layout.top.row(i).expect("the row is drawn")
 }
 
@@ -1459,7 +1464,7 @@ fn source_control_actions_menu_as_a_card() {
     let (_fixture, mut app) = scm_menu_app(card);
     open_scm_flyout(&mut app, "Commit");
     let _ = draw(&mut app, 120, 40);
-    let fly_out = app.scm_actions_layout().and_then(|l| l.fly_out).unwrap();
+    let fly_out = app.scm_menu_layout().and_then(|l| l.fly_out).unwrap();
     let second = fly_out.1.row(1).unwrap();
     point_at(&mut app, middle(second));
     failures.extend(workbench_scene_result("scm-menu-card-commit", &mut app));
@@ -1527,16 +1532,31 @@ fn commit_button_dropdown() {
         let caret = app.source_control.last_commit_caret_area;
         assert!(caret.width > 0, "the Commit button draws its ▾");
         press(&mut app, middle(caret));
-        assert!(app.commit_menu_open, "a click on ▾ opens the dropdown");
+        assert!(
+            app.context_menu
+                .as_ref()
+                .is_some_and(|m| m.look == MenuLook::CommitActions && !m.keyed),
+            "a click on ▾ opens the dropdown"
+        );
         // The pointer on the second row (a card theme lifts it).
         let _ = draw(&mut app, 120, 40);
-        let row = app
-            .source_control
-            .commit_menu_item_areas
-            .get(1)
-            .map(|(r, _)| *r);
-        point_at(&mut app, middle(row.expect("the dropdown draws its rows")));
+        let row = scm_menu_row(&app, 1);
+        point_at(&mut app, middle(row));
         failures.extend(workbench_scene_result(name, &mut app));
+        // Opened from the keyboard, Cmd+K Shift+C: the first row highlighted.
+        let (_fixture, mut app) = source_control_app(theme);
+        let _ = draw(&mut app, 120, 40);
+        app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('C'), KeyModifiers::SHIFT))
+            .unwrap();
+        assert!(
+            app.context_menu
+                .as_ref()
+                .is_some_and(|m| m.look == MenuLook::CommitActions && m.keyed),
+            "Cmd+K Shift+C opens the dropdown with the keyboard on it"
+        );
+        failures.extend(workbench_scene_result(&format!("{name}-keys"), &mut app));
     }
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }

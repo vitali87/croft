@@ -121,6 +121,19 @@ impl App {
                 }
                 true
             }
+            // Cmd+K Shift+C anywhere but the terminal: Git: Show Commit
+            // Actions (#871), the Commit button's dropdown with the keyboard
+            // on it. Case-insensitive for the CSI-u reason given at Shift+W,
+            // and before the plain C arm below.
+            KeyCode::Char(c)
+                if shifted
+                    && plain
+                    && c.eq_ignore_ascii_case(&'c')
+                    && self.focus != Pane::Terminal =>
+            {
+                self.open_commit_actions_menu_from_keyboard();
+                true
+            }
             // Cmd+K Shift+T: reopen the most recently closed terminal pane
             // (the browser reopen-tab convention under the Cmd+K leader).
             // Cmd+K Cmd+S (Cmd held on the second key): the Keyboard Shortcuts

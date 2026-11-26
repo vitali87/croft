@@ -2742,14 +2742,14 @@ fn a_click_on_a_fly_out_row_runs_it() {
         .iter()
         .position(|e| matches!(e, MenuEntry::Submenu { label, .. } if label == "Branch"))
         .unwrap();
-    let row = app.scm_actions_layout().unwrap().top.row(branch).unwrap();
+    let row = app.scm_menu_layout().unwrap().top.row(branch).unwrap();
     left_click(&mut app, row.x + 2, row.y);
     assert_eq!(
         app.context_menu.as_ref().unwrap().open_submenu,
         Some(branch)
     );
     draw(&mut app, 120, 40);
-    let (_, fly_out) = app.scm_actions_layout().unwrap().fly_out.unwrap();
+    let (_, fly_out) = app.scm_menu_layout().unwrap().fly_out.unwrap();
     let rename = fly_out.row(2).unwrap();
     left_click(&mut app, rename.x + 2, rename.y);
     assert!(app.context_menu.is_none());
@@ -2788,7 +2788,7 @@ fn a_short_terminal_scrolls_the_actions_menu_to_the_keyboards_row() {
     let (_tmp, mut app) = scm_with_two_changes();
     app.open_scm_actions_menu_from_keyboard();
     draw(&mut app, 120, 12);
-    let layout = app.scm_actions_layout().expect("the menu is drawn");
+    let layout = app.scm_menu_layout().expect("the menu is drawn");
     assert!(
         layout.top.shown() < layout.rows.len(),
         "12 rows cannot show all of it"
@@ -2799,7 +2799,7 @@ fn a_short_terminal_scrolls_the_actions_menu_to_the_keyboards_row() {
     let buf = draw_buffer(&mut app, 120, 12);
     let selected = app.context_menu.as_ref().unwrap().selected;
     let row = app
-        .scm_actions_layout()
+        .scm_menu_layout()
         .and_then(|l| l.top.row(selected))
         .expect("the keyboard's row is drawn");
     let text: String = (row.x..row.right())
@@ -2807,7 +2807,7 @@ fn a_short_terminal_scrolls_the_actions_menu_to_the_keyboards_row() {
         .collect();
     assert!(text.contains("Show Git Output"), "{text:?}");
     assert_eq!(
-        app.scm_actions_layout()
+        app.scm_menu_layout()
             .and_then(|l| l.top.row_at(row.x + 2, row.y)),
         Some(selected),
         "a click there picks the same row"
@@ -2816,11 +2816,109 @@ fn a_short_terminal_scrolls_the_actions_menu_to_the_keyboards_row() {
         .unwrap();
     draw(&mut app, 120, 12);
     assert!(
-        app.scm_actions_layout()
-            .and_then(|l| l.top.row(0))
-            .is_some(),
+        app.scm_menu_layout().and_then(|l| l.top.row(0)).is_some(),
         "Home scrolls back to the first row"
     );
+}
+
+fn commit_dropdown_open(app: &App) -> bool {
+    app.context_menu
+        .as_ref()
+        .is_some_and(|m| m.look == MenuLook::CommitActions)
+}
+
+/// #871: Cmd+K Shift+C (Git: Show Commit Actions) brings Source Control up
+/// with the Commit button's dropdown open and its first row highlighted;
+/// the arrows walk it and Enter runs the row highlighted.
+#[test]
+fn cmd_k_shift_c_opens_the_commit_dropdown_and_enter_runs_a_row() {
+    let (_tmp, mut app) = scm_with_two_changes();
+    app.set_sidebar_view(SidebarView::Explorer);
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('C'), KeyModifiers::SHIFT))
+        .unwrap();
+    assert_eq!(app.sidebar_view, SidebarView::SourceControl);
+    assert!(commit_dropdown_open(&app));
+    assert!(app.context_menu.as_ref().unwrap().keyed);
+    draw(&mut app, 120, 40);
+    assert!(commit_dropdown_open(&app), "drawn, it stays open");
+    assert_eq!(scm_menu_cursor(&app), "Commit & Push");
+    for _ in 0..4 {
+        app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(scm_menu_cursor(&app), "Checkout / Create Branch");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.context_menu.is_none(),
+        "running a row closes the dropdown"
+    );
+    assert!(
+        app.branch_picker.is_some(),
+        "the row opens the branch picker"
+    );
+}
+
+/// #871: in the terminal, Cmd+K Shift+C keeps copying the last command's
+/// output; it opens no dropdown.
+#[test]
+fn cmd_k_shift_c_in_the_terminal_still_acts_on_the_last_command() {
+    let (_tmp, mut app) = scm_with_two_changes();
+    app.focus_pane(Pane::Terminal);
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('C'), KeyModifiers::SHIFT))
+        .unwrap();
+    assert!(app.context_menu.is_none());
+    assert_eq!(app.status, "No finished commands yet");
+}
+
+/// #871: a click on `▾` opens the dropdown with no row highlighted, a click
+/// on a row runs it, a second click on `▾` closes it, and Esc closes it.
+#[test]
+fn the_commit_dropdown_answers_clicks_and_esc() {
+    let (_tmp, mut app) = scm_with_two_changes();
+    draw(&mut app, 120, 40);
+    let caret = app.source_control.last_commit_caret_area;
+    assert!(caret.width > 0);
+    left_click(&mut app, caret.x, caret.y);
+    assert!(commit_dropdown_open(&app));
+    assert!(!app.context_menu.as_ref().unwrap().keyed);
+    draw(&mut app, 120, 40);
+    left_click(&mut app, caret.x, caret.y);
+    assert!(app.context_menu.is_none(), "a second click on ▾ closes it");
+    draw(&mut app, 120, 40);
+    assert!(app.context_menu.is_none(), "and it stays closed");
+    left_click(&mut app, caret.x, caret.y);
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.context_menu.is_none(), "Esc closes it");
+    left_click(&mut app, caret.x, caret.y);
+    draw(&mut app, 120, 40);
+    let row = app.scm_menu_layout().unwrap().top.row(4).unwrap();
+    left_click(&mut app, row.x + 2, row.y);
+    assert!(app.context_menu.is_none());
+    assert!(app.branch_picker.is_some(), "Checkout / Create Branch runs");
+}
+
+/// #871: a click outside the dropdown closes it and still does what it
+/// does there, as it always has: here, the header's refresh.
+#[test]
+fn a_click_outside_the_commit_dropdown_closes_it_and_goes_on() {
+    let (_tmp, mut app) = scm_with_two_changes();
+    draw(&mut app, 120, 40);
+    let caret = app.source_control.last_commit_caret_area;
+    left_click(&mut app, caret.x, caret.y);
+    draw(&mut app, 120, 40);
+    assert!(commit_dropdown_open(&app));
+    let refresh = app.source_control.header_refresh_btn;
+    assert!(refresh.width > 0);
+    left_click(&mut app, refresh.x, refresh.y);
+    assert!(app.context_menu.is_none());
+    assert_eq!(app.status, "Refreshed Source Control");
 }
 
 /// #871: in the list `s` stages the selected row, `u` unstages it and `d`
@@ -8056,4 +8154,31 @@ fn the_source_control_badge_counts_every_row_in_every_folder() {
         "3",
         "the same count as with pictures"
     );
+}
+
+/// #871 review: the Commit dropdown keeps the keyboard's row on screen too,
+/// when the terminal is too short for all ten rows below the button.
+#[test]
+fn a_short_terminal_scrolls_the_commit_dropdown_to_the_keyboards_row() {
+    let (_tmp, mut app) = scm_with_two_changes();
+    app.open_commit_actions_menu_from_keyboard();
+    draw(&mut app, 120, 18);
+    let layout = app.scm_menu_layout().expect("the dropdown is drawn");
+    assert!(
+        layout.top.shown() < layout.rows.len(),
+        "18 rows cannot show all of it"
+    );
+    app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+        .unwrap();
+    assert!(scm_menu_cursor(&app).starts_with("View Changes vs "));
+    let buf = draw_buffer(&mut app, 120, 18);
+    let selected = app.context_menu.as_ref().unwrap().selected;
+    let row = app
+        .scm_menu_layout()
+        .and_then(|l| l.top.row(selected))
+        .expect("the keyboard's row is drawn");
+    let text: String = (row.x..row.right())
+        .map(|x| buf[(x, row.y)].symbol().to_string())
+        .collect();
+    assert!(text.contains("View Changes vs "), "{text:?}");
 }

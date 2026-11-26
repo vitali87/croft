@@ -16,6 +16,9 @@ pub(super) fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         // Cmd+K Shift+A (Git: Show Source Control Actions) and the arrows
         // reach every row; its look draws no hints.
         MenuAction::Scm(_) => None,
+        // The Commit button's `▾` dropdown (#871): Cmd+K Shift+C (Git: Show
+        // Commit Actions) opens it, and its look draws no hints either.
+        MenuAction::Commit(_) => None,
         MenuAction::Create(CreateKind::File) => Some("⌘F"),
         MenuAction::Create(CreateKind::Folder) => Some("⌘⇧N"),
         MenuAction::Cut(_) => Some("⌘X"),
@@ -654,7 +657,7 @@ impl App {
             return;
         };
         if menu.look != MenuLook::Panel {
-            self.render_scm_actions_menu(frame);
+            self.render_scm_menu(frame);
             return;
         }
         // `menu_rect` already clamps against `last_frame_area`, so the
@@ -945,7 +948,7 @@ impl App {
     pub(super) fn menu_rect(&self) -> Option<Rect> {
         let menu = self.context_menu.as_ref()?;
         if menu.look != MenuLook::Panel {
-            return self.scm_actions_layout().map(|l| l.top.rect);
+            return self.scm_menu_layout().map(|l| l.top.rect);
         }
         // Use char count (not byte len) so multi-byte glyphs in menu
         // labels (e.g. the "" in "Rename", the arrow in "Compare with
@@ -992,7 +995,7 @@ impl App {
     pub(super) fn submenu_rect(&self) -> Option<Rect> {
         let menu = self.context_menu.as_ref()?;
         if menu.look != MenuLook::Panel {
-            return self.scm_actions_layout()?.fly_out.map(|(_, col)| col.rect);
+            return self.scm_menu_layout()?.fly_out.map(|(_, col)| col.rect);
         }
         let parent = menu.open_submenu?;
         let MenuEntry::Submenu { items, .. } = menu.items.get(parent)? else {
@@ -1033,7 +1036,7 @@ impl App {
     /// one is open, else the top-level panel. Shared by the wheel, PgUp/PgDn
     /// and Home/End so every one of them pages against what is on screen.
     pub(super) fn menu_visible_rows(&self) -> usize {
-        if let Some(layout) = self.scm_actions_layout() {
+        if let Some(layout) = self.scm_menu_layout() {
             return match layout.fly_out {
                 Some((_, col)) => col.shown(),
                 None => layout.top.shown(),
@@ -1059,7 +1062,7 @@ impl App {
             .as_ref()
             .is_some_and(|m| m.look != MenuLook::Panel)
         {
-            return self.scm_actions_layout()?.top.row_at(x, y);
+            return self.scm_menu_layout()?.top.row_at(x, y);
         }
         let r = self.menu_rect()?;
         if !rect_contains(r, x, y) {
@@ -1080,7 +1083,7 @@ impl App {
             .as_ref()
             .is_some_and(|m| m.look != MenuLook::Panel)
         {
-            return self.scm_actions_layout()?.fly_out?.1.row_at(x, y);
+            return self.scm_menu_layout()?.fly_out?.1.row_at(x, y);
         }
         let r = self.submenu_rect()?;
         if !rect_contains(r, x, y) {
@@ -1233,6 +1236,7 @@ impl App {
     pub(super) fn dispatch_menu_action(&mut self, action: MenuAction, target_dir: PathBuf) {
         match action {
             MenuAction::Scm(action) => self.dispatch_scm_action(action),
+            MenuAction::Commit(item) => self.dispatch_commit_menu_item(item),
             MenuAction::Create(kind) => self.open_create_prompt(kind, target_dir),
             MenuAction::Delete { paths } => self.delete_paths(paths),
             MenuAction::Rename(path) => self.open_rename_prompt(path),

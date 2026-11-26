@@ -512,6 +512,8 @@ struct PendingCapture {
 enum MenuAction {
     /// A row of Source Control's `⋯` actions menu (#871).
     Scm(crate::widgets::scm_menu::ScmAction),
+    /// A row of the Commit button's `▾` dropdown (#871).
+    Commit(crate::widgets::source_control::CommitMenuItem),
     Create(CreateKind),
     /// Move every path in `paths` to the OS trash (recoverable). One entry
     /// for a single right-click, more when a multi-selection is active.
@@ -1058,6 +1060,9 @@ enum MenuLook {
     /// is the operation the repository was in when it opened, whose rows
     /// lead the menu (#1356); the rows are drawn from it.
     ScmActions { op: Option<crate::git::RepoOp> },
+    /// The Commit button's `▾` dropdown (#871): the same rows, under the
+    /// `▾`. A click outside it closes it and goes on to what it lands on.
+    CommitActions,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -2355,10 +2360,6 @@ pub struct App {
     /// and the user hasn't silenced the nudge. Drawn as a dismissible modal
     /// recommending iTerm2 (macOS) / Ghostty (macOS/Linux).
     pending_terminal_warning: bool,
-    /// True while the Source Control commit dropdown (▾ caret) is open.
-    /// The caret button toggles this; clicking a menu row, the commit
-    /// button, or anywhere outside the menu closes it.
-    commit_menu_open: bool,
     /// Cached default-branch name (e.g. "main" / "master"), refreshed
     /// when the workspace root changes. Surfaced in the commit dropdown's
     /// "View Changes vs <name>" label so users know which branch the
@@ -4607,7 +4608,6 @@ impl App {
             run_tasks: Vec::new(),
             last_task: None,
             pending_terminal_warning: false,
-            commit_menu_open: false,
             default_branch_label: None,
             default_branch_ask: None,
             trust_local_browser: false,

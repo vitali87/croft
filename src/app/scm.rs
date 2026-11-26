@@ -8,7 +8,9 @@ use crate::widgets::picker_rows::{PickerMouse, answer_mouse};
 
 /// Source Control's `⋯` menu laid out (#871): its rows and top column, and
 /// the open fly-out's rows and column.
-pub(super) struct ScmActionsLayout {
+pub(super) struct ScmMenuLayout {
+    /// Which plain panel the top column is.
+    pub(super) panel: crate::widgets::scm_menu::Panel,
     pub(super) rows: Vec<crate::widgets::scm_menu::Row>,
     pub(super) top: crate::widgets::scm_menu::Column,
     pub(super) fly_out: Option<(
@@ -694,150 +696,6 @@ impl App {
             self.hover_anchor.unwrap_or((0, 0)),
         ));
         true
-    }
-
-    pub(super) fn render_commit_dropdown(&mut self, frame: &mut ratatui::Frame) {
-        use crate::widgets::source_control::CommitMenuItem;
-        // The dropdown belongs to the Source Control view only. Gate on it
-        // so a stale `commit_menu_open` flag can never paint the menu over
-        // another sidebar view (e.g. Run-Debug) after a view switch.
-        if !self.commit_menu_open || self.sidebar_view != SidebarView::SourceControl {
-            self.source_control.commit_menu_item_areas.clear();
-            return;
-        }
-        let caret = self.source_control.last_commit_caret_area;
-        let main = self.source_control.last_button_area;
-        if caret.width == 0 || main.width == 0 {
-            return;
-        }
-        let default_branch = self
-            .default_branch_label
-            .clone()
-            .unwrap_or_else(|| "default".to_string());
-        let items: Vec<(CommitMenuItem, String)> = CommitMenuItem::ALL
-            .iter()
-            .map(|item| (*item, item.label(&default_branch)))
-            .collect();
-        // Row layout: [pad][icon][gap][label][pad]. The icon occupies one
-        // cell at item_x+1; the label starts two cells later at item_x+3.
-        const ICON_PAD: u16 = 3;
-        let label_w = items
-            .iter()
-            .map(|(_, l)| l.chars().count() as u16 + ICON_PAD + 1)
-            .max()
-            .unwrap_or(0);
-        let item_w: u16 = label_w.max(caret.width);
-        let item_x = (caret.x + caret.width).saturating_sub(item_w).max(main.x);
-        let item_y_top = caret.y + caret.height;
-        self.source_control.commit_menu_item_areas.clear();
-        if let Some(t) = crate::widgets::surface::tones(self.theme) {
-            // A raised card with the accent lip, one row taller above and
-            // below than the rows, whose rim falls on the rows' pad cells:
-            // each hit rect is still the row drawn. Icons rest muted; the
-            // row under the pointer lifts, its icon and label with it.
-            let card = Rect {
-                x: item_x,
-                y: item_y_top,
-                width: item_w,
-                height: items.len() as u16 + 2,
-            }
-            .intersection(frame.area());
-            if card.width < 3 || card.height < 3 {
-                return;
-            }
-            let pointer = self.pointer_cell;
-            let buf = frame.buffer_mut();
-            ratatui::widgets::Widget::render(ratatui::widgets::Clear, card, buf);
-            buf.set_style(card, Style::default().bg(t.raised()));
-            crate::widgets::surface::paint_overlay_frame(buf, card, self.theme);
-            for (i, (item, label)) in items.into_iter().enumerate() {
-                let row_y = card.y + 1 + i as u16;
-                if row_y + 1 >= card.bottom() {
-                    break;
-                }
-                let row_rect = Rect::new(card.x, row_y, card.width, 1);
-                let lit = crate::widgets::hover::contains(row_rect, pointer);
-                if lit {
-                    let inner = Rect::new(card.x + 1, row_y, card.width - 2, 1);
-                    buf.set_style(inner, Style::default().bg(t.hover_on(t.raised)));
-                }
-                let (icon_fg, ink) = if lit {
-                    (t.text(), t.strong())
-                } else {
-                    (t.muted(), t.text())
-                };
-                buf.set_string(
-                    card.x + 1,
-                    row_y,
-                    item.icon().to_string(),
-                    Style::default().fg(icon_fg),
-                );
-                buf.set_stringn(
-                    card.x + 3,
-                    row_y,
-                    &label,
-                    usize::from(card.width.saturating_sub(4)),
-                    Style::default().fg(ink),
-                );
-                self.source_control
-                    .commit_menu_item_areas
-                    .push((row_rect, item));
-            }
-            return;
-        }
-        let menu_rect = Rect {
-            x: item_x,
-            y: item_y_top,
-            width: item_w,
-            height: items.len() as u16,
-        };
-        let bg = self.theme.ui(Color::Rgb(0x25, 0x2b, 0x37));
-        let fg = self.theme.ui(Color::White);
-        let style = Style::default().fg(fg).bg(bg);
-        frame.render_widget(ratatui::widgets::Clear, menu_rect);
-        for (i, (item, label)) in items.into_iter().enumerate() {
-            let row_y = item_y_top + i as u16;
-            let row_rect = Rect {
-                x: item_x,
-                y: row_y,
-                width: item_w,
-                height: 1,
-            };
-            for rx in 0..row_rect.width {
-                frame.buffer_mut()[(row_rect.x + rx, row_rect.y)]
-                    .set_symbol(" ")
-                    .set_style(style);
-            }
-            // Leading codicon, colored per action: push glyphs in blue,
-            // diff/compare glyphs in purple, mirroring VS Code's SCM accents.
-            let icon_color = match item {
-                CommitMenuItem::CommitAndPush => self.theme.ui(Color::Rgb(0x9a, 0xa4, 0xb2)),
-                CommitMenuItem::Push | CommitMenuItem::Pull | CommitMenuItem::Sync => {
-                    self.theme.ui(Color::Rgb(0x6c, 0xb6, 0xff))
-                }
-                CommitMenuItem::CheckoutBranch => self.theme.ui(Color::Rgb(0x88, 0xc0, 0xd0)),
-                CommitMenuItem::Stash | CommitMenuItem::StashPop => {
-                    self.theme.ui(Color::Rgb(0xeb, 0xcb, 0x8b))
-                }
-                CommitMenuItem::ViewStagedDiff
-                | CommitMenuItem::ViewPreviousCommitDiff
-                | CommitMenuItem::ViewDefaultBranchDiff => {
-                    self.theme.ui(Color::Rgb(0xc0, 0xa4, 0xf5))
-                }
-            };
-            frame.buffer_mut().set_string(
-                row_rect.x + 1,
-                row_rect.y,
-                item.icon().to_string(),
-                Style::default().fg(icon_color).bg(bg),
-            );
-            frame
-                .buffer_mut()
-                .set_string(row_rect.x + 3, row_rect.y, &label, style);
-            self.source_control
-                .commit_menu_item_areas
-                .push((row_rect, item));
-        }
     }
 
     pub(super) fn dispatch_commit_menu_item(
@@ -2576,7 +2434,7 @@ impl App {
         use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
         use crate::widgets::list_picker::ListPurpose;
         use crate::widgets::scm_menu::ScmAction;
-        self.close_scm_actions_menu();
+        self.close_scm_menus();
         // Nothing else touches the repository while a push, pull or fetch
         // runs in the background: a commit or branch switch under it fights
         // over `index.lock`, and a pull would land on the switched branch.
@@ -3510,7 +3368,7 @@ impl App {
         if self.branch_picker.is_some() {
             return;
         }
-        self.commit_menu_open = false;
+        self.close_scm_menus();
         match crate::git::list_branches(&self.scm_root()) {
             Ok(branches) => {
                 let n = branches.len();
@@ -3834,7 +3692,6 @@ impl App {
             })
             .collect();
         let selected = items.iter().position(MenuEntry::is_selectable).unwrap_or(0);
-        self.commit_menu_open = false;
         self.context_menu = Some(ContextMenu {
             origin: (0, 0),
             items,
@@ -3850,16 +3707,73 @@ impl App {
         });
     }
 
-    /// Close Source Control's `⋯` menu, when it is the menu open: a prompt
-    /// or picker one of its rows opened takes the keys from here on.
-    pub(super) fn close_scm_actions_menu(&mut self) {
+    /// Close Source Control's `⋯` menu or Commit dropdown, when one is the
+    /// menu open: a prompt or picker one of its rows opened takes the keys
+    /// from here on, and neither outlives its view.
+    pub(super) fn close_scm_menus(&mut self) {
         if self
             .context_menu
             .as_ref()
-            .is_some_and(|m| matches!(m.look, MenuLook::ScmActions { .. }))
+            .is_some_and(|m| m.look != MenuLook::Panel)
         {
             self.context_menu = None;
         }
+    }
+
+    /// The Commit button's `▾` dropdown (#871), opened on the shared menu
+    /// with Source Control's look, under the `▾`. A click opens it with no
+    /// row highlighted; the keyboard (`keyed`) with its first row
+    /// highlighted.
+    pub(super) fn open_commit_actions_menu(&mut self, keyed: bool) {
+        use crate::widgets::source_control::CommitMenuItem;
+        let default_branch = self.default_branch_label.as_deref().unwrap_or("default");
+        let items = CommitMenuItem::ALL
+            .iter()
+            .map(|item| MenuEntry::item(item.label(default_branch), MenuAction::Commit(*item)))
+            .collect();
+        self.context_menu = Some(ContextMenu {
+            origin: (0, 0),
+            items,
+            selected: 0,
+            open_submenu: None,
+            submenu_selected: 0,
+            target_dir: self.scm_root(),
+            crumb: None,
+            scroll: Default::default(),
+            submenu_scroll: Default::default(),
+            look: MenuLook::CommitActions,
+            keyed,
+        });
+    }
+
+    /// Git: Show Commit Actions (Cmd+K Shift+C, #871): the Commit button's
+    /// dropdown from the keyboard, showing Source Control first when it is
+    /// not up.
+    pub(super) fn open_commit_actions_menu_from_keyboard(&mut self) {
+        if self.sidebar_view != SidebarView::SourceControl || !self.show_tree {
+            self.set_sidebar_view(SidebarView::SourceControl);
+        }
+        self.open_commit_actions_menu(true);
+    }
+
+    /// A left click while the Commit dropdown is open, answered as the
+    /// dropdown always answered it: a row runs its action, and a click on
+    /// the `▾` closes it; both are spent here (`true`). Anywhere else closes
+    /// the dropdown and the click goes on to what it lands on (`false`).
+    pub(super) fn click_commit_actions_menu(&mut self, x: u16, y: u16) -> bool {
+        let row = self.scm_menu_layout().and_then(|l| l.top.row_at(x, y));
+        let Some(menu) = self.context_menu.take() else {
+            return false;
+        };
+        if let Some(action) = row
+            .and_then(|i| menu.items.get(i))
+            .and_then(MenuEntry::action)
+            .cloned()
+        {
+            self.dispatch_menu_action(action, menu.target_dir);
+            return true;
+        }
+        self.source_control.click_commit_caret(x, y)
     }
 
     /// A left click while Source Control's `⋯` menu is open (#871), answered
@@ -3868,7 +3782,7 @@ impl App {
     /// closes it when it is the one open; an action's row runs it; anywhere
     /// else, a separator included, closes the menu.
     pub(super) fn click_scm_actions_menu(&mut self, x: u16, y: u16) {
-        let Some(layout) = self.scm_actions_layout() else {
+        let Some(layout) = self.scm_menu_layout() else {
             self.context_menu = None;
             return;
         };
@@ -3921,21 +3835,41 @@ impl App {
         self.open_scm_actions_menu(true);
     }
 
-    /// Source Control's `⋯` menu as it is laid out now: its top column
-    /// under the header's `⋯` pill, and the open fly-out's beside its row.
-    /// `None` unless that menu is open and the pill is drawn.
-    pub(super) fn scm_actions_layout(&self) -> Option<ScmActionsLayout> {
+    /// Source Control's open menu as it is laid out now: the `⋯` menu's top
+    /// column under the header's `⋯` pill with its open fly-out beside its
+    /// row, or the Commit dropdown under the button's `▾`. `None` unless one
+    /// of them is open and what it hangs from is drawn.
+    pub(super) fn scm_menu_layout(&self) -> Option<ScmMenuLayout> {
         use crate::widgets::scm_menu;
         let menu = self.context_menu.as_ref()?;
-        let MenuLook::ScmActions { op } = menu.look else {
-            return None;
+        let card = crate::widgets::surface::tones(self.theme).is_some();
+        let op = match menu.look {
+            MenuLook::Panel => return None,
+            MenuLook::CommitActions => {
+                let default_branch = self.default_branch_label.as_deref().unwrap_or("default");
+                let rows = scm_menu::commit_rows(default_branch);
+                let top = scm_menu::commit_column(
+                    &rows,
+                    self.source_control.last_commit_caret_area,
+                    self.source_control.last_button_area,
+                    self.last_frame_area,
+                    card,
+                )?;
+                let top = top.shown_from(menu.scroll_for(top.shown()));
+                return Some(ScmMenuLayout {
+                    panel: scm_menu::Panel::Commit,
+                    rows,
+                    top,
+                    fly_out: None,
+                });
+            }
+            MenuLook::ScmActions { op } => op,
         };
         let anchor = self.source_control.header_more_btn;
         if anchor.width == 0 {
             return None;
         }
         let screen = self.last_frame_area;
-        let card = crate::widgets::surface::tones(self.theme).is_some();
         let nodes = scm_menu::menu_for(op);
         let rows = scm_menu::rows(&nodes);
         // On a terminal too short for every row, each column shows a window
@@ -3948,15 +3882,20 @@ impl App {
             let col = col.shown_from(menu.submenu_scroll_for(col.shown()));
             Some((items, col))
         });
-        Some(ScmActionsLayout { rows, top, fly_out })
+        Some(ScmMenuLayout {
+            panel: scm_menu::Panel::Top,
+            rows,
+            top,
+            fly_out,
+        })
     }
 
-    /// Paint Source Control's `⋯` menu: the top column, then the open
+    /// Paint Source Control's open menu: the top column, then the open
     /// fly-out. The keyboard's row shows once the keyboard drives the menu,
     /// on the level it is on; a card lifts the row under the pointer too.
-    pub(super) fn render_scm_actions_menu(&self, frame: &mut ratatui::Frame) {
-        use crate::widgets::scm_menu::{Marks, paint_column};
-        let (Some(menu), Some(layout)) = (self.context_menu.as_ref(), self.scm_actions_layout())
+    pub(super) fn render_scm_menu(&self, frame: &mut ratatui::Frame) {
+        use crate::widgets::scm_menu::{Marks, Panel, paint_column};
+        let (Some(menu), Some(layout)) = (self.context_menu.as_ref(), self.scm_menu_layout())
         else {
             return;
         };
@@ -3973,7 +3912,14 @@ impl App {
             cursor_colours,
         };
         let buf = frame.buffer_mut();
-        paint_column(buf, layout.top, &layout.rows, false, top_marks, self.theme);
+        paint_column(
+            buf,
+            layout.top,
+            &layout.rows,
+            layout.panel,
+            top_marks,
+            self.theme,
+        );
         if let Some((items, col)) = &layout.fly_out {
             let marks = Marks {
                 open: None,
@@ -3981,7 +3927,7 @@ impl App {
                 pointer: self.pointer_cell,
                 cursor_colours,
             };
-            paint_column(buf, *col, items, true, marks, self.theme);
+            paint_column(buf, *col, items, Panel::FlyOut, marks, self.theme);
         }
     }
 

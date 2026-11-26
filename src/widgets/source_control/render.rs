@@ -47,7 +47,6 @@ impl Widget for &mut SourceControlPanel {
         self.last_input_area = Rect::default();
         self.last_button_area = Rect::default();
         self.last_commit_caret_area = Rect::default();
-        self.commit_menu_item_areas.clear();
         self.last_list_area = Rect::default();
         self.last_scrollbar = Rect::default();
         self.last_row_actions = None;
