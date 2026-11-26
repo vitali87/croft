@@ -2876,6 +2876,21 @@ fn cmd_k_shift_c_in_the_terminal_still_acts_on_the_last_command() {
     assert_eq!(app.status, "No finished commands yet");
 }
 
+/// #871 review: on the panel's other tabs (Output, Problems, Ports,
+/// Captures) the panel has focus but no shell, so Cmd+K Shift+C opens the
+/// Commit dropdown there too.
+#[test]
+fn cmd_k_shift_c_on_the_problems_tab_opens_the_commit_dropdown() {
+    let (_tmp, mut app) = scm_with_two_changes();
+    app.set_bottom_panel_tab(BottomPanelTab::Problems);
+    assert!(app.focus == Pane::Terminal, "the panel has focus");
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('C'), KeyModifiers::SHIFT))
+        .unwrap();
+    assert!(commit_dropdown_open(&app), "{}", app.status);
+}
+
 /// #871: a click on `▾` opens the dropdown with no row highlighted, a click
 /// on a row runs it, a second click on `▾` closes it, and Esc closes it.
 #[test]
