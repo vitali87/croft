@@ -3253,6 +3253,36 @@ fn a_command_reading_when_a_discard_asks_reads_again_after() {
     assert_eq!(asking(&app).as_deref(), Some("seed.txt"));
 }
 
+/// #871 (review of #2732): a command run while an earlier one waits its
+/// turn joins the back of the line. Run between a discard's answer and the
+/// next tick, Unstage started ahead of the Stage set aside for the question,
+/// and the Stage then staged the whole file.
+#[test]
+fn a_command_run_while_one_waits_goes_behind_it() {
+    use crate::widgets::command_palette::Command;
+    let (tmp, mut app) = scm_with_seed_open();
+    app.run_command(Command::GitStageChanges);
+    let scratch = app
+        .source_control
+        .entries
+        .iter()
+        .position(|e| e.path == "scratch.txt")
+        .expect("scratch.txt is listed");
+    app.request_discard_source_control_entry(scratch);
+    app.drain_git_file_lookup();
+    assert!(app.git_file_lookup.is_none(), "Stage is set aside");
+    assert_eq!(app.git_file_queue.len(), 1);
+    app.cancel_pending_discard();
+    app.run_command(Command::GitUnstageChanges);
+    settle_git_file_commands(&mut app);
+    assert_eq!(app.status, "Unstaged seed.txt");
+    assert_eq!(
+        staged_names(&tmp).trim(),
+        "",
+        "Stage ran first, then Unstage"
+    );
+}
+
 /// #871: in the list `s` stages the selected row, `u` unstages it and `d`
 /// asks before discarding it, each staying on the file it moved.
 #[test]

@@ -1120,12 +1120,11 @@ impl App {
         let folder = self.active_scm_root.clone();
         // One at a time, in the order they were run: each reads the changes
         // after the one before it has acted, so Stage then Unstage sees
-        // what Stage staged.
-        if self.git_file_lookup.is_some() {
-            self.git_file_queue.push_back((command, path, folder));
-            return;
-        }
-        self.start_git_file_lookup(command, path, folder);
+        // what Stage staged. Every command joins the back of the line, and
+        // the line starts its head, so a command run while an earlier one
+        // waits (behind a discard's question, say) never jumps ahead of it.
+        self.git_file_queue.push_back((command, path, folder));
+        self.start_next_git_file_command();
     }
 
     /// Read `folder`'s repository's changes off the UI thread for
