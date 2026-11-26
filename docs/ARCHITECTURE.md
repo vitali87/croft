@@ -428,6 +428,7 @@ src/
     ├── diff.rs               side-by-side file diff renderer behind the explorer's Compare action; also derives hunk ranges and the unified patches behind the diff pane's stage / unstage / revert keys
     ├── editor.rs             the `Editor` type and its constructor, the data types its parts share (undo snapshots, diff inks, tab state and others) and the small helpers every part uses; each feature lives in a file in `editor/` below
     ├── editor/               the editor's feature files, beside editor.rs; each file's `//!` doc says what it holds
+    │   ├── align.rs         Cursor Align: padding every caret's selection into one column with spaces at both ends, at the front only (right-aligning the text), or with tabs snapped to the buffer's own tab stops, and padding whole lines so their selection ends line up
     │   ├── brackets.rs      brackets: matching pairs, jumping and selecting to the matching bracket, and highlighting the pair at the caret
     │   ├── comments.rs      comment toggling: line and block comments for each language, JSX comments, and the comment tokens each language uses
     │   ├── diff_view.rs     the diff and merge views: side-by-side and inline diffs, the three-way merge panes and their accept chips, merge conflicts, and a file as it was at a commit

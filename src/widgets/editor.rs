@@ -19,6 +19,7 @@ pub use crate::sheet::SheetCellEdit;
 pub use crate::text_edit::TextSpanEdit;
 use crate::widgets::scrollbar;
 
+mod align;
 mod brackets;
 mod comments;
 mod diff_view;
@@ -69,6 +70,7 @@ pub use language::language_scope_id;
 pub use language::normalize_rulers;
 use language::*;
 use line_commands::*;
+pub use multi_cursor::CaretMotion;
 use multi_cursor::*;
 pub(crate) use navigation::is_word_char;
 #[cfg(test)]

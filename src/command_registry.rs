@@ -570,6 +570,42 @@ commands! {
         title: "Add Cursor Below",
         hint: "Cmd+Opt+↓",
     }
+    /// Multi-cursor: keep every caret through moves and Enter instead of
+    /// collapsing to one (#1022). Off by default; palette-only.
+    ToggleMultiCursorPersist {
+        id: "toggle_multi_cursor_persist",
+        title: "Toggle Multi-Cursor Persistence",
+        hint: "",
+    }
+    /// Cursor Align (#2339): line several carets' selections up into one
+    /// column, ported from the VS Code extension of the same name.
+    AlignCursors {
+        id: "align_cursors",
+        title: "Align Cursors",
+        hint: "Alt+A",
+    }
+    AlignCursorsPadFront {
+        id: "align_cursors_pad_front",
+        title: "Align Cursors (Pad Front)",
+        hint: "Alt+F",
+    }
+    AlignCursorsUsingTabs {
+        id: "align_cursors_using_tabs",
+        title: "Align Cursors Using Tabs",
+        hint: "Ctrl+Alt+A",
+    }
+    AlignCursorsUsingAuto {
+        id: "align_cursors_using_auto",
+        title: "Align Cursors Using Indentation Settings",
+        hint: "",
+    }
+    AlignLineLastCursors {
+        id: "align_line_last_cursors",
+        title: "Align Line Last Cursors",
+        // Not Ctrl+Alt+Shift+A: that is Cmd+Opt+Shift+A's Linux spelling,
+        // which upstream's Sort Lines Ascending already takes.
+        hint: "Ctrl+Alt+L",
+    }
     ColumnSelectUp {
         id: "column_select_up",
         title: "Column Select Up",
@@ -1982,10 +2018,12 @@ commands! {
     }
     /// Terminal: Run Selected Text in Active Terminal (#1292): the
     /// editor's selection, or the caret's line, run in the active pane.
+    /// Send Selection/Line to Terminal (#1292, #2340): the editor's selection,
+    /// or the caret's line, run in the active pane; Alt+X.
     RunSelectedText {
         id: "run_selected_text",
-        title: "Terminal: Run Selected Text in Active Terminal",
-        hint: "",
+        title: "Send Selection/Line to Terminal",
+        hint: "Alt+X",
         group: Terminal,
     }
     /// Terminal: Focus Next / Previous Terminal (#843): Cmd+] / Cmd+[, which

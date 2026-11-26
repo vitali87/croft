@@ -2648,6 +2648,27 @@ fn line_commands_on_a_non_text_view_say_so_and_leave_the_tab_clean() {
 }
 
 #[test]
+fn align_commands_on_a_non_text_view_say_so_and_leave_the_tab_clean() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let bin = tmp.path().join("a.bin");
+    std::fs::write(&bin, [0u8, 1, 2, 3, 4, 5, 6, 7]).unwrap();
+    app.editor.hex = Some(crate::hex::HexView::open(&bin).unwrap());
+    assert!(app.editor.has_non_text_view(), "precondition");
+    for cmd in [
+        Command::AlignCursors,
+        Command::AlignCursorsPadFront,
+        Command::AlignCursorsUsingTabs,
+        Command::AlignLineLastCursors,
+    ] {
+        app.run_command(cmd);
+        assert_eq!(app.status, format!("{} needs a text file", cmd.title()));
+        assert!(!app.editor.dirty, "{cmd:?} left the preview dirty");
+    }
+}
+
+#[test]
 fn rename_symbol_defers_the_prompt_until_a_verdict_arrives() {
     // #254 item 6: F2 no longer opens the prompt straight away — it fires
     // prepareRename and parks, so the prompt can pre-fill the server's own

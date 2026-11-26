@@ -1,0 +1,1 @@
+feature: Editor: Multi-Cursor Persistence (#1022) keeps every caret through arrows, Home/End, word-wise moves and Enter instead of collapsing to one. Off by default; turn it on in the Settings hub (or the palette). Esc and a mouse click still collapse.
