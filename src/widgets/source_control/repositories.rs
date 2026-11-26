@@ -23,21 +23,33 @@ impl SourceControlPanel {
         self.settle_keys();
     }
 
-    /// REPOSITORIES takes the keys (#871), on the shown repository's row.
-    pub fn focus_repositories(&mut self) {
-        self.keys = KeyStop::Repositories;
-        self.repo_cursor = self.repositories.iter().position(|r| r.active).unwrap_or(0);
+    /// How many REPOSITORIES rows the last frame drew. A short panel draws
+    /// only the first few, and the keyboard reaches only those, as the mouse
+    /// does: a row it cannot see is never the one Enter opens.
+    pub(super) fn drawn_repo_rows(&self) -> usize {
+        self.repo_row_areas.len().min(self.repositories.len())
     }
 
-    /// Move REPOSITORIES' keyboard row `delta` rows, stopping at the ends.
+    /// REPOSITORIES takes the keys (#871), on the shown repository's row, or
+    /// on the last drawn row when that one is below the panel's bottom.
+    pub fn focus_repositories(&mut self) {
+        self.keys = KeyStop::Repositories;
+        let shown = self.repositories.iter().position(|r| r.active).unwrap_or(0);
+        self.repo_cursor = shown.min(self.drawn_repo_rows().saturating_sub(1));
+    }
+
+    /// Move REPOSITORIES' keyboard row `delta` rows, stopping at the first
+    /// and at the last drawn.
     pub fn move_repo_cursor(&mut self, delta: isize) {
-        let last = self.repositories.len().saturating_sub(1);
+        let last = self.drawn_repo_rows().saturating_sub(1);
         self.repo_cursor = self.repo_cursor.saturating_add_signed(delta).min(last);
     }
 
-    /// The repository on REPOSITORIES' keyboard row.
+    /// The repository on REPOSITORIES' keyboard row, if that row was drawn.
     pub fn repo_under_cursor(&self) -> Option<&RepoRow> {
-        self.repositories.get(self.repo_cursor)
+        (self.repo_cursor < self.drawn_repo_rows())
+            .then(|| self.repositories.get(self.repo_cursor))
+            .flatten()
     }
 
     /// Paint the multi-root REPOSITORIES overview (#161) starting at `y`,

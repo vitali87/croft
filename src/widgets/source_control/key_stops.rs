@@ -9,7 +9,9 @@ impl SourceControlPanel {
     /// one stop here: Tab walks them before it leaves the card.
     fn stops(&self) -> Vec<KeyStop> {
         let mut stops = Vec::with_capacity(4);
-        if self.repositories.len() >= 2 {
+        // REPOSITORIES while it shows (two or more) and the last frame drew
+        // a row of it: a panel too short for any has no such stop.
+        if self.repositories.len() >= 2 && self.drawn_repo_rows() > 0 {
             stops.push(KeyStop::Repositories);
         }
         if self.shows_repository() {

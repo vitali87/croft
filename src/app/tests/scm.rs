@@ -9162,3 +9162,15 @@ fn the_card_takes_the_keys_only_once_git_has_answered() {
     scm_card_ready(&mut app, 120, 40);
     assert_eq!(app.source_control.keys, KeyStop::Card);
 }
+
+/// Git: Initialize Repository in a folder whose subfolders are repositories
+/// runs nothing, as the card offers only their Open there: `git init` would
+/// wrap them (#871).
+#[test]
+fn initialize_repository_leaves_a_folder_of_repositories_alone() {
+    let (tmp, _) = nested_repo_1227();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(crate::command_registry::Command::GitInitializeRepository);
+    assert!(!tmp.path().join(".git").exists(), "status: {}", app.status);
+    assert!(app.status.contains("subfolders"), "{}", app.status);
+}

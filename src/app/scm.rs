@@ -1395,13 +1395,19 @@ impl App {
     }
 
     /// Git: Initialize Repository from the Command Palette (#871): what the
-    /// no-repository card's button does, or, in a folder that already is a
-    /// repository, a line saying so.
+    /// no-repository card's button does. In a folder that already is a
+    /// repository, or one whose subfolders are (where the card offers only
+    /// their Open, as `git init` would wrap them), a line says why not.
     pub(super) fn initialize_repository_command(&mut self) {
+        let folder = self.active_scm_root.clone();
         if self.source_control.status.in_repo {
+            self.status = format!("{} is already in a Git repository", folder.display());
+            return;
+        }
+        if !crate::git::child_repos(&folder).is_empty() {
             self.status = format!(
-                "{} is already in a Git repository",
-                self.active_scm_root.display()
+                "{} holds repositories in its subfolders: open one from Source Control",
+                folder.display()
             );
             return;
         }
