@@ -1,0 +1,42 @@
+== a folder row
+opens at (7, 2), Panel, keyed, row 0 lit
+New File goes in <ws>/src
+  New File  =>  Create(File)
+  New Folder  =>  Create(Folder)
+  Cut  =>  Cut(["<ws>/src"])
+  Copy  =>  Copy(["<ws>/src"])
+  Rename  =>  Rename("<ws>/src")
+  Make root  =>  MakeRoot("<ws>/src")
+  Delete  =>  Delete { paths: ["<ws>/src"] }
+keys: Tree
+selected "src", marked []
+== a file row
+opens at (7, 4), Panel, keyed, row 0 lit
+New File goes in <ws>
+  New File  =>  Create(File)
+  New Folder  =>  Create(Folder)
+  Cut  =>  Cut(["<ws>/README.md"])
+  Copy  =>  Copy(["<ws>/README.md"])
+  Rename  =>  Rename("<ws>/README.md")
+  Select for Compare  =>  SelectForCompare("<ws>/README.md")
+  Delete  =>  Delete { paths: ["<ws>/README.md"] }
+keys: Tree
+selected "README.md", marked []
+== one of two marked rows
+opens at (7, 3), Panel, keyed, row 0 lit
+New File goes in <ws>
+  New File  =>  Create(File)
+  New Folder  =>  Create(Folder)
+  Cut  =>  Cut(["<ws>/notes.txt", "<ws>/README.md"])
+  Copy  =>  Copy(["<ws>/notes.txt", "<ws>/README.md"])
+  Compare Selected  =>  CompareWithSelected { anchor: "<ws>/notes.txt", other: "<ws>/README.md" }
+  Delete 2 items  =>  Delete { paths: ["<ws>/notes.txt", "<ws>/README.md"] }
+keys: Tree
+selected "notes.txt", marked ["README.md", "notes.txt"]
+== the empty space below the rows
+opens at (7, 5), Panel, keyed, row 0 lit
+New File goes in <ws>
+  New File  =>  Create(File)
+  New Folder  =>  Create(Folder)
+keys: Tree
+selected "notes.txt", marked ["README.md", "notes.txt"]

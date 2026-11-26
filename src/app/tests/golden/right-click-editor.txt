@@ -1,0 +1,32 @@
+== the text, nothing selected
+opens at (47, 4), Panel, keyed, row 0 lit
+New File goes in <ws>
+  Go to Definition  =>  GoToDefinitionAt { row: 1, col: 5 }
+  Go Back  =>  NavigateBack
+  Go Forward  =>  NavigateForward
+  Rename Symbol  =>  RenameSymbolAt { row: 1, col: 5 }
+  Change All Occurrences  =>  ChangeAllOccurrencesAt { row: 1, col: 5 }
+  Copy Permalink  =>  CopyPermalink
+  Open on Remote  =>  OpenOnRemote
+  ---
+  Paste  =>  EditorPaste
+  ---
+  Command Palette  =>  ShowCommandPalette
+keys: Editor
+== the text, a word selected
+opens at (47, 4), Panel, keyed, row 0 lit
+New File goes in <ws>
+  Go to Definition  =>  GoToDefinitionAt { row: 1, col: 5 }
+  Go Back  =>  NavigateBack
+  Go Forward  =>  NavigateForward
+  Rename Symbol  =>  RenameSymbolAt { row: 1, col: 5 }
+  Change All Occurrences  =>  ChangeAllOccurrencesAt { row: 1, col: 5 }
+  Copy Permalink  =>  CopyPermalink
+  Open on Remote  =>  OpenOnRemote
+  ---
+  Cut  =>  EditorCut
+  Copy  =>  EditorCopy
+  Paste  =>  EditorPaste
+  ---
+  Command Palette  =>  ShowCommandPalette
+keys: Editor
