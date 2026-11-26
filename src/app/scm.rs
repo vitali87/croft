@@ -3938,10 +3938,14 @@ impl App {
         let card = crate::widgets::surface::tones(self.theme).is_some();
         let nodes = scm_menu::menu_for(op);
         let rows = scm_menu::rows(&nodes);
+        // On a terminal too short for every row, each column shows a window
+        // of them kept around the keyboard's row, as croft's other menus do.
         let top = scm_menu::top_column(&rows, anchor, screen, card);
+        let top = top.shown_from(menu.scroll_for(top.shown()));
         let fly_out = menu.open_submenu.and_then(|parent| {
             let items = scm_menu::fly_out_rows(&nodes, parent)?;
             let col = scm_menu::fly_out_column(top, parent, &items, screen, card);
+            let col = col.shown_from(menu.submenu_scroll_for(col.shown()));
             Some((items, col))
         });
         Some(ScmActionsLayout { rows, top, fly_out })

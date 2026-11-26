@@ -2780,6 +2780,49 @@ fn the_source_control_actions_menu_closes_when_its_view_leaves_the_screen() {
     assert!(app.context_menu.is_none(), "another view took the side bar");
 }
 
+/// #871 review: on a terminal too short for every row, the menu shows a
+/// window of its rows kept around the keyboard's row, so the row Enter
+/// would run is always the one highlighted on screen.
+#[test]
+fn a_short_terminal_scrolls_the_actions_menu_to_the_keyboards_row() {
+    let (_tmp, mut app) = scm_with_two_changes();
+    app.open_scm_actions_menu_from_keyboard();
+    draw(&mut app, 120, 12);
+    let layout = app.scm_actions_layout().expect("the menu is drawn");
+    assert!(
+        layout.top.shown() < layout.rows.len(),
+        "12 rows cannot show all of it"
+    );
+    app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(scm_menu_cursor(&app), "Show Git Output");
+    let buf = draw_buffer(&mut app, 120, 12);
+    let selected = app.context_menu.as_ref().unwrap().selected;
+    let row = app
+        .scm_actions_layout()
+        .and_then(|l| l.top.row(selected))
+        .expect("the keyboard's row is drawn");
+    let text: String = (row.x..row.right())
+        .map(|x| buf[(x, row.y)].symbol().to_string())
+        .collect();
+    assert!(text.contains("Show Git Output"), "{text:?}");
+    assert_eq!(
+        app.scm_actions_layout()
+            .and_then(|l| l.top.row_at(row.x + 2, row.y)),
+        Some(selected),
+        "a click there picks the same row"
+    );
+    app.handle_key(key(KeyCode::Home, KeyModifiers::NONE))
+        .unwrap();
+    draw(&mut app, 120, 12);
+    assert!(
+        app.scm_actions_layout()
+            .and_then(|l| l.top.row(0))
+            .is_some(),
+        "Home scrolls back to the first row"
+    );
+}
+
 /// #871: in the list `s` stages the selected row, `u` unstages it and `d`
 /// asks before discarding it, each staying on the file it moved.
 #[test]

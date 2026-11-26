@@ -359,13 +359,16 @@ pub fn fly_out_rows(nodes: &[Node], parent: usize) -> Option<Vec<Row>> {
 }
 
 /// Where one column of the menu sits: its rect, the rim rows a card keeps
-/// above and below its rows (none on a plain panel), and how many rows it
-/// holds. A row is drawn only while it fits inside the rim.
+/// above and below its rows (none on a plain panel), how many rows it holds,
+/// and the first one it shows. A row is drawn only while it fits inside the
+/// rim, so on a short terminal the column shows a window of its rows, moved
+/// to keep the keyboard's row on screen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Column {
     pub rect: Rect,
     pub pad: u16,
     rows: usize,
+    first: usize,
 }
 
 impl Column {
@@ -374,7 +377,8 @@ impl Column {
         if i >= self.rows {
             return None;
         }
-        let y = self.rect.y + self.pad + u16::try_from(i).ok()?;
+        let k = u16::try_from(i.checked_sub(self.first)?).ok()?;
+        let y = self.rect.y + self.pad + k;
         (y + self.pad < self.rect.bottom()).then(|| Rect::new(self.rect.x, y, self.rect.width, 1))
     }
 
@@ -383,15 +387,21 @@ impl Column {
         if x < self.rect.x || x >= self.rect.right() {
             return None;
         }
-        let i = usize::from(y.checked_sub(self.rect.y + self.pad)?);
+        let i = self.first + usize::from(y.checked_sub(self.rect.y + self.pad)?);
         self.row(i).map(|_| i)
     }
 
-    /// How many rows the column draws.
+    /// How many rows the column has room to draw at once.
     pub fn shown(&self) -> usize {
-        (0..self.rows)
-            .take_while(|&i| self.row(i).is_some())
-            .count()
+        usize::from(self.rect.height.saturating_sub(2 * self.pad)).min(self.rows)
+    }
+
+    /// The column showing its rows from `first` on.
+    pub fn shown_from(self, first: usize) -> Column {
+        Column {
+            first: first.min(self.rows.saturating_sub(self.shown())),
+            ..self
+        }
     }
 }
 
@@ -432,6 +442,7 @@ pub fn top_column(rows: &[Row], anchor: Rect, screen: Rect, card: bool) -> Colum
         rect,
         pad,
         rows: rows.len(),
+        first: 0,
     }
 }
 
@@ -458,7 +469,8 @@ pub fn fly_out_column(
         top.rect.x.saturating_sub(width)
     };
     let n = u16::try_from(rows.len()).unwrap_or(u16::MAX);
-    let parent_y = top.rect.y + top.pad + u16::try_from(parent).unwrap_or(u16::MAX);
+    // Level with the parent row where the top column draws it.
+    let parent_y = top.row(parent).map_or(top.rect.y + top.pad, |r| r.y);
     let (pad, height) = if card {
         let pad = edge_pad(n, screen.height);
         (pad, (n + 2 * pad).min(screen.height))
@@ -477,6 +489,7 @@ pub fn fly_out_column(
         rect,
         pad,
         rows: rows.len(),
+        first: 0,
     }
 }
 
@@ -582,7 +595,7 @@ pub fn paint_column(
     Widget::render(Clear, col.rect, buf);
     fill(buf, col.rect, bg);
     let (cursor_bg, cursor_ink) = marks.cursor_colours;
-    for (i, row) in rows.iter().enumerate() {
+    for (i, row) in rows.iter().enumerate().skip(col.first) {
         let Some(r) = col.row(i) else {
             break;
         };
@@ -658,7 +671,7 @@ fn paint_card_column(
     Widget::render(Clear, col.rect, buf);
     fill(buf, col.rect, t.raised());
     crate::widgets::surface::paint_overlay_frame(buf, col.rect, theme);
-    for (i, row) in rows.iter().enumerate() {
+    for (i, row) in rows.iter().enumerate().skip(col.first) {
         let Some(r) = col.row(i) else {
             break;
         };
@@ -939,6 +952,25 @@ mod tests {
         let fly = fly_out_column(top, stash, &items, narrow, false);
         assert!(fly.rect.width < pill.x, "room on the left");
         assert_eq!(fly.rect.right(), top.rect.x, "flipped to the left");
+    }
+
+    /// A column shown from a later row draws that row first, maps its cells
+    /// back to it, and draws none of the rows above it.
+    #[test]
+    fn a_column_shown_from_a_later_row() {
+        let rows = rows(&menu_for(None));
+        let short = Rect::new(0, 0, 120, 8);
+        let col = top_column(&rows, Rect::new(10, 0, 2, 1), short, false);
+        assert!(col.shown() < rows.len());
+        let col = col.shown_from(5);
+        assert_eq!(col.row(4), None);
+        let first = col.row(5).unwrap();
+        assert_eq!(first.y, col.rect.y);
+        assert_eq!(col.row_at(first.x + 1, first.y), Some(5));
+        assert_eq!(
+            col.shown_from(99).row(rows.len() - 1).map(|r| r.bottom()),
+            Some(col.rect.bottom())
+        );
     }
 
     /// A cell maps to the row drawn there, and nothing outside the column.
