@@ -671,8 +671,10 @@ fn scm_view(sc: &crate::widgets::source_control::SourceControlPanel) -> String {
     if sc.focused {
         out.push_str(" +focus");
     }
-    if sc.list_focused {
-        out.push_str(" +list");
+    match sc.keys {
+        crate::widgets::source_control::KeyStop::Message => {}
+        crate::widgets::source_control::KeyStop::List => out.push_str(" +list"),
+        crate::widgets::source_control::KeyStop::Commits => out.push_str(" +commits"),
     }
     if let Some(i) = sc.selected_change {
         out.push_str(&format!(" sel={i}"));
@@ -1908,7 +1910,7 @@ fn scm_list_on(app: &mut App, path: &str) {
             app.source_control.entries.len() == 2
         },
     );
-    app.source_control.list_focused = true;
+    app.source_control.keys = crate::widgets::source_control::KeyStop::List;
     app.source_control.selected_change = app
         .source_control
         .entries
@@ -2118,6 +2120,18 @@ const PROOF_PLACES: &[ProofPlace] = &[
             setup: |app| scm_list_on(app, "docs/notes.md"),
         },
         commands: &[Command::GitUnstageChanges],
+    },
+    ProofPlace {
+        context: Context {
+            name: "Source Control's COMMITS with the keys",
+            repo: true,
+            setup: |app| {
+                scm_list_on(app, "todo.txt");
+                app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+                    .unwrap();
+            },
+        },
+        commands: &[Command::GitRefresh],
     },
 ];
 

@@ -750,6 +750,8 @@ impl App {
                             height: graph_h,
                             ..usable_area
                         };
+                        self.commit_graph.has_keys = self.source_control.keys
+                            == crate::widgets::source_control::KeyStop::Commits;
                         frame.render_widget(&mut self.commit_graph, graph_area);
                     } else {
                         self.commit_graph.last_area = Rect::default();

@@ -2285,6 +2285,12 @@ commands! {
         title: "Git: Discard Changes",
         hint: "D in Source Control",
     }
+    /// The header's refresh button (#871); `R` in Source Control's lists.
+    GitRefresh {
+        id: "git_refresh",
+        title: "Git: Refresh",
+        hint: "R in Source Control",
+    }
     ToggleTerminalSuggestions {
         id: "toggle_terminal_suggestions",
         title: "Terminal: Toggle Command Suggestions",

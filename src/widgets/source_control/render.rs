@@ -242,7 +242,7 @@ impl Widget for &mut SourceControlPanel {
                 .min(left),
         };
         self.last_input_area = input_box;
-        let input_border_style = if self.focused && !self.list_focused {
+        let input_border_style = if self.focused && self.keys == KeyStop::Message {
             Style::default().fg(accent)
         } else {
             Style::default().fg(self.theme.ui(Color::Rgb(0x60, 0x68, 0x78)))
@@ -256,7 +256,7 @@ impl Widget for &mut SourceControlPanel {
         // the accent while it has the keyboard) in place of the rounded line
         // box. The inner rect is the box's, so the text and the caret land on
         // the same cells.
-        let field_focused = self.focused && !self.list_focused;
+        let field_focused = self.focused && self.keys == KeyStop::Message;
         match tones {
             Some(t) => crate::widgets::surface::paint_field(
                 buf,
@@ -625,7 +625,7 @@ impl Widget for &mut SourceControlPanel {
                             },
                             t,
                             t.chrome,
-                            self.focused && self.list_focused,
+                            self.focused && self.keys == KeyStop::List,
                         );
                     }
                     let row_bg = if is_primary {

@@ -1,0 +1,1 @@
+feature: Source Control's COMMITS answers the keyboard: Tab and Shift+Tab step between the message box, the change list and COMMITS, the arrows, Page Up / Page Down and Home / End pick a commit, Enter opens it, Left / Right collapse and expand the section, and R refreshes from the lists (Git: Refresh on the Command Palette); a click on a commit also picks it (#871).

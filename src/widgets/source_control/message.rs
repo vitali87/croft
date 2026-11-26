@@ -260,7 +260,7 @@ impl SourceControlPanel {
     /// column `input_box.x + 2 + col`, row `input_box.y + 1 + line`
     /// (rounded border occupies one cell on each side).
     pub fn cursor_screen_pos(&self) -> Option<(u16, u16)> {
-        if !self.focused || self.list_focused {
+        if !self.focused || self.keys != KeyStop::Message {
             return None;
         }
         let r = self.last_input_area;

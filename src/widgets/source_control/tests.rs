@@ -2290,7 +2290,7 @@ fn a_refresh_keeps_the_selection_on_its_file() {
         ],
     );
     p.selected_change = Some(1);
-    p.list_focused = true;
+    p.keys = KeyStop::List;
     p.set_status(
         main(),
         vec![
@@ -2310,7 +2310,11 @@ fn a_refresh_keeps_the_selection_on_its_file() {
     );
     assert_eq!(p.selected_change, Some(2));
     p.set_status(main(), Vec::new());
-    assert!(!p.list_focused, "an empty list gives the keyboard back");
+    assert_eq!(
+        p.keys,
+        KeyStop::Message,
+        "an empty list gives the keyboard back"
+    );
 }
 
 /// #871: the multi-selection follows its files through a refresh that

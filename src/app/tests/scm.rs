@@ -3021,7 +3021,10 @@ fn git_file_commands_act_on_the_selected_row_in_the_change_list() {
     app.set_sidebar_view(SidebarView::SourceControl);
     app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
         .unwrap();
-    assert!(app.source_control.list_focused);
+    assert_eq!(
+        app.source_control.keys,
+        crate::widgets::source_control::KeyStop::List
+    );
     let scratch = app
         .source_control
         .entries
@@ -3281,6 +3284,192 @@ fn a_command_run_while_one_waits_goes_behind_it() {
         "",
         "Stage ran first, then Unstage"
     );
+}
+
+/// #871 step 5: a repository with `n` commits and a clean tree, Source
+/// Control showing its COMMITS loaded and drawn at 120x40.
+fn scm_with_history(n: usize) -> (tempfile::TempDir, App) {
+    let tmp = make_committed_repo();
+    for i in 1..n {
+        std::fs::write(tmp.path().join("seed.txt"), format!("change {i}\n")).unwrap();
+        assert!(git_succeeds(
+            tmp.path(),
+            &["commit", "-q", "-am", &format!("change {i}")]
+        ));
+    }
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(wait_for_changes(&mut app, |a| a
+        .source_control
+        .status
+        .in_repo));
+    app.set_sidebar_view(SidebarView::SourceControl);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !(app.commit_graph.is_loaded() && app.commit_graph.last_row() + 1 == n) {
+        app.sync_explorer_panels();
+        assert!(std::time::Instant::now() < deadline, "COMMITS loads");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    draw(&mut app, 120, 40);
+    (tmp, app)
+}
+
+fn press(app: &mut App, code: KeyCode, mods: KeyModifiers) {
+    app.handle_key(key(code, mods)).unwrap();
+}
+
+/// #871 step 5: Tab steps message box -> change list -> COMMITS -> message
+/// box, and Shift+Tab goes round the other way.
+#[test]
+fn tab_steps_through_source_control_message_list_and_commits() {
+    let (_tmp, mut app) = scm_with_two_changes();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !app.commit_graph.is_loaded() {
+        app.sync_explorer_panels();
+        assert!(std::time::Instant::now() < deadline, "COMMITS loads");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    draw(&mut app, 120, 40);
+    let at = |app: &App| match app.source_control.keys {
+        crate::widgets::source_control::KeyStop::Message => "message",
+        crate::widgets::source_control::KeyStop::List => "list",
+        crate::widgets::source_control::KeyStop::Commits => "commits",
+    };
+    assert_eq!(at(&app), "message");
+    press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+    assert_eq!(at(&app), "list");
+    press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+    assert_eq!(at(&app), "commits");
+    assert!(
+        app.commit_graph.selected_commit().is_some(),
+        "a commit is picked"
+    );
+    // One stop has the keys at a time: the message box shows no caret
+    // while COMMITS has them.
+    draw(&mut app, 120, 40);
+    assert_eq!(app.source_control.cursor_screen_pos(), None);
+    press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+    assert_eq!(at(&app), "message");
+    draw(&mut app, 120, 40);
+    assert!(app.source_control.cursor_screen_pos().is_some());
+    press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT);
+    assert_eq!(at(&app), "commits");
+    press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT);
+    assert_eq!(at(&app), "list");
+    press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT);
+    assert_eq!(at(&app), "message");
+}
+
+/// #871 step 5: a clean repository has no change list, so Tab goes from
+/// the message box straight to COMMITS.
+#[test]
+fn tab_skips_an_empty_change_list_to_commits() {
+    let (_tmp, mut app) = scm_with_history(3);
+    press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+    assert_eq!(
+        app.source_control.keys,
+        crate::widgets::source_control::KeyStop::Commits
+    );
+}
+
+/// #871 step 5: in COMMITS the arrows, Home / End and PageUp / PageDown
+/// pick a commit and keep it on screen, Enter opens the picked commit,
+/// and Left / Right collapse and expand the section.
+#[test]
+fn commits_answer_the_keyboard() {
+    let (_tmp, mut app) = scm_with_history(40);
+    press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+    let summary = |app: &App| app.commit_graph.selected_commit().unwrap().summary.clone();
+    assert_eq!(summary(&app), "change 39", "the newest commit first");
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+    assert_eq!(summary(&app), "change 38");
+    press(&mut app, KeyCode::End, KeyModifiers::NONE);
+    assert_eq!(summary(&app), "init");
+    let buf = draw_buffer(&mut app, 120, 40);
+    let area = app.commit_graph.last_area;
+    let drawn: String = (area.y..area.bottom())
+        .flat_map(|y| (area.x..area.right()).map(move |x| (x, y)))
+        .map(|(x, y)| buf[(x, y)].symbol().to_string())
+        .collect();
+    assert!(
+        drawn.contains("init"),
+        "End scrolls the oldest commit on screen"
+    );
+    press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+    assert_ne!(summary(&app), "init");
+    press(&mut app, KeyCode::Home, KeyModifiers::NONE);
+    assert_eq!(summary(&app), "change 39");
+    let short = app
+        .commit_graph
+        .selected_commit()
+        .unwrap()
+        .short_hash
+        .clone();
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(app.status, format!("Loading commit {short}\u{2026}"));
+    press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+    assert!(app.commit_graph.collapsed);
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+    assert_eq!(
+        summary(&app),
+        "change 39",
+        "a collapsed section does not move"
+    );
+    press(&mut app, KeyCode::Right, KeyModifiers::NONE);
+    assert!(!app.commit_graph.collapsed);
+}
+
+/// #871 step 5: a click on a commit picks it and gives COMMITS the keys; a
+/// click back in the message box takes them away.
+#[test]
+fn a_click_on_a_commit_picks_it_for_the_keyboard() {
+    let (tmp, mut app) = scm_with_history(5);
+    let row_y = (0..40)
+        .find(|&y| {
+            app.commit_graph
+                .commit_at(y)
+                .is_some_and(|c| c.summary == "change 2")
+        })
+        .expect("the commit is drawn");
+    let x = app.commit_graph.last_area.x + 4;
+    left_click(&mut app, x, row_y);
+    assert_eq!(
+        app.source_control.keys,
+        crate::widgets::source_control::KeyStop::Commits
+    );
+    assert_eq!(
+        app.commit_graph.selected_commit().unwrap().summary,
+        "change 2"
+    );
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+    assert_eq!(
+        app.commit_graph.selected_commit().unwrap().summary,
+        "change 1"
+    );
+    draw(&mut app, 120, 40);
+    let input = app.source_control.last_input_area;
+    left_click(&mut app, input.x + 1, input.y);
+    assert_eq!(
+        app.source_control.keys,
+        crate::widgets::source_control::KeyStop::Message
+    );
+    drop(tmp);
+}
+
+/// #871 step 5: R in the change list or COMMITS refreshes, as the header's
+/// button does (Git: Refresh); in the message box it is a letter.
+#[test]
+fn r_refreshes_from_the_lists_and_types_in_the_message_box() {
+    let (_tmp, mut app) = scm_with_two_changes();
+    press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE);
+    assert_eq!(app.source_control.message, "r");
+    press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+    app.status.clear();
+    press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE);
+    assert_eq!(app.status, "Refreshed Source Control");
+    press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+    app.status.clear();
+    press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE);
+    assert_eq!(app.status, "Refreshed Source Control");
 }
 
 /// #871: in the list `s` stages the selected row, `u` unstages it and `d`
