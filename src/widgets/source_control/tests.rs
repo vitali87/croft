@@ -2612,3 +2612,37 @@ fn a_one_line_message_keeps_the_three_row_box() {
     render_rows(&mut p);
     assert_eq!(p.last_input_area.height, 3);
 }
+
+/// On a panel too short to draw every REPOSITORIES row, the keyboard stops
+/// at the last row drawn and never opens one it cannot see (#871).
+#[test]
+fn the_keyboard_reaches_only_the_repository_rows_drawn() {
+    use ratatui::buffer::Buffer;
+    let mut p = SourceControlPanel::new();
+    p.status = dummy_status_with_branch("trunk");
+    p.status_known = true;
+    p.repositories = ["a", "b", "c", "d"]
+        .iter()
+        .enumerate()
+        .map(|(i, label)| RepoRow {
+            label: String::from(*label),
+            branch: Some(String::from("trunk")),
+            changes: 0,
+            active: i == 3,
+            workspace_root: std::path::PathBuf::from(format!("/w/{label}")),
+        })
+        .collect();
+    let area = Rect::new(0, 0, 34, 6);
+    let mut buf = Buffer::empty(area);
+    (&mut p).render(area, &mut buf);
+    let drawn = p.repo_row_areas.len();
+    assert!(drawn > 0 && drawn < 4, "{drawn} of 4 rows drawn");
+    p.focus_repositories();
+    assert_eq!(p.repo_cursor, drawn - 1, "the shown row is not drawn");
+    p.move_repo_cursor(isize::MAX);
+    assert_eq!(p.repo_cursor, drawn - 1);
+    assert_eq!(
+        p.repo_under_cursor().map(|r| r.label.as_str()),
+        Some(["a", "b", "c"][drawn - 1])
+    );
+}

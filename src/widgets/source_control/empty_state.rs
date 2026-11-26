@@ -3,7 +3,81 @@
 
 use super::*;
 
+/// A button on the no-repository card, as the keyboard presses it (#871).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CardButton {
+    /// Initialize Repository: `git init` in the folder.
+    Initialize,
+    /// Open on a subfolder's repository: that folder becomes the workspace.
+    Open(std::path::PathBuf),
+}
+
 impl SourceControlPanel {
+    /// The card's title: what the folder holds.
+    pub fn card_title(&self) -> &'static str {
+        if self.nested_repos.is_empty() {
+            "No repository detected"
+        } else {
+            "Repositories found in subfolders"
+        }
+    }
+
+    /// How many buttons the card drew on the last frame.
+    pub fn card_buttons(&self) -> usize {
+        self.nested_repo_button_areas.len() + usize::from(self.last_init_repo_button_area.width > 0)
+    }
+
+    /// The card's button with the keys, as the last frame drew it.
+    pub fn keyed_card_button(&self) -> Option<CardButton> {
+        if self.last_init_repo_button_area.width > 0 {
+            return Some(CardButton::Initialize);
+        }
+        self.nested_repo_button_areas
+            .get(self.card_button)
+            .map(|(_, path)| CardButton::Open(path.clone()))
+    }
+
+    /// The label of the card's button with the keys, as drawn in full.
+    pub fn keyed_card_label(&self) -> Option<String> {
+        match self.keyed_card_button()? {
+            CardButton::Initialize => Some(String::from("Initialize Repository")),
+            CardButton::Open(path) => self
+                .nested_repos
+                .iter()
+                .find(|(_, p)| *p == path)
+                .map(|(label, _)| format!("Open {label}")),
+        }
+    }
+
+    /// The card takes the keys (#871), on its first button, or with
+    /// `first` false (Shift+Tab coming in from below) on its last.
+    pub fn focus_card(&mut self, first: bool) {
+        self.keys = KeyStop::Card;
+        self.card_button = if first {
+            0
+        } else {
+            self.card_buttons().saturating_sub(1)
+        };
+    }
+
+    /// Move the keys to the card's next (`forward`) or previous button.
+    /// False past either end, where Tab leaves the card.
+    pub fn move_card_button(&mut self, forward: bool) -> bool {
+        let next = if forward {
+            self.card_button + 1
+        } else {
+            match self.card_button.checked_sub(1) {
+                Some(n) => n,
+                None => return false,
+            }
+        };
+        if next >= self.card_buttons() {
+            return false;
+        }
+        self.card_button = next;
+        true
+    }
+
     /// Paint the "No repository detected" empty-state card. `inner` is the
     /// panel's inner rect (border already drawn); the SOURCE CONTROL header
     /// sits on `inner.y` so the card starts two rows below.
@@ -112,11 +186,7 @@ impl SourceControlPanel {
         // truncating mid-word - that's the "text inside is not even
         // adjusted" bug from the user's screenshot.
         let nested = !self.nested_repos.is_empty();
-        let title_text = if nested {
-            "Repositories found in subfolders"
-        } else {
-            "No repository detected"
-        };
+        let title_text = self.card_title();
         let title_h = paragraph_line_count(title_text, card_inner.width).min(3) as u16;
         if y + title_h <= bottom && title_h > 0 {
             let title_rect = Rect {
@@ -159,13 +229,30 @@ impl SourceControlPanel {
         let max_btn_w: u16 = 40;
         let btn_w = card_inner.width.saturating_sub(2).min(max_btn_w);
         let btn_x = card_inner.x + (card_inner.width.saturating_sub(btn_w)) / 2;
+        // The button with the keys (#871) lifts as a hovered one does, and
+        // only one that fits can have them.
+        let card_has_keys = self.focused && self.keys == KeyStop::Card;
+        // A plain theme's button draws no hover, so its keys lift the fill.
+        let fill = |keyed: bool| {
+            if keyed && tones.is_none() {
+                lift_button(blue_bg)
+            } else {
+                blue_bg
+            }
+        };
         if nested {
             // One Open button per repo while they fit; Initialize would
             // `git init` this folder around them, so it is not offered.
-            for (label, path) in &self.nested_repos {
-                if y + 3 > bottom || btn_w < 6 {
-                    break;
-                }
+            let fit = if btn_w >= 6 && y + 3 <= bottom {
+                ((bottom - y - 3) / 4 + 1) as usize
+            } else {
+                0
+            };
+            self.card_button = self
+                .card_button
+                .min(fit.min(self.nested_repos.len()).saturating_sub(1));
+            let keyed = card_has_keys.then_some(self.card_button);
+            for (i, (label, path)) in self.nested_repos.iter().enumerate().take(fit) {
                 let area = Rect {
                     x: btn_x,
                     y,
@@ -173,8 +260,10 @@ impl SourceControlPanel {
                     height: 3,
                 };
                 let text = format!("Open {label}");
-                let hovered = crate::widgets::hover::contains(area, self.hover_pointer);
-                render_button(buf, area, &text, blue_bg, text_white, self.theme, hovered);
+                let hovered =
+                    crate::widgets::hover::contains(area, self.hover_pointer) || keyed == Some(i);
+                let bg = fill(keyed == Some(i));
+                render_button(buf, area, &text, bg, text_white, self.theme, hovered);
                 self.nested_repo_button_areas.push((area, path.clone()));
                 y += 4;
             }
@@ -195,9 +284,11 @@ impl SourceControlPanel {
                 height: 3,
             };
             self.last_init_repo_button_area = init_area;
-            let hovered = crate::widgets::hover::contains(init_area, self.hover_pointer);
+            let hovered =
+                crate::widgets::hover::contains(init_area, self.hover_pointer) || card_has_keys;
+            let bg = fill(card_has_keys);
             render_button(
-                buf, init_area, init_label, blue_bg, text_white, self.theme, hovered,
+                buf, init_area, init_label, bg, text_white, self.theme, hovered,
             );
         }
     }
