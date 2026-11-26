@@ -2250,6 +2250,13 @@ commands! {
         title: "Git: Stash",
         hint: "",
     }
+    /// Source Control's `⋯` actions menu from the keyboard (#871): every
+    /// Git action it lists, reached with the arrows and run with Enter.
+    GitShowSourceControlActions {
+        id: "git_show_source_control_actions",
+        title: "Git: Show Source Control Actions",
+        hint: "Cmd+K Shift+A",
+    }
     ToggleTerminalSuggestions {
         id: "toggle_terminal_suggestions",
         title: "Terminal: Toggle Command Suggestions",

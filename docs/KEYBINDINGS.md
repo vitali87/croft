@@ -115,6 +115,7 @@ Per platform:
 | `Cmd+K` `Cmd+T` | Open the Color Theme picker |
 | `Cmd+K` `G` | Remote: accept the status bar's offer to open a workspace on the host a pane has `ssh`'d into; `Esc` dismisses it. Settings: `disable_remote_offer`, `remote_offer_excluded_hosts` |
 | `Cmd+K` `Shift+L` | Agent: New Worktree Lane: creates a worktree on `agent/<slug>`, adds it as a workspace folder and opens a pane there, running the `lane_agent` setting's agent. Close: "Agent: Close Worktree Lane" |
+| `Cmd+K` `Shift+A` | Git: Show Source Control Actions: Source Control's `⋯` menu, driven by the keyboard (see [Source Control sidebar](#source-control-sidebar)) |
 | `Cmd+K` `A` | Session: Participants: who is attached to this persistent session. `Enter` on a row grants/revokes write control or disconnects them |
 | `Cmd+K` `Shift+Q` | Session: Detach: leave a persistent session (`croft attach`, `croft remote`) while it keeps running |
 | `Cmd+K` `X` | Collab: Cancel AI Stream: stop a `croft pair` collaborator's stream into a shared file and revert its text (same as the gutter's orange `■`) |
@@ -497,6 +498,7 @@ Not supported yet: transforms such as `${TM_FILENAME/(.*)\\..+$/$1/}`, a picker 
 | Click the branch name | Checkout / Create Branch picker: type to filter, `Enter` to switch, or a new name and `Enter` to create it. A remote branch checks out as a local tracking branch |
 | Click the `▾` caret next to Commit | Quick actions menu: Commit & Push, Push, Pull, Sync (Pull, Push), Checkout / Create Branch, Stash, Pop Stash, View Staged Changes, View Changes vs previous, View Changes vs `<default>` |
 | Click the `⋯` icon in the header | Open the full Source Control actions menu with fly-out submenus (listed below the table); `Esc` closes |
+| `Cmd+K` `Shift+A` (Command Palette "Git: Show Source Control Actions") | Open the same `⋯` menu from anywhere, Source Control coming up first: `Up` / `Down` move, `Enter` or `→` opens a fly-out, `←` leaves it, `Enter` runs the row, `Esc` closes. After a click on `⋯`, the first key shows the highlight |
 | Right-click a row in COMMITS | The commit's actions: Cherry-Pick, Revert, Checkout (Detached), Create Branch Here, Create Tag Here, Reset Current Branch to Here (Soft / Mixed / Hard), Copy Commit Hash, Copy Commit Message |
 | Discard All Changes | Revert every tracked file to HEAD after a `Y`/`N` confirm (untracked files are kept) |
 | Click the header refresh icon | Force an immediate git re-scan |

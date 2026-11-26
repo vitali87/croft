@@ -691,6 +691,8 @@ impl App {
         // the primary side bar.
         self.render_secondary_side_bar(frame, secondary_area);
 
+        // Whether Source Control is on screen this frame, for its `⋯` menu.
+        let mut scm_drawn = false;
         if let Some(area) = side_area {
             // Croft Loch's side bar is one chrome surface: the views and the
             // Explorer's stacked sections paint on it.
@@ -725,6 +727,7 @@ impl App {
                 SidebarView::Explorer => self.render_explorer_sections(frame, usable_area),
                 SidebarView::Search => frame.render_widget(&mut self.search, usable_area),
                 SidebarView::SourceControl => {
+                    scm_drawn = true;
                     // The COMMITS graph section docks under the change list,
                     // capped at half the strip (like the Explorer sub-views).
                     // Hidden entirely while the repo empty-state hero shows.
@@ -2383,6 +2386,12 @@ impl App {
         self.render_port_toast(frame);
         self.render_update_toast(frame);
         self.render_zen_hint(frame);
+        // Source Control's `⋯` menu hangs from the view's `⋯` pill: with the
+        // view or the pill off screen it closes, so it never takes keys
+        // unseen.
+        if !scm_drawn || self.source_control.header_more_btn.width == 0 {
+            self.close_scm_actions_menu();
+        }
         self.render_context_menu(frame);
         self.render_commit_dropdown(frame);
         self.render_prompt(frame);
@@ -2411,7 +2420,6 @@ impl App {
         self.render_zoxide_jump(frame);
         self.render_command_history_popup(frame);
         self.render_branch_picker(frame);
-        self.render_scm_menu(frame);
         // Below the input prompt: Enter on a number or text setting opens
         // the prompt over the editor, and drawn after it the editor hid it.
         self.render_settings_editor(frame);

@@ -2604,6 +2604,182 @@ fn arrows_and_enter_in_source_control_open_the_selected_changes_diff() {
     assert!(app.focus == Pane::Editor);
 }
 
+/// The open menu's label at the keyboard's row, on the level it is on.
+fn scm_menu_cursor(app: &App) -> String {
+    let menu = app.context_menu.as_ref().expect("a menu is open");
+    let entry = match menu.open_submenu.and_then(|i| menu.items.get(i)) {
+        Some(MenuEntry::Submenu { items, .. }) => items.get(menu.submenu_selected),
+        _ => menu.items.get(menu.selected),
+    };
+    match entry {
+        Some(MenuEntry::Item { label, .. } | MenuEntry::Submenu { label, .. }) => label.clone(),
+        other => panic!("the cursor is on {other:?}"),
+    }
+}
+
+fn scm_actions_menu_open(app: &App) -> bool {
+    app.context_menu
+        .as_ref()
+        .is_some_and(|m| matches!(m.look, MenuLook::ScmActions { .. }))
+}
+
+/// #871: Cmd+K Shift+A (Git: Show Source Control Actions) brings Source
+/// Control up from another view with its `⋯` menu open and the first action
+/// highlighted; the arrows walk the rows, past the separator, and Enter runs
+/// the one highlighted.
+#[test]
+fn cmd_k_shift_a_opens_source_control_actions_and_enter_runs_a_row() {
+    let (_tmp, mut app) = scm_with_two_changes();
+    app.set_sidebar_view(SidebarView::Explorer);
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('A'), KeyModifiers::SHIFT))
+        .unwrap();
+    assert_eq!(app.sidebar_view, SidebarView::SourceControl);
+    assert!(scm_actions_menu_open(&app));
+    assert!(app.context_menu.as_ref().unwrap().keyed);
+    draw(&mut app, 120, 40);
+    assert!(scm_actions_menu_open(&app), "drawn, it stays open");
+    assert_eq!(scm_menu_cursor(&app), "Pull");
+    for _ in 0..3 {
+        app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(scm_menu_cursor(&app), "Checkout to");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.context_menu.is_none(), "running a row closes the menu");
+    assert!(
+        app.branch_picker.is_some(),
+        "Checkout to opens the branch picker"
+    );
+}
+
+/// #871: → opens a fly-out with its first row highlighted and ← closes it;
+/// Esc backs out of an open fly-out first, then closes the menu.
+#[test]
+fn source_control_actions_fly_outs_open_and_close_from_the_keyboard() {
+    let (_tmp, mut app) = scm_with_two_changes();
+    app.open_scm_actions_menu_from_keyboard();
+    draw(&mut app, 120, 40);
+    for _ in 0..5 {
+        app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(
+        scm_menu_cursor(&app),
+        "Commit",
+        "Down steps over the separator"
+    );
+    app.handle_key(key(KeyCode::Right, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(scm_menu_cursor(&app), "Commit", "the fly-out's first row");
+    assert!(app.context_menu.as_ref().unwrap().open_submenu.is_some());
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(scm_menu_cursor(&app), "Commit Staged");
+    app.handle_key(key(KeyCode::Left, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.context_menu.as_ref().unwrap().open_submenu.is_none());
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.context_menu.as_ref().unwrap().open_submenu.is_some(),
+        "Enter opens it too"
+    );
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(scm_actions_menu_open(&app), "Esc closes the fly-out first");
+    assert!(app.context_menu.as_ref().unwrap().open_submenu.is_none());
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.context_menu.is_none());
+}
+
+/// #871: a click on `⋯` opens the menu as it always has, with no row
+/// highlighted; the first key shows the highlight where it stands, and the
+/// next moves it. A second click on `⋯` closes the menu.
+#[test]
+fn a_click_on_the_more_pill_opens_the_menu_with_no_highlight_until_a_key() {
+    let (_tmp, mut app) = scm_with_two_changes();
+    draw(&mut app, 120, 40);
+    let more = app.source_control.header_more_btn;
+    assert!(more.width > 0);
+    left_click(&mut app, more.x, more.y);
+    assert!(scm_actions_menu_open(&app));
+    assert!(!app.context_menu.as_ref().unwrap().keyed);
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.context_menu.as_ref().unwrap().keyed);
+    assert_eq!(
+        scm_menu_cursor(&app),
+        "Pull",
+        "the first key only shows the row"
+    );
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(scm_menu_cursor(&app), "Push");
+    draw(&mut app, 120, 40);
+    left_click(&mut app, more.x, more.y);
+    assert!(app.context_menu.is_none(), "a second click on ⋯ closes it");
+}
+
+/// #871: a click on a fly-out's row opens the fly-out, and a click on one
+/// of its rows runs it and closes the menu.
+#[test]
+fn a_click_on_a_fly_out_row_runs_it() {
+    let (_tmp, mut app) = scm_with_two_changes();
+    draw(&mut app, 120, 40);
+    let more = app.source_control.header_more_btn;
+    left_click(&mut app, more.x, more.y);
+    draw(&mut app, 120, 40);
+    let branch = app
+        .context_menu
+        .as_ref()
+        .unwrap()
+        .items
+        .iter()
+        .position(|e| matches!(e, MenuEntry::Submenu { label, .. } if label == "Branch"))
+        .unwrap();
+    let row = app.scm_actions_layout().unwrap().top.row(branch).unwrap();
+    left_click(&mut app, row.x + 2, row.y);
+    assert_eq!(
+        app.context_menu.as_ref().unwrap().open_submenu,
+        Some(branch)
+    );
+    draw(&mut app, 120, 40);
+    let (_, fly_out) = app.scm_actions_layout().unwrap().fly_out.unwrap();
+    let rename = fly_out.row(2).unwrap();
+    left_click(&mut app, rename.x + 2, rename.y);
+    assert!(app.context_menu.is_none());
+    assert!(
+        app.input_prompt.is_some(),
+        "Rename Branch asks for the new name"
+    );
+}
+
+/// #871: the menu hangs from the view's `⋯` pill, so it closes when the
+/// view, or the side bar it is in, leaves the screen; it never takes the
+/// keys while unseen.
+#[test]
+fn the_source_control_actions_menu_closes_when_its_view_leaves_the_screen() {
+    let (_tmp, mut app) = scm_with_two_changes();
+    app.open_scm_actions_menu_from_keyboard();
+    draw(&mut app, 120, 40);
+    assert!(scm_actions_menu_open(&app));
+    app.show_tree = false;
+    draw(&mut app, 120, 40);
+    assert!(app.context_menu.is_none(), "the side bar hid");
+    app.open_scm_actions_menu_from_keyboard();
+    assert!(app.show_tree, "the keyboard brings the side bar back");
+    draw(&mut app, 120, 40);
+    assert!(scm_actions_menu_open(&app));
+    app.sidebar_view = SidebarView::Explorer;
+    draw(&mut app, 120, 40);
+    assert!(app.context_menu.is_none(), "another view took the side bar");
+}
+
 /// #871: in the list `s` stages the selected row, `u` unstages it and `d`
 /// asks before discarding it, each staying on the file it moved.
 #[test]

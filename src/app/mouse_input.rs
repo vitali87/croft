@@ -831,13 +831,15 @@ impl App {
             self.handle_list_picker_mouse(m);
             return;
         }
-        if self.scm_menu.open && matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
-            use crate::widgets::scm_menu::ClickOutcome;
-            match self.scm_menu.click(m.column, m.row) {
-                ClickOutcome::Fire(action) => self.dispatch_scm_action(action),
-                ClickOutcome::Toggled => {}
-                ClickOutcome::Missed => self.scm_menu.close(),
-            }
+        // Source Control's `⋯` menu (#871) takes left clicks here, where it
+        // always has; the pointer, the wheel and other buttons pass it by.
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+            && self
+                .context_menu
+                .as_ref()
+                .is_some_and(|menu| matches!(menu.look, MenuLook::ScmActions { .. }))
+        {
+            self.click_scm_actions_menu(m.column, m.row);
             return;
         }
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
@@ -927,7 +929,11 @@ impl App {
         }
 
         // While a context menu is open, route clicks to it.
-        if self.context_menu.is_some() {
+        if self
+            .context_menu
+            .as_ref()
+            .is_some_and(|menu| menu.look == MenuLook::Panel)
+        {
             match m.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
                     // 1. A click inside the open submenu panel dispatches that child.
@@ -1612,6 +1618,8 @@ impl App {
                         crumb: None,
                         scroll: Default::default(),
                         submenu_scroll: Default::default(),
+                        look: MenuLook::Panel,
+                        keyed: true,
                         origin: (m.column, m.row),
                         items,
                         selected: 0,
@@ -1777,6 +1785,8 @@ impl App {
                         crumb: None,
                         scroll: Default::default(),
                         submenu_scroll: Default::default(),
+                        look: MenuLook::Panel,
+                        keyed: true,
                         origin: (m.column, m.row),
                         items,
                         selected: 0,
@@ -2714,14 +2724,7 @@ impl App {
                         return;
                     }
                     if self.source_control.click_more(m.column, m.row) {
-                        self.commit_menu_open = false;
-                        self.scm_menu.open = !self.scm_menu.open;
-                        if self.scm_menu.open {
-                            self.scm_menu.operation = crate::git::repo_operation(&self.scm_root());
-                        }
-                        if !self.scm_menu.open {
-                            self.scm_menu.close();
-                        }
+                        self.open_scm_actions_menu(false);
                         return;
                     }
                     if self.source_control.click_header_refresh(m.column, m.row) {

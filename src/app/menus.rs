@@ -12,6 +12,10 @@ use super::*;
 /// compile until it says which shortcut it shows, or why it shows none.
 pub(super) fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
     match action {
+        // Source Control's `⋯` actions (#871): the menu itself opens with
+        // Cmd+K Shift+A (Git: Show Source Control Actions) and the arrows
+        // reach every row; its look draws no hints.
+        MenuAction::Scm(_) => None,
         MenuAction::Create(CreateKind::File) => Some("⌘F"),
         MenuAction::Create(CreateKind::Folder) => Some("⌘⇧N"),
         MenuAction::Cut(_) => Some("⌘X"),
@@ -309,12 +313,19 @@ impl ContextMenu {
             crumb: None,
             scroll: Default::default(),
             submenu_scroll: Default::default(),
+            look: MenuLook::Panel,
+            keyed: true,
         }
     }
 
     /// Translate every label through the UI catalog (#621). Idempotent: a
     /// translated label is not itself a key.
     pub(super) fn localize(&mut self) {
+        // Source Control's menus draw their own English labels, as they
+        // always have; their rows stay as drawn.
+        if self.look != MenuLook::Panel {
+            return;
+        }
         fn walk(items: &mut [MenuEntry]) {
             for e in items {
                 match e {
@@ -642,6 +653,10 @@ impl App {
         let Some(menu) = &self.context_menu else {
             return;
         };
+        if menu.look != MenuLook::Panel {
+            self.render_scm_actions_menu(frame);
+            return;
+        }
         // `menu_rect` already clamps against `last_frame_area`, so the
         // rect we draw here is the same rect `menu_item_at` hit-tests
         // against. Keeping the two in lock-step is what prevents the
@@ -929,6 +944,9 @@ impl App {
     /// Compute the menu's bounding rect from current state.
     pub(super) fn menu_rect(&self) -> Option<Rect> {
         let menu = self.context_menu.as_ref()?;
+        if menu.look != MenuLook::Panel {
+            return self.scm_actions_layout().map(|l| l.top.rect);
+        }
         // Use char count (not byte len) so multi-byte glyphs in menu
         // labels (e.g. the "" in "Rename", the arrow in "Compare with
         // Selected") don't inflate the menu width past what's needed.
@@ -973,6 +991,9 @@ impl App {
     /// first row aligned to the parent row. `None` when no submenu is open.
     pub(super) fn submenu_rect(&self) -> Option<Rect> {
         let menu = self.context_menu.as_ref()?;
+        if menu.look != MenuLook::Panel {
+            return self.scm_actions_layout()?.fly_out.map(|(_, col)| col.rect);
+        }
         let parent = menu.open_submenu?;
         let MenuEntry::Submenu { items, .. } = menu.items.get(parent)? else {
             return None;
@@ -1012,6 +1033,12 @@ impl App {
     /// one is open, else the top-level panel. Shared by the wheel, PgUp/PgDn
     /// and Home/End so every one of them pages against what is on screen.
     pub(super) fn menu_visible_rows(&self) -> usize {
+        if let Some(layout) = self.scm_actions_layout() {
+            return match layout.fly_out {
+                Some((_, col)) => col.shown(),
+                None => layout.top.shown(),
+            };
+        }
         let rect = if self
             .context_menu
             .as_ref()
@@ -1027,6 +1054,13 @@ impl App {
 
     /// If (x, y) hits a top-level menu row, return its index.
     pub(super) fn menu_item_at(&self, x: u16, y: u16) -> Option<usize> {
+        if self
+            .context_menu
+            .as_ref()
+            .is_some_and(|m| m.look != MenuLook::Panel)
+        {
+            return self.scm_actions_layout()?.top.row_at(x, y);
+        }
         let r = self.menu_rect()?;
         if !rect_contains(r, x, y) {
             return None;
@@ -1041,6 +1075,13 @@ impl App {
 
     /// If (x, y) hits a row of the open submenu panel, return that child index.
     pub(super) fn submenu_item_at(&self, x: u16, y: u16) -> Option<usize> {
+        if self
+            .context_menu
+            .as_ref()
+            .is_some_and(|m| m.look != MenuLook::Panel)
+        {
+            return self.scm_actions_layout()?.fly_out?.1.row_at(x, y);
+        }
         let r = self.submenu_rect()?;
         if !rect_contains(r, x, y) {
             return None;
@@ -1059,6 +1100,16 @@ impl App {
     }
 
     pub(super) fn handle_menu_key(&mut self, key: KeyEvent) {
+        // A Source Control menu opened by a click shows no highlight: the
+        // first key but Esc shows it where it stands instead of acting.
+        if let Some(menu) = self.context_menu.as_mut()
+            && !menu.keyed
+        {
+            menu.keyed = true;
+            if key.code != KeyCode::Esc {
+                return;
+            }
+        }
         // A breadcrumb picker filters as you type (the rows are a long list
         // of symbols, files or folders): characters narrow it, Backspace
         // widens it, Esc clears the text before it dismisses the picker.
@@ -1181,6 +1232,7 @@ impl App {
 
     pub(super) fn dispatch_menu_action(&mut self, action: MenuAction, target_dir: PathBuf) {
         match action {
+            MenuAction::Scm(action) => self.dispatch_scm_action(action),
             MenuAction::Create(kind) => self.open_create_prompt(kind, target_dir),
             MenuAction::Delete { paths } => self.delete_paths(paths),
             MenuAction::Rename(path) => self.open_rename_prompt(path),
@@ -1584,6 +1636,8 @@ impl App {
             crumb: None,
             scroll: Default::default(),
             submenu_scroll: Default::default(),
+            look: MenuLook::Panel,
+            keyed: true,
             origin: (col, row),
             items,
             selected: 0,

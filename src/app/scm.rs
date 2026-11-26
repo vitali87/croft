@@ -6,6 +6,17 @@ use super::*;
 use crate::widgets::confirm_frame::{ConfirmFrame, Inset, draw_confirm, yes_no_keys};
 use crate::widgets::picker_rows::{PickerMouse, answer_mouse};
 
+/// Source Control's `⋯` menu laid out (#871): its rows and top column, and
+/// the open fly-out's rows and column.
+pub(super) struct ScmActionsLayout {
+    pub(super) rows: Vec<crate::widgets::scm_menu::Row>,
+    pub(super) top: crate::widgets::scm_menu::Column,
+    pub(super) fly_out: Option<(
+        Vec<crate::widgets::scm_menu::Row>,
+        crate::widgets::scm_menu::Column,
+    )>,
+}
+
 /// How many commits the history scrubber loads up front (#371).
 ///
 /// A ceiling rather than the whole history: the issue's own criterion is
@@ -2565,7 +2576,7 @@ impl App {
         use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
         use crate::widgets::list_picker::ListPurpose;
         use crate::widgets::scm_menu::ScmAction;
-        self.scm_menu.close();
+        self.close_scm_actions_menu();
         // Nothing else touches the repository while a push, pull or fetch
         // runs in the background: a commit or branch switch under it fights
         // over `index.lock`, and a pull would land on the switched branch.
@@ -3791,25 +3802,183 @@ impl App {
         );
     }
 
-    /// Render the Source Control "⋯" actions menu under the header pill.
-    pub(super) fn render_scm_menu(&mut self, frame: &mut ratatui::Frame) {
-        if !self.scm_menu.open || self.sidebar_view != SidebarView::SourceControl {
-            self.scm_menu.close();
-            return;
+    /// Source Control's `⋯` actions menu (#871), opened on the shared menu
+    /// with its own look. A click opens it with no row highlighted, as it
+    /// always has; the keyboard (`keyed`) opens it with its first row
+    /// highlighted. The operation the repository is in leads it (#1356).
+    pub(super) fn open_scm_actions_menu(&mut self, keyed: bool) {
+        let op = crate::git::repo_operation(&self.scm_root());
+        self.open_scm_actions_menu_for(op, keyed);
+    }
+
+    /// Open Source Control's `⋯` menu for a repository in `op`, whose rows
+    /// lead it (#1356).
+    pub(super) fn open_scm_actions_menu_for(
+        &mut self,
+        op: Option<crate::git::RepoOp>,
+        keyed: bool,
+    ) {
+        use crate::widgets::scm_menu::{Node, menu_for};
+        let leaf = |l: &crate::widgets::scm_menu::Leaf| {
+            MenuEntry::item(l.label, MenuAction::Scm(l.action))
+        };
+        let items: Vec<MenuEntry> = menu_for(op)
+            .iter()
+            .map(|node| match node {
+                Node::Item(l) => leaf(l),
+                Node::Sep => MenuEntry::Separator,
+                Node::Sub { label, items, .. } => MenuEntry::Submenu {
+                    label: label.to_string(),
+                    items: items.iter().map(leaf).collect(),
+                },
+            })
+            .collect();
+        let selected = items.iter().position(MenuEntry::is_selectable).unwrap_or(0);
+        self.commit_menu_open = false;
+        self.context_menu = Some(ContextMenu {
+            origin: (0, 0),
+            items,
+            selected,
+            open_submenu: None,
+            submenu_selected: 0,
+            target_dir: self.scm_root(),
+            crumb: None,
+            scroll: Default::default(),
+            submenu_scroll: Default::default(),
+            look: MenuLook::ScmActions { op },
+            keyed,
+        });
+    }
+
+    /// Close Source Control's `⋯` menu, when it is the menu open: a prompt
+    /// or picker one of its rows opened takes the keys from here on.
+    pub(super) fn close_scm_actions_menu(&mut self) {
+        if self
+            .context_menu
+            .as_ref()
+            .is_some_and(|m| matches!(m.look, MenuLook::ScmActions { .. }))
+        {
+            self.context_menu = None;
         }
+    }
+
+    /// A left click while Source Control's `⋯` menu is open (#871), answered
+    /// as that menu always answered it: a row of the open fly-out runs its
+    /// action; a fly-out's row in the top column opens that fly-out, or
+    /// closes it when it is the one open; an action's row runs it; anywhere
+    /// else, a separator included, closes the menu.
+    pub(super) fn click_scm_actions_menu(&mut self, x: u16, y: u16) {
+        let Some(layout) = self.scm_actions_layout() else {
+            self.context_menu = None;
+            return;
+        };
+        let Some(menu) = self.context_menu.as_mut() else {
+            return;
+        };
+        let fly_out_hit = layout
+            .fly_out
+            .as_ref()
+            .and_then(|(_, col)| col.row_at(x, y))
+            .zip(menu.open_submenu);
+        let action = if let Some((child, parent)) = fly_out_hit {
+            match menu.items.get(parent) {
+                Some(MenuEntry::Submenu { items, .. }) => {
+                    items.get(child).and_then(MenuEntry::action).cloned()
+                }
+                _ => None,
+            }
+        } else if let Some(row) = layout.top.row_at(x, y) {
+            match menu.items.get(row) {
+                Some(MenuEntry::Item { action, .. }) => Some(action.clone()),
+                Some(MenuEntry::Submenu { .. }) => {
+                    let was_open = menu.open_submenu == Some(row);
+                    menu.close_submenu();
+                    if !was_open {
+                        menu.selected = row;
+                        menu.open_cursor_submenu();
+                    }
+                    return;
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let dir = menu.target_dir.clone();
+        self.context_menu = None;
+        if let Some(action) = action {
+            self.dispatch_menu_action(action, dir);
+        }
+    }
+
+    /// Git: Show Source Control Actions (Cmd+K Shift+A, #871): the `⋯` menu
+    /// from the keyboard, showing Source Control first when it is not up.
+    /// The view already up keeps its focus, in the message box or the list.
+    pub(super) fn open_scm_actions_menu_from_keyboard(&mut self) {
+        if self.sidebar_view != SidebarView::SourceControl || !self.show_tree {
+            self.set_sidebar_view(SidebarView::SourceControl);
+        }
+        self.open_scm_actions_menu(true);
+    }
+
+    /// Source Control's `⋯` menu as it is laid out now: its top column
+    /// under the header's `⋯` pill, and the open fly-out's beside its row.
+    /// `None` unless that menu is open and the pill is drawn.
+    pub(super) fn scm_actions_layout(&self) -> Option<ScmActionsLayout> {
+        use crate::widgets::scm_menu;
+        let menu = self.context_menu.as_ref()?;
+        let MenuLook::ScmActions { op } = menu.look else {
+            return None;
+        };
         let anchor = self.source_control.header_more_btn;
         if anchor.width == 0 {
-            return;
+            return None;
         }
-        let screen = frame.area();
-        self.scm_menu.hover = self.pointer_cell;
-        crate::widgets::scm_menu::render(
-            &mut self.scm_menu,
-            anchor,
-            screen,
-            frame.buffer_mut(),
-            self.theme,
-        );
+        let screen = self.last_frame_area;
+        let card = crate::widgets::surface::tones(self.theme).is_some();
+        let nodes = scm_menu::menu_for(op);
+        let rows = scm_menu::rows(&nodes);
+        let top = scm_menu::top_column(&rows, anchor, screen, card);
+        let fly_out = menu.open_submenu.and_then(|parent| {
+            let items = scm_menu::fly_out_rows(&nodes, parent)?;
+            let col = scm_menu::fly_out_column(top, parent, &items, screen, card);
+            Some((items, col))
+        });
+        Some(ScmActionsLayout { rows, top, fly_out })
+    }
+
+    /// Paint Source Control's `⋯` menu: the top column, then the open
+    /// fly-out. The keyboard's row shows once the keyboard drives the menu,
+    /// on the level it is on; a card lifts the row under the pointer too.
+    pub(super) fn render_scm_actions_menu(&self, frame: &mut ratatui::Frame) {
+        use crate::widgets::scm_menu::{Marks, paint_column};
+        let (Some(menu), Some(layout)) = (self.context_menu.as_ref(), self.scm_actions_layout())
+        else {
+            return;
+        };
+        let cursor_colours = if self.popup_gradient() {
+            (rgb_color(POPUP_SEL_BG), Color::White)
+        } else {
+            (self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff)), Color::Black)
+        };
+        let in_fly_out = menu.open_submenu.is_some();
+        let top_marks = Marks {
+            open: menu.open_submenu,
+            cursor: (menu.keyed && !in_fly_out).then_some(menu.selected),
+            pointer: self.pointer_cell,
+            cursor_colours,
+        };
+        let buf = frame.buffer_mut();
+        paint_column(buf, layout.top, &layout.rows, false, top_marks, self.theme);
+        if let Some((items, col)) = &layout.fly_out {
+            let marks = Marks {
+                open: None,
+                cursor: (menu.keyed && in_fly_out).then_some(menu.submenu_selected),
+                pointer: self.pointer_cell,
+                cursor_colours,
+            };
+            paint_column(buf, *col, items, true, marks, self.theme);
+        }
     }
 
     pub(super) fn toggle_inline_blame(&mut self) {
@@ -3885,6 +4054,8 @@ impl App {
             crumb: None,
             scroll: Default::default(),
             submenu_scroll: Default::default(),
+            look: MenuLook::Panel,
+            keyed: true,
         }
     }
 

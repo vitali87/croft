@@ -1347,6 +1347,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "",
             },
             ShortcutEntry {
+                keys: "Cmd/Ctrl+K Shift+A",
+                description: "Open the ⋯ actions menu: arrows, Enter, → / ← for its fly-outs, Esc",
+                handler: "",
+            },
+            ShortcutEntry {
                 keys: "S / U / R in a diff",
                 description: "Stage / unstage / revert the change hunk under the cursor (revert confirms first)",
                 handler: "",

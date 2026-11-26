@@ -211,6 +211,14 @@ impl App {
                 self.open_theme_picker();
                 true
             }
+            // Cmd+K Shift+A: Git: Show Source Control Actions (#871), the
+            // `⋯` menu with the keyboard on it. Matched case-insensitively
+            // for the CSI-u reason given at Shift+W, and before the plain A
+            // arm below.
+            KeyCode::Char(c) if shifted && plain && c.eq_ignore_ascii_case(&'a') => {
+                self.open_scm_actions_menu_from_keyboard();
+                true
+            }
             // Cmd+K A: who is attached to this multiplayer session
             // (Session: Participants).
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'a') => {
@@ -1094,10 +1102,6 @@ impl App {
             } else {
                 self.finish_tour();
             }
-            return Ok(());
-        }
-        if self.scm_menu.open && matches!(key.code, KeyCode::Esc) {
-            self.scm_menu.close();
             return Ok(());
         }
         // Macro recording (#255) taps the key here: every modal above has

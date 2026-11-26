@@ -980,7 +980,6 @@ fn fields(app: &App, root: &Path, read: &[String; 5], hide_ids: bool) -> Fields 
                     .map(|p| format!("{} {}", quote(&p.label), quote(&p.buffer))),
             ),
             ("menu", menu),
-            ("scm_menu", on(app.scm_menu.open)),
             ("commit_menu", on(app.commit_menu_open)),
             (
                 "commit_feedback",

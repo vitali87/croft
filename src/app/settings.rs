@@ -48,6 +48,8 @@ impl App {
             crumb: None,
             scroll: Default::default(),
             submenu_scroll: Default::default(),
+            look: MenuLook::Panel,
+            keyed: true,
             origin,
             items: items.into_iter().map(MenuEntry::from).collect(),
             selected,
