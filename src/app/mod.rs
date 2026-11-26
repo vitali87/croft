@@ -510,6 +510,8 @@ struct PendingCapture {
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum MenuAction {
+    /// A row of Source Control's `⋯` actions menu (#871).
+    Scm(crate::widgets::scm_menu::ScmAction),
     Create(CreateKind),
     /// Move every path in `paths` to the OS trash (recoverable). One entry
     /// for a single right-click, more when a multi-selection is active.
@@ -1035,6 +1037,27 @@ struct ContextMenu {
     /// wheel (`wheel_active`) and kept in range by
     /// render_context_menu.
     submenu_scroll: std::cell::Cell<usize>,
+    /// How the menu is drawn and where it opens.
+    look: MenuLook,
+    /// The keyboard (or the wheel) has moved the highlight, so a look that
+    /// otherwise shows none draws it. A [`MenuLook::Panel`] menu always
+    /// shows its highlight; Source Control's menus show it only once the
+    /// keyboard drives them, so one opened with a click looks as it did.
+    keyed: bool,
+}
+
+/// How a [`ContextMenu`] is drawn and placed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MenuLook {
+    /// croft's menus: a bordered panel at the menu's origin (a card in a
+    /// `surfaces` theme), with each row's shortcut on its right.
+    Panel,
+    /// Source Control's `⋯` actions menu (#871): rows with a coloured
+    /// glyph and no border, opened under the header's `⋯` pill, each
+    /// fly-out beside its row. A click on a fly-out's row toggles it. `op`
+    /// is the operation the repository was in when it opened, whose rows
+    /// lead the menu (#1356); the rows are drawn from it.
+    ScmActions { op: Option<crate::git::RepoOp> },
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -3535,8 +3558,6 @@ pub struct App {
         Option<String>,
         crate::widgets::branch_picker::BranchAction,
     )>,
-    /// The Source Control "⋯" title menu (open/expanded state + hit rects).
-    pub scm_menu: crate::widgets::scm_menu::ScmMenuState,
     /// Single-line input modal for SCM ops that need a typed value
     /// (clone URL, branch rename, remote name/URL, tag name).
     pub input_prompt: Option<crate::widgets::input_prompt::InputPrompt>,
@@ -4867,7 +4888,6 @@ impl App {
             branch_picker: None,
             branch_purpose: BranchPurpose::Checkout,
             blocked_switch: None,
-            scm_menu: crate::widgets::scm_menu::ScmMenuState::default(),
             input_prompt: None,
             list_picker: None,
             session_channel: crate::session_host::InnerChannel::from_env(),

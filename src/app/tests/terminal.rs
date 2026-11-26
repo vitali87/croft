@@ -5449,6 +5449,8 @@ fn the_terminal_image_yields_to_an_open_context_menu() {
         crumb: None,
         scroll: Default::default(),
         submenu_scroll: Default::default(),
+        look: MenuLook::Panel,
+        keyed: true,
         origin: (l.cell_x, l.cell_y),
         items: vec![
             MenuEntry::Item {

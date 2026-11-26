@@ -1321,9 +1321,11 @@ fn source_control_with_a_staged_and_an_unstaged_change() {
 /// fly-out open and with a rebase under way, and the Commit button's
 /// dropdown, in a theme that draws plain panels (Croft Black) and in one
 /// that draws cards (Croft Loch, the default) with the row under the
-/// pointer lifted. Moving the two menus onto the shared menu must leave
-/// every one unchanged.
-const SCM_MENU_GOLDENS: [&str; 13] = [
+/// pointer lifted. Moving the two menus onto the shared menu left every one
+/// unchanged but the message box's caret, hidden while a menu takes the
+/// keys. The `-keys` scenes open the `⋯` menu from the keyboard, which shows
+/// its highlight.
+const SCM_MENU_GOLDENS: [&str; 17] = [
     "scm-menu-plain",
     "scm-menu-plain-commit",
     "scm-menu-plain-changes",
@@ -1335,6 +1337,10 @@ const SCM_MENU_GOLDENS: [&str; 13] = [
     "scm-menu-plain-rebase",
     "scm-menu-card",
     "scm-menu-card-commit",
+    "scm-menu-plain-keys",
+    "scm-menu-plain-keys-commit",
+    "scm-menu-card-keys",
+    "scm-menu-card-keys-commit",
     "commit-menu-plain",
     "commit-menu-card",
 ];
@@ -1384,27 +1390,35 @@ fn scm_menu_app(theme: crate::theme::Theme) -> (Fixture, App) {
     let more = app.source_control.header_more_btn;
     assert!(more.width > 0, "the header draws its ⋯ pill");
     press(&mut app, middle(more));
-    assert!(app.scm_menu.open, "a click on ⋯ opens the menu");
+    assert!(
+        app.scm_actions_layout().is_some(),
+        "a click on ⋯ opens the menu"
+    );
     (fixture, app)
+}
+
+/// The `⋯` menu's top-level row `i`, as it is laid out now.
+fn scm_menu_row(app: &App, i: usize) -> Rect {
+    let layout = app.scm_actions_layout().expect("the ⋯ menu is open");
+    layout.top.row(i).expect("the row is drawn")
 }
 
 /// Open the `⋯` menu's fly-out whose row reads `label`, by a click on it.
 fn open_scm_flyout(app: &mut App, label: &str) {
-    use crate::widgets::scm_menu::{Node, TopHit, menu_for};
     let _ = draw(app, 120, 40);
-    let index = menu_for(app.scm_menu.operation)
-        .iter()
-        .position(|node| matches!(node, Node::Sub { label: l, .. } if *l == label))
+    let index = app
+        .context_menu
+        .as_ref()
+        .and_then(|menu| {
+            menu.items.iter().position(
+                |entry| matches!(entry, MenuEntry::Submenu { label: l, .. } if l == label),
+            )
+        })
         .unwrap_or_else(|| panic!("the menu has a {label:?} fly-out"));
-    let row = app
-        .scm_menu
-        .top_hits
-        .iter()
-        .find(|(_, hit)| *hit == TopHit::Expand(index))
-        .map(|(rect, _)| *rect)
-        .unwrap_or_else(|| panic!("the {label:?} row is drawn"));
+    let row = scm_menu_row(app, index);
     press(app, middle(row));
-    assert_eq!(app.scm_menu.expanded, Some(index), "{label:?} opens");
+    let open = app.context_menu.as_ref().and_then(|m| m.open_submenu);
+    assert_eq!(open, Some(index), "{label:?} opens");
 }
 
 #[test]
@@ -1422,7 +1436,10 @@ fn source_control_actions_menu_in_a_plain_theme() {
     }
     // A rebase under way leads the menu with its own rows (#1356).
     let (_fixture, mut app) = scm_menu_app(plain);
-    app.scm_menu.operation = Some(crate::git::RepoOp::Rebase { step: 2, total: 5 });
+    app.open_scm_actions_menu_for(
+        Some(crate::git::RepoOp::Rebase { step: 2, total: 5 }),
+        false,
+    );
     failures.extend(workbench_scene_result("scm-menu-plain-rebase", &mut app));
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
@@ -1435,21 +1452,66 @@ fn source_control_actions_menu_as_a_card() {
     // The pointer on the first action row lifts it.
     let (_fixture, mut app) = scm_menu_app(card);
     let _ = draw(&mut app, 120, 40);
-    let first = app
-        .scm_menu
-        .top_hits
-        .first()
-        .map(|(rect, _)| *rect)
-        .unwrap();
+    let first = scm_menu_row(&app, 0);
     point_at(&mut app, middle(first));
     failures.extend(workbench_scene_result("scm-menu-card", &mut app));
     // With the Commit fly-out open, the pointer on its second row.
     let (_fixture, mut app) = scm_menu_app(card);
     open_scm_flyout(&mut app, "Commit");
     let _ = draw(&mut app, 120, 40);
-    let second = app.scm_menu.sub_hits.get(1).map(|(rect, _)| *rect).unwrap();
+    let fly_out = app.scm_actions_layout().and_then(|l| l.fly_out).unwrap();
+    let second = fly_out.1.row(1).unwrap();
     point_at(&mut app, middle(second));
     failures.extend(workbench_scene_result("scm-menu-card-commit", &mut app));
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+/// Source Control in `theme` with its `⋯` menu opened from the keyboard:
+/// Cmd+K Shift+A, Git: Show Source Control Actions.
+fn scm_menu_keys_app(theme: crate::theme::Theme) -> (Fixture, App) {
+    let (fixture, mut app) = source_control_app(theme);
+    let _ = draw(&mut app, 120, 40);
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('A'), KeyModifiers::SHIFT))
+        .unwrap();
+    assert!(
+        app.context_menu.as_ref().is_some_and(|m| m.keyed),
+        "Cmd+K Shift+A opens the menu with the keyboard on it"
+    );
+    (fixture, app)
+}
+
+#[test]
+fn source_control_actions_menu_from_the_keyboard() {
+    let mut failures = Vec::new();
+    for (theme, look) in [
+        (crate::theme::Theme::BLACK, "plain"),
+        (crate::theme::Theme::default(), "card"),
+    ] {
+        // The first action highlighted.
+        let (_fixture, mut app) = scm_menu_keys_app(theme);
+        failures.extend(workbench_scene_result(
+            &format!("scm-menu-{look}-keys"),
+            &mut app,
+        ));
+        // Down to Commit, past the separator, and → into its fly-out: the
+        // highlight on the fly-out's first row.
+        let (_fixture, mut app) = scm_menu_keys_app(theme);
+        for _ in 0..5 {
+            app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+                .unwrap();
+        }
+        app.handle_key(key(KeyCode::Right, KeyModifiers::NONE))
+            .unwrap();
+        let menu = app.context_menu.as_ref().unwrap();
+        assert!(
+            matches!(menu.open_submenu.and_then(|i| menu.items.get(i)), Some(MenuEntry::Submenu { label, .. }) if label == "Commit"),
+            "→ opens the Commit fly-out"
+        );
+        let name = format!("scm-menu-{look}-keys-commit");
+        failures.extend(workbench_scene_result(&name, &mut app));
+    }
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
 

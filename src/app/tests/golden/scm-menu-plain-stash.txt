@@ -4,7 +4,7 @@ size: 120x40
 theme: black
 colour depth: truecolor
 settled after: 1 frame
-caret: row 6 col 7
+caret: hidden
 --- symbols
 00|    ╭──────────────────────────────╮ main.rs ✕                                                                       |
 01|   │SOURCE CONTROL              │ src › main.rs                                                                      |

@@ -1,0 +1,1 @@
+feature: Source Control's `⋯` menu works from the keyboard: Cmd+K Shift+A (Git: Show Source Control Actions) opens it from anywhere, and the arrows, Enter, → and ← for its fly-outs, and Esc drive it, after a click on `⋯` too (#871).

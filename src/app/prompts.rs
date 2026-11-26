@@ -242,7 +242,7 @@ impl App {
     /// Open a single-line input modal for an SCM value (clone URL, branch
     /// rename, …).
     pub(super) fn open_input_prompt(&mut self, prompt: crate::widgets::input_prompt::InputPrompt) {
-        self.scm_menu.close();
+        self.close_scm_actions_menu();
         self.input_prompt = Some(prompt);
         self.overlays.popup_clear.request();
     }
@@ -265,7 +265,7 @@ impl App {
         picker: crate::widgets::list_picker::ListPicker,
         empty_msg: &str,
     ) {
-        self.scm_menu.close();
+        self.close_scm_actions_menu();
         if picker.rows.is_empty() {
             self.status = empty_msg.to_string();
             return;

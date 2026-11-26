@@ -987,6 +987,8 @@ fn open_tab_menu_on_split_and_move(app: &mut App) {
         crumb: None,
         scroll: Default::default(),
         submenu_scroll: Default::default(),
+        look: MenuLook::Panel,
+        keyed: true,
         origin: (0, 0),
         items,
         selected: sub_idx,

@@ -300,82 +300,210 @@ fn base_menu() -> Vec<Node> {
     ]
 }
 
-/// What a click on a top-level row resolves to.
+/// One row of the menu as it is drawn: an action, a fly-out's parent, or a
+/// separator. `accent` is the glyph's colour before the theme maps it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TopHit {
-    /// A leaf row: fire this action and close.
-    Action(ScmAction),
-    /// A submenu row: toggle its fly-out (this is its top-level index).
-    Expand(usize),
+pub enum Row {
+    Leaf {
+        icon: char,
+        accent: Color,
+        label: &'static str,
+    },
+    Sub {
+        icon: char,
+        accent: Color,
+        label: &'static str,
+    },
+    Sep,
 }
 
-/// Open/closed + expansion state and the hit-test rects, owned by the App.
-#[derive(Default)]
-pub struct ScmMenuState {
-    pub open: bool,
-    /// Index (into `menu_for(operation)`) of the submenu whose fly-out is showing.
-    pub expanded: Option<usize>,
-    pub top_hits: Vec<(Rect, TopHit)>,
-    pub sub_hits: Vec<(Rect, ScmAction)>,
-    /// The repository's operation in progress (#1356), whose rows the menu
-    /// shows first. Set by the App when it opens the menu.
-    pub operation: Option<crate::git::RepoOp>,
-    /// The pointer's cell at render time, set by the App before each draw,
-    /// so a `surfaces` theme can lift the row under it.
-    pub hover: Option<(u16, u16)>,
-}
-
-impl ScmMenuState {
-    pub fn close(&mut self) {
-        self.open = false;
-        self.expanded = None;
-        self.top_hits.clear();
-        self.sub_hits.clear();
+impl Row {
+    fn leaf(l: &Leaf) -> Self {
+        Row::Leaf {
+            icon: l.icon,
+            accent: action_color(l.action),
+            label: l.label,
+        }
     }
 
-    /// Resolve a click at (x, y) to a menu outcome, mutating expansion
-    /// state for submenu toggles. Returns `Some(action)` only when a leaf
-    /// fired (the caller then dispatches and closes). Returns `None` for a
-    /// submenu toggle (menu stays open) or a miss.
-    pub fn click(&mut self, x: u16, y: u16) -> ClickOutcome {
-        for (rect, action) in &self.sub_hits {
-            if hit(*rect, x, y) {
-                return ClickOutcome::Fire(*action);
-            }
+    fn label(&self) -> Option<&'static str> {
+        match self {
+            Row::Leaf { label, .. } | Row::Sub { label, .. } => Some(label),
+            Row::Sep => None,
         }
-        for (rect, top) in &self.top_hits {
-            if hit(*rect, x, y) {
-                return match top {
-                    TopHit::Action(a) => ClickOutcome::Fire(*a),
-                    TopHit::Expand(i) => {
-                        self.expanded = if self.expanded == Some(*i) {
-                            None
-                        } else {
-                            Some(*i)
-                        };
-                        ClickOutcome::Toggled
-                    }
-                };
-            }
-        }
-        ClickOutcome::Missed
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ClickOutcome {
-    Fire(ScmAction),
-    Toggled,
-    Missed,
+/// The top column's rows for `nodes` (a [`menu_for`] list).
+pub fn rows(nodes: &[Node]) -> Vec<Row> {
+    nodes
+        .iter()
+        .map(|node| match node {
+            Node::Item(l) => Row::leaf(l),
+            Node::Sub { label, icon, .. } => Row::Sub {
+                icon: *icon,
+                accent: submenu_color(label),
+                label,
+            },
+            Node::Sep => Row::Sep,
+        })
+        .collect()
 }
 
-fn hit(rect: Rect, x: u16, y: u16) -> bool {
-    rect.width > 0
-        && rect.height > 0
-        && x >= rect.x
-        && x < rect.x + rect.width
-        && y >= rect.y
-        && y < rect.y + rect.height
+/// The rows of the fly-out under `nodes[parent]`, when that is a fly-out.
+pub fn fly_out_rows(nodes: &[Node], parent: usize) -> Option<Vec<Row>> {
+    match nodes.get(parent)? {
+        Node::Sub { items, .. } => Some(items.iter().map(Row::leaf).collect()),
+        _ => None,
+    }
+}
+
+/// Where one column of the menu sits: its rect, the rim rows a card keeps
+/// above and below its rows (none on a plain panel), how many rows it holds,
+/// and the first one it shows. A row is drawn only while it fits inside the
+/// rim, so on a short terminal the column shows a window of its rows, moved
+/// to keep the keyboard's row on screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Column {
+    pub rect: Rect,
+    pub pad: u16,
+    rows: usize,
+    first: usize,
+}
+
+impl Column {
+    /// Row `i`'s rect, when the column draws it.
+    pub fn row(&self, i: usize) -> Option<Rect> {
+        if i >= self.rows {
+            return None;
+        }
+        let k = u16::try_from(i.checked_sub(self.first)?).ok()?;
+        let y = self.rect.y + self.pad + k;
+        (y + self.pad < self.rect.bottom()).then(|| Rect::new(self.rect.x, y, self.rect.width, 1))
+    }
+
+    /// The row drawn under `(x, y)`, if any.
+    pub fn row_at(&self, x: u16, y: u16) -> Option<usize> {
+        if x < self.rect.x || x >= self.rect.right() {
+            return None;
+        }
+        let i = self.first + usize::from(y.checked_sub(self.rect.y + self.pad)?);
+        self.row(i).map(|_| i)
+    }
+
+    /// How many rows the column has room to draw at once.
+    pub fn shown(&self) -> usize {
+        usize::from(self.rect.height.saturating_sub(2 * self.pad)).min(self.rows)
+    }
+
+    /// The column showing its rows from `first` on.
+    pub fn shown_from(self, first: usize) -> Column {
+        Column {
+            first: first.min(self.rows.saturating_sub(self.shown())),
+            ..self
+        }
+    }
+}
+
+/// The rim rows a card of `rows` items gets above and below them: one while
+/// the padded card fits the screen's height, else none, so on a short
+/// terminal every action matters more than the padding.
+fn edge_pad(rows: u16, height: u16) -> u16 {
+    u16::from(rows.saturating_add(2) <= height)
+}
+
+/// The top column for `rows`, under `anchor` (the header's `⋯` pill) within
+/// `screen`. A `card` (a `surfaces` theme) pads its rows with a rim row
+/// above and below.
+pub fn top_column(rows: &[Row], anchor: Rect, screen: Rect, card: bool) -> Column {
+    let width = column_width(
+        rows.iter()
+            .filter_map(|r| r.label())
+            .map(|l| l.chars().count()),
+        true,
+    );
+    let n = u16::try_from(rows.len()).unwrap_or(u16::MAX);
+    let x = anchor.x.min(screen.x + screen.width.saturating_sub(width));
+    let (pad, height) = if card {
+        let pad = edge_pad(n, screen.height);
+        (pad, (n + 2 * pad).min(screen.height))
+    } else {
+        (0, n)
+    };
+    let rect = Rect {
+        x,
+        y: anchor
+            .bottom()
+            .min(screen.y + screen.height.saturating_sub(height)),
+        width: if card { width.min(screen.width) } else { width },
+        height: height.min(screen.height),
+    };
+    Column {
+        rect,
+        pad,
+        rows: rows.len(),
+        first: 0,
+    }
+}
+
+/// The fly-out column for `rows`, beside row `parent` of `top`: to its right,
+/// or to its left when there is no room, its first row level with the
+/// parent's.
+pub fn fly_out_column(
+    top: Column,
+    parent: usize,
+    rows: &[Row],
+    screen: Rect,
+    card: bool,
+) -> Column {
+    let width = column_width(
+        rows.iter()
+            .filter_map(|r| r.label())
+            .map(|l| l.chars().count()),
+        false,
+    );
+    let right_x = top.rect.x + top.rect.width;
+    let x = if right_x + width <= screen.x + screen.width {
+        right_x
+    } else {
+        top.rect.x.saturating_sub(width)
+    };
+    let n = u16::try_from(rows.len()).unwrap_or(u16::MAX);
+    // Level with the parent row where the top column draws it.
+    let parent_y = top.row(parent).map_or(top.rect.y + top.pad, |r| r.y);
+    let (pad, height) = if card {
+        let pad = edge_pad(n, screen.height);
+        (pad, (n + 2 * pad).min(screen.height))
+    } else {
+        (0, n)
+    };
+    let rect = Rect {
+        x,
+        y: parent_y
+            .saturating_sub(pad)
+            .min(screen.y + screen.height.saturating_sub(height)),
+        width,
+        height: height.min(screen.height),
+    };
+    Column {
+        rect,
+        pad,
+        rows: rows.len(),
+        first: 0,
+    }
+}
+
+/// What a column marks on its rows besides their own look.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Marks {
+    /// The row whose fly-out is open.
+    pub open: Option<usize>,
+    /// The keyboard's row.
+    pub cursor: Option<usize>,
+    /// The pointer's cell: a card lifts the row under it.
+    pub pointer: Option<(u16, u16)>,
+    /// The keyboard row's background and ink on a plain panel.
+    pub cursor_colours: (Color, Color),
 }
 
 const BG: Color = Color::Rgb(0x25, 0x2b, 0x37);
@@ -443,265 +571,123 @@ fn column_width(labels: impl Iterator<Item = usize>, with_arrow: bool) -> u16 {
     (1 + 1 + 1 + max + arrow + 1).max(12)
 }
 
-/// Paint the menu anchored under `anchor` within `screen`, recording hit
-/// rects into `state`. The submenu fly-out renders to the right of the top
-/// column (or to its left when there is no room).
-pub fn render(
-    state: &mut ScmMenuState,
-    anchor: Rect,
-    screen: Rect,
+/// Paint `col` with `rows`: a plain panel (no border, each glyph in its
+/// accent) unless the theme draws `surfaces`, where the column is a raised
+/// card with the accent lip, its rows one cell in from the card's top and
+/// bottom edges and its rim on the rows' pad columns, so each row's rect is
+/// still exactly the row drawn. A card's icons rest muted and lift to the
+/// body ink with their row; the row under the pointer, or the keyboard's,
+/// gets the neutral hover lift, and the open fly-out's parent the selected
+/// band with its accent bar. Separators run edge to edge on a card.
+pub fn paint_column(
     buf: &mut Buffer,
+    col: Column,
+    rows: &[Row],
+    fly_out: bool,
+    marks: Marks,
     theme: crate::theme::Theme,
 ) {
-    state.top_hits.clear();
-    state.sub_hits.clear();
     if let Some(t) = crate::widgets::surface::tones(theme) {
-        render_card(state, anchor, screen, buf, theme, t);
+        paint_card_column(buf, col, rows, marks, theme, t);
         return;
     }
-    let nodes = menu_for(state.operation);
-
-    let top_w = column_width(
-        nodes.iter().filter_map(|n| match n {
-            Node::Item(l) => Some(l.label.chars().count()),
-            Node::Sub { label, .. } => Some(label.chars().count()),
-            Node::Sep => None,
-        }),
-        true,
-    );
-    let top_h = nodes.len() as u16;
-    let top_x = anchor.x.min(screen.x + screen.width.saturating_sub(top_w));
-    let top_y = (anchor.y + anchor.height).min(screen.y + screen.height.saturating_sub(top_h));
-    let top_rect = Rect {
-        x: top_x,
-        y: top_y,
-        width: top_w,
-        height: top_h.min(screen.height),
-    };
-    Widget::render(Clear, top_rect, buf);
-    fill(buf, top_rect, theme.ui(BG));
-
-    for (i, node) in nodes.iter().enumerate() {
-        let row_y = top_rect.y + i as u16;
-        if row_y >= screen.y + screen.height {
+    let bg = theme.ui(if fly_out { SUB_BG } else { BG });
+    Widget::render(Clear, col.rect, buf);
+    fill(buf, col.rect, bg);
+    let (cursor_bg, cursor_ink) = marks.cursor_colours;
+    for (i, row) in rows.iter().enumerate().skip(col.first) {
+        let Some(r) = col.row(i) else {
             break;
-        }
-        let row = Rect {
-            x: top_rect.x,
-            y: row_y,
-            width: top_rect.width,
-            height: 1,
         };
-        match node {
-            Node::Sep => {
-                for x in row.x + 1..row.x + row.width.saturating_sub(1) {
-                    buf.set_string(
-                        x,
-                        row_y,
-                        "─",
-                        Style::default().fg(theme.ui(SEP_FG)).bg(theme.ui(BG)),
-                    );
+        let cursor = marks.cursor == Some(i);
+        if cursor {
+            fill(buf, r, cursor_bg);
+        }
+        match *row {
+            Row::Sep => {
+                for x in r.x + 1..r.x + r.width.saturating_sub(1) {
+                    buf.set_string(x, r.y, "─", Style::default().fg(theme.ui(SEP_FG)).bg(bg));
                 }
             }
-            Node::Item(l) => {
-                paint_row(
-                    buf,
-                    row,
-                    l.icon,
-                    theme.ui(action_color(l.action)),
-                    l.label,
-                    false,
-                    theme.ui(BG),
-                    theme,
-                );
-                state.top_hits.push((row, TopHit::Action(l.action)));
-            }
-            Node::Sub { label, icon, .. } => {
-                let is_open = state.expanded == Some(i);
-                let row_bg = if is_open {
-                    theme.ui(SUB_BG)
+            Row::Leaf {
+                icon,
+                accent,
+                label,
+            } => {
+                let (row_bg, ink) = if cursor {
+                    (cursor_bg, Some(cursor_ink))
                 } else {
-                    theme.ui(BG)
+                    (bg, None)
                 };
                 paint_row(
                     buf,
-                    row,
-                    *icon,
-                    theme.ui(submenu_color(label)),
+                    r,
+                    icon,
+                    theme.ui(accent),
+                    label,
+                    false,
+                    row_bg,
+                    ink,
+                    theme,
+                );
+            }
+            Row::Sub {
+                icon,
+                accent,
+                label,
+            } => {
+                let (row_bg, ink) = if cursor {
+                    (cursor_bg, Some(cursor_ink))
+                } else if marks.open == Some(i) {
+                    (theme.ui(SUB_BG), None)
+                } else {
+                    (bg, None)
+                };
+                paint_row(
+                    buf,
+                    r,
+                    icon,
+                    theme.ui(accent),
                     label,
                     true,
                     row_bg,
+                    ink,
                     theme,
                 );
-                state.top_hits.push((row, TopHit::Expand(i)));
             }
-        }
-    }
-
-    // Fly-out submenu column.
-    if let Some(i) = state.expanded
-        && let Some(Node::Sub { items, .. }) = nodes.get(i)
-    {
-        let sub_w = column_width(items.iter().map(|l| l.label.chars().count()), false);
-        let parent_y = top_rect.y + i as u16;
-        // Prefer the right of the top column; fall back to its left.
-        let right_x = top_rect.x + top_rect.width;
-        let sub_x = if right_x + sub_w <= screen.x + screen.width {
-            right_x
-        } else {
-            top_rect.x.saturating_sub(sub_w)
-        };
-        let sub_h = items.len() as u16;
-        let sub_y = parent_y.min(screen.y + screen.height.saturating_sub(sub_h));
-        let sub_rect = Rect {
-            x: sub_x,
-            y: sub_y,
-            width: sub_w,
-            height: sub_h.min(screen.height),
-        };
-        Widget::render(Clear, sub_rect, buf);
-        fill(buf, sub_rect, theme.ui(SUB_BG));
-        for (j, l) in items.iter().enumerate() {
-            let row_y = sub_rect.y + j as u16;
-            if row_y >= screen.y + screen.height {
-                break;
-            }
-            let row = Rect {
-                x: sub_rect.x,
-                y: row_y,
-                width: sub_rect.width,
-                height: 1,
-            };
-            paint_row(
-                buf,
-                row,
-                l.icon,
-                theme.ui(action_color(l.action)),
-                l.label,
-                false,
-                theme.ui(SUB_BG),
-                theme,
-            );
-            state.sub_hits.push((row, l.action));
         }
     }
 }
 
-/// The menu as a `surfaces` theme draws it: each column a raised card with
-/// the accent lip (the menu is what the user is driving), its rows one cell
-/// in from the card's top and bottom edges and its rim on the rows' pad
-/// columns, so each hit rect is still exactly the row drawn. Icons rest
-/// muted and lift to the body ink with their row; the row under the pointer
-/// gets the neutral hover lift, and the open submenu's parent the selected
-/// band with its accent bar. Separators run edge to edge.
-fn render_card(
-    state: &mut ScmMenuState,
-    anchor: Rect,
-    screen: Rect,
+/// [`paint_column`] as a `surfaces` theme draws it.
+fn paint_card_column(
     buf: &mut Buffer,
+    col: Column,
+    rows: &[Row],
+    marks: Marks,
     theme: crate::theme::Theme,
     t: crate::widgets::surface::Tones,
 ) {
-    use crate::widgets::surface;
-    let nodes = menu_for(state.operation);
-    let top_w = column_width(
-        nodes.iter().filter_map(|n| match n {
-            Node::Item(l) => Some(l.label.chars().count()),
-            Node::Sub { label, .. } => Some(label.chars().count()),
-            Node::Sep => None,
-        }),
-        true,
-    );
-    let rows = nodes.len() as u16;
-    // The card pads its rows with a row above and below for its rim, but
-    // only while that still fits: on a short terminal every action matters
-    // more than the padding, so the rows take the rim's rows instead.
-    let pad = edge_pad(rows, screen.height);
-    let card_h = (rows + 2 * pad).min(screen.height);
-    let card = Rect {
-        x: anchor.x.min(screen.x + screen.width.saturating_sub(top_w)),
-        y: (anchor.y + anchor.height).min(screen.y + screen.height.saturating_sub(card_h)),
-        width: top_w.min(screen.width),
-        height: card_h,
-    };
-    paint_card(buf, card, theme, t);
-    let hover = state.hover;
-    for (i, node) in nodes.iter().enumerate() {
-        let row_y = card.y + pad + i as u16;
-        if row_y + pad >= card.bottom() {
+    Widget::render(Clear, col.rect, buf);
+    fill(buf, col.rect, t.raised());
+    crate::widgets::surface::paint_overlay_frame(buf, col.rect, theme);
+    for (i, row) in rows.iter().enumerate().skip(col.first) {
+        let Some(r) = col.row(i) else {
             break;
-        }
-        let row = Rect::new(card.x, row_y, card.width, 1);
-        match node {
-            Node::Sep => {
-                let rule = "─".repeat(usize::from(row.width));
-                buf.set_string(row.x, row_y, rule, Style::default().fg(t.rim()));
-            }
-            Node::Item(l) => {
-                let lit = crate::widgets::hover::contains(row, hover);
-                paint_card_row(buf, row, t, l.icon, l.label, false, lit, false);
-                state.top_hits.push((row, TopHit::Action(l.action)));
-            }
-            Node::Sub { label, icon, .. } => {
-                let open = state.expanded == Some(i);
-                let lit = crate::widgets::hover::contains(row, hover);
-                paint_card_row(buf, row, t, *icon, label, true, lit, open);
-                state.top_hits.push((row, TopHit::Expand(i)));
-            }
-        }
-    }
-
-    if let Some(i) = state.expanded
-        && let Some(Node::Sub { items, .. }) = nodes.get(i)
-    {
-        let sub_w = column_width(items.iter().map(|l| l.label.chars().count()), false);
-        let right_x = card.x + card.width;
-        let sub_x = if right_x + sub_w <= screen.x + screen.width {
-            right_x
-        } else {
-            card.x.saturating_sub(sub_w)
         };
-        let sub_pad = edge_pad(items.len() as u16, screen.height);
-        let sub_h = (items.len() as u16 + 2 * sub_pad).min(screen.height);
-        // Level the fly-out's first row with its parent row.
-        let parent_y = card.y + pad + i as u16;
-        let sub = Rect {
-            x: sub_x,
-            y: parent_y
-                .saturating_sub(sub_pad)
-                .min(screen.y + screen.height.saturating_sub(sub_h)),
-            width: sub_w,
-            height: sub_h,
-        };
-        paint_card(buf, sub, theme, t);
-        for (j, l) in items.iter().enumerate() {
-            let row_y = sub.y + sub_pad + j as u16;
-            if row_y + sub_pad >= sub.bottom() {
-                break;
+        let lit = marks.cursor == Some(i) || crate::widgets::hover::contains(r, marks.pointer);
+        match *row {
+            Row::Sep => {
+                let rule = "─".repeat(usize::from(r.width));
+                buf.set_string(r.x, r.y, rule, Style::default().fg(t.rim()));
             }
-            let row = Rect::new(sub.x, row_y, sub.width, 1);
-            let lit = crate::widgets::hover::contains(row, hover);
-            paint_card_row(buf, row, t, l.icon, l.label, false, lit, false);
-            state.sub_hits.push((row, l.action));
+            Row::Leaf { icon, label, .. } => {
+                paint_card_row(buf, r, t, icon, label, false, lit, false);
+            }
+            Row::Sub { icon, label, .. } => {
+                paint_card_row(buf, r, t, icon, label, true, lit, marks.open == Some(i));
+            }
         }
-    }
-
-    /// The rim rows a card of `rows` items gets above and below them: one
-    /// while the padded card fits the screen's height, else none.
-    fn edge_pad(rows: u16, height: u16) -> u16 {
-        u16::from(rows.saturating_add(2) <= height)
-    }
-
-    /// Clear `card`, fill it with the raised tone and draw its edge.
-    fn paint_card(
-        buf: &mut Buffer,
-        card: Rect,
-        theme: crate::theme::Theme,
-        t: crate::widgets::surface::Tones,
-    ) {
-        Widget::render(Clear, card, buf);
-        fill(buf, card, t.raised());
-        surface::paint_overlay_frame(buf, card, theme);
     }
 }
 
@@ -755,6 +741,8 @@ fn fill(buf: &mut Buffer, rect: Rect, bg: Color) {
     }
 }
 
+/// One row of a plain panel: `[pad][icon][gap][label]…[›][pad]`, the label
+/// and `›` in `ink` when given, else the panel's own.
 #[allow(clippy::too_many_arguments)]
 fn paint_row(
     buf: &mut Buffer,
@@ -764,9 +752,10 @@ fn paint_row(
     label: &str,
     submenu: bool,
     bg: Color,
+    ink: Option<Color>,
     theme: crate::theme::Theme,
 ) {
-    let fg = Style::default().fg(theme.ui(FG)).bg(bg);
+    let fg = Style::default().fg(ink.unwrap_or(theme.ui(FG))).bg(bg);
     buf.set_string(
         row.x + 1,
         row.y,
@@ -782,7 +771,9 @@ fn paint_row(
             row.x + row.width - 2,
             row.y,
             "›",
-            Style::default().fg(theme.ui(SUB_ARROW_FG)).bg(bg),
+            Style::default()
+                .fg(ink.unwrap_or(theme.ui(SUB_ARROW_FG)))
+                .bg(bg),
         );
     }
 }
@@ -824,177 +815,175 @@ mod tests {
         assert_eq!(subs, 7, "Commit/Changes/Pull-Push/Branch/Remote/Stash/Tags");
     }
 
-    #[test]
-    fn clicking_a_submenu_row_toggles_its_flyout_without_firing() {
-        let mut st = ScmMenuState::default();
-        let screen = Rect::new(0, 0, 120, 40);
-        let anchor = Rect::new(10, 0, 2, 1);
-        let mut buf = Buffer::empty(screen);
-        st.open = true;
-        render(
-            &mut st,
-            anchor,
-            screen,
-            &mut buf,
-            crate::theme::Theme::default(),
-        );
-        // Find the "Branch" submenu's top-level index and its rect.
-        let branch_idx = menu_for(None)
-            .iter()
-            .position(|n| matches!(n, Node::Sub { label, .. } if *label == "Branch"))
-            .unwrap();
-        let (rect, _) = st
-            .top_hits
-            .iter()
-            .find(|(_, t)| *t == TopHit::Expand(branch_idx))
-            .copied()
-            .unwrap();
-        let outcome = st.click(rect.x, rect.y);
-        assert_eq!(outcome, ClickOutcome::Toggled);
-        assert_eq!(st.expanded, Some(branch_idx));
+    /// The top column, drawn under a pill at (10, 0) on a 120×40 screen.
+    fn top(theme: crate::theme::Theme, screen: Rect) -> (Vec<Row>, Column) {
+        let rows = rows(&menu_for(None));
+        let card = crate::widgets::surface::tones(theme).is_some();
+        let col = top_column(&rows, Rect::new(10, 0, 2, 1), screen, card);
+        (rows, col)
     }
 
-    #[test]
-    fn clicking_a_leaf_fires_its_action() {
-        let mut st = ScmMenuState::default();
-        let screen = Rect::new(0, 0, 120, 40);
-        let mut buf = Buffer::empty(screen);
-        st.open = true;
-        render(
-            &mut st,
-            Rect::new(10, 0, 2, 1),
-            screen,
-            &mut buf,
-            crate::theme::Theme::default(),
-        );
-        let (rect, _) = st
-            .top_hits
-            .iter()
-            .find(|(_, t)| *t == TopHit::Action(ScmAction::Pull))
-            .copied()
-            .unwrap();
-        assert_eq!(
-            st.click(rect.x, rect.y),
-            ClickOutcome::Fire(ScmAction::Pull)
-        );
+    fn row_of(rows: &[Row], label: &str) -> usize {
+        rows.iter().position(|r| r.label() == Some(label)).unwrap()
     }
 
     /// The boxed brand theme keeps its per-action icon accents.
     #[test]
     fn leaf_icons_carry_their_per_action_accent_colour() {
-        let mut st = ScmMenuState::default();
         let screen = Rect::new(0, 0, 120, 40);
+        let theme = crate::theme::Theme::BLACK;
+        let (rows, col) = top(theme, screen);
         let mut buf = Buffer::empty(screen);
-        st.open = true;
-        render(
-            &mut st,
-            Rect::new(10, 0, 2, 1),
-            screen,
-            &mut buf,
-            crate::theme::Theme::BLACK,
-        );
-        let (rect, _) = st
-            .top_hits
-            .iter()
-            .find(|(_, t)| *t == TopHit::Action(ScmAction::Pull))
-            .copied()
-            .unwrap();
+        paint_column(&mut buf, col, &rows, false, Marks::default(), theme);
+        let pull = col.row(row_of(&rows, "Pull")).unwrap();
         // The icon sits one cell in from the row's left edge.
         assert_eq!(
-            buf[(rect.x + 1, rect.y)].fg,
+            buf[(pull.x + 1, pull.y)].fg,
             ACCENT_BLUE,
             "the Pull icon must be painted in its blue accent, not the neutral foreground"
         );
     }
 
     /// Croft Loch draws the menu as a raised card: its rows sit inside an
-    /// edge one row above and below them (the hits are the rows drawn),
-    /// icons rest muted, and the row under the pointer lifts with its icon
-    /// in the body ink.
+    /// edge one row above and below them (each row's rect is the row
+    /// drawn), icons rest muted, and the row under the pointer lifts with
+    /// its icon in the body ink.
     #[test]
     fn croft_loch_draws_the_menu_as_a_card_with_a_hover_lift() {
         let theme = crate::theme::Theme::from_id("loch");
         let t = crate::widgets::surface::tones(theme).unwrap();
         let screen = Rect::new(0, 0, 120, 40);
-        let anchor = Rect::new(10, 0, 2, 1);
-        let mut st = ScmMenuState {
-            open: true,
-            ..Default::default()
-        };
+        let (rows, col) = top(theme, screen);
+        let first = col.row(0).unwrap();
+        assert_eq!(first.y, 2, "a card edge above the rows, under the pill");
         let mut buf = Buffer::empty(screen);
-        render(&mut st, anchor, screen, &mut buf, theme);
-        let (first, _) = st.top_hits[0];
-        assert_eq!(first.y, anchor.bottom() + 1, "a card edge above the rows");
+        paint_column(&mut buf, col, &rows, false, Marks::default(), theme);
         assert_eq!(buf[(first.x, first.y - 1)].symbol(), "\u{2594}");
         assert_eq!(buf[(first.x + 3, first.y)].bg, t.raised());
-        let (pull, _) = st
-            .top_hits
-            .iter()
-            .find(|(_, h)| *h == TopHit::Action(ScmAction::Pull))
-            .copied()
-            .unwrap();
+        let pull = col.row(row_of(&rows, "Pull")).unwrap();
         assert_eq!(buf[(pull.x + 1, pull.y)].fg, t.muted(), "icons rest muted");
 
-        st.hover = Some((pull.x + 4, pull.y));
+        let marks = Marks {
+            pointer: Some((pull.x + 4, pull.y)),
+            ..Marks::default()
+        };
         let mut buf = Buffer::empty(screen);
-        render(&mut st, anchor, screen, &mut buf, theme);
+        paint_column(&mut buf, col, &rows, false, marks, theme);
         assert_eq!(buf[(pull.x + 3, pull.y)].bg, t.hover_on(t.raised));
         assert_eq!(buf[(pull.x + 1, pull.y)].fg, t.text(), "the icon lifts too");
+        assert_eq!(col.row_at(pull.x + 4, pull.y), Some(row_of(&rows, "Pull")));
+    }
+
+    /// The keyboard's row shows on a plain panel as a band in the cursor
+    /// colours, and on a card as the hover lift.
+    #[test]
+    fn the_keyboards_row_shows_in_both_looks() {
+        let screen = Rect::new(0, 0, 120, 40);
+        let band = Color::Rgb(1, 2, 3);
+        let ink = Color::Rgb(4, 5, 6);
+        let plain = crate::theme::Theme::BLACK;
+        let (rows, col) = top(plain, screen);
+        let push = row_of(&rows, "Push");
+        let marks = Marks {
+            cursor: Some(push),
+            cursor_colours: (band, ink),
+            ..Marks::default()
+        };
+        let mut buf = Buffer::empty(screen);
+        paint_column(&mut buf, col, &rows, false, marks, plain);
+        let r = col.row(push).unwrap();
+        assert_eq!(buf[(r.x, r.y)].bg, band, "the band fills the whole row");
+        assert_eq!(buf[(r.x + 3, r.y)].fg, ink);
         assert_eq!(
-            st.click(pull.x + 4, pull.y),
-            ClickOutcome::Fire(ScmAction::Pull)
+            buf[(r.x + 1, r.y)].fg,
+            plain.ui(ACCENT_BLUE),
+            "the icon keeps its accent"
         );
+
+        let card = crate::theme::Theme::from_id("loch");
+        let t = crate::widgets::surface::tones(card).unwrap();
+        let (rows, col) = top(card, screen);
+        let marks = Marks {
+            cursor: Some(push),
+            ..Marks::default()
+        };
+        let mut buf = Buffer::empty(screen);
+        paint_column(&mut buf, col, &rows, false, marks, card);
+        let r = col.row(push).unwrap();
+        assert_eq!(buf[(r.x + 3, r.y)].bg, t.hover_on(t.raised));
     }
 
     /// On a terminal too short for the padded card, Croft Loch's menu gives
-    /// its rim rows to the actions: every row the boxed menu reaches stays
+    /// its rim rows to the actions: every row the plain menu reaches stays
     /// reachable on the card too.
     #[test]
     fn croft_loch_keeps_every_action_reachable_on_a_short_terminal() {
-        let rows = menu_for(None).len() as u16;
-        let screen = Rect::new(0, 0, 120, rows + 1);
-        let anchor = Rect::new(10, 0, 2, 1);
-        let hits = |theme| {
-            let mut st = ScmMenuState {
-                open: true,
-                ..Default::default()
-            };
-            let mut buf = Buffer::empty(screen);
-            render(&mut st, anchor, screen, &mut buf, theme);
-            st.top_hits.len()
-        };
-        assert_eq!(
-            hits(crate::theme::Theme::from_id("loch")),
-            menu_for(None)
-                .iter()
-                .filter(|n| !matches!(n, Node::Sep))
-                .count(),
-            "no action clipped"
-        );
-        assert!(hits(crate::theme::Theme::from_id("loch")) >= hits(crate::theme::Theme::BLACK));
+        let rows_n = menu_for(None).len() as u16;
+        let screen = Rect::new(0, 0, 120, rows_n + 1);
+        let (_, card) = top(crate::theme::Theme::from_id("loch"), screen);
+        let (_, plain) = top(crate::theme::Theme::BLACK, screen);
+        assert_eq!(card.shown(), menu_for(None).len(), "no action clipped");
+        assert!(card.shown() >= plain.shown());
     }
 
+    /// A fly-out opens to the right of its parent row, level with it, and
+    /// flips to the left when the screen has no room on the right.
     #[test]
-    fn expanded_submenu_exposes_its_leaves_as_hits() {
-        let mut st = ScmMenuState::default();
+    fn a_fly_out_sits_beside_its_parent_row() {
+        let nodes = menu_for(None);
+        let rows = rows(&nodes);
+        let stash = row_of(&rows, "Stash");
+        let items = fly_out_rows(&nodes, stash).unwrap();
+        assert!(items.iter().any(|r| r.label() == Some("Drop Stash")));
         let screen = Rect::new(0, 0, 120, 40);
-        let mut buf = Buffer::empty(screen);
-        st.open = true;
-        let stash_idx = menu_for(None)
-            .iter()
-            .position(|n| matches!(n, Node::Sub { label, .. } if *label == "Stash"))
-            .unwrap();
-        st.expanded = Some(stash_idx);
-        render(
-            &mut st,
-            Rect::new(10, 0, 2, 1),
-            screen,
-            &mut buf,
-            crate::theme::Theme::default(),
+        let top = top_column(&rows, Rect::new(10, 0, 2, 1), screen, false);
+        let fly = fly_out_column(top, stash, &items, screen, false);
+        assert_eq!(fly.rect.x, top.rect.right());
+        assert_eq!(fly.row(0).unwrap().y, top.row(stash).unwrap().y);
+        // Far enough from the left edge for the fly-out to fit there.
+        let pill = Rect::new(60, 0, 2, 1);
+        let narrow = Rect::new(
+            0,
+            0,
+            top_column(&rows, pill, screen, false).rect.right() + 3,
+            40,
         );
-        assert!(
-            st.sub_hits.iter().any(|(_, a)| *a == ScmAction::DropStash),
-            "the expanded Stash submenu must expose Drop Stash as a hit target"
+        let top = top_column(&rows, pill, narrow, false);
+        let fly = fly_out_column(top, stash, &items, narrow, false);
+        assert!(fly.rect.width < pill.x, "room on the left");
+        assert_eq!(fly.rect.right(), top.rect.x, "flipped to the left");
+    }
+
+    /// A column shown from a later row draws that row first, maps its cells
+    /// back to it, and draws none of the rows above it.
+    #[test]
+    fn a_column_shown_from_a_later_row() {
+        let rows = rows(&menu_for(None));
+        let short = Rect::new(0, 0, 120, 8);
+        let col = top_column(&rows, Rect::new(10, 0, 2, 1), short, false);
+        assert!(col.shown() < rows.len());
+        let col = col.shown_from(5);
+        assert_eq!(col.row(4), None);
+        let first = col.row(5).unwrap();
+        assert_eq!(first.y, col.rect.y);
+        assert_eq!(col.row_at(first.x + 1, first.y), Some(5));
+        assert_eq!(
+            col.shown_from(99).row(rows.len() - 1).map(|r| r.bottom()),
+            Some(col.rect.bottom())
         );
+    }
+
+    /// A cell maps to the row drawn there, and nothing outside the column.
+    #[test]
+    fn a_cell_maps_to_the_row_drawn_there() {
+        let screen = Rect::new(0, 0, 120, 40);
+        let (rows, col) = top(crate::theme::Theme::BLACK, screen);
+        for i in 0..rows.len() {
+            let r = col.row(i).unwrap();
+            assert_eq!(col.row_at(r.x, r.y), Some(i));
+            assert_eq!(col.row_at(r.right() - 1, r.y), Some(i));
+        }
+        assert_eq!(col.row_at(col.rect.right(), col.rect.y), None);
+        assert_eq!(col.row_at(col.rect.x, col.rect.bottom()), None);
     }
 }
