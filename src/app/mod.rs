@@ -54,6 +54,7 @@ mod popups;
 mod prompts;
 mod remote_sessions;
 mod review;
+mod right_click;
 mod runners;
 mod save_restore;
 mod scm;

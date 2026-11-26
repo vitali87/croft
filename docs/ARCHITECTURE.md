@@ -297,6 +297,7 @@ src/
 │   ├── prompts.rs       the input popup and the list picker (opening, keys, clicks, drawing), `submit_input_prompt` and `confirm_list_picker`, and the small inline prompt
 │   ├── remote_sessions.rs SSH connect and install, the ssh-pane offer, handing off to a remote croft, Remote Explorer keys, config sync, drop relay and scp uploads, port forwarding, and opening URLs on the local machine
 │   ├── review.rs        pull-request review tabs (fetching with gh, viewed marks, checks, per-file diffs, worktree checkout) and the comment boxes in the editor: review threads, navigator notes and sticky notes
+│   ├── right_click.rs   what a right-click lands on (`right_click_target`) and the menu each of those things opens (`open_context_menu`)
 │   ├── runners.rs       the Testing view, Tasks (Run Task, the build task, task inputs, problem matchers), runnable Markdown blocks, notebooks and kernels, Fleet, Live Run and .http requests
 │   ├── save_restore.rs  saving (save all, auto save, format on save, sudo save, encoding loss), unsaved prompts, hot exit, session save and restore, Revert, New Untitled, Save As and the launch file
 │   ├── scm.rs           Source Control: the panel and its keys, background git and its log, commits, push, pull and sync, stash, branches and pickers, hunks, permalinks, the commit graph, its dialogs, change gutters and inline blame
