@@ -1644,18 +1644,19 @@ impl App {
         }
     }
 
+    /// The card's Initialize Repository: `git init` in the folder Source
+    /// Control shows, which with several folders open is the focused
+    /// file's, not the first (#2734).
     pub(super) fn initialize_repository(&mut self) {
+        let folder = self.active_scm_root.clone();
         match crate::proc::command("git")
             .arg("-C")
-            .arg(&self.tree.root)
+            .arg(&folder)
             .arg("init")
             .output()
         {
             Ok(out) if out.status.success() => {
-                self.status = format!(
-                    "Initialized empty Git repository in {}",
-                    self.tree.root.display()
-                );
+                self.status = format!("Initialized empty Git repository in {}", folder.display());
                 self.active_git_bypass_debounce();
                 self.refresh_git_status_debounced();
                 self.refresh_source_control();
