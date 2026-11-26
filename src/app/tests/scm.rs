@@ -3333,6 +3333,8 @@ fn tab_steps_through_source_control_message_list_and_commits() {
         crate::widgets::source_control::KeyStop::Message => "message",
         crate::widgets::source_control::KeyStop::List => "list",
         crate::widgets::source_control::KeyStop::Commits => "commits",
+        crate::widgets::source_control::KeyStop::Repositories => "repositories",
+        crate::widgets::source_control::KeyStop::Card => "card",
     };
     assert_eq!(at(&app), "message");
     press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
@@ -8877,6 +8879,237 @@ fn a_click_where_initialize_was_does_not_init_again() {
     assert!(
         !app.status.starts_with("Initialized"),
         "a click where the button was ran git init again: {}",
+        app.status
+    );
+}
+
+use crate::widgets::source_control::KeyStop;
+
+/// Two open folders that are both repositories, with Source Control open
+/// on the first and REPOSITORIES drawn: (temp dir, app, first, second).
+fn scm_with_two_repositories() -> (
+    tempfile::TempDir,
+    App,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mk_repo = |name: &str| {
+        let dir = tmp.path().join(name);
+        std::fs::create_dir(&dir).unwrap();
+        git_ok(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("f.txt"), "x\n").unwrap();
+        dir.canonicalize().unwrap()
+    };
+    let (a, b) = (mk_repo("repa"), mk_repo("repb"));
+    let mut app = App::new(a.clone()).unwrap();
+    app.add_workspace_folder(b.clone());
+    app.set_sidebar_view(SidebarView::SourceControl);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let _ = app.drain_git_responses();
+        app.sync_focus_flags();
+        draw(&mut app, 120, 40);
+        if app.source_control.repo_row_areas.len() == 2 && app.source_control.status.in_repo {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "REPOSITORIES never drew both rows"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    (tmp, app, a, b)
+}
+
+/// #871 step 5b: REPOSITORIES is the first Tab stop. Shift+Tab from the
+/// message box reaches it on the shown repository's row, the arrows move,
+/// Enter shows the row's repository and keeps the keys there, and Tab goes
+/// on to the message box; Tab from COMMITS comes round to it.
+#[test]
+fn the_repositories_rows_answer_the_keyboard() {
+    let (_tmp, mut app, a, b) = scm_with_two_repositories();
+    assert_eq!(app.source_control.keys, KeyStop::Message);
+    press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT);
+    assert_eq!(app.source_control.keys, KeyStop::Repositories);
+    assert_eq!(app.active_scm_root, a);
+    assert_eq!(app.source_control.repo_cursor, 0, "on the shown row");
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+    assert_eq!(app.source_control.repo_cursor, 1);
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+    assert_eq!(app.source_control.repo_cursor, 1, "stops at the last row");
+    assert_eq!(app.active_scm_root, a, "moving shows nothing yet");
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(app.active_scm_root, b, "Enter shows the row's repository");
+    assert_eq!(app.scm_pin.as_ref(), Some(&b), "pinned, as a click pins");
+    assert_eq!(app.source_control.keys, KeyStop::Repositories);
+    press(&mut app, KeyCode::Home, KeyModifiers::NONE);
+    assert_eq!(app.source_control.repo_cursor, 0);
+    press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+    assert_eq!(app.active_scm_root, a, "Space shows it too");
+    press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+    assert_eq!(app.source_control.keys, KeyStop::Message);
+    // Round the other way: from COMMITS, Tab comes back to REPOSITORIES.
+    press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT);
+    press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT);
+    assert_eq!(app.source_control.keys, KeyStop::Commits);
+    press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+    assert_eq!(app.source_control.keys, KeyStop::Repositories);
+}
+
+/// While REPOSITORIES has the keys, the keyboard's row wears the focused
+/// selection band and the shown repository's row only its bold label; with
+/// the keys back in the message box the band returns to the shown row,
+/// greyed, as the change list's does without the keys.
+#[test]
+fn the_repositories_band_follows_the_keyboard_row() {
+    let (_tmp, mut app, _, _) = scm_with_two_repositories();
+    let rows = app.source_control.repo_row_areas.clone();
+    let bg = |app: &mut App, row: usize| {
+        let buf = draw_buffer(app, 120, 40);
+        let r = rows[row].0;
+        buf[(r.x + r.width / 2, r.y)].bg
+    };
+    let shown_unkeyed = bg(&mut app, 0);
+    let other_unkeyed = bg(&mut app, 1);
+    assert_ne!(shown_unkeyed, other_unkeyed, "the shown row has the band");
+    press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT);
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+    let shown_keyed = bg(&mut app, 0);
+    let cursor_keyed = bg(&mut app, 1);
+    assert_eq!(shown_keyed, other_unkeyed, "the band left the shown row");
+    assert_ne!(cursor_keyed, shown_unkeyed, "the keyed band wears the focus");
+    assert_ne!(cursor_keyed, other_unkeyed, "the keyboard's row has the band");
+}
+
+/// A click on a REPOSITORIES row gives the rows the keys on that row, as a
+/// click on a change does for the change list; a click elsewhere in the
+/// view takes them back.
+#[test]
+fn a_click_on_a_repository_row_gives_it_the_keys() {
+    let (_tmp, mut app, _, b) = scm_with_two_repositories();
+    let (rect, _) = app.source_control.repo_row_areas[1].clone();
+    left_click(&mut app, rect.x + 2, rect.y);
+    assert_eq!(app.active_scm_root, b);
+    assert_eq!(app.source_control.keys, KeyStop::Repositories);
+    assert_eq!(app.source_control.repo_cursor, 1);
+    draw(&mut app, 120, 40);
+    let input = app.source_control.last_input_area;
+    left_click(&mut app, input.x + 2, input.y + 1);
+    assert_eq!(app.source_control.keys, KeyStop::Message);
+}
+
+/// #871 step 5b: in a folder with no repository the card's Initialize
+/// Repository has the keys (typing writes nowhere), Enter presses it, and
+/// once the folder is a repository the keys are the message box's.
+#[test]
+fn the_no_repository_card_answers_the_keyboard() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.txt"), "x\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    draw(&mut app, 120, 40);
+    assert_eq!(app.source_control.keys, KeyStop::Card);
+    assert_eq!(
+        app.source_control.keyed_card_button(),
+        Some(crate::widgets::source_control::CardButton::Initialize)
+    );
+    press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+    assert_eq!(app.source_control.message, "", "no hidden message box");
+    press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+    assert_eq!(app.source_control.keys, KeyStop::Card, "the only stop");
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(tmp.path().join(".git").is_dir(), "status: {}", app.status);
+    assert!(wait_for_changes(&mut app, |a| a.source_control.status.in_repo));
+    assert_eq!(app.source_control.keys, KeyStop::Message);
+}
+
+/// With repositories in subfolders, the card's Open buttons are its stops:
+/// Tab and Down walk them, Shift+Tab and Up walk back, and Enter opens the
+/// one with the keys.
+#[test]
+fn tab_walks_the_cards_open_buttons() {
+    let (tmp, _) = nested_repo_1227();
+    let other = tmp.path().join("zother");
+    std::fs::create_dir(&other).unwrap();
+    git_init_with_identity(&other);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    draw(&mut app, 140, 50);
+    assert_eq!(app.source_control.nested_repo_button_areas.len(), 2);
+    assert_eq!(app.source_control.keys, KeyStop::Card);
+    assert_eq!(app.source_control.card_button, 0);
+    press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+    assert_eq!(app.source_control.card_button, 1);
+    press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+    assert_eq!(app.source_control.card_button, 0, "round again");
+    press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT);
+    assert_eq!(app.source_control.card_button, 1, "from the last");
+    press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+    assert_eq!(app.source_control.card_button, 0);
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+    let target = app.source_control.nested_repo_button_areas[1].1.clone();
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(app.workspace_root(), target.as_path());
+}
+
+/// The card's button with the keys lifts as a hovered one does, on a
+/// surfaces theme and on a plain one, and only while Source Control is
+/// focused.
+#[test]
+fn the_keyed_card_button_lifts() {
+    for theme in [crate::theme::Theme::LOCH, crate::theme::Theme::DARK_BLUE] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.apply_theme_visuals(theme);
+        app.set_sidebar_view(SidebarView::SourceControl);
+        app.sync_focus_flags();
+        let buf = draw_buffer(&mut app, 120, 40);
+        let b = app.source_control.last_init_repo_button_area;
+        let keyed = buf[(b.x + 1, b.y + 1)].bg;
+        app.focus_pane(Pane::Editor);
+        app.sync_focus_flags();
+        let buf = draw_buffer(&mut app, 120, 40);
+        let unkeyed = buf[(b.x + 1, b.y + 1)].bg;
+        assert_ne!(keyed, unkeyed, "{theme:?}: the keys show on the button");
+    }
+}
+
+/// Screen reader mode names the new stops: a REPOSITORIES row with its
+/// branch, changes and whether it is the one shown, and the card's button.
+#[test]
+fn screen_reader_names_the_repository_row_and_the_card_button() {
+    let (_tmp, mut app, _, _) = scm_with_two_repositories();
+    press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT);
+    let (focus, item) = app.source_control_a11y();
+    assert_eq!(focus, "Source Control, Repositories, 2 repositories");
+    let item = item.unwrap();
+    assert!(
+        item.starts_with("repa, ") && item.ends_with(", selected"),
+        "{item}"
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    draw(&mut app, 120, 40);
+    assert_eq!(
+        app.source_control_a11y(),
+        (
+            String::from("Source Control, No repository detected"),
+            Some(String::from("Initialize Repository, button"))
+        )
+    );
+}
+
+/// Git: Initialize Repository from the palette in a folder that already
+/// is a repository says so and runs nothing.
+#[test]
+fn initialize_repository_in_a_repository_says_so() {
+    let (_tmp, mut app) = scm_with_history(1);
+    app.run_command(crate::command_registry::Command::GitInitializeRepository);
+    assert!(
+        app.status.ends_with("is already in a Git repository"),
+        "{}",
         app.status
     );
 }

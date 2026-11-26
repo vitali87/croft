@@ -2133,6 +2133,14 @@ const PROOF_PLACES: &[ProofPlace] = &[
         },
         commands: &[Command::GitRefresh],
     },
+    ProofPlace {
+        context: Context {
+            name: "Source Control in a folder with no repository",
+            repo: false,
+            setup: |app| app.set_sidebar_view(SidebarView::SourceControl),
+        },
+        commands: &[Command::GitInitializeRepository],
+    },
 ];
 
 /// What `run` did on an app freshly set up as `ctx`.

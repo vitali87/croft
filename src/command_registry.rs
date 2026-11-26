@@ -2291,6 +2291,13 @@ commands! {
         title: "Git: Refresh",
         hint: "R in Source Control",
     }
+    /// The no-repository card's button (#871); `Enter` on it in Source
+    /// Control.
+    GitInitializeRepository {
+        id: "git_initialize_repository",
+        title: "Git: Initialize Repository",
+        hint: "Enter in Source Control",
+    }
     ToggleTerminalSuggestions {
         id: "toggle_terminal_suggestions",
         title: "Terminal: Toggle Command Suggestions",

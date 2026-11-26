@@ -3212,8 +3212,27 @@ impl App {
     /// commits, and the picked one, which Enter opens.
     pub(super) fn source_control_a11y(&self) -> (String, Option<String>) {
         use crate::git::ChangeKind;
+        use crate::widgets::source_control::KeyStop;
         let name = crate::i18n::tr("Source Control").into_owned();
-        if self.source_control.keys == crate::widgets::source_control::KeyStop::Commits {
+        let sc = &self.source_control;
+        if sc.keys == KeyStop::Repositories {
+            let focus = format!(
+                "{name}, Repositories, {}",
+                a11y_count(sc.repositories.len(), "repository", "repositories")
+            );
+            let item = sc.repo_under_cursor().map(|r| {
+                let branch = r.branch.as_deref().unwrap_or("no branch");
+                let changes = a11y_count(r.changes, "change", "changes");
+                let shown = if r.active { ", selected" } else { "" };
+                format!("{}, {branch}, {changes}{shown}", r.label)
+            });
+            return (focus, item);
+        }
+        if sc.keys == KeyStop::Card {
+            let item = sc.keyed_card_label().map(|label| format!("{label}, button"));
+            return (format!("{name}, {}", sc.card_title()), item);
+        }
+        if sc.keys == KeyStop::Commits {
             let graph = &self.commit_graph;
             if graph.collapsed {
                 return (format!("{name}, Commits, collapsed"), None);

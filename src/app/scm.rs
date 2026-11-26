@@ -5,7 +5,7 @@
 use super::*;
 use crate::widgets::confirm_frame::{ConfirmFrame, Inset, draw_confirm, yes_no_keys};
 use crate::widgets::picker_rows::{PickerMouse, answer_mouse};
-use crate::widgets::source_control::KeyStop;
+use crate::widgets::source_control::{CardButton, KeyStop};
 
 /// The *Git: … Changes* commands that act on one file (#871).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -478,7 +478,7 @@ impl App {
     /// the focus sync, and the seed (active-highlight moves with a row
     /// click). Empty — section hidden — with one folder.
     pub(super) fn refresh_scm_repositories(&mut self) {
-        self.source_control.repositories = if self.roots.is_multi() {
+        let rows = if self.roots.is_multi() {
             let roots: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
             let labels = crate::workspace::root_display_labels(&roots);
             roots
@@ -501,6 +501,7 @@ impl App {
         } else {
             Vec::new()
         };
+        self.source_control.set_repositories(rows);
     }
 
     /// Let the ACTIVE repo's next debounced refresh through immediately —
@@ -973,9 +974,12 @@ impl App {
             self.stage_selected_source_control_entries();
             return;
         }
+        self.source_control.settle_keys();
         match self.source_control.keys {
+            KeyStop::Repositories => return self.handle_repositories_key(key),
             KeyStop::Commits => return self.handle_commit_graph_key(key),
             KeyStop::List => return self.handle_source_control_list_key(key),
+            KeyStop::Card => return self.handle_card_key(key),
             KeyStop::Message => {}
         }
         if is_clipboard_paste_key(key) {
@@ -1038,14 +1042,10 @@ impl App {
                 }
             }
             // Tab steps to the change list, or past an empty one to COMMITS
-            // (#871), so a clean repository still reaches its history.
-            KeyCode::Tab => {
-                if !self.source_control.focus_list() {
-                    self.focus_commit_graph();
-                }
-            }
-            // Shift+Tab goes round the other way, to COMMITS (#871).
-            KeyCode::BackTab => self.focus_commit_graph(),
+            // (#871), so a clean repository still reaches its history;
+            // Shift+Tab goes back up to REPOSITORIES, or round to COMMITS.
+            KeyCode::Tab => self.step_source_control_keys(true),
+            KeyCode::BackTab => self.step_source_control_keys(false),
             // Shift/Alt+Enter start a new message line (the commit body),
             // VS Code's multi-line SCM input; plain Enter commits.
             KeyCode::Enter
@@ -1089,8 +1089,8 @@ impl App {
         match (key.code, selected) {
             // Source Control's Tab stops, in VS Code's order (#871): the
             // message box, the change list, COMMITS, and round again.
-            (KeyCode::BackTab, _) => sc.keys = KeyStop::Message,
-            (KeyCode::Tab, _) => self.focus_commit_graph(),
+            (KeyCode::BackTab, _) => self.step_source_control_keys(false),
+            (KeyCode::Tab, _) => self.step_source_control_keys(true),
             (KeyCode::Char('r'), _) => self.refresh_source_control_from_key(),
             (KeyCode::Up, _) => {
                 if !sc.move_selection(true) {
@@ -1299,6 +1299,113 @@ impl App {
         row
     }
 
+    /// Tab (`forward`) or Shift+Tab in Source Control (#871): the keys go
+    /// to the next of the view's stops on screen, in VS Code's order
+    /// (REPOSITORIES, the message box, the change list, COMMITS; or with no
+    /// repository, REPOSITORIES and the card's buttons), round again past
+    /// either end.
+    pub(super) fn step_source_control_keys(&mut self, forward: bool) {
+        match self.source_control.next_stop(forward) {
+            KeyStop::Repositories => self.source_control.focus_repositories(),
+            KeyStop::Message => self.source_control.keys = KeyStop::Message,
+            KeyStop::List => {
+                self.source_control.focus_list();
+            }
+            KeyStop::Commits => self.focus_commit_graph(),
+            KeyStop::Card => self.source_control.focus_card(forward),
+        }
+    }
+
+    /// Show the repository of workspace folder `root` in Source Control,
+    /// pinned there (#161) until the focus next crosses folders: what a
+    /// click on its REPOSITORIES row, or Enter on it, does.
+    pub(super) fn pin_scm_repository(&mut self, root: PathBuf) {
+        self.scm_pin = Some(root.clone());
+        self.seed_active_scm(root);
+    }
+
+    /// A key while REPOSITORIES has the keys (#871): the arrows, Home and
+    /// End move its keyboard row, Enter or Space shows that row's
+    /// repository, R refreshes, and Tab / Shift+Tab go on to the message
+    /// box (or the card) / back round to COMMITS.
+    pub(super) fn handle_repositories_key(&mut self, key: KeyEvent) {
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        {
+            return;
+        }
+        let sc = &mut self.source_control;
+        match key.code {
+            KeyCode::Tab => self.step_source_control_keys(true),
+            KeyCode::BackTab => self.step_source_control_keys(false),
+            KeyCode::Up => sc.move_repo_cursor(-1),
+            KeyCode::Down => sc.move_repo_cursor(1),
+            KeyCode::Home => sc.repo_cursor = 0,
+            KeyCode::End => sc.move_repo_cursor(isize::MAX),
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if let Some(root) = sc.repo_under_cursor().map(|r| r.workspace_root.clone()) {
+                    self.pin_scm_repository(root);
+                }
+            }
+            KeyCode::Char('r' | 'R') => self.refresh_source_control_from_key(),
+            _ => {}
+        }
+    }
+
+    /// A key while the no-repository card has the keys (#871): Tab and
+    /// Shift+Tab walk its buttons and then go on round the view, Up and
+    /// Down walk the buttons, Enter or Space presses the one with the
+    /// keys, and R refreshes.
+    pub(super) fn handle_card_key(&mut self, key: KeyEvent) {
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        {
+            return;
+        }
+        let sc = &mut self.source_control;
+        match key.code {
+            KeyCode::Tab => {
+                if !sc.move_card_button(true) {
+                    self.step_source_control_keys(true);
+                }
+            }
+            KeyCode::BackTab => {
+                if !sc.move_card_button(false) {
+                    self.step_source_control_keys(false);
+                }
+            }
+            KeyCode::Up => {
+                sc.move_card_button(false);
+            }
+            KeyCode::Down => {
+                sc.move_card_button(true);
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => match sc.keyed_card_button() {
+                Some(CardButton::Initialize) => self.initialize_repository(),
+                Some(CardButton::Open(repo)) => self.change_workspace_root(repo),
+                None => {}
+            },
+            KeyCode::Char('r' | 'R') => self.refresh_source_control_from_key(),
+            _ => {}
+        }
+    }
+
+    /// Git: Initialize Repository from the Command Palette (#871): what the
+    /// no-repository card's button does, or, in a folder that already is a
+    /// repository, a line saying so.
+    pub(super) fn initialize_repository_command(&mut self) {
+        if self.source_control.status.in_repo {
+            self.status = format!(
+                "{} is already in a Git repository",
+                self.active_scm_root.display()
+            );
+            return;
+        }
+        self.initialize_repository();
+    }
+
     /// COMMITS takes the keys (#871), its first row picked when none is.
     pub(super) fn focus_commit_graph(&mut self) {
         self.source_control.keys = KeyStop::Commits;
@@ -1328,13 +1435,10 @@ impl App {
         let graph = &mut self.commit_graph;
         let open = !graph.collapsed;
         match key.code {
-            KeyCode::Tab => self.source_control.keys = KeyStop::Message,
-            // Back to the change list, or past an empty one to the message.
-            KeyCode::BackTab => {
-                if !self.source_control.focus_list() {
-                    self.source_control.keys = KeyStop::Message;
-                }
-            }
+            // On round to REPOSITORIES or the message box; back to the
+            // change list, or past an empty one to the message box.
+            KeyCode::Tab => self.step_source_control_keys(true),
+            KeyCode::BackTab => self.step_source_control_keys(false),
             KeyCode::Up if open => graph.move_selection(-1),
             KeyCode::Down if open => graph.move_selection(1),
             KeyCode::PageUp if open => {
