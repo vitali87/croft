@@ -2953,9 +2953,20 @@ fn staged_names(tmp: &tempfile::TempDir) -> String {
 /// land and the command to act (#871).
 fn run_git_file_command(app: &mut App, command: crate::widgets::command_palette::Command) {
     app.run_command(command);
+    settle_git_file_commands(app);
+}
+
+/// Drain the *Git: … Changes* commands until none is reading and none can
+/// start: the queue is empty, or a discard is asking first.
+fn settle_git_file_commands(app: &mut App) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while app.git_file_lookup.is_some() {
+    loop {
         app.drain_git_file_lookup();
+        let idle = app.git_file_lookup.is_none()
+            && (app.git_file_queue.is_empty() || app.pending_discard.is_some());
+        if idle {
+            return;
+        }
         assert!(std::time::Instant::now() < deadline, "the read lands");
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
@@ -3159,6 +3170,43 @@ fn git_file_commands_run_while_one_is_reading_wait_their_turn() {
         "both are staged: {staged:?} ({})",
         app.status
     );
+}
+
+/// #871 (review of #2732): a command waiting its turn does not run while a
+/// discard is asking first. A second Discard replaced the question's file,
+/// so answering yes discarded the wrong one; it now asks after the first is
+/// answered.
+#[test]
+fn a_waiting_command_holds_while_a_discard_asks_first() {
+    use crate::widgets::command_palette::Command;
+    let (tmp, mut app) = scm_with_seed_open();
+    app.run_command(Command::GitDiscardChanges);
+    assert!(app.open_file_at_launch(&tmp.path().join("scratch.txt")));
+    app.focus_pane(Pane::Editor);
+    run_git_file_command(&mut app, Command::GitDiscardChanges);
+    let asking = |app: &App| app.pending_discard.as_ref().map(|p| p.rel_path.clone());
+    assert_eq!(asking(&app).as_deref(), Some("seed.txt"));
+    for _ in 0..20 {
+        app.drain_git_file_lookup();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(
+        asking(&app).as_deref(),
+        Some("seed.txt"),
+        "the question stays on its own file"
+    );
+    app.confirm_pending_discard();
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("seed.txt")).unwrap(),
+        git_stdout_untrimmed(tmp.path(), &["show", "HEAD:seed.txt"]),
+        "yes discarded seed.txt"
+    );
+    assert!(
+        tmp.path().join("scratch.txt").exists(),
+        "scratch.txt is kept"
+    );
+    settle_git_file_commands(&mut app);
+    assert_eq!(asking(&app).as_deref(), Some("scratch.txt"));
 }
 
 /// #871: in the list `s` stages the selected row, `u` unstages it and `d`

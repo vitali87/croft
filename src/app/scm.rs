@@ -1177,19 +1177,34 @@ impl App {
     /// landed: show the fresh list and act on the open file's row. True
     /// when something changed on screen.
     pub(super) fn drain_git_file_lookup(&mut self) -> bool {
+        let started = self.start_next_git_file_command();
         let reply = match self.git_file_lookup.as_ref().map(|l| l.job.poll()) {
-            None | Some(crate::jobs::Poll::Pending) => return false,
+            None | Some(crate::jobs::Poll::Pending) => return started,
             Some(crate::jobs::Poll::Done(reply)) => Some(reply),
             // Its thread crashed, and the crash notice said so.
             Some(crate::jobs::Poll::Died) => None,
         };
         let Some(lookup) = self.git_file_lookup.take() else {
-            return false;
+            return started;
         };
         self.finish_git_file_lookup(lookup, reply);
-        if let Some((command, path, folder)) = self.git_file_queue.pop_front() {
-            self.start_git_file_lookup(command, path, folder);
+        self.start_next_git_file_command();
+        true
+    }
+
+    /// Start the next waiting *Git: … Changes* command, unless one is still
+    /// reading or a discard is asking first: a command that ran meanwhile
+    /// would act behind the question, and a second Discard would replace
+    /// the file the open question is about. The queue moves on once the
+    /// question is answered either way. True when one started.
+    fn start_next_git_file_command(&mut self) -> bool {
+        if self.git_file_lookup.is_some() || self.pending_discard.is_some() {
+            return false;
         }
+        let Some((command, path, folder)) = self.git_file_queue.pop_front() else {
+            return false;
+        };
+        self.start_git_file_lookup(command, path, folder);
         true
     }
 
