@@ -1269,6 +1269,13 @@ impl App {
             self.debug_run_to_cursor();
             return Ok(());
         }
+        // Show Context Menu (#2739), checked before the F10 step-over below,
+        // which took Shift+F10 too. Modified, so even a focused shell's app
+        // does not get it, as in VS Code's terminal.
+        if is_show_context_menu_key(key) {
+            self.show_context_menu();
+            return Ok(());
+        }
         if matches!(key.code, KeyCode::F(10)) && !terminal_owns_fkeys {
             self.debug_step("next");
             return Ok(());
@@ -3270,6 +3277,19 @@ pub(super) fn is_go_to_references_key(key: KeyEvent) -> bool {
         && key.modifiers.contains(KeyModifiers::SHIFT)
         && !key.modifiers.contains(KeyModifiers::CONTROL)
         && !key.modifiers.contains(KeyModifiers::SUPER)
+}
+
+/// Show Context Menu (#2739): `Shift+F10`, or the Menu key a terminal reports
+/// on the modern keyboard protocol, opens the right-click menu of what has
+/// the keys, as in VS Code. Shift+F10 was Step Over, which bare F10 still is.
+pub(super) fn is_show_context_menu_key(key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::F(10) => key.modifiers == KeyModifiers::SHIFT,
+        KeyCode::Menu => !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER),
+        _ => false,
+    }
 }
 
 /// Debug: Run to Cursor, `Ctrl+F10` (#611), Visual Studio's binding. Checked

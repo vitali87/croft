@@ -2322,6 +2322,13 @@ commands! {
         title: "Debug: Step Over",
         hint: "F10",
     }
+    /// The right-click menu of what has the keys, at it (#2739): VS Code's
+    /// Shift+F10. The Menu key opens it too.
+    ShowContextMenu {
+        id: "show_context_menu",
+        title: "View: Show Context Menu",
+        hint: "Shift+F10",
+    }
     /// Debug: Continue / Step Into / Step Out (#1543): the F5 / F11 /
     /// Shift+F11 actions as commands, so the palette finds them and
     /// `keybindings.json` can rebind them.

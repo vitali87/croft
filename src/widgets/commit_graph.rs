@@ -226,6 +226,11 @@ impl CommitGraphPanel {
             picked.and_then(|hash| self.rows.iter().position(|r| r.commit.hash == hash));
     }
 
+    /// The history row of the commit the keyboard or a click picked.
+    pub fn selected_row(&self) -> Option<usize> {
+        self.selected
+    }
+
     /// The commit the keyboard or a click picked.
     pub fn selected_commit(&self) -> Option<&GraphCommit> {
         self.selected

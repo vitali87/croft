@@ -25,6 +25,7 @@ Per platform:
 | `Ctrl+q` | Quit (not from a focused terminal, where the key goes to its app). Unsaved changes prompt: `S` / `Enter` save all, `D` discard, `Esc` / `N` cancel |
 | `F1` | Open the shortcuts modal |
 | `F6` | Cycle focus across panes (tree → editor → terminal → tree) |
+| `Shift+F10` / the `Menu` key | Show Context Menu (`View: Show Context Menu`): open the right-click menu of what has the keys, just below it, as in VS Code. The text at the caret in the editor, the selected Explorer row, the picked COMMITS row, the active terminal pane, the selected capture, or the first problem shown. The menu then takes its own keys: arrows, `Enter`, `Esc`. The `Menu` key reaches croft only in a terminal that reports it on the kitty keyboard protocol; `Shift+F10` works everywhere. Command id: `show_context_menu` |
 | `Shift+F8` | Screencast Mode (`Developer: Toggle Screencast Mode`): show each key, the command it ran, and clicks. Password and shell input are never shown |
 | `Ctrl+b` / `Cmd+b` | Toggle the primary side bar (left pane) |
 | `Opt+Ctrl+b` / `Opt+Cmd+b` | Toggle the secondary side bar (the active file's Outline) |
@@ -1013,10 +1014,10 @@ Set `"disable_save_before_debug": true` (or VS Code's `"debug.saveBeforeStart": 
 | `Shift+F9` | Add or edit a conditional breakpoint on the cursor's line |
 | `Shift+Alt+F9` | Add or edit a logpoint on the cursor's line (amber diamond; prints instead of pausing) |
 | `Alt+F9` | Toggle break on raised (not just uncaught) exceptions |
-| `F10` | Step over |
+| `F10` | Step over (`Shift+F10` is Show Context Menu, as in VS Code) |
 | `F11` / `Shift+F11` | Step into / out (palette: "Debug: Step Into" / "Debug: Step Out"). Command ids: `step_into` / `step_out` |
 
-With the **terminal pane** focused and no debug session live, a bare `F5` / `F9` / `F10` / `F11` goes to the app running in the shell. Modified chords keep their debug meaning everywhere.
+With the **terminal pane** focused and no debug session live, a bare `F5` / `F9` / `F10` / `F11` goes to the app running in the shell. Modified chords keep their croft meaning everywhere.
 
 The updater's chord is `Ctrl+Shift+F9` (`Cmd+Shift+F9` too); you can also click the status bar's "Update ready" or rebuild pill, or run "Help: Update croft (Relaunch or Rebuild)" from the Command Palette.
 

@@ -304,6 +304,7 @@ fn key_predicates() -> Vec<(&'static str, KeyPredicate)> {
         is_peek_definition_key,
         is_go_to_references_key,
         is_run_to_cursor_key,
+        is_show_context_menu_key,
         is_peek_references_key,
         is_go_to_declaration_key,
         is_go_to_type_definition_key,

@@ -2217,6 +2217,7 @@ impl App {
             Cmd::ShowOutgoingCalls => self.request_call_hierarchy_at_cursor(false),
             Cmd::EditBreakpointCondition => self.debug_edit_condition(),
             Cmd::StepOver => self.debug_step("next"),
+            Cmd::ShowContextMenu => self.show_context_menu(),
             Cmd::ContinueDebugging => self.debug_continue(),
             Cmd::StepInto => self.debug_step("stepIn"),
             Cmd::StepOut => self.debug_step("stepOut"),

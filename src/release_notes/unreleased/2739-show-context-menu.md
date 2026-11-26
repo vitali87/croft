@@ -1,0 +1,1 @@
+feature: `Shift+F10` and the Menu key open the right-click menu of what has the keys, as in VS Code: the editor at the caret, the selected Explorer row, the picked commit, the active terminal pane, a capture or a problem (#2739).
