@@ -1118,7 +1118,25 @@ impl App {
             return;
         };
         let folder = self.active_scm_root.clone();
-        let root = self.scm_root();
+        // One at a time, in the order they were run: each reads the changes
+        // after the one before it has acted, so Stage then Unstage sees
+        // what Stage staged.
+        if self.git_file_lookup.is_some() {
+            self.git_file_queue.push_back((command, path, folder));
+            return;
+        }
+        self.start_git_file_lookup(command, path, folder);
+    }
+
+    /// Read `folder`'s repository's changes off the UI thread for
+    /// `command` on `path`; [`Self::drain_git_file_lookup`] finishes it.
+    fn start_git_file_lookup(&mut self, command: GitFileCommand, path: PathBuf, folder: PathBuf) {
+        let root = self
+            .git_worker_for_root(&folder)
+            .status()
+            .repo_root
+            .clone()
+            .unwrap_or_else(|| folder.clone());
         let job = crate::jobs::Job::spawn("git-file-command", crate::jobs::Start::Now, move || {
             (crate::git::query(&root), crate::git::query_changes(&root))
         });
@@ -1168,31 +1186,46 @@ impl App {
         let Some(lookup) = self.git_file_lookup.take() else {
             return false;
         };
+        self.finish_git_file_lookup(lookup, reply);
+        if let Some((command, path, folder)) = self.git_file_queue.pop_front() {
+            self.start_git_file_lookup(command, path, folder);
+        }
+        true
+    }
+
+    /// Act on the open file's row in the changes `reply` read, against the
+    /// repository root that read found: before git's first status lands the
+    /// app's own idea of the root is the workspace folder, which for a
+    /// folder inside a repository is not where git's paths start.
+    fn finish_git_file_lookup(
+        &mut self,
+        lookup: GitFileLookup,
+        reply: Option<(crate::git::GitStatus, Vec<crate::git::ChangeEntry>)>,
+    ) {
         let Some((status, entries)) = reply else {
             self.status = String::from("Could not read the changes");
-            return true;
+            return;
         };
         if lookup.folder != self.active_scm_root {
             self.status =
                 String::from("Git: cancelled: Source Control moved to another repository");
-            return true;
+            return;
         }
         let root = status.repo_root.clone().unwrap_or(lookup.folder);
         let Some(rel) = relative_to_repo(&lookup.path, &root) else {
             self.status = format!("{} is outside the repository", lookup.path.display());
-            return true;
+            return;
         };
         self.source_control.set_status(status, entries);
         let Some(idx) = self.change_row_for(lookup.command, &rel) else {
-            return true;
+            return;
         };
         match lookup.command {
-            GitFileCommand::Open => self.open_source_control_entry(idx),
-            GitFileCommand::Stage => self.stage_source_control_entry(idx),
-            GitFileCommand::Unstage => self.unstage_source_control_entry(idx),
-            GitFileCommand::Discard => self.request_discard_source_control_entry(idx),
+            GitFileCommand::Open => self.open_source_control_entry_in(&root, idx),
+            GitFileCommand::Stage => self.stage_source_control_entry_in(&root, idx),
+            GitFileCommand::Unstage => self.unstage_source_control_entry_in(&root, idx),
+            GitFileCommand::Discard => self.request_discard_source_control_entry_in(&root, idx),
         }
-        true
     }
 
     /// The change list's row for `rel` that `command` acts on, or `None`
@@ -1327,6 +1360,13 @@ impl App {
     /// (Deleted). Selection state on the panel updates so the user can
     /// see which entry the editor is bound to.
     pub fn open_source_control_entry(&mut self, entry_idx: usize) {
+        let root = self.scm_root();
+        self.open_source_control_entry_in(&root, entry_idx);
+    }
+
+    /// [`Self::open_source_control_entry`] for the repository at
+    /// `scm_root`.
+    pub(super) fn open_source_control_entry_in(&mut self, scm_root: &Path, entry_idx: usize) {
         use crate::git::ChangeKind;
         let Some(entry) = self.source_control.entries.get(entry_idx).cloned() else {
             return;
@@ -1334,7 +1374,6 @@ impl App {
         self.source_control.selected_change = Some(entry_idx);
         // Porcelain paths are toplevel-relative (#139): join and HEAD-read
         // against the repo root, never the workspace root.
-        let scm_root = self.scm_root();
         let abs = scm_root.join(&entry.path);
         let opened = match entry.kind {
             // A conflicted entry opens the three-way MERGE EDITOR (#253)
@@ -1375,9 +1414,9 @@ impl App {
             // HEAD:lib` is "bad object"): show what moved in it, read-only,
             // the way a commit's patch opens (#1235).
             ChangeKind::Modified | ChangeKind::StagedModified
-                if crate::git::is_submodule(&scm_root, &entry.path) =>
+                if crate::git::is_submodule(scm_root, &entry.path) =>
             {
-                match crate::git::submodule_diff(&scm_root, &entry.path) {
+                match crate::git::submodule_diff(scm_root, &entry.path) {
                     Ok(text) => {
                         let label = format!("{} (submodule)", entry.path);
                         match self.editor.open_text_buffer(Path::new(&label), &text) {
@@ -1402,7 +1441,7 @@ impl App {
                 // so a windows-1252 or UTF-16 file diffs too (#1242).
                 let enc = self.open_tab_encoding(&abs);
                 let texts =
-                    crate::git::read_bytes_at_head(&scm_root, &entry.path).and_then(|head| {
+                    crate::git::read_bytes_at_head(scm_root, &entry.path).and_then(|head| {
                         let working = std::fs::read(&abs).map_err(|e| e.to_string())?;
                         let decode = |b: &[u8]| crate::widgets::editor::decode_blob(b, enc);
                         decode(&head)
@@ -1459,7 +1498,7 @@ impl App {
                 // blob as a one-sided unified diff so every removed
                 // line is visible in red, matching `git diff` output
                 // for a deletion.
-                match crate::git::read_file_at_head(&scm_root, &entry.path) {
+                match crate::git::read_file_at_head(scm_root, &entry.path) {
                     Ok(head_text) => {
                         let label = std::path::PathBuf::from(&entry.path);
                         match self.editor.open_deleted_diff_with_text(&label, &head_text) {
@@ -1860,13 +1899,19 @@ impl App {
     /// Unstage a single entry by index (the inline "−" icon on a staged
     /// row). Mirror of `stage_source_control_entry`.
     pub fn unstage_source_control_entry(&mut self, entry_idx: usize) {
+        let root = self.scm_root();
+        self.unstage_source_control_entry_in(&root, entry_idx);
+    }
+
+    /// [`Self::unstage_source_control_entry`] in the repository at `root`.
+    pub(super) fn unstage_source_control_entry_in(&mut self, root: &Path, entry_idx: usize) {
         if self.repo_git_busy() {
             return;
         }
         let Some(entry) = self.source_control.entries.get(entry_idx).cloned() else {
             return;
         };
-        match crate::git::unstage_path(&self.scm_root(), &entry.path) {
+        match crate::git::unstage_path(root, &entry.path) {
             Ok(()) => {
                 self.status = format!("Unstaged {}", entry.path);
                 self.active_git_bypass_debounce();
@@ -3130,13 +3175,19 @@ impl App {
     }
 
     pub fn stage_source_control_entry(&mut self, entry_idx: usize) {
+        let root = self.scm_root();
+        self.stage_source_control_entry_in(&root, entry_idx);
+    }
+
+    /// [`Self::stage_source_control_entry`] in the repository at `root`.
+    pub(super) fn stage_source_control_entry_in(&mut self, root: &Path, entry_idx: usize) {
         if self.repo_git_busy() {
             return;
         }
         let Some(entry) = self.source_control.entries.get(entry_idx).cloned() else {
             return;
         };
-        match crate::git::stage_path(&self.scm_root(), &entry.path) {
+        match crate::git::stage_path(root, &entry.path) {
             Ok(()) => {
                 self.status = format!("Staged {}", entry.path);
                 self.active_git_bypass_debounce();
@@ -3386,6 +3437,17 @@ impl App {
     }
 
     pub fn request_discard_source_control_entry(&mut self, entry_idx: usize) {
+        let root = self.scm_root();
+        self.request_discard_source_control_entry_in(&root, entry_idx);
+    }
+
+    /// [`Self::request_discard_source_control_entry`] in the repository at
+    /// `root`, which the confirmed discard then acts in.
+    pub(super) fn request_discard_source_control_entry_in(
+        &mut self,
+        root: &Path,
+        entry_idx: usize,
+    ) {
         use crate::git::ChangeKind;
         let Some(entry) = self.source_control.entries.get(entry_idx).cloned() else {
             return;
@@ -3399,6 +3461,7 @@ impl App {
                 | ChangeKind::StagedRenamed
         );
         self.pending_discard = Some(PendingDiscard {
+            root: root.to_path_buf(),
             rel_path: entry.path,
             untracked,
             staged,
@@ -3409,7 +3472,7 @@ impl App {
         let Some(pd) = self.pending_discard.take() else {
             return;
         };
-        match crate::git::discard_path(&self.scm_root(), &pd.rel_path, pd.untracked, pd.staged) {
+        match crate::git::discard_path(&pd.root, &pd.rel_path, pd.untracked, pd.staged) {
             Ok(()) => {
                 self.status = format!("Discarded {}", pd.rel_path);
                 self.active_git_bypass_debounce();

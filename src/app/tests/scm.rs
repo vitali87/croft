@@ -3113,6 +3113,54 @@ fn git_file_commands_find_the_file_through_a_symlinked_folder() {
     assert_eq!(staged_names(&tmp).trim(), "seed.txt", "{}", app.status);
 }
 
+/// #871 (review of #2732): before git's first status lands, the app takes the
+/// workspace folder for the repository's root. A folder inside a repository
+/// is not where git's paths start, so the command ran `git add sub/f.txt`
+/// from `sub` and failed; it acts in the repository its own read found.
+#[test]
+fn git_file_commands_act_in_the_repository_their_read_found() {
+    use crate::widgets::command_palette::Command;
+    let tmp = make_committed_repo();
+    let sub = tmp.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::write(sub.join("f.txt"), b"one\n").unwrap();
+    assert!(git_succeeds(tmp.path(), &["add", "sub/f.txt"]));
+    assert!(git_succeeds(tmp.path(), &["commit", "-q", "-m", "sub"]));
+    std::fs::write(sub.join("f.txt"), b"two\n").unwrap();
+    let mut app = App::new(sub.clone()).unwrap();
+    assert!(app.open_file_at_launch(&sub.join("f.txt")));
+    app.focus_pane(Pane::Editor);
+    assert_eq!(
+        app.git.status().repo_root,
+        None,
+        "git's first status has not landed"
+    );
+    run_git_file_command(&mut app, Command::GitStageChanges);
+    assert_eq!(staged_names(&tmp).trim(), "sub/f.txt", "{}", app.status);
+}
+
+/// #871 (review of #2732): a command run while another is still reading the
+/// changes waits its turn; it replaced the first, which never ran.
+#[test]
+fn git_file_commands_run_while_one_is_reading_wait_their_turn() {
+    use crate::widgets::command_palette::Command;
+    let (tmp, mut app) = scm_with_seed_open();
+    app.run_command(Command::GitStageChanges);
+    assert!(
+        app.git_file_lookup.is_some(),
+        "Stage on seed.txt is reading"
+    );
+    assert!(app.open_file_at_launch(&tmp.path().join("scratch.txt")));
+    app.focus_pane(Pane::Editor);
+    run_git_file_command(&mut app, Command::GitStageChanges);
+    let staged = staged_names(&tmp);
+    assert!(
+        staged.contains("seed.txt") && staged.contains("scratch.txt"),
+        "both are staged: {staged:?} ({})",
+        app.status
+    );
+}
+
 /// #871: in the list `s` stages the selected row, `u` unstages it and `d`
 /// asks before discarding it, each staying on the file it moved.
 #[test]
@@ -7833,6 +7881,7 @@ fn discarding_a_submodule_refuses_instead_of_claiming_success() {
     let inner_head = git_stdout_untrimmed(&root.join("lib"), &["rev-parse", "HEAD"]);
     let mut app = App::new(root.clone()).unwrap();
     app.pending_discard = Some(PendingDiscard {
+        root: root.clone(),
         rel_path: "lib".into(),
         untracked: false,
         staged: false,
@@ -7863,6 +7912,7 @@ fn a_plain_file_beside_a_submodule_still_discards() {
     std::fs::write(root.join("a.txt"), "changed\n").unwrap();
     let mut app = App::new(root.clone()).unwrap();
     app.pending_discard = Some(PendingDiscard {
+        root: root.clone(),
         rel_path: "a.txt".into(),
         untracked: false,
         staged: false,

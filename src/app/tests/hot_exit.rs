@@ -191,6 +191,7 @@ fn discard_and_replace_all_confirmations_are_announced() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.pending_discard = Some(PendingDiscard {
+        root: std::path::PathBuf::new(),
         rel_path: String::from("src/seed.txt"),
         untracked: false,
         staged: false,
@@ -321,6 +322,7 @@ fn a_long_confirmation_still_announces_its_keys() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.screen_reader = true;
     app.pending_discard = Some(PendingDiscard {
+        root: std::path::PathBuf::new(),
         rel_path: format!("src/{}/seed.txt", "deeply/nested".repeat(30)),
         untracked: false,
         staged: false,

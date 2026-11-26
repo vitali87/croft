@@ -1581,6 +1581,7 @@ const CONFIRM_SCENES: [ConfirmScene; 13] = [
         name: "confirm-discard",
         raise: |app, _| {
             app.pending_discard = Some(PendingDiscard {
+                root: std::path::PathBuf::new(),
                 rel_path: String::from("src/main.rs"),
                 untracked: false,
                 staged: false,
