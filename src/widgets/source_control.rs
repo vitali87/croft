@@ -83,11 +83,6 @@ pub struct SourceControlPanel {
     /// dropdown (Commit & Push, Push, View …). Empty when the panel is in
     /// the no-repo state or the button row was clipped.
     pub last_commit_caret_area: Rect,
-    /// Hit-test rects for the dropdown items (Commit & Push, Push, …)
-    /// that pop below the caret. Empty when the menu is closed. The App
-    /// owns the open/closed flag (`commit_menu_open`) so menu state
-    /// survives re-renders.
-    pub commit_menu_item_areas: Vec<(Rect, CommitMenuItem)>,
     pub last_list_area: Rect,
     pub last_scrollbar: Rect,
     /// Hit-test rect for the empty-state "Initialize Repository" button.
@@ -175,7 +170,6 @@ impl SourceControlPanel {
             last_input_area: Rect::default(),
             last_button_area: Rect::default(),
             last_commit_caret_area: Rect::default(),
-            commit_menu_item_areas: Vec::new(),
             last_list_area: Rect::default(),
             last_scrollbar: Rect::default(),
             last_init_repo_button_area: Rect::default(),

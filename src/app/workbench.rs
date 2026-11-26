@@ -1632,10 +1632,9 @@ impl App {
             {
                 self.overlays.hero.request_clear_if_displayed();
             }
-            // The Source Control commit dropdown is anchored to that view;
-            // close it on any view change so it can't linger over the next
-            // sidebar.
-            self.commit_menu_open = false;
+            // Source Control's menus are anchored to that view; close them
+            // on any view change so they can't linger over the next sidebar.
+            self.close_scm_menus();
         }
         self.sidebar_view = view;
         if self.sidebar_view == SidebarView::Remote && self.remote.refresh_if_config_changed() {

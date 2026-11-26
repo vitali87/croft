@@ -2427,64 +2427,6 @@ fn split_commit_button_records_a_separate_caret_rect_at_default_widths() {
 }
 
 #[test]
-fn click_commit_menu_item_dispatches_on_recorded_rects() {
-    let mut p = SourceControlPanel::new();
-    p.commit_menu_item_areas = vec![
-        (
-            Rect {
-                x: 10,
-                y: 5,
-                width: 20,
-                height: 1,
-            },
-            CommitMenuItem::CommitAndPush,
-        ),
-        (
-            Rect {
-                x: 10,
-                y: 6,
-                width: 20,
-                height: 1,
-            },
-            CommitMenuItem::Push,
-        ),
-        (
-            Rect {
-                x: 10,
-                y: 7,
-                width: 20,
-                height: 1,
-            },
-            CommitMenuItem::ViewStagedDiff,
-        ),
-        (
-            Rect {
-                x: 10,
-                y: 8,
-                width: 20,
-                height: 1,
-            },
-            CommitMenuItem::ViewDefaultBranchDiff,
-        ),
-    ];
-    assert_eq!(
-        p.click_commit_menu_item(15, 5),
-        Some(CommitMenuItem::CommitAndPush)
-    );
-    assert_eq!(p.click_commit_menu_item(15, 6), Some(CommitMenuItem::Push));
-    assert_eq!(
-        p.click_commit_menu_item(15, 7),
-        Some(CommitMenuItem::ViewStagedDiff)
-    );
-    assert_eq!(
-        p.click_commit_menu_item(15, 8),
-        Some(CommitMenuItem::ViewDefaultBranchDiff)
-    );
-    assert_eq!(p.click_commit_menu_item(5, 5), None, "outside the rects");
-    assert_eq!(p.click_commit_menu_item(15, 9), None, "below the menu");
-}
-
-#[test]
 fn commit_menu_item_label_inlines_default_branch_for_view_diff_item() {
     assert_eq!(
         CommitMenuItem::ViewDefaultBranchDiff.label("trunk"),

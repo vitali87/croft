@@ -831,16 +831,22 @@ impl App {
             self.handle_list_picker_mouse(m);
             return;
         }
-        // Source Control's `⋯` menu (#871) takes left clicks here, where it
-        // always has; the pointer, the wheel and other buttons pass it by.
-        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
-            && self
-                .context_menu
-                .as_ref()
-                .is_some_and(|menu| matches!(menu.look, MenuLook::ScmActions { .. }))
-        {
-            self.click_scm_actions_menu(m.column, m.row);
-            return;
+        // Source Control's menus (#871) take left clicks here, where they
+        // always have; the pointer, the wheel and other buttons pass them by.
+        // A click outside the Commit dropdown closes it and goes on.
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+            match self.context_menu.as_ref().map(|menu| menu.look) {
+                Some(MenuLook::ScmActions { .. }) => {
+                    self.click_scm_actions_menu(m.column, m.row);
+                    return;
+                }
+                Some(MenuLook::CommitActions)
+                    if self.click_commit_actions_menu(m.column, m.row) =>
+                {
+                    return;
+                }
+                _ => {}
+            }
         }
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
             && self
@@ -2732,25 +2738,9 @@ impl App {
                         self.status = String::from("Refreshed Source Control");
                         return;
                     }
-                    if self.commit_menu_open
-                        && let Some(item) =
-                            self.source_control.click_commit_menu_item(m.column, m.row)
-                    {
-                        self.commit_menu_open = false;
-                        self.dispatch_commit_menu_item(item);
-                        return;
-                    }
                     if self.source_control.click_commit_caret(m.column, m.row) {
-                        self.commit_menu_open = !self.commit_menu_open;
+                        self.open_commit_actions_menu(false);
                         return;
-                    }
-                    if self.commit_menu_open {
-                        // Any click outside the caret/menu closes the
-                        // dropdown without firing its action; fall through
-                        // so the underlying gesture still applies (the
-                        // user can dismiss-by-clicking-elsewhere instead
-                        // of needing Esc + click).
-                        self.commit_menu_open = false;
                     }
                     if self.source_control.click_init_repo_button(m.column, m.row) {
                         self.initialize_repository();

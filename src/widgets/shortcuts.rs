@@ -1352,6 +1352,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "",
             },
             ShortcutEntry {
+                keys: "Cmd/Ctrl+K Shift+C",
+                description: "Open the Commit button's ▾ menu (outside the terminal): arrows, Enter, Esc",
+                handler: "",
+            },
+            ShortcutEntry {
                 keys: "S / U / R in a diff",
                 description: "Stage / unstage / revert the change hunk under the cursor (revert confirms first)",
                 handler: "",

@@ -1,12 +1,15 @@
-//! The Source Control "⋯" title menu: a VS Code-style actions menu with
-//! one level of fly-out submenus (Commit ›, Changes ›, Branch ›, Stash ›,
-//! …). Opened from the `⋯` pill in the SOURCE CONTROL header.
+//! Source Control's two menus, as they look: the "⋯" title menu, a VS
+//! Code-style actions menu with one level of fly-out submenus (Commit ›,
+//! Changes ›, Branch ›, Stash ›, …) opened from the `⋯` pill in the SOURCE
+//! CONTROL header, and the Commit button's `▾` dropdown.
 //!
-//! The widget is a thin renderer over a static menu tree. It owns no git
-//! state: every leaf is an [`ScmAction`] the App dispatches in
-//! `dispatch_scm_action`, and the open/expanded state plus hit-test rects
-//! live in [`ScmMenuState`] (held by the App, mirroring how the commit
-//! dropdown stores its rects on the panel).
+//! Both run on croft's shared menu, which keeps what is open and where the
+//! keyboard is (#871). This file holds the ⋯ menu's tree, the rows both
+//! menus draw, where their columns sit, and how a column is painted. It owns
+//! no git state: every ⋯ leaf is an [`ScmAction`] the App dispatches in
+//! `dispatch_scm_action`.
+
+use std::borrow::Cow;
 
 use ratatui::{
     buffer::Buffer,
@@ -300,19 +303,19 @@ fn base_menu() -> Vec<Node> {
     ]
 }
 
-/// One row of the menu as it is drawn: an action, a fly-out's parent, or a
+/// One row of a menu as it is drawn: an action, a fly-out's parent, or a
 /// separator. `accent` is the glyph's colour before the theme maps it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Row {
     Leaf {
         icon: char,
         accent: Color,
-        label: &'static str,
+        label: Cow<'static, str>,
     },
     Sub {
         icon: char,
         accent: Color,
-        label: &'static str,
+        label: Cow<'static, str>,
     },
     Sep,
 }
@@ -322,11 +325,11 @@ impl Row {
         Row::Leaf {
             icon: l.icon,
             accent: action_color(l.action),
-            label: l.label,
+            label: Cow::Borrowed(l.label),
         }
     }
 
-    fn label(&self) -> Option<&'static str> {
+    fn label(&self) -> Option<&str> {
         match self {
             Row::Leaf { label, .. } | Row::Sub { label, .. } => Some(label),
             Row::Sep => None,
@@ -343,7 +346,7 @@ pub fn rows(nodes: &[Node]) -> Vec<Row> {
             Node::Sub { label, icon, .. } => Row::Sub {
                 icon: *icon,
                 accent: submenu_color(label),
-                label,
+                label: Cow::Borrowed(label),
             },
             Node::Sep => Row::Sep,
         })
@@ -356,6 +359,70 @@ pub fn fly_out_rows(nodes: &[Node], parent: usize) -> Option<Vec<Row>> {
         Node::Sub { items, .. } => Some(items.iter().map(Row::leaf).collect()),
         _ => None,
     }
+}
+
+/// The Commit button's dropdown rows, in VS Code's order, each glyph in its
+/// action's accent. `default_branch` names the branch the last row compares
+/// against.
+pub fn commit_rows(default_branch: &str) -> Vec<Row> {
+    use crate::widgets::source_control::CommitMenuItem as Item;
+    Item::ALL
+        .iter()
+        .map(|item| Row::Leaf {
+            icon: item.icon(),
+            accent: match item {
+                Item::CommitAndPush => ACCENT_GREY,
+                Item::Push | Item::Pull | Item::Sync => ACCENT_BLUE,
+                Item::CheckoutBranch => ACCENT_CYAN,
+                Item::Stash | Item::StashPop => ACCENT_AMBER,
+                Item::ViewStagedDiff
+                | Item::ViewPreviousCommitDiff
+                | Item::ViewDefaultBranchDiff => ACCENT_PURPLE,
+            },
+            label: Cow::Owned(item.label(default_branch)),
+        })
+        .collect()
+}
+
+/// The Commit dropdown's column for `rows`, under the button's `▾` `caret`
+/// and right-aligned to it, never left of the `button`: as wide as its
+/// longest row, and at least as wide as the caret. A `card` keeps a rim row
+/// above and below its rows. `None` when too little of it fits on `screen`.
+pub fn commit_column(
+    rows: &[Row],
+    caret: Rect,
+    button: Rect,
+    screen: Rect,
+    card: bool,
+) -> Option<Column> {
+    if caret.width == 0 || button.width == 0 {
+        return None;
+    }
+    // [pad][icon][gap][label][pad]
+    let width = rows
+        .iter()
+        .filter_map(Row::label)
+        .map(|l| {
+            u16::try_from(l.chars().count())
+                .unwrap_or(u16::MAX)
+                .saturating_add(4)
+        })
+        .max()
+        .unwrap_or(0)
+        .max(caret.width);
+    let x = caret.right().saturating_sub(width).max(button.x);
+    let n = u16::try_from(rows.len()).unwrap_or(u16::MAX);
+    let pad = u16::from(card);
+    let rect = Rect::new(x, caret.bottom(), width, n.saturating_add(2 * pad)).intersection(screen);
+    if card && (rect.width < 3 || rect.height < 3) || rect.is_empty() {
+        return None;
+    }
+    Some(Column {
+        rect,
+        pad,
+        rows: rows.len(),
+        first: 0,
+    })
 }
 
 /// Where one column of the menu sits: its rect, the rim rows a card keeps
@@ -571,7 +638,43 @@ fn column_width(labels: impl Iterator<Item = usize>, with_arrow: bool) -> u16 {
     (1 + 1 + 1 + max + arrow + 1).max(12)
 }
 
-/// Paint `col` with `rows`: a plain panel (no border, each glyph in its
+/// Which plain panel a column is, for its colours: the ⋯ menu's top column,
+/// one of its fly-outs, or the Commit button's dropdown. A `surfaces` theme
+/// draws all three as the same card.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Panel {
+    Top,
+    FlyOut,
+    Commit,
+}
+
+impl Panel {
+    fn bg(self) -> Color {
+        match self {
+            Panel::Top | Panel::Commit => BG,
+            Panel::FlyOut => SUB_BG,
+        }
+    }
+
+    /// The labels' ink: the ⋯ menu's soft white, the dropdown's white.
+    fn ink(self) -> Color {
+        match self {
+            Panel::Top | Panel::FlyOut => FG,
+            Panel::Commit => Color::White,
+        }
+    }
+
+    /// The blank cells' style: the dropdown fills its rows with its ink set.
+    fn fill(self, theme: crate::theme::Theme) -> Style {
+        let fill = Style::default().bg(theme.ui(self.bg()));
+        match self {
+            Panel::Top | Panel::FlyOut => fill,
+            Panel::Commit => fill.fg(theme.ui(self.ink())),
+        }
+    }
+}
+
+/// Paint `col` with `rows`: a plain `panel` (no border, each glyph in its
 /// accent) unless the theme draws `surfaces`, where the column is a raised
 /// card with the accent lip, its rows one cell in from the card's top and
 /// bottom edges and its rim on the rows' pad columns, so each row's rect is
@@ -583,7 +686,7 @@ pub fn paint_column(
     buf: &mut Buffer,
     col: Column,
     rows: &[Row],
-    fly_out: bool,
+    panel: Panel,
     marks: Marks,
     theme: crate::theme::Theme,
 ) {
@@ -591,9 +694,11 @@ pub fn paint_column(
         paint_card_column(buf, col, rows, marks, theme, t);
         return;
     }
-    let bg = theme.ui(if fly_out { SUB_BG } else { BG });
+    let bg = theme.ui(panel.bg());
+    let ink = theme.ui(panel.ink());
+    let arrow = theme.ui(SUB_ARROW_FG);
     Widget::render(Clear, col.rect, buf);
-    fill(buf, col.rect, bg);
+    fill(buf, col.rect, panel.fill(theme));
     let (cursor_bg, cursor_ink) = marks.cursor_colours;
     for (i, row) in rows.iter().enumerate().skip(col.first) {
         let Some(r) = col.row(i) else {
@@ -601,9 +706,9 @@ pub fn paint_column(
         };
         let cursor = marks.cursor == Some(i);
         if cursor {
-            fill(buf, r, cursor_bg);
+            fill(buf, r, Style::default().bg(cursor_bg));
         }
-        match *row {
+        match row {
             Row::Sep => {
                 for x in r.x + 1..r.x + r.width.saturating_sub(1) {
                     buf.set_string(x, r.y, "─", Style::default().fg(theme.ui(SEP_FG)).bg(bg));
@@ -615,44 +720,33 @@ pub fn paint_column(
                 label,
             } => {
                 let (row_bg, ink) = if cursor {
-                    (cursor_bg, Some(cursor_ink))
+                    (cursor_bg, cursor_ink)
                 } else {
-                    (bg, None)
+                    (bg, ink)
                 };
-                paint_row(
-                    buf,
-                    r,
-                    icon,
-                    theme.ui(accent),
-                    label,
-                    false,
-                    row_bg,
-                    ink,
-                    theme,
-                );
+                paint_row(buf, r, *icon, theme.ui(*accent), label, None, row_bg, ink);
             }
             Row::Sub {
                 icon,
                 accent,
                 label,
             } => {
-                let (row_bg, ink) = if cursor {
-                    (cursor_bg, Some(cursor_ink))
+                let (row_bg, ink, arrow) = if cursor {
+                    (cursor_bg, cursor_ink, cursor_ink)
                 } else if marks.open == Some(i) {
-                    (theme.ui(SUB_BG), None)
+                    (theme.ui(SUB_BG), ink, arrow)
                 } else {
-                    (bg, None)
+                    (bg, ink, arrow)
                 };
                 paint_row(
                     buf,
                     r,
-                    icon,
-                    theme.ui(accent),
+                    *icon,
+                    theme.ui(*accent),
                     label,
-                    true,
+                    Some(arrow),
                     row_bg,
                     ink,
-                    theme,
                 );
             }
         }
@@ -669,23 +763,23 @@ fn paint_card_column(
     t: crate::widgets::surface::Tones,
 ) {
     Widget::render(Clear, col.rect, buf);
-    fill(buf, col.rect, t.raised());
+    fill(buf, col.rect, Style::default().bg(t.raised()));
     crate::widgets::surface::paint_overlay_frame(buf, col.rect, theme);
     for (i, row) in rows.iter().enumerate().skip(col.first) {
         let Some(r) = col.row(i) else {
             break;
         };
         let lit = marks.cursor == Some(i) || crate::widgets::hover::contains(r, marks.pointer);
-        match *row {
+        match row {
             Row::Sep => {
                 let rule = "─".repeat(usize::from(r.width));
                 buf.set_string(r.x, r.y, rule, Style::default().fg(t.rim()));
             }
             Row::Leaf { icon, label, .. } => {
-                paint_card_row(buf, r, t, icon, label, false, lit, false);
+                paint_card_row(buf, r, t, *icon, label, false, lit, false);
             }
             Row::Sub { icon, label, .. } => {
-                paint_card_row(buf, r, t, icon, label, true, lit, marks.open == Some(i));
+                paint_card_row(buf, r, t, *icon, label, true, lit, marks.open == Some(i));
             }
         }
     }
@@ -730,8 +824,7 @@ fn paint_card_row(
     }
 }
 
-fn fill(buf: &mut Buffer, rect: Rect, bg: Color) {
-    let style = Style::default().bg(bg);
+fn fill(buf: &mut Buffer, rect: Rect, style: Style) {
     for ry in 0..rect.height {
         for rx in 0..rect.width {
             buf[(rect.x + rx, rect.y + ry)]
@@ -741,8 +834,8 @@ fn fill(buf: &mut Buffer, rect: Rect, bg: Color) {
     }
 }
 
-/// One row of a plain panel: `[pad][icon][gap][label]…[›][pad]`, the label
-/// and `›` in `ink` when given, else the panel's own.
+/// One row of a plain panel: `[pad][icon][gap][label]…[›][pad]`, the label in
+/// `ink`, and a fly-out's parent's `›` in its `arrow` colour.
 #[allow(clippy::too_many_arguments)]
 fn paint_row(
     buf: &mut Buffer,
@@ -750,30 +843,29 @@ fn paint_row(
     icon: char,
     icon_color: Color,
     label: &str,
-    submenu: bool,
+    arrow: Option<Color>,
     bg: Color,
-    ink: Option<Color>,
-    theme: crate::theme::Theme,
+    ink: Color,
 ) {
-    let fg = Style::default().fg(ink.unwrap_or(theme.ui(FG))).bg(bg);
     buf.set_string(
         row.x + 1,
         row.y,
         icon.to_string(),
         Style::default().fg(icon_color).bg(bg),
     );
-    let label_x = row.x + 3;
-    let avail = row.width.saturating_sub(3 + if submenu { 2 } else { 1 }) as usize;
+    let avail = row
+        .width
+        .saturating_sub(3 + if arrow.is_some() { 2 } else { 1 }) as usize;
     let shown: String = label.chars().take(avail).collect();
-    buf.set_string(label_x, row.y, &shown, fg);
-    if submenu && row.width >= 2 {
+    buf.set_string(row.x + 3, row.y, &shown, Style::default().fg(ink).bg(bg));
+    if let Some(arrow) = arrow
+        && row.width >= 2
+    {
         buf.set_string(
             row.x + row.width - 2,
             row.y,
             "›",
-            Style::default()
-                .fg(ink.unwrap_or(theme.ui(SUB_ARROW_FG)))
-                .bg(bg),
+            Style::default().fg(arrow).bg(bg),
         );
     }
 }
@@ -834,7 +926,7 @@ mod tests {
         let theme = crate::theme::Theme::BLACK;
         let (rows, col) = top(theme, screen);
         let mut buf = Buffer::empty(screen);
-        paint_column(&mut buf, col, &rows, false, Marks::default(), theme);
+        paint_column(&mut buf, col, &rows, Panel::Top, Marks::default(), theme);
         let pull = col.row(row_of(&rows, "Pull")).unwrap();
         // The icon sits one cell in from the row's left edge.
         assert_eq!(
@@ -857,7 +949,7 @@ mod tests {
         let first = col.row(0).unwrap();
         assert_eq!(first.y, 2, "a card edge above the rows, under the pill");
         let mut buf = Buffer::empty(screen);
-        paint_column(&mut buf, col, &rows, false, Marks::default(), theme);
+        paint_column(&mut buf, col, &rows, Panel::Top, Marks::default(), theme);
         assert_eq!(buf[(first.x, first.y - 1)].symbol(), "\u{2594}");
         assert_eq!(buf[(first.x + 3, first.y)].bg, t.raised());
         let pull = col.row(row_of(&rows, "Pull")).unwrap();
@@ -868,7 +960,7 @@ mod tests {
             ..Marks::default()
         };
         let mut buf = Buffer::empty(screen);
-        paint_column(&mut buf, col, &rows, false, marks, theme);
+        paint_column(&mut buf, col, &rows, Panel::Top, marks, theme);
         assert_eq!(buf[(pull.x + 3, pull.y)].bg, t.hover_on(t.raised));
         assert_eq!(buf[(pull.x + 1, pull.y)].fg, t.text(), "the icon lifts too");
         assert_eq!(col.row_at(pull.x + 4, pull.y), Some(row_of(&rows, "Pull")));
@@ -890,7 +982,7 @@ mod tests {
             ..Marks::default()
         };
         let mut buf = Buffer::empty(screen);
-        paint_column(&mut buf, col, &rows, false, marks, plain);
+        paint_column(&mut buf, col, &rows, Panel::Top, marks, plain);
         let r = col.row(push).unwrap();
         assert_eq!(buf[(r.x, r.y)].bg, band, "the band fills the whole row");
         assert_eq!(buf[(r.x + 3, r.y)].fg, ink);
@@ -908,7 +1000,7 @@ mod tests {
             ..Marks::default()
         };
         let mut buf = Buffer::empty(screen);
-        paint_column(&mut buf, col, &rows, false, marks, card);
+        paint_column(&mut buf, col, &rows, Panel::Top, marks, card);
         let r = col.row(push).unwrap();
         assert_eq!(buf[(r.x + 3, r.y)].bg, t.hover_on(t.raised));
     }

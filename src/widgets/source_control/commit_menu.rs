@@ -1,11 +1,11 @@
 //! The Commit button's dropdown: its items in VS Code's order, their labels and icons, and
-//! the clicks that open it and pick an item.
+//! the click on its `▾` that opens it. It opens on the shared menu (#871).
 
 use super::*;
 
-/// Items in the chevron-opened dropdown next to the Commit button.
-/// Ordered top-to-bottom in render order; the click handler in `App`
-/// dispatches on the variant returned by `click_commit_menu_item`.
+/// Items in the chevron-opened dropdown next to the Commit button,
+/// ordered top-to-bottom as drawn. `App` dispatches each in
+/// `dispatch_commit_menu_item`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommitMenuItem {
     CommitAndPush,
@@ -89,12 +89,5 @@ impl CommitMenuItem {
 impl SourceControlPanel {
     pub fn click_commit_caret(&self, x: u16, y: u16) -> bool {
         rect_hit(self.last_commit_caret_area, x, y)
-    }
-
-    pub fn click_commit_menu_item(&self, x: u16, y: u16) -> Option<CommitMenuItem> {
-        self.commit_menu_item_areas
-            .iter()
-            .find(|(rect, _)| rect_hit(*rect, x, y))
-            .map(|(_, item)| *item)
     }
 }

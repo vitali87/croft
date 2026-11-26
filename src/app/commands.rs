@@ -2194,6 +2194,7 @@ impl App {
             }
             Cmd::GitStash => self.dispatch_scm_action(crate::widgets::scm_menu::ScmAction::Stash),
             Cmd::GitShowSourceControlActions => self.open_scm_actions_menu_from_keyboard(),
+            Cmd::GitShowCommitActions => self.open_commit_actions_menu_from_keyboard(),
             Cmd::ToggleTerminalSuggestions => self.toggle_terminal_suggestions(),
             Cmd::ToggleScreenReader => self.toggle_screen_reader(),
             Cmd::OpenKeyboardShortcuts => self.open_keyboard_shortcuts(),

@@ -1,0 +1,1 @@
+feature: The Commit button's `▾` menu works from the keyboard: Cmd+K Shift+C (Git: Show Commit Actions) opens it from anywhere but the terminal, the arrows and Enter run a row, and Esc now closes it (#871).
