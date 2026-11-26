@@ -290,6 +290,28 @@ impl App {
         }
     }
 
+    /// Flip `multi_cursor_persist`: whether every caret survives ordinary
+    /// movement and Enter instead of collapsing to one. Saved as the mode
+    /// the next launch starts in, like Vim mode; under test it only writes a
+    /// config dir the test chose.
+    pub(super) fn toggle_multi_cursor_persist(&mut self) {
+        self.multi_cursor_persist = !self.multi_cursor_persist;
+        self.status = format!(
+            "Multi-Cursor Persistence: {}",
+            if self.multi_cursor_persist {
+                "on"
+            } else {
+                "off"
+            }
+        );
+        if !cfg!(test) || self.config_dir != crate::paths::config_dir() {
+            self.report_unsaved_setting(crate::prefs::save_multi_cursor_persist_in(
+                &self.config_dir,
+                self.multi_cursor_persist,
+            ));
+        }
+    }
+
     /// Increment (`delta` 1) or decrement (`delta` -1) the number under the
     /// cursor, reporting in the status bar when there is nothing to bump so
     /// the keystroke never looks broken.
@@ -826,7 +848,19 @@ impl App {
         // delete fan out to every caret and Esc collapses back to one cursor.
         // Any other key collapses the carets and falls through to normal
         // single-cursor handling (e.g. an arrow moves just the primary).
+        // With `multi_cursor_persist` on, movement and Enter act on every
+        // caret instead; Esc and a mouse click still collapse.
         if self.editor.has_multi_cursor() {
+            if self.multi_cursor_persist {
+                if let Some((motion, extend)) = multi_caret_motion(key) {
+                    self.editor.multi_move(motion, extend);
+                    return;
+                }
+                if key.code == KeyCode::Enter && key.modifiers.is_empty() {
+                    self.editor.multi_newline();
+                    return;
+                }
+            }
             match key.code {
                 KeyCode::Esc => {
                     self.editor.collapse_carets();
@@ -3159,4 +3193,45 @@ pub(super) fn is_plain_letter(key: KeyEvent, letter: char) -> bool {
     !(key.modifiers.contains(KeyModifiers::CONTROL)
         || key.modifiers.contains(KeyModifiers::SUPER)
         || key.modifiers.contains(KeyModifiers::ALT))
+}
+
+/// The multi-caret motion `key` asks for when `multi_cursor_persist` is on,
+/// and whether Shift extends the selection: arrows, Alt/Ctrl+Left/Right
+/// word-wise (Alt is the word modifier on macOS and Linux, as in the
+/// single-caret path), Home and End. Chords that mean something else on the
+/// way in — Alt+Up/Down moves a line, Cmd+Alt adds a caret,
+/// Shift+Alt+Left/Right grows a selection, Cmd+Home/End jumps to the file's
+/// ends — are left to their own handlers, so the preference only ever takes
+/// plain movement.
+fn multi_caret_motion(key: KeyEvent) -> Option<(crate::widgets::editor::CaretMotion, bool)> {
+    use crate::widgets::editor::CaretMotion;
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    if key.modifiers.contains(KeyModifiers::SUPER) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Up if !ctrl && !alt => Some((CaretMotion::Up, shift)),
+        KeyCode::Down if !ctrl && !alt => Some((CaretMotion::Down, shift)),
+        KeyCode::Left if !(alt && shift) => Some((
+            if alt || ctrl {
+                CaretMotion::WordLeft
+            } else {
+                CaretMotion::Left
+            },
+            shift,
+        )),
+        KeyCode::Right if !(alt && shift) => Some((
+            if alt || ctrl {
+                CaretMotion::WordRight
+            } else {
+                CaretMotion::Right
+            },
+            shift,
+        )),
+        KeyCode::Home if !ctrl && !alt => Some((CaretMotion::Home, shift)),
+        KeyCode::End if !ctrl && !alt => Some((CaretMotion::End, shift)),
+        _ => None,
+    }
 }

@@ -570,6 +570,13 @@ commands! {
         title: "Add Cursor Below",
         hint: "Cmd+Opt+↓",
     }
+    /// Multi-cursor: keep every caret through moves and Enter instead of
+    /// collapsing to one (#1022). Off by default; palette-only.
+    ToggleMultiCursorPersist {
+        id: "toggle_multi_cursor_persist",
+        title: "Toggle Multi-Cursor Persistence",
+        hint: "",
+    }
     ColumnSelectUp {
         id: "column_select_up",
         title: "Column Select Up",
