@@ -797,6 +797,13 @@ impl App {
                 && revspec == self.graph_revspec
             {
                 self.commit_graph.set_rows(rows);
+                // COMMITS took the keys before its history landed (#871):
+                // the newest commit is picked now, as Tab would have.
+                if self.source_control.keys == crate::widgets::source_control::KeyStop::Commits
+                    && self.commit_graph.selected_commit().is_none()
+                {
+                    self.commit_graph.select(0);
+                }
                 changed = true;
             }
             // A trigger arrived while this fetch was in flight: what it

@@ -3371,6 +3371,38 @@ fn tab_skips_an_empty_change_list_to_commits() {
     );
 }
 
+/// #871 (review of #2733): Tab to COMMITS before its history has loaded
+/// picks the newest commit once it lands, so Enter opens it; nothing stayed
+/// picked until an arrow was pressed.
+#[test]
+fn commits_given_the_keys_while_loading_pick_the_newest_once_loaded() {
+    let tmp = make_committed_repo();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(wait_for_changes(&mut app, |a| a
+        .source_control
+        .status
+        .in_repo));
+    app.set_sidebar_view(SidebarView::SourceControl);
+    assert!(!app.commit_graph.is_loaded(), "COMMITS is still loading");
+    press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+    assert_eq!(
+        app.source_control.keys,
+        crate::widgets::source_control::KeyStop::Commits
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !app.commit_graph.is_loaded() {
+        app.sync_explorer_panels();
+        assert!(std::time::Instant::now() < deadline, "COMMITS loads");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        app.commit_graph
+            .selected_commit()
+            .map(|c| c.summary.as_str()),
+        Some("init")
+    );
+}
+
 /// #871 step 5: in COMMITS the arrows, Home / End and PageUp / PageDown
 /// pick a commit and keep it on screen, Enter opens the picked commit,
 /// and Left / Right collapse and expand the section.
