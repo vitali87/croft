@@ -3403,6 +3403,35 @@ fn commits_given_the_keys_while_loading_pick_the_newest_once_loaded() {
     );
 }
 
+/// #871 (review of #2733): with COMMITS holding the keys, screen reader mode
+/// reads COMMITS and the picked commit, which Enter opens; it read the change
+/// list's selected file, or nothing in a clean repository.
+#[test]
+fn screen_reader_mode_reads_the_picked_commit() {
+    let (_tmp, mut app) = scm_with_history(3);
+    press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+    let read = |app: &App| {
+        let snap = app.a11y_snapshot();
+        (snap.focus, snap.item)
+    };
+    let picked = |app: &App| {
+        let c = app.commit_graph.selected_commit().unwrap();
+        format!("{}, by {}, {}", c.summary, c.author, c.short_hash)
+    };
+    let (focus, item) = read(&app);
+    assert_eq!(focus, "Source Control, Commits, 3 commits");
+    assert_eq!(item, Some(picked(&app)));
+    assert!(item.unwrap().starts_with("change 2, by "));
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+    let (_, item) = read(&app);
+    assert!(item.as_deref().unwrap().starts_with("change 1, by "));
+    press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+    assert_eq!(
+        read(&app),
+        (String::from("Source Control, Commits, collapsed"), None)
+    );
+}
+
 /// #871 step 5: in COMMITS the arrows, Home / End and PageUp / PageDown
 /// pick a commit and keep it on screen, Enter opens the picked commit,
 /// and Left / Right collapse and expand the section.

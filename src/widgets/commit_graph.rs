@@ -263,6 +263,11 @@ impl CommitGraphPanel {
         usize::from(self.viewport_rows.max(1))
     }
 
+    /// How many commits the history holds.
+    pub fn commit_count(&self) -> usize {
+        self.rows.len()
+    }
+
     /// The last history row.
     pub fn last_row(&self) -> usize {
         self.rows.len().saturating_sub(1)
