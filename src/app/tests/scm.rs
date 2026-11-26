@@ -9174,3 +9174,22 @@ fn initialize_repository_leaves_a_folder_of_repositories_alone() {
     assert!(!tmp.path().join(".git").exists(), "status: {}", app.status);
     assert!(app.status.contains("subfolders"), "{}", app.status);
 }
+
+/// Initialize Repository asks git itself whether the folder is inside a
+/// repository, so a folder below one is never given a nested repository,
+/// even before Source Control's own status has arrived (#871).
+#[test]
+fn initialize_repository_inside_a_repository_runs_no_git_init() {
+    let tmp = make_committed_repo();
+    let sub = tmp.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    let mut app = App::new(sub.clone()).unwrap();
+    assert!(!app.source_control.status_known, "git has not answered yet");
+    app.run_command(crate::command_registry::Command::GitInitializeRepository);
+    assert!(!sub.join(".git").exists(), "status: {}", app.status);
+    assert!(
+        app.status.ends_with("is already in a Git repository"),
+        "{}",
+        app.status
+    );
+}

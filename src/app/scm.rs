@@ -1395,15 +1395,12 @@ impl App {
     }
 
     /// Git: Initialize Repository from the Command Palette (#871): what the
-    /// no-repository card's button does. In a folder that already is a
-    /// repository, or one whose subfolders are (where the card offers only
-    /// their Open, as `git init` would wrap them), a line says why not.
+    /// no-repository card's button does, which itself refuses a folder
+    /// inside a repository. In one whose subfolders are repositories (where
+    /// the card offers only their Open, as `git init` would wrap them), a
+    /// line says why not.
     pub(super) fn initialize_repository_command(&mut self) {
         let folder = self.active_scm_root.clone();
-        if self.source_control.status.in_repo {
-            self.status = format!("{} is already in a Git repository", folder.display());
-            return;
-        }
         if !crate::git::child_repos(&folder).is_empty() {
             self.status = format!(
                 "{} holds repositories in its subfolders: open one from Source Control",
@@ -1761,6 +1758,19 @@ impl App {
     /// file's, not the first (#2734).
     pub(super) fn initialize_repository(&mut self) {
         let folder = self.active_scm_root.clone();
+        // Asked of git itself, right before acting: Source Control's own
+        // status may not have arrived yet, or be the last folder's, and
+        // `git init` inside a repository nests a new one in it (#871).
+        let inside = crate::proc::command("git")
+            .arg("-C")
+            .arg(&folder)
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .output()
+            .is_ok_and(|out| out.status.success());
+        if inside {
+            self.status = format!("{} is already in a Git repository", folder.display());
+            return;
+        }
         match crate::proc::command("git")
             .arg("-C")
             .arg(&folder)
