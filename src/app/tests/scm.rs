@@ -8922,6 +8922,27 @@ fn scm_with_two_repositories() -> (
     (tmp, app, a, b)
 }
 
+/// Source Control open on `app`'s folder, drawn at `w` x `h` until git
+/// has answered for it, so the no-repository card has the keys.
+fn scm_card_ready(app: &mut App, w: u16, h: u16) {
+    app.set_sidebar_view(SidebarView::SourceControl);
+    app.sync_focus_flags();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let _ = app.drain_git_responses();
+        draw(app, w, h);
+        if app.source_control.status_known {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "git never answered for the folder"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    draw(app, w, h);
+}
+
 /// #871 step 5b: REPOSITORIES is the first Tab stop. Shift+Tab from the
 /// message box reaches it on the shown repository's row, the arrows move,
 /// Enter shows the row's repository and keeps the keys there, and Tab goes
@@ -8978,8 +8999,14 @@ fn the_repositories_band_follows_the_keyboard_row() {
     let shown_keyed = bg(&mut app, 0);
     let cursor_keyed = bg(&mut app, 1);
     assert_eq!(shown_keyed, other_unkeyed, "the band left the shown row");
-    assert_ne!(cursor_keyed, shown_unkeyed, "the keyed band wears the focus");
-    assert_ne!(cursor_keyed, other_unkeyed, "the keyboard's row has the band");
+    assert_ne!(
+        cursor_keyed, shown_unkeyed,
+        "the keyed band wears the focus"
+    );
+    assert_ne!(
+        cursor_keyed, other_unkeyed,
+        "the keyboard's row has the band"
+    );
 }
 
 /// A click on a REPOSITORIES row gives the rows the keys on that row, as a
@@ -9007,8 +9034,7 @@ fn the_no_repository_card_answers_the_keyboard() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("a.txt"), "x\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.set_sidebar_view(SidebarView::SourceControl);
-    draw(&mut app, 120, 40);
+    scm_card_ready(&mut app, 120, 40);
     assert_eq!(app.source_control.keys, KeyStop::Card);
     assert_eq!(
         app.source_control.keyed_card_button(),
@@ -9020,7 +9046,10 @@ fn the_no_repository_card_answers_the_keyboard() {
     assert_eq!(app.source_control.keys, KeyStop::Card, "the only stop");
     press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
     assert!(tmp.path().join(".git").is_dir(), "status: {}", app.status);
-    assert!(wait_for_changes(&mut app, |a| a.source_control.status.in_repo));
+    assert!(wait_for_changes(&mut app, |a| a
+        .source_control
+        .status
+        .in_repo));
     assert_eq!(app.source_control.keys, KeyStop::Message);
 }
 
@@ -9034,8 +9063,7 @@ fn tab_walks_the_cards_open_buttons() {
     std::fs::create_dir(&other).unwrap();
     git_init_with_identity(&other);
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.set_sidebar_view(SidebarView::SourceControl);
-    draw(&mut app, 140, 50);
+    scm_card_ready(&mut app, 140, 50);
     assert_eq!(app.source_control.nested_repo_button_areas.len(), 2);
     assert_eq!(app.source_control.keys, KeyStop::Card);
     assert_eq!(app.source_control.card_button, 0);
@@ -9062,8 +9090,7 @@ fn the_keyed_card_button_lifts() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
         app.apply_theme_visuals(theme);
-        app.set_sidebar_view(SidebarView::SourceControl);
-        app.sync_focus_flags();
+        scm_card_ready(&mut app, 120, 40);
         let buf = draw_buffer(&mut app, 120, 40);
         let b = app.source_control.last_init_repo_button_area;
         let keyed = buf[(b.x + 1, b.y + 1)].bg;
@@ -9090,8 +9117,7 @@ fn screen_reader_names_the_repository_row_and_the_card_button() {
     );
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.set_sidebar_view(SidebarView::SourceControl);
-    draw(&mut app, 120, 40);
+    scm_card_ready(&mut app, 120, 40);
     assert_eq!(
         app.source_control_a11y(),
         (
@@ -9112,4 +9138,27 @@ fn initialize_repository_in_a_repository_says_so() {
         "{}",
         app.status
     );
+}
+
+/// Until git has answered, Source Control's status is a default that reads
+/// as "no repository" and the card is drawn; the keys stay with the message
+/// box, as before the card took any, so Enter pressed that early in a
+/// repository commits rather than running `git init`. Once git says the
+/// folder is in none, the card has them.
+#[test]
+fn the_card_takes_the_keys_only_once_git_has_answered() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    app.sync_focus_flags();
+    draw(&mut app, 120, 40);
+    assert!(!app.source_control.status_known);
+    assert_eq!(app.source_control.keys, KeyStop::Message);
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        !tmp.path().join(".git").exists(),
+        "Enter before git answered ran git init"
+    );
+    scm_card_ready(&mut app, 120, 40);
+    assert_eq!(app.source_control.keys, KeyStop::Card);
 }

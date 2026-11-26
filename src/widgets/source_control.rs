@@ -91,6 +91,11 @@ pub struct SourceControlPanel {
     /// render, like `message_scroll`, to keep the caret's line visible.
     pub message_line_scroll: usize,
     pub status: GitStatus,
+    /// Git has answered for the folder shown (#871). Until it has, `status`
+    /// is a default that reads as "no repository", so the keys stay with the
+    /// message box as before rather than going to the card, where Enter
+    /// would run `git init`.
+    pub status_known: bool,
     /// The prepared merge message last put in the box (#1282), whole
     /// (#1336), to tell an untouched seed from the user's own text.
     seeded_message: Option<String>,
@@ -193,6 +198,7 @@ impl SourceControlPanel {
             message_scroll: 0,
             message_line_scroll: 0,
             status: GitStatus::default(),
+            status_known: false,
             seeded_message: None,
             entries: Vec::new(),
             repositories: Vec::new(),

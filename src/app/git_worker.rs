@@ -34,6 +34,10 @@ pub struct GitWorker {
     /// alone would never re-run that view; "a status refresh completed" is
     /// the signal that the index may have moved.
     status_arrived: bool,
+    /// The worker has answered a status for its current root at least once:
+    /// until then `status` is a default that reads as "no repository"
+    /// (#871).
+    reported: bool,
     /// Stamps on the files in git's own folder that git used outside croft
     /// writes (#2577); see [`Self::refresh_if_git_moved`].
     state_watch: GitStateWatch,
@@ -64,6 +68,7 @@ impl GitWorker {
             last_check: Instant::now(),
             pending: None,
             status_arrived: false,
+            reported: false,
             state_watch: GitStateWatch::default(),
         }
     }
@@ -134,6 +139,7 @@ impl GitWorker {
 
     pub fn set_root(&mut self, root: PathBuf) {
         self.root = root.clone();
+        self.reported = false;
         self.worker.send(GitRequest::SetRoot(root));
     }
 
@@ -155,6 +161,10 @@ impl GitWorker {
             match self.worker.poll() {
                 WorkerPoll::Answer(GitResponse::Status(s)) => {
                     self.status_arrived = true;
+                    self.reported = true;
+                    if let Some(p) = panel.as_deref_mut() {
+                        p.status_known = true;
+                    }
                     if self.status != s {
                         self.status = s.clone();
                         if let Some(p) = panel.as_deref_mut() {
@@ -166,8 +176,10 @@ impl GitWorker {
                 }
                 WorkerPoll::Answer(GitResponse::StatusAndChanges(s, entries)) => {
                     self.status_arrived = true;
+                    self.reported = true;
                     self.status = s.clone();
                     if let Some(p) = panel.as_deref_mut() {
+                        p.status_known = true;
                         p.set_status(s, entries);
                     }
                     changed = true;
@@ -194,6 +206,11 @@ impl GitWorker {
     /// after a restart (#2589), so the app can say so.
     pub fn take_stopped(&mut self) -> bool {
         std::mem::take(&mut self.stopped_news)
+    }
+
+    /// Whether the worker has answered a status for its current root yet.
+    pub fn reported(&self) -> bool {
+        self.reported
     }
 
     /// True once per completed status refresh since the last call, changed
@@ -229,6 +246,7 @@ mod tests {
                     .unwrap_or_else(Instant::now),
                 pending: None,
                 status_arrived: false,
+                reported: false,
                 state_watch: GitStateWatch::default(),
             };
             (worker, request_rx)
@@ -247,6 +265,7 @@ mod tests {
                 last_check: Instant::now(),
                 pending: None,
                 status_arrived: false,
+                reported: false,
                 state_watch: GitStateWatch::default(),
             };
             (worker, response_tx)

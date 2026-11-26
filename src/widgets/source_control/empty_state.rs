@@ -260,8 +260,8 @@ impl SourceControlPanel {
                     height: 3,
                 };
                 let text = format!("Open {label}");
-                let hovered = crate::widgets::hover::contains(area, self.hover_pointer)
-                    || keyed == Some(i);
+                let hovered =
+                    crate::widgets::hover::contains(area, self.hover_pointer) || keyed == Some(i);
                 let bg = fill(keyed == Some(i));
                 render_button(buf, area, &text, bg, text_white, self.theme, hovered);
                 self.nested_repo_button_areas.push((area, path.clone()));
@@ -284,10 +284,12 @@ impl SourceControlPanel {
                 height: 3,
             };
             self.last_init_repo_button_area = init_area;
-            let hovered = crate::widgets::hover::contains(init_area, self.hover_pointer)
-                || card_has_keys;
+            let hovered =
+                crate::widgets::hover::contains(init_area, self.hover_pointer) || card_has_keys;
             let bg = fill(card_has_keys);
-            render_button(buf, init_area, init_label, bg, text_white, self.theme, hovered);
+            render_button(
+                buf, init_area, init_label, bg, text_white, self.theme, hovered,
+            );
         }
     }
 }

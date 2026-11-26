@@ -26,11 +26,7 @@ impl SourceControlPanel {
     /// REPOSITORIES takes the keys (#871), on the shown repository's row.
     pub fn focus_repositories(&mut self) {
         self.keys = KeyStop::Repositories;
-        self.repo_cursor = self
-            .repositories
-            .iter()
-            .position(|r| r.active)
-            .unwrap_or(0);
+        self.repo_cursor = self.repositories.iter().position(|r| r.active).unwrap_or(0);
     }
 
     /// Move REPOSITORIES' keyboard row `delta` rows, stopping at the ends.

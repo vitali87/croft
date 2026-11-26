@@ -12,7 +12,7 @@ impl SourceControlPanel {
         if self.repositories.len() >= 2 {
             stops.push(KeyStop::Repositories);
         }
-        if self.status.in_repo {
+        if self.shows_repository() {
             stops.push(KeyStop::Message);
             if !self.entries.is_empty() {
                 stops.push(KeyStop::List);
@@ -24,12 +24,18 @@ impl SourceControlPanel {
         stops
     }
 
+    /// Whether the keys work the repository stops rather than the card: in
+    /// a repository, and until git has said the folder is in none.
+    fn shows_repository(&self) -> bool {
+        self.status.in_repo || !self.status_known
+    }
+
     /// The keys' stop after their stop has left the screen: the last change
     /// committed, a folder closed, the folder made a repository. They go to
     /// the message box, or to the card in a folder with no repository.
     pub fn settle_keys(&mut self) {
         if !self.stops().contains(&self.keys) {
-            self.keys = if self.status.in_repo {
+            self.keys = if self.shows_repository() {
                 KeyStop::Message
             } else {
                 KeyStop::Card
@@ -47,6 +53,10 @@ impl SourceControlPanel {
         let stops = self.stops();
         let n = stops.len();
         let at = stops.iter().position(|s| *s == self.keys).unwrap_or(0);
-        stops[if forward { (at + 1) % n } else { (at + n - 1) % n }]
+        stops[if forward {
+            (at + 1) % n
+        } else {
+            (at + n - 1) % n
+        }]
     }
 }

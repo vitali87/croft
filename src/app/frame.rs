@@ -3229,7 +3229,9 @@ impl App {
             return (focus, item);
         }
         if sc.keys == KeyStop::Card {
-            let item = sc.keyed_card_label().map(|label| format!("{label}, button"));
+            let item = sc
+                .keyed_card_label()
+                .map(|label| format!("{label}, button"));
             return (format!("{name}, {}", sc.card_title()), item);
         }
         if sc.keys == KeyStop::Commits {

@@ -416,7 +416,9 @@ impl App {
         let w = self.git_worker_for_root_mut(&active);
         w.bypass_debounce();
         w.request_status_and_changes();
-        let status = self.git_worker_for_root(&active).status().clone();
+        let worker = self.git_worker_for_root(&active);
+        let (status, known) = (worker.status().clone(), worker.reported());
+        self.source_control.status_known = known;
         self.source_control.set_status(status, Vec::new());
         self.refresh_scm_repositories();
         self.refresh_commit_graph();
