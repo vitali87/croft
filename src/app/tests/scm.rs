@@ -8797,6 +8797,56 @@ fn a_short_terminal_scrolls_the_commit_dropdown_to_the_keyboards_row() {
     assert!(text.contains("View Changes vs "), "{text:?}");
 }
 
+/// With two folders open, Source Control shows the folder of the focused
+/// file; its Initialize Repository button turns THAT folder into a
+/// repository, not the first folder (which already is one).
+#[test]
+fn initialize_repository_inits_the_folder_source_control_shows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("repa");
+    std::fs::create_dir(&a).unwrap();
+    git_ok(&a, &["init", "-q"]);
+    std::fs::write(a.join("f.txt"), "x\n").unwrap();
+    let b = tmp.path().join("plain");
+    std::fs::create_dir(&b).unwrap();
+    std::fs::write(b.join("g.txt"), "y\n").unwrap();
+    let mut app = App::new(a.clone()).unwrap();
+    app.add_workspace_folder(b.clone());
+    let b = b.canonicalize().unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    app.editor.open_pinned(&b.join("g.txt")).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let _ = app.drain_git_responses();
+        let _ = draw_buffer(&mut app, 140, 50);
+        if app.active_scm_root == b && app.source_control.last_init_repo_button_area.width > 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Source Control never showed the plain folder's card"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let btn = app.source_control.last_init_repo_button_area;
+    left_click(&mut app, btn.x + btn.width / 2, btn.y + 1);
+    assert!(
+        b.join(".git").is_dir(),
+        "the shown folder became a repository; status: {}",
+        app.status
+    );
+    // And Source Control then shows it as one.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !app.source_control.status.in_repo {
+        let _ = app.drain_git_responses();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the card stayed after Initialize"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 /// Once Initialize Repository has made the folder a repository, the spot
 /// where its button was is the change list's (or nothing's): a click there
 /// does what is drawn there now, and never runs `git init` again (#2736).
