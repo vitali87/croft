@@ -38,10 +38,13 @@ pub struct GitWorker {
     /// until then `status` is a default that reads as "no repository"
     /// (#871).
     reported: bool,
-    /// A `SetRoot` is on its way to the thread: answers until its
-    /// `RootSet` read the old root and are dropped, so a late "no
-    /// repository" for the old folder never speaks for the new one (#871).
-    root_pending: bool,
+    /// The `SetRoot`s on their way to the thread, each acknowledged by a
+    /// `RootSet`. Until the last one's lands, answers read an earlier root
+    /// and are dropped, so a late "no repository" for an old folder never
+    /// speaks for the new one (#871), even after two quick changes of
+    /// folder. A restarted thread has a channel of its own, so the count
+    /// starts again from what was sent to it.
+    roots_in_flight: usize,
     /// Stamps on the files in git's own folder that git used outside croft
     /// writes (#2577); see [`Self::refresh_if_git_moved`].
     state_watch: GitStateWatch,
@@ -73,7 +76,7 @@ impl GitWorker {
             pending: None,
             status_arrived: false,
             reported: false,
-            root_pending: false,
+            roots_in_flight: 0,
             state_watch: GitStateWatch::default(),
         }
     }
@@ -138,7 +141,7 @@ impl GitWorker {
     pub fn request_status_and_changes(&mut self) {
         if self.worker.is_stopped() && self.worker.restart().is_ok() {
             self.worker.send(GitRequest::SetRoot(self.root.clone()));
-            self.root_pending = true;
+            self.roots_in_flight = 1;
         }
         self.worker.send(GitRequest::StatusAndChanges);
     }
@@ -146,7 +149,7 @@ impl GitWorker {
     pub fn set_root(&mut self, root: PathBuf) {
         self.root = root.clone();
         self.reported = false;
-        self.root_pending = true;
+        self.roots_in_flight += 1;
         self.worker.send(GitRequest::SetRoot(root));
     }
 
@@ -166,9 +169,11 @@ impl GitWorker {
         let mut changed = false;
         loop {
             match self.worker.poll() {
-                WorkerPoll::Answer(GitResponse::RootSet) => self.root_pending = false,
-                // An answer read for the folder before the last `set_root`.
-                WorkerPoll::Answer(_) if self.root_pending => {}
+                WorkerPoll::Answer(GitResponse::RootSet) => {
+                    self.roots_in_flight = self.roots_in_flight.saturating_sub(1);
+                }
+                // An answer read for a folder before the last `set_root`.
+                WorkerPoll::Answer(_) if self.roots_in_flight > 0 => {}
                 WorkerPoll::Answer(GitResponse::Status(s)) => {
                     self.status_arrived = true;
                     self.reported = true;
@@ -200,7 +205,7 @@ impl GitWorker {
                 // one owed, so nothing about git freezes (#2589).
                 WorkerPoll::Restarted => {
                     self.worker.send(GitRequest::SetRoot(self.root.clone()));
-                    self.root_pending = true;
+                    self.roots_in_flight = 1;
                     self.worker.send(GitRequest::StatusAndChanges);
                 }
                 WorkerPoll::Stopped => {
@@ -258,7 +263,7 @@ mod tests {
                 pending: None,
                 status_arrived: false,
                 reported: false,
-                root_pending: false,
+                roots_in_flight: 0,
                 state_watch: GitStateWatch::default(),
             };
             (worker, request_rx)
@@ -278,7 +283,7 @@ mod tests {
                 pending: None,
                 status_arrived: false,
                 reported: false,
-                root_pending: false,
+                roots_in_flight: 0,
                 state_watch: GitStateWatch::default(),
             };
             (worker, response_tx)
@@ -413,5 +418,29 @@ mod tests {
         worker.drain_into(None);
         assert!(worker.reported());
         assert!(worker.status().in_repo, "the new folder's answer lands");
+    }
+
+    /// #871: two changes of folder before a drain. The answer the thread
+    /// read for the middle folder arrives after that folder's `RootSet` and
+    /// before the last one's, and is dropped like any other old answer.
+    #[test]
+    fn an_answer_for_a_root_changed_again_is_dropped() {
+        let (mut worker, tx) = GitWorker::for_test_with_responses();
+        worker.set_root(PathBuf::from("/b"));
+        worker.set_root(PathBuf::from("/c"));
+        let in_repo = GitStatus {
+            in_repo: true,
+            ..GitStatus::default()
+        };
+        tx.send(GitResponse::RootSet).unwrap();
+        tx.send(GitResponse::Status(in_repo.clone())).unwrap();
+        worker.drain_into(None);
+        assert!(!worker.reported(), "the middle folder's answer is dropped");
+        assert!(!worker.status().in_repo);
+        tx.send(GitResponse::RootSet).unwrap();
+        tx.send(GitResponse::Status(in_repo)).unwrap();
+        worker.drain_into(None);
+        assert!(worker.reported());
+        assert!(worker.status().in_repo, "the last folder's answer lands");
     }
 }
