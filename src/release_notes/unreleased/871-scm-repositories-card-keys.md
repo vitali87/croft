@@ -1,0 +1,1 @@
+feature: Source Control's REPOSITORIES rows and its no-repository screen answer the keyboard: Tab reaches the repository rows, where the arrows move and Enter shows that repository, and on a folder with no repository Tab and the arrows move between Initialize Repository and each subfolder's Open, and Enter presses it. Git: Initialize Repository is on the Command Palette (#871).

@@ -44,9 +44,7 @@ impl SourceControlPanel {
             self.selected_change = None;
         }
         self.multi_selection = multi_selection;
-        if self.entries.is_empty() && self.keys == KeyStop::List {
-            self.keys = KeyStop::Message;
-        }
+        self.settle_keys();
     }
 
     /// Click-to-select: returns the entry index now selected, if the

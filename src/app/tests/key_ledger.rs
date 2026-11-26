@@ -675,6 +675,12 @@ fn scm_view(sc: &crate::widgets::source_control::SourceControlPanel) -> String {
         crate::widgets::source_control::KeyStop::Message => {}
         crate::widgets::source_control::KeyStop::List => out.push_str(" +list"),
         crate::widgets::source_control::KeyStop::Commits => out.push_str(" +commits"),
+        crate::widgets::source_control::KeyStop::Repositories => {
+            out.push_str(&format!(" +repositories@{}", sc.repo_cursor));
+        }
+        crate::widgets::source_control::KeyStop::Card => {
+            out.push_str(&format!(" +card@{}", sc.card_button));
+        }
     }
     if let Some(i) = sc.selected_change {
         out.push_str(&format!(" sel={i}"));
@@ -2132,6 +2138,24 @@ const PROOF_PLACES: &[ProofPlace] = &[
             },
         },
         commands: &[Command::GitRefresh],
+    },
+    ProofPlace {
+        context: Context {
+            name: "Source Control in a folder with no repository",
+            repo: false,
+            setup: |app| {
+                app.set_sidebar_view(SidebarView::SourceControl);
+                crate::test_budget::await_spawned(
+                    std::time::Duration::from_millis(500),
+                    "git status for Source Control",
+                    || {
+                        app.drain_git_responses();
+                        app.source_control.status_known
+                    },
+                );
+            },
+        },
+        commands: &[Command::GitInitializeRepository],
     },
 ];
 
