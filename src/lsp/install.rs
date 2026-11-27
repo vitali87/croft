@@ -1467,23 +1467,56 @@ fn bootstrap_uv() -> Option<PathBuf> {
 
 /// A directory to PREPEND to PATH so a non-shell `exec` can find `node`/`npm`,
 /// or `None` when `node` is already on croft's PATH (nothing to add) or none
-/// could be discovered. Cached: discovery runs at most once.
+/// could be discovered. A directory found is kept for the process; a miss is
+/// looked for again next time, as [`NodeDirMemo`] says (#2806).
 ///
 /// Version managers (nvm, fnm, asdf, volta) keep node off croft's inherited
 /// PATH (they add it only when a shell sources its init files). croft is exec'd
-/// without a shell, so [`discover_node_dir`] finds it — first by reading the
-/// well-known on-disk layouts, then by asking the user's shell in a detached
-/// session that can't touch croft's terminal.
+/// without a shell, so it finds node itself: first by reading the well-known
+/// on-disk layouts, then by asking the user's shell in a detached session that
+/// can't touch croft's terminal.
 pub(crate) fn node_path_prepend() -> Option<PathBuf> {
-    static NODE_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
-    NODE_DIR
-        .get_or_init(|| {
-            if crate::lsp::manager::is_on_path("node") && crate::lsp::manager::is_on_path("npm") {
-                return None;
-            }
-            discover_node_dir()
-        })
-        .clone()
+    if crate::lsp::manager::is_on_path("node") && crate::lsp::manager::is_on_path("npm") {
+        return None;
+    }
+    static FOUND: NodeDirMemo = NodeDirMemo::new();
+    FOUND.get(on_disk_node_dir, detached_shell_node_dir)
+}
+
+/// What [`node_path_prepend`] keeps between calls: the node directory once
+/// found, and the login shell's one answer. Reading the on-disk layouts costs
+/// a few file checks, so after a miss they are read again, and a node
+/// installed while croft runs is found without a restart (#2806). Asking the
+/// shell can take 15 s and runs where the caller is, the UI thread among
+/// them, so it is asked once per process.
+struct NodeDirMemo {
+    found: Mutex<Option<PathBuf>>,
+    shell: OnceLock<Option<PathBuf>>,
+}
+
+impl NodeDirMemo {
+    const fn new() -> Self {
+        Self {
+            found: Mutex::new(None),
+            shell: OnceLock::new(),
+        }
+    }
+
+    /// The node directory: the one kept, else `on_disk`'s, else the shell's.
+    fn get(
+        &self,
+        on_disk: impl FnOnce() -> Option<PathBuf>,
+        shell: impl FnOnce() -> Option<PathBuf>,
+    ) -> Option<PathBuf> {
+        let mut found = self
+            .found
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if found.is_none() {
+            *found = on_disk().or_else(|| self.shell.get_or_init(shell).clone());
+        }
+        found.clone()
+    }
 }
 
 /// True when croft can find a usable `node` + `npm`, either already on PATH or
@@ -1493,25 +1526,20 @@ fn node_available() -> bool {
         || node_path_prepend().is_some()
 }
 
-/// Find a directory containing real `node` + `npm` binaries.
-///
-/// Fast path first: read the well-known on-disk layouts (nvm versions dir,
-/// Volta, Homebrew) with no process spawn. Universal fallback: ask the user's
-/// own login+interactive shell where `node` resolves — detached from croft's
-/// controlling terminal so it can never do tty job control. The fallback is
-/// what makes fnm / asdf / volta-shim / custom setups work, not just the ones
-/// with a guessable directory.
-fn discover_node_dir() -> Option<PathBuf> {
+/// A directory with real `node` + `npm` binaries in a well-known on-disk
+/// layout (nvm's versions dir, Volta, Homebrew), read with no process spawn.
+/// When none has one, [`node_path_prepend`] asks the user's own
+/// login+interactive shell where `node` resolves, detached from croft's
+/// controlling terminal so it can never do tty job control; that is what makes
+/// fnm / asdf / volta-shim / custom setups work, not just the ones with a
+/// guessable directory.
+fn on_disk_node_dir() -> Option<PathBuf> {
     if let Some(dir) = nvm_node_dir() {
         return Some(dir);
     }
-    if let Some(dir) = well_known_node_dirs()
+    well_known_node_dirs()
         .into_iter()
         .find(|dir| dir.join("node").is_file() && dir.join("npm").exists())
-    {
-        return Some(dir);
-    }
-    detached_shell_node_dir()
 }
 
 /// Marker the probe wraps `process.execPath` in, so the real path is
@@ -1676,6 +1704,28 @@ pub(crate) fn prepend_paths(dirs: &[PathBuf]) -> OsString {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2806: a node found is kept; a miss is no answer for good. The
+    /// on-disk layouts are read again next time, so a node installed since
+    /// (nvm, Volta, Homebrew) is found without a restart, while the login
+    /// shell, which can take 15 s, is asked only once.
+    #[test]
+    fn a_node_installed_after_a_miss_is_found_and_the_shell_is_asked_once() {
+        let memo = NodeDirMemo::new();
+        let asked = std::cell::Cell::new(0);
+        let shell = || {
+            asked.set(asked.get() + 1);
+            None
+        };
+        assert_eq!(memo.get(|| None, shell), None);
+        let nvm = PathBuf::from("/home/u/.nvm/versions/node/v22.1.0/bin");
+        assert_eq!(memo.get(|| Some(nvm.clone()), shell), Some(nvm.clone()));
+        assert_eq!(asked.get(), 1, "the shell was asked once");
+        assert_eq!(
+            memo.get(|| panic!("a found node is kept"), shell),
+            Some(nvm),
+        );
+    }
     use tempfile::TempDir;
 
     #[test]
