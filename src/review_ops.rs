@@ -105,11 +105,11 @@ fn flatten_pages(json: &str) -> String {
 
 /// The PR number for the branch checked out in `root`, if it has one; or
 /// why gh could not tell (#917).
-fn pr_number(program: &str, root: &Path, limit: Duration) -> Result<Option<String>, String> {
+fn pr_number(program: &str, root: &Path, budget: &Budget) -> Result<Option<String>, String> {
     match gh(
         program,
         root,
-        limit,
+        budget,
         &["pr", "view", "--json", "number", "--jq", ".number"],
         None,
     ) {
@@ -121,30 +121,70 @@ fn pr_number(program: &str, root: &Path, limit: Duration) -> Result<Option<Strin
     }
 }
 
+/// One job's time with gh: every call the job makes comes out of the same
+/// limit, so a submit that reads the diff and then posts still ends at its
+/// limit, not at twice it (#2787).
+struct Budget {
+    limit: Duration,
+    ends: std::time::Instant,
+}
+
+impl Budget {
+    fn new(limit: Duration) -> Self {
+        Self {
+            limit,
+            ends: std::time::Instant::now() + limit,
+        }
+    }
+
+    /// What is left of the limit; nothing once it has passed.
+    fn left(&self) -> Duration {
+        self.ends
+            .saturating_duration_since(std::time::Instant::now())
+    }
+
+    /// Why a call ran out of it.
+    fn spent(&self, program: &str) -> String {
+        format!("{program} took longer than {}s", self.limit.as_secs())
+    }
+}
+
 /// Run `gh` (`program`) with `args` in `root`, handing it `stdin` when
-/// there is one, for at most `limit`: a write that stalls on a slow network
-/// ends with that said (#2787). Its stdout, or gh's first stderr line, which
-/// names the problem (scope, rate limit, a line outside the diff) better
-/// than anything croft could say; or that gh is missing or has no account
-/// signed in (#917).
+/// there is one, for at most what is left of `budget`: a write that stalls
+/// on a slow network ends with that said (#2787). Its stdout, or gh's first
+/// stderr line, which names the problem (scope, rate limit, a line outside
+/// the diff) better than anything croft could say; or that gh is missing or
+/// has no account signed in (#917).
 fn gh(
     program: &str,
     root: &Path,
-    limit: Duration,
+    budget: &Budget,
     args: &[&str],
     stdin: Option<&str>,
 ) -> Result<String, String> {
+    let limit = budget.left();
+    if limit.is_zero() {
+        return Err(budget.spent(program));
+    }
     let client = crate::gh::Client::new(program, root, limit);
     match stdin {
         Some(input) => client.run_fed(args, input.as_bytes()),
         None => client.run(args),
     }
     .map(|out| String::from_utf8_lossy(&out).into_owned())
-    .map_err(|e| e.first_line())
+    .map_err(|e| match e {
+        // Out of time: said against the job's whole limit, not what was
+        // left of it for this one call.
+        crate::gh::Error::NoAnswer(_) if budget.left().is_zero() => budget.spent(program),
+        e => e.first_line(),
+    })
 }
 
-/// Carry out `job` with `program` (normally `gh`) in `root`.
+/// Carry out `job` with `program` (normally `gh`) in `root`, in at most
+/// `limit` for all the gh calls it makes together.
 pub fn run(program: &str, root: &Path, job: Job, limit: Duration) -> Outcome {
+    let budget = Budget::new(limit);
+    let budget = &budget;
     match job {
         Job::Reply {
             number,
@@ -157,7 +197,7 @@ pub fn run(program: &str, root: &Path, job: Job, limit: Duration) -> Outcome {
             match gh(
                 program,
                 root,
-                limit,
+                budget,
                 &["api", "-X", "POST", &endpoint, "-f", &body],
                 None,
             ) {
@@ -175,7 +215,7 @@ pub fn run(program: &str, root: &Path, job: Job, limit: Duration) -> Outcome {
             match gh(
                 program,
                 root,
-                limit,
+                budget,
                 &["api", "graphql", "-f", &query, "-f", &id],
                 None,
             ) {
@@ -196,7 +236,8 @@ pub fn run(program: &str, root: &Path, job: Job, limit: Duration) -> Outcome {
             // The diff decides which comments GitHub will take inline; a
             // failure to read it folds every comment into the summary rather
             // than risking a refused review.
-            let diff = gh(program, root, limit, &["pr", "diff", &number], None).unwrap_or_default();
+            let diff =
+                gh(program, root, budget, &["pr", "diff", &number], None).unwrap_or_default();
             let mut lines: std::collections::HashMap<String, std::collections::HashSet<usize>> =
                 std::collections::HashMap::new();
             for c in &pending {
@@ -213,7 +254,7 @@ pub fn run(program: &str, root: &Path, job: Job, limit: Duration) -> Outcome {
             match gh(
                 program,
                 root,
-                limit,
+                budget,
                 &["api", "-X", "POST", &endpoint, "--input", "-"],
                 Some(&payload.to_string()),
             ) {
@@ -226,7 +267,7 @@ pub fn run(program: &str, root: &Path, job: Job, limit: Duration) -> Outcome {
             }
         }
         Job::LoadThreads { path, rel } => {
-            let number = match pr_number(program, root, limit) {
+            let number = match pr_number(program, root, budget) {
                 Ok(Some(number)) => number,
                 Ok(None) => return Outcome::NoPr,
                 Err(why) => return Outcome::Failed(why),
@@ -235,7 +276,7 @@ pub fn run(program: &str, root: &Path, job: Job, limit: Duration) -> Outcome {
             let json = match gh(
                 program,
                 root,
-                limit,
+                budget,
                 &["api", &endpoint, "--paginate"],
                 None,
             ) {
@@ -270,7 +311,7 @@ pub fn run(program: &str, root: &Path, job: Job, limit: Duration) -> Outcome {
                     args.push(format!("after={cursor}"));
                 }
                 let args: Vec<&str> = args.iter().map(String::as_str).collect();
-                let Ok(page) = gh(program, root, limit, &args, None) else {
+                let Ok(page) = gh(program, root, budget, &args, None) else {
                     break;
                 };
                 states.extend(crate::review_threads::parse_thread_states(&page));
@@ -291,14 +332,15 @@ pub fn run(program: &str, root: &Path, job: Job, limit: Duration) -> Outcome {
             }
         }
         Job::ExportPreview { comments, notes } => {
-            let number = match pr_number(program, root, limit) {
+            let number = match pr_number(program, root, budget) {
                 Ok(Some(number)) => number,
                 Ok(None) => return Outcome::NoPr,
                 Err(why) => return Outcome::Failed(why),
             };
             // Which comments GitHub will take inline, so one folded into the
             // summary is no surprise after posting.
-            let diff = gh(program, root, limit, &["pr", "diff", &number], None).unwrap_or_default();
+            let diff =
+                gh(program, root, budget, &["pr", "diff", &number], None).unwrap_or_default();
             let inline = comments
                 .iter()
                 .filter(|c| {
@@ -544,6 +586,49 @@ mod tests {
         assert_eq!(
             out,
             Outcome::SubmitFailed(format!("Review not submitted: {gh} took longer than 1s"))
+        );
+    }
+
+    /// #2787: the submit's calls share its one limit. A diff read that
+    /// stalls through it leaves no time for the post, which is not started
+    /// with a fresh limit of its own, so the submit ends at its limit, not
+    /// twice that.
+    #[test]
+    fn a_review_submit_ends_at_its_one_limit_however_many_calls_it_makes() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let calls = tmp.path().join("calls");
+        let gh = tmp.path().join("gh");
+        std::fs::write(
+            &gh,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\nexec sleep 30\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let gh = gh.display().to_string();
+        let out = run(
+            &gh,
+            tmp.path(),
+            Job::Submit {
+                number: "7".into(),
+                event: ReviewEvent::Comment,
+                summary: "looks good".into(),
+                pending: Vec::new(),
+                settles: Settles::default(),
+            },
+            Duration::from_secs(1),
+        );
+        assert_eq!(
+            out,
+            Outcome::SubmitFailed(format!("Review not submitted: {gh} took longer than 1s"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(&calls).unwrap(),
+            "pr diff 7\n",
+            "only the diff read ran"
         );
     }
 }
