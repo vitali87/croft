@@ -272,32 +272,6 @@ fn run_git(path: &Path, args: &[&str]) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Keep a git child from prompting on croft's terminal. A push or pull
-/// needing a password or an ssh passphrase opened `/dev/tty`, drew over
-/// the full-screen UI and waited for input croft never passed on. With no
-/// terminal prompt and no controlling tty, git and ssh fail at once with a
-/// message the panel shows; credential helpers and agents still work.
-fn never_prompt(cmd: &mut Command) {
-    cmd.env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(std::process::Stdio::null());
-    #[cfg(unix)]
-    detach_from_tty(cmd);
-}
-
-#[cfg(unix)]
-fn detach_from_tty(cmd: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    // SAFETY: `setsid` is async-signal-safe and the only call in the
-    // pre-exec hook; the forked child is never a process-group leader, so
-    // the call always succeeds.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-}
-
 /// Run a mutating git subcommand and return a human-readable summary.
 ///
 /// Shared by every operation the Source Control panel invokes

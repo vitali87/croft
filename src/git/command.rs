@@ -47,18 +47,50 @@ impl Git {
     }
 
     /// Never prompt: no terminal prompt, an empty stdin, and a session of its
-    /// own, apart from croft's terminal ([`super::never_prompt`]). A push or
-    /// pull needing a password or passphrase drew over the full-screen UI and
-    /// waited for input croft never passed on; now it fails at once with a
-    /// message the panel shows, and credential helpers and agents still work.
+    /// own, apart from croft's terminal. A push or pull needing a password or
+    /// an ssh passphrase opened `/dev/tty`, drew over the full-screen UI and
+    /// waited for input croft never passed on. With no terminal prompt and no
+    /// controlling tty, git and ssh fail at once with a message the panel
+    /// shows; credential helpers and agents still work.
     pub(crate) fn never_prompting(mut self) -> Self {
-        super::never_prompt(&mut self.0);
+        self.0
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(std::process::Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            // SAFETY: `setsid` is async-signal-safe and the only call in the
+            // pre-exec hook; the forked child is never a process-group
+            // leader, so the call always succeeds.
+            unsafe {
+                self.0.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+        }
         self
     }
 
     /// One more argument.
     pub(crate) fn arg(mut self, arg: impl AsRef<OsStr>) -> Self {
         self.0.arg(arg);
+        self
+    }
+
+    /// Find the repository from the `-C` folder alone: an inherited
+    /// `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE` or `GIT_COMMON_DIR`
+    /// (croft started from a git hook, or a test harness that sets them)
+    /// would point git at another repository whatever `-C` names.
+    pub(crate) fn outside_inherited_repo(mut self) -> Self {
+        for name in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_COMMON_DIR",
+        ] {
+            self.0.env_remove(name);
+        }
         self
     }
 
