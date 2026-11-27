@@ -45,7 +45,7 @@ caret: row 5 col 33
 36|   ▏▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▕                                                                                    |
 37|    ▏ TIMELINE                    ▕                                                                                    |
 38|    ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁|
-39| <> golden    0  1   Command Palette: 408 commands — Esc to close      Ln 1, Col 1   Spaces: 4   UTF-8   LF   Rust|
+39| <> golden    0  1   Command Palette: 410 commands — Esc to close      Ln 1, Col 1   Spaces: 4   UTF-8   LF   Rust|
 --- cells
 r00 c037 icon U+E7A8
 r00 c112 icon U+EBF3

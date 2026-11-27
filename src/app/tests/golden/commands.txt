@@ -430,62 +430,64 @@
 427 | OpenSettingsJson | open_settings_json | Preferences: Open Settings (JSON) |  |  |  |
 428 | OpenWorkspaceSettingsJson | open_workspace_settings_json | Preferences: Open Workspace Settings (JSON) |  |  |  |
 429 | OpenWorkspaceSettingsLocalJson | open_workspace_settings_local_json | Preferences: Open Workspace Settings — Local (JSON) |  |  |  |
-430 | OpenKeybindingsJson | open_keybindings_json | Preferences: Open Keyboard Shortcuts (JSON) |  |  |  |
-431 | ConfigureSnippets | configure_snippets | Preferences: Configure User Snippets |  |  |  |
-432 | OpenTriggersJson | open_triggers_json | Preferences: Open Terminal Triggers (JSON) |  |  |  |
-433 | OpenAgentsJson | open_agents_json | Preferences: Open Agent Lanes (JSON) |  |  |  |
-434 | OpenMatchersJson | open_matchers_json | Preferences: Open Problem Matchers (JSON) |  |  |  |
-435 | ToggleTerminalTimestamps | toggle_terminal_timestamps | Terminal: Toggle Timestamps |  |  |  | skips-the-shell
-436 | ToggleLogHighlight | toggle_log_highlight | Log: Toggle Highlighting (tailspin) |  |  |  |
-437 | CollapseTerminalPane | collapse_terminal_pane | Terminal: Collapse Pane |  | Cmd+K [ | Ctrl+K [ | skips-the-shell
-438 | RestoreTerminalPanes | restore_terminal_panes | Terminal: Restore All Collapsed Panes |  | Cmd+K ] | Ctrl+K ] | skips-the-shell
-439 | ToggleSecretRedaction | toggle_secret_redaction | Terminal: Toggle Secret Redaction |  |  |  | skips-the-shell
-440 | RevealRedactedSecrets | reveal_redacted_secrets | Terminal: Reveal Redacted Secrets for 10s |  |  |  | skips-the-shell
-441 | SearchFromTerminal | search_from_terminal | Terminal: Search & Replace from Last grep/rg |  |  |  | skips-the-shell
-442 | SessionParticipants | session_participants | Session: Participants |  | Cmd+K A | Ctrl+K A |
-443 | SessionDetach | session_detach | Session: Detach |  | Cmd+K Shift+Q | Ctrl+K Shift+Q |
-444 | CollabCancelStream | collab_cancel_stream | Collab: Cancel AI Stream |  | Cmd+K X | Ctrl+K X |
-445 | AskNavigator | navigator_ask | Navigator: Ask About Line or Selection |  | Cmd+K Q | Ctrl+K Q |
-446 | AskNavigatorAboutCapture | captures_ask_navigator | Captures: Ask Navigator About This Line |  |  |  |
-447 | OpenWorkspaceOnSshHost | remote_open_workspace_on_ssh_host | Remote: Open Workspace on This Pane's Host |  |  |  |
-448 | ScrubHistory | scm_scrub_history | Source Control: Scrub History |  |  |  |
-449 | DebugInstallDelve | debug_install_delve | Debug: Install Go Debugger (delve) |  |  |  |
-450 | RemoteSyncConfigNow | remote_sync_config_now | Remote: Sync Config Now |  |  |  |
-451 | DropToLocal | drop_to_local | Remote: Drop to Local |  | Cmd+K L | Ctrl+K L |
-452 | StopAutoApprove | agents_stop_auto_approve | Agents: Stop Auto-Approving |  |  |  |
-453 | ScrubOpenHere | scm_scrub_open_here | Source Control: Open Scrubbed File Here |  |  |  |
-454 | ScrubDiffToWorkingTree | scm_scrub_diff_working_tree | Source Control: Diff Scrubbed File to Working Tree |  |  |  |
-455 | FleetRun | terminal_fleet_run | Terminal: Fleet Run |  |  |  | skips-the-shell
-456 | OpenAsSymbolTab | editor_open_symbol_tab | Editor: Open Symbol as Its Own Tab |  | Cmd+K Shift+V | Ctrl+K Shift+V |
-457 | LoadReviewThreads | review_load_threads | Review: Load PR Comments for This File |  |  |  |
-458 | ReviewAddComment | review_add_comment | Review: Add Comment on This Line |  |  |  |
-459 | ReviewSubmit | review_submit | Review: Submit Review |  |  |  |
-460 | ReviewToggleResolved | review_toggle_resolved | Review: Resolve or Unresolve Thread |  |  |  |
-461 | ReviewDiscardPending | review_discard_pending | Review: Discard Pending Comments |  |  |  |
-462 | ExportCommentsToPr | scm_export_comments_to_pr | Source Control: Export Comments to Pull Request |  |  |  |
-463 | NoteAdd | note_add | Notes: Add Note on This Line |  | Cmd+K N | Ctrl+K N |
-464 | NoteDelete | note_delete | Notes: Delete Note |  |  |  |
-465 | ToggleSessionRecording | session_toggle_recording | Session: Record Terminal as Asciicast |  |  |  |
-466 | NewWorktreeLane | agent_new_worktree_lane | Agent: New Worktree Lane |  | Cmd+K Shift+L | Ctrl+K Shift+L |
-467 | ReviewPullRequest | review_pull_request | Source Control: Review Pull Request |  |  |  |
-468 | CloseWorktreeLane | agent_close_worktree_lane | Agent: Close Worktree Lane |  |  |  |
-469 | DiffWorktreeLane | agent_diff_worktree_lane | Agent: Diff Lane Against Its Base |  |  |  |
-470 | MarkAgentLaneReviewed | agents_mark_reviewed | Agents: Mark Changed Files Reviewed |  |  |  |
-471 | ShowAgentLane | agents_show_lane | Agents: Show Changed Files |  |  |  |
-472 | OpenAgentLaneSection | agents_open_lane | Agents: Open Agent Lane |  |  |  |
-473 | MarkAgentFileReviewed | agents_mark_file_reviewed | Agents: Mark This File Reviewed |  |  |  |
-474 | DiffAgentFileSinceReview | agents_diff_since_review | Agents: Diff This File Since Review |  |  |  |
-475 | PickAgentLaneFile | agents_pick_changed_file | Agents: Review a Changed File… |  |  |  |
-476 | FixProblemWithNavigator | problems_fix_navigator | Problems: Fix With Navigator |  |  |  |
-477 | SendHttpRequest | http_send_request | HTTP: Send Request Under Caret |  | Cmd+Enter | Ctrl+Enter |
-478 | CopyHttpRequestAsCurl | http_copy_curl | HTTP: Copy Request as curl |  |  |  |
-479 | SwitchHttpEnvironment | http_switch_environment | HTTP: Switch Environment |  |  |  |
-480 | YieldToNavigator | navigator_yield | Navigator: Yield the Turn |  | Cmd+K Y | Ctrl+K Y |
-481 | ToggleNavigator | navigator_toggle | Navigator: Activate or Deactivate |  |  |  |
-482 | ClearNavigatorNotes | navigator_clear_notes | Navigator: Clear Comments |  |  |  |
-483 | ToggleProactiveNavigator | navigator_toggle_proactive | Navigator: Toggle Proactive Comments |  |  |  |
-484 | NextComment | navigator_next_comment | Navigator: Next Comment |  | F4 | F4 |
-485 | IgnoreComment | navigator_ignore_comment | Navigator: Ignore Comment |  | Shift+F4 | Shift+F4 |
+430 | OpenUserMenu | open_user_menu | User Menu: Open |  | Cmd+K Shift+N | Ctrl+K Shift+N |
+431 | OpenUserMenuJson | open_user_menu_json | Preferences: Open User Menu (JSON) |  |  |  |
+432 | OpenKeybindingsJson | open_keybindings_json | Preferences: Open Keyboard Shortcuts (JSON) |  |  |  |
+433 | ConfigureSnippets | configure_snippets | Preferences: Configure User Snippets |  |  |  |
+434 | OpenTriggersJson | open_triggers_json | Preferences: Open Terminal Triggers (JSON) |  |  |  |
+435 | OpenAgentsJson | open_agents_json | Preferences: Open Agent Lanes (JSON) |  |  |  |
+436 | OpenMatchersJson | open_matchers_json | Preferences: Open Problem Matchers (JSON) |  |  |  |
+437 | ToggleTerminalTimestamps | toggle_terminal_timestamps | Terminal: Toggle Timestamps |  |  |  | skips-the-shell
+438 | ToggleLogHighlight | toggle_log_highlight | Log: Toggle Highlighting (tailspin) |  |  |  |
+439 | CollapseTerminalPane | collapse_terminal_pane | Terminal: Collapse Pane |  | Cmd+K [ | Ctrl+K [ | skips-the-shell
+440 | RestoreTerminalPanes | restore_terminal_panes | Terminal: Restore All Collapsed Panes |  | Cmd+K ] | Ctrl+K ] | skips-the-shell
+441 | ToggleSecretRedaction | toggle_secret_redaction | Terminal: Toggle Secret Redaction |  |  |  | skips-the-shell
+442 | RevealRedactedSecrets | reveal_redacted_secrets | Terminal: Reveal Redacted Secrets for 10s |  |  |  | skips-the-shell
+443 | SearchFromTerminal | search_from_terminal | Terminal: Search & Replace from Last grep/rg |  |  |  | skips-the-shell
+444 | SessionParticipants | session_participants | Session: Participants |  | Cmd+K A | Ctrl+K A |
+445 | SessionDetach | session_detach | Session: Detach |  | Cmd+K Shift+Q | Ctrl+K Shift+Q |
+446 | CollabCancelStream | collab_cancel_stream | Collab: Cancel AI Stream |  | Cmd+K X | Ctrl+K X |
+447 | AskNavigator | navigator_ask | Navigator: Ask About Line or Selection |  | Cmd+K Q | Ctrl+K Q |
+448 | AskNavigatorAboutCapture | captures_ask_navigator | Captures: Ask Navigator About This Line |  |  |  |
+449 | OpenWorkspaceOnSshHost | remote_open_workspace_on_ssh_host | Remote: Open Workspace on This Pane's Host |  |  |  |
+450 | ScrubHistory | scm_scrub_history | Source Control: Scrub History |  |  |  |
+451 | DebugInstallDelve | debug_install_delve | Debug: Install Go Debugger (delve) |  |  |  |
+452 | RemoteSyncConfigNow | remote_sync_config_now | Remote: Sync Config Now |  |  |  |
+453 | DropToLocal | drop_to_local | Remote: Drop to Local |  | Cmd+K L | Ctrl+K L |
+454 | StopAutoApprove | agents_stop_auto_approve | Agents: Stop Auto-Approving |  |  |  |
+455 | ScrubOpenHere | scm_scrub_open_here | Source Control: Open Scrubbed File Here |  |  |  |
+456 | ScrubDiffToWorkingTree | scm_scrub_diff_working_tree | Source Control: Diff Scrubbed File to Working Tree |  |  |  |
+457 | FleetRun | terminal_fleet_run | Terminal: Fleet Run |  |  |  | skips-the-shell
+458 | OpenAsSymbolTab | editor_open_symbol_tab | Editor: Open Symbol as Its Own Tab |  | Cmd+K Shift+V | Ctrl+K Shift+V |
+459 | LoadReviewThreads | review_load_threads | Review: Load PR Comments for This File |  |  |  |
+460 | ReviewAddComment | review_add_comment | Review: Add Comment on This Line |  |  |  |
+461 | ReviewSubmit | review_submit | Review: Submit Review |  |  |  |
+462 | ReviewToggleResolved | review_toggle_resolved | Review: Resolve or Unresolve Thread |  |  |  |
+463 | ReviewDiscardPending | review_discard_pending | Review: Discard Pending Comments |  |  |  |
+464 | ExportCommentsToPr | scm_export_comments_to_pr | Source Control: Export Comments to Pull Request |  |  |  |
+465 | NoteAdd | note_add | Notes: Add Note on This Line |  | Cmd+K N | Ctrl+K N |
+466 | NoteDelete | note_delete | Notes: Delete Note |  |  |  |
+467 | ToggleSessionRecording | session_toggle_recording | Session: Record Terminal as Asciicast |  |  |  |
+468 | NewWorktreeLane | agent_new_worktree_lane | Agent: New Worktree Lane |  | Cmd+K Shift+L | Ctrl+K Shift+L |
+469 | ReviewPullRequest | review_pull_request | Source Control: Review Pull Request |  |  |  |
+470 | CloseWorktreeLane | agent_close_worktree_lane | Agent: Close Worktree Lane |  |  |  |
+471 | DiffWorktreeLane | agent_diff_worktree_lane | Agent: Diff Lane Against Its Base |  |  |  |
+472 | MarkAgentLaneReviewed | agents_mark_reviewed | Agents: Mark Changed Files Reviewed |  |  |  |
+473 | ShowAgentLane | agents_show_lane | Agents: Show Changed Files |  |  |  |
+474 | OpenAgentLaneSection | agents_open_lane | Agents: Open Agent Lane |  |  |  |
+475 | MarkAgentFileReviewed | agents_mark_file_reviewed | Agents: Mark This File Reviewed |  |  |  |
+476 | DiffAgentFileSinceReview | agents_diff_since_review | Agents: Diff This File Since Review |  |  |  |
+477 | PickAgentLaneFile | agents_pick_changed_file | Agents: Review a Changed File… |  |  |  |
+478 | FixProblemWithNavigator | problems_fix_navigator | Problems: Fix With Navigator |  |  |  |
+479 | SendHttpRequest | http_send_request | HTTP: Send Request Under Caret |  | Cmd+Enter | Ctrl+Enter |
+480 | CopyHttpRequestAsCurl | http_copy_curl | HTTP: Copy Request as curl |  |  |  |
+481 | SwitchHttpEnvironment | http_switch_environment | HTTP: Switch Environment |  |  |  |
+482 | YieldToNavigator | navigator_yield | Navigator: Yield the Turn |  | Cmd+K Y | Ctrl+K Y |
+483 | ToggleNavigator | navigator_toggle | Navigator: Activate or Deactivate |  |  |  |
+484 | ClearNavigatorNotes | navigator_clear_notes | Navigator: Clear Comments |  |  |  |
+485 | ToggleProactiveNavigator | navigator_toggle_proactive | Navigator: Toggle Proactive Comments |  |  |  |
+486 | NextComment | navigator_next_comment | Navigator: Next Comment |  | F4 | F4 |
+487 | IgnoreComment | navigator_ignore_comment | Navigator: Ignore Comment |  | Shift+F4 | Shift+F4 |
 # Customize Layout, in the popup's order
 layout | CustomizeLayout
 layout | ToggleActivityBar
