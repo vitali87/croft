@@ -4,9 +4,8 @@
 //! work and returns what the app should show.
 
 use crate::review_threads::{PendingComment, ReviewEvent};
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::time::Duration;
 
 /// What a posted export settles once it lands: navigator notes to remove
 /// and sticky notes to mark resolved. It rides the job and comes back in
@@ -106,10 +105,11 @@ fn flatten_pages(json: &str) -> String {
 
 /// The PR number for the branch checked out in `root`, if it has one; or
 /// why gh could not tell (#917).
-fn pr_number(program: &str, root: &Path) -> Result<Option<String>, String> {
+fn pr_number(program: &str, root: &Path, limit: Duration) -> Result<Option<String>, String> {
     match gh(
         program,
         root,
+        limit,
         &["pr", "view", "--json", "number", "--jq", ".number"],
         None,
     ) {
@@ -124,42 +124,71 @@ fn pr_number(program: &str, root: &Path) -> Result<Option<String>, String> {
 /// gh's first stderr line, which names the problem (scope, rate limit, a
 /// line outside the diff) better than anything croft could say; or that
 /// gh has no account signed in (#917).
-fn gh_error(out: &std::process::Output) -> String {
-    if crate::gh::signed_out(out.status) {
+fn gh_error(status: std::process::ExitStatus, stderr: &str) -> String {
+    if crate::gh::signed_out(status) {
         return String::from(crate::gh::SIGNED_OUT);
     }
-    let err = String::from_utf8_lossy(&out.stderr);
-    err.trim().lines().next().unwrap_or("gh failed").to_string()
+    stderr
+        .trim()
+        .lines()
+        .next()
+        .unwrap_or("gh failed")
+        .to_string()
 }
 
-fn gh(program: &str, root: &Path, args: &[&str], stdin: Option<&str>) -> Result<String, String> {
-    let mut cmd = Command::new(program);
-    cmd.args(args)
-        .current_dir(root)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(if stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        });
-    let mut child = crate::proc::spawn_retrying_busy(&mut cmd)
-        .map_err(|e| crate::gh::spawn_error(&e, Some(root)))?;
-    if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
-        let _ = pipe.write_all(input.as_bytes());
-    }
-    let out = child
-        .wait_with_output()
-        .map_err(|e| format!("gh failed: {e}"))?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+/// Run `gh` (`program`) with `args` in `root`, handing it `stdin` when
+/// there is one, for at most `limit`: a write that stalls on a slow network
+/// ends with that said, where it used to wait for good and every later
+/// submit was refused as already running (#2787). Both outputs are read
+/// while it runs, so neither can fill its pipe and stall gh.
+fn gh(
+    program: &str,
+    root: &Path,
+    limit: Duration,
+    args: &[&str],
+    stdin: Option<&str>,
+) -> Result<String, String> {
+    use crate::proc::{Apart, Bounded, Keep, RunError};
+    let run = Bounded {
+        stdout: Keep::All { cap: OUTPUT_CAP },
+        stderr: Keep::All { cap: OUTPUT_CAP },
+        apart: Apart::No,
+        limit,
+        retry_busy: true,
+    };
+    let mut cmd = crate::proc::command(program);
+    cmd.args(args).current_dir(root);
+    let ran = match stdin {
+        Some(input) => run.run_fed(&mut cmd, input.as_bytes()),
+        None => run.run(&mut cmd),
+    };
+    let ran = match ran {
+        Ok(ran) => ran,
+        Err(RunError::Spawn(e)) => return Err(crate::gh::spawn_error(&e, Some(root))),
+        Err(RunError::TimedOut) => {
+            return Err(format!("{program} took longer than {}s", limit.as_secs()));
+        }
+        Err(RunError::TooLong { .. }) => {
+            return Err(format!(
+                "{program} answered more than {} MiB",
+                OUTPUT_CAP / (1024 * 1024)
+            ));
+        }
+        Err(RunError::Wait(e) | RunError::Pipe(e)) => return Err(format!("gh failed: {e}")),
+    };
+    if ran.status.success() {
+        Ok(ran.stdout.text())
     } else {
-        Err(gh_error(&out))
+        Err(gh_error(ran.status, &ran.stderr.text()))
     }
 }
+
+/// The most of either output a write keeps: far past any answer or error
+/// gh gives, so only a runaway one is refused.
+const OUTPUT_CAP: usize = 1024 * 1024 * 1024;
 
 /// Carry out `job` with `program` (normally `gh`) in `root`.
-pub fn run(program: &str, root: &Path, job: Job) -> Outcome {
+pub fn run(program: &str, root: &Path, job: Job, limit: Duration) -> Outcome {
     match job {
         Job::Reply {
             number,
@@ -172,6 +201,7 @@ pub fn run(program: &str, root: &Path, job: Job) -> Outcome {
             match gh(
                 program,
                 root,
+                limit,
                 &["api", "-X", "POST", &endpoint, "-f", &body],
                 None,
             ) {
@@ -189,6 +219,7 @@ pub fn run(program: &str, root: &Path, job: Job) -> Outcome {
             match gh(
                 program,
                 root,
+                limit,
                 &["api", "graphql", "-f", &query, "-f", &id],
                 None,
             ) {
@@ -209,7 +240,7 @@ pub fn run(program: &str, root: &Path, job: Job) -> Outcome {
             // The diff decides which comments GitHub will take inline; a
             // failure to read it folds every comment into the summary rather
             // than risking a refused review.
-            let diff = gh(program, root, &["pr", "diff", &number], None).unwrap_or_default();
+            let diff = gh(program, root, limit, &["pr", "diff", &number], None).unwrap_or_default();
             let mut lines: std::collections::HashMap<String, std::collections::HashSet<usize>> =
                 std::collections::HashMap::new();
             for c in &pending {
@@ -226,6 +257,7 @@ pub fn run(program: &str, root: &Path, job: Job) -> Outcome {
             match gh(
                 program,
                 root,
+                limit,
                 &["api", "-X", "POST", &endpoint, "--input", "-"],
                 Some(&payload.to_string()),
             ) {
@@ -238,13 +270,19 @@ pub fn run(program: &str, root: &Path, job: Job) -> Outcome {
             }
         }
         Job::LoadThreads { path, rel } => {
-            let number = match pr_number(program, root) {
+            let number = match pr_number(program, root, limit) {
                 Ok(Some(number)) => number,
                 Ok(None) => return Outcome::NoPr,
                 Err(why) => return Outcome::Failed(why),
             };
             let endpoint = format!("repos/{{owner}}/{{repo}}/pulls/{number}/comments");
-            let json = match gh(program, root, &["api", &endpoint, "--paginate"], None) {
+            let json = match gh(
+                program,
+                root,
+                limit,
+                &["api", &endpoint, "--paginate"],
+                None,
+            ) {
                 Ok(j) => j,
                 Err(e) => return Outcome::Failed(format!("Could not read the PR's comments: {e}")),
             };
@@ -276,7 +314,7 @@ pub fn run(program: &str, root: &Path, job: Job) -> Outcome {
                     args.push(format!("after={cursor}"));
                 }
                 let args: Vec<&str> = args.iter().map(String::as_str).collect();
-                let Ok(page) = gh(program, root, &args, None) else {
+                let Ok(page) = gh(program, root, limit, &args, None) else {
                     break;
                 };
                 states.extend(crate::review_threads::parse_thread_states(&page));
@@ -297,14 +335,14 @@ pub fn run(program: &str, root: &Path, job: Job) -> Outcome {
             }
         }
         Job::ExportPreview { comments, notes } => {
-            let number = match pr_number(program, root) {
+            let number = match pr_number(program, root, limit) {
                 Ok(Some(number)) => number,
                 Ok(None) => return Outcome::NoPr,
                 Err(why) => return Outcome::Failed(why),
             };
             // Which comments GitHub will take inline, so one folded into the
             // summary is no surprise after posting.
-            let diff = gh(program, root, &["pr", "diff", &number], None).unwrap_or_default();
+            let diff = gh(program, root, limit, &["pr", "diff", &number], None).unwrap_or_default();
             let inline = comments
                 .iter()
                 .filter(|c| {
@@ -325,7 +363,7 @@ pub fn run(program: &str, root: &Path, job: Job) -> Outcome {
 /// Run `job` on a thread; the outcome arrives on `tx`.
 pub fn spawn(program: String, root: PathBuf, job: Job, tx: std::sync::mpsc::Sender<Outcome>) {
     std::thread::spawn(move || {
-        let _ = tx.send(run(&program, &root, job));
+        let _ = tx.send(run(&program, &root, job, crate::pr_review::GH_TIMEOUT));
     });
 }
 
@@ -367,6 +405,7 @@ mod tests {
         // Exec of a file open for writing fails with ETXTBSY, as it does
         // for a stand-in script while a forked sibling holds its descriptor.
         use std::os::unix::fs::PermissionsExt as _;
+        use std::process::{Command, Stdio};
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("busy");
         std::fs::write(&path, "#!/bin/sh\necho ran\n").unwrap();
@@ -403,6 +442,7 @@ mod tests {
                 thread: 42,
                 text: "fixed".into(),
             },
+            crate::pr_review::GH_TIMEOUT,
         );
         assert_eq!(
             out,
@@ -445,6 +485,7 @@ mod tests {
                 ],
                 settles: Settles::default(),
             },
+            crate::pr_review::GH_TIMEOUT,
         );
         assert_eq!(
             out,
@@ -474,6 +515,7 @@ mod tests {
                 node: "PRRT_x".into(),
                 resolve: true,
             },
+            crate::pr_review::GH_TIMEOUT,
         );
         assert_eq!(
             out,
@@ -500,7 +542,7 @@ mod tests {
                 rel: "a.rs".into(),
             };
             assert_eq!(
-                run(&gh, tmp.path(), load),
+                run(&gh, tmp.path(), load, crate::pr_review::GH_TIMEOUT),
                 Outcome::Failed(format!("Could not find this branch's PR: {why}"))
             );
             let reply = Job::Reply {
@@ -509,9 +551,43 @@ mod tests {
                 text: "fixed".into(),
             };
             assert_eq!(
-                run(&gh, tmp.path(), reply),
+                run(&gh, tmp.path(), reply, crate::pr_review::GH_TIMEOUT),
                 Outcome::Failed(format!("Reply failed: {why}"))
             );
         }
+    }
+
+    /// #2787: a write that stalls ends at the limit and says so, so the
+    /// submit job finishes and the next one is not refused as running.
+    #[test]
+    fn a_review_submit_that_stalls_ends_at_the_limit() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let gh = tmp.path().join("gh");
+        std::fs::write(&gh, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let gh = gh.display().to_string();
+        let started = std::time::Instant::now();
+        let out = run(
+            &gh,
+            tmp.path(),
+            Job::Submit {
+                number: "7".into(),
+                event: ReviewEvent::Comment,
+                summary: "looks good".into(),
+                pending: Vec::new(),
+                settles: Settles::default(),
+            },
+            Duration::from_secs(1),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the submit waited {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            out,
+            Outcome::SubmitFailed(format!("Review not submitted: {gh} took longer than 1s"))
+        );
     }
 }

@@ -429,7 +429,7 @@ impl App {
     fn start_review_submit(&mut self, root: PathBuf, job: crate::review_ops::Job, status: &str) {
         let program = self.review_gh.clone();
         let submit = crate::jobs::Job::spawn("review-submit", crate::jobs::Start::Now, move || {
-            crate::review_ops::run(&program, &root, job)
+            crate::review_ops::run(&program, &root, job, crate::pr_review::GH_TIMEOUT)
         });
         match submit {
             Ok(submit) => {
