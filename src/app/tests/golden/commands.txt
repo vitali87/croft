@@ -172,308 +172,320 @@
 169 | MoveEditorToNextGroup | move_editor_to_next_group | View: Move Editor into Next Group |  |  |  |
 170 | MoveEditorToPreviousGroup | move_editor_to_previous_group | View: Move Editor into Previous Group |  |  |  |
 171 | SplitEditor | split_editor | View: Split Editor |  | Cmd+\ | Super+\ |
-172 | FocusLeftEditorGroup | focus_left_editor_group | View: Focus Left Editor Group |  | Cmd+Opt+← | Super+Alt+← |
-173 | FocusRightEditorGroup | focus_right_editor_group | View: Focus Right Editor Group |  | Cmd+Opt+→ | Super+Alt+→ |
-174 | QuickOpen | quick_open | Go to File |  | Cmd+P | Ctrl+P |
-175 | TakeTheTour | help_take_the_tour | Help: Take the Tour |  |  |  |
-176 | SponsorCroft | help_sponsor_croft | Help: Sponsor croft |  |  |  |
-177 | SarifNextResult | sarif_next_result | SARIF: Next Result |  |  |  |
-178 | SarifPreviousResult | sarif_previous_result | SARIF: Previous Result |  |  |  |
-179 | SarifOpenCodeScanning | sarif_open_code_scanning | SARIF: Open GitHub Code Scanning Analysis |  |  |  |
-180 | SarifLoadCodeScanning | sarif_load_code_scanning | SARIF: Load Code Scanning Results for This Branch |  |  |  |
-181 | GoToSymbol | go_to_symbol | Go to Symbol in Editor |  | Cmd+Shift+O | Ctrl+Shift+O |
-182 | GoToWorkspaceSymbol | go_to_workspace_symbol | Go to Symbol in Workspace |  | Cmd+P # | Ctrl+P # |
-183 | NavigateBack | navigate_back | Go Back |  | Ctrl+- | Ctrl+- |
-184 | NavigateForward | navigate_forward | Go Forward |  | Ctrl+Shift+- | Ctrl+Shift+- |
-185 | GoToLastEditLocation | go_to_last_edit_location | Go to Last Edit Location |  | Cmd+K Cmd+Q | Ctrl+K Ctrl+Q |
-186 | ToggleVimMode | toggle_vim_mode | Toggle Vim Mode |  | Cmd+E | Super+E |
-187 | MacroStartStopRecording | macro_record | Macro: Start/Stop Recording |  |  |  |
-188 | MacroReplayLast | macro_replay_last | Macro: Replay Last |  |  |  |
-189 | MacroReplayTimes | macro_replay_times | Macro: Replay N Times… |  |  |  |
-190 | ShowExplorer | show_explorer | View: Show Explorer |  | Cmd+Shift+E | Ctrl+Shift+E |
-191 | FocusBreadcrumbs | breadcrumbs_focus_and_select | View: Focus and Select Breadcrumbs |  | Cmd+Shift+. | Ctrl+Shift+. |
-192 | ShowSearch | show_search | View: Show Search |  | Cmd+Shift+F | Ctrl+Shift+F |
-193 | ReplaceInFiles | replace_in_files | Search: Replace in Files |  | Cmd+Shift+H | Ctrl+Shift+H |
-194 | SearchToggleMatchCase | search_toggle_match_case | Search: Toggle Match Case |  | Alt+C | Alt+C |
-195 | SearchToggleWholeWord | search_toggle_whole_word | Search: Toggle Match Whole Word |  | Alt+W | Alt+W |
-196 | SearchToggleRegex | search_toggle_regex | Search: Toggle Use Regular Expression |  | Alt+R | Alt+R |
-197 | SearchTogglePreserveCase | search_toggle_preserve_case | Search: Toggle Preserve Case |  | Alt+P | Alt+P |
-198 | SearchToggleDetails | search_toggle_details | Search: Toggle Search Details |  | Alt+D | Alt+D |
-199 | ShowSourceControl | show_source_control | View: Show Source Control |  | Cmd+Shift+S | Ctrl+Shift+S |
-200 | AddWorkspaceFolder | add_workspace_folder | Workspaces: Add Folder to Workspace |  |  |  |
-201 | RemoveWorkspaceFolder | remove_workspace_folder | Workspaces: Remove Folder from Workspace |  |  |  |
-202 | SaveWorkspaceAs | save_workspace_as | Workspaces: Save Workspace As |  |  |  |
-203 | OpenWorkspaceFromFile | open_workspace_from_file | Workspaces: Open Workspace from File |  |  |  |
-204 | ReopenAsHex | reopen_as_hex | File: Reopen as Hex |  |  |  |
-205 | ReopenAsPreview | reopen_as_preview | File: Reopen as Preview |  |  |  |
-206 | ReopenAsText | reopen_as_text | File: Reopen as Text |  |  |  |
-207 | NotebookRunAll | notebook_run_all | Notebook: Run All Cells |  |  |  |
-208 | NotebookInterrupt | notebook_interrupt | Notebook: Interrupt Kernel |  |  |  |
-209 | NotebookRestart | notebook_restart | Notebook: Restart Kernel |  |  |  |
-210 | NotebookSelectKernel | notebook_select_kernel | Notebook: Select Kernel |  |  |  |
-211 | RestartLanguageServers | restart_language_servers | Language Servers: Restart All | restart language server, restart ts server, restart lsp |  |  |
-212 | RestartLanguageServersForFile | restart_language_servers_for_file | Language Servers: Restart for This File | restart language server, restart ts server, restart lsp |  |  |
-213 | TestingRunWithCoverage | testing_run_with_coverage | Testing: Run All Tests with Coverage |  |  |  |
-214 | CoverageClear | coverage_clear | Coverage: Clear |  |  |  |
-215 | TestingInstallCoverageTool | testing_install_coverage_tool | Testing: Install Coverage Tool |  |  |  |
-216 | TestingShowCoverageReport | testing_show_coverage_report | Testing: Show Coverage Report |  |  |  |
-217 | DeveloperShowMemoryUsage | developer_show_memory_usage | Developer: Show Memory Usage |  |  |  |
-218 | ToggleScreencastMode | toggle_screencast_mode | Developer: Toggle Screencast Mode |  | Shift+F8 | Shift+F8 |
-219 | RunTestAtCursorWithCoverage | run_test_at_cursor_with_coverage | Testing: Run Test at Cursor with Coverage |  |  |  |
-220 | TestingToggleWatchAll | testing_toggle_watch_all | Testing: Toggle Watch All Tests |  |  |  |
-221 | TestingGoToFirstFailure | testing_go_to_first_failure | Testing: Go to First Failure |  |  |  |
-222 | TestingCancelRun | testing_cancel_run | Testing: Cancel Test Run |  |  |  |
-223 | HexFindNext | hex_find_next | Hex: Find Next |  | F3 | F3 |
-224 | SheetInsertRowBelow | sheet_insert_row_below | Sheet: Insert Row Below |  |  |  |
-225 | SheetDeleteRow | sheet_delete_row | Sheet: Delete Row |  |  |  |
-226 | SheetInsertColRight | sheet_insert_col_right | Sheet: Insert Column Right |  |  |  |
-227 | SheetDeleteCol | sheet_delete_col | Sheet: Delete Column |  |  |  |
-228 | MediaOpenExternal | media_open_external | Media: Open in System Player |  |  |  |
-229 | ShowRunDebug | show_run_debug | View: Show Run and Debug |  | Cmd+Shift+D | Ctrl+Shift+D |
-230 | ShowRemote | show_remote | View: Show Remote |  | Cmd+Shift+R | Ctrl+Shift+R |
-231 | ShowExtensions | show_extensions | View: Show Extensions |  | Cmd+Shift+X | Ctrl+Shift+X |
-232 | CompareExtensionsWithVscode | compare_extensions_with_vscode | Extensions: Compare with VS Code |  |  |  |
-233 | ShowTesting | show_testing | View: Show Testing |  | Cmd+K B | Ctrl+K B |
-234 | ShowCodeQL | show_codeql | View: Show CodeQL |  |  |  | codeql
-235 | CodeqlRunQuery | codeql_run_query | CodeQL: Run Query on Selected Database |  |  |  | codeql
-236 | CodeqlRunQuerySuite | codeql_run_query_suite | CodeQL: Run Query Suite |  |  |  | codeql
-237 | CodeqlRemoveDatabase | codeql_remove_database | CodeQL: Remove Database |  |  |  | codeql
-238 | CodeqlRenameDatabase | codeql_rename_database | CodeQL: Rename Database |  |  |  | codeql
-239 | CodeqlSortDatabases | codeql_sort_databases | CodeQL: Sort Databases |  |  |  | codeql
-240 | CodeqlRevealDatabase | codeql_reveal_database | CodeQL: Reveal Database in Explorer |  |  |  | codeql
-241 | CodeqlUpgradeDatabase | codeql_upgrade_database | CodeQL: Upgrade Database |  |  |  | codeql
-242 | CodeqlClearCache | codeql_clear_cache | CodeQL: Clear Cache |  |  |  | codeql
-243 | CodeqlTrimCache | codeql_trim_cache | CodeQL: Trim Cache |  |  |  | codeql
-244 | CodeqlTrimCacheToOverlay | codeql_trim_cache_to_overlay_base | CodeQL: Trim Cache to Overlay Base |  |  |  | codeql
-245 | CodeqlAddDatabaseSource | codeql_add_database_source | CodeQL: Add Database Source to Workspace |  |  |  | codeql
-246 | CodeqlDeleteUnusedDatabases | codeql_delete_unused_databases | CodeQL: Delete Unused Databases |  |  |  | codeql
-247 | CodeqlRemoveHistory | codeql_remove_history | CodeQL: Remove Query History Entry |  |  |  | codeql
-248 | CodeqlRenameHistory | codeql_rename_history | CodeQL: Rename Query History Entry |  |  |  | codeql
-249 | CodeqlSortHistory | codeql_sort_history | CodeQL: Sort Query History |  |  |  | codeql
-250 | CodeqlViewQuery | codeql_view_query | CodeQL: View Query |  |  |  | codeql
-251 | CodeqlCreateQuery | codeql_create_query | CodeQL: Create Query |  |  |  | codeql
-252 | CodeqlRunPack | codeql_run_pack | CodeQL: Run Queries in Pack |  |  |  | codeql
-253 | CodeqlRunQueryOnDatabases | codeql_run_query_on_databases | CodeQL: Run Query on Multiple Databases |  |  |  | codeql
-254 | CodeqlCancelQueue | codeql_cancel_queue | CodeQL: Cancel Queued Queries |  |  |  | codeql
-255 | CodeqlCopyVersion | codeql_copy_version_information | CodeQL: Copy Version Information |  |  |  | codeql
-256 | CodeqlDownloadCli | codeql_download_cli | CodeQL: Download CLI |  |  |  | codeql
-257 | CodeqlCheckCliUpdates | codeql_check_for_cli_updates | CodeQL: Check for CLI Updates |  |  |  | codeql
-258 | CodeqlInstallPackDependencies | codeql_install_pack_dependencies | CodeQL: Install Pack Dependencies |  |  |  | codeql
-259 | CodeqlDownloadPacks | codeql_download_packs | CodeQL: Download Packs |  |  |  | codeql
-260 | CodeqlRunPublishedPack | codeql_run_published_pack | CodeQL: Run Queries in Published Pack |  |  |  | codeql
-261 | CodeqlQuickQuery | codeql_quick_query | CodeQL: Quick Query |  |  |  | codeql
-262 | CodeqlCompareResults | codeql_compare_query_results | CodeQL: Compare Query Results |  |  |  | codeql
-263 | CodeqlShowEvaluatorLog | codeql_show_evaluator_log | CodeQL: Show Evaluator Log (Raw JSON) |  |  |  | codeql
-264 | CodeqlShowEvaluatorLogSummary | codeql_show_evaluator_log_summary | CodeQL: Show Evaluator Log (Summary Text) |  |  |  | codeql
-265 | CodeqlShowEvaluatorLogViewer | codeql_show_evaluator_log_viewer | CodeQL: Show Evaluator Log (Viewer) |  |  |  | codeql
-266 | CodeqlShowQueryLog | codeql_show_query_log | CodeQL: Show Query Log |  |  |  | codeql
-267 | CodeqlComparePerformance | codeql_compare_performance | CodeQL: Compare Performance |  |  |  | codeql
-268 | CodeqlPreviewQueryHelp | codeql_preview_query_help | CodeQL: Preview Query Help |  |  |  | codeql
-269 | CodeqlExportResults | codeql_export_results | CodeQL: Export Results |  |  |  | codeql
-270 | CodeqlSetUpController | codeql_set_up_controller_repository | CodeQL: Set Up Controller Repository |  |  |  | codeql
-271 | CodeqlAddVariantRepo | codeql_add_variant_analysis_repository | CodeQL: Add Variant Analysis Repository |  |  |  | codeql
-272 | CodeqlAddVariantList | codeql_add_variant_analysis_list | CodeQL: Add Variant Analysis Repository List |  |  |  | codeql
-273 | CodeqlAddVariantOwner | codeql_add_variant_analysis_owner | CodeQL: Add Variant Analysis Owner |  |  |  | codeql
-274 | CodeqlVariantCodeSearch | codeql_add_repositories_with_code_search | CodeQL: Add Repositories with GitHub Code Search |  |  |  | codeql
-275 | CodeqlOpenVariantConfig | codeql_open_variant_analysis_config | CodeQL: Open Variant Analysis Config File |  |  |  | codeql
-276 | CodeqlOpenVariantOnGithub | codeql_open_variant_analysis_on_github | CodeQL: Open Variant Analysis Repository on GitHub |  |  |  | codeql
-277 | CodeqlRunVariantAnalysis | codeql_run_variant_analysis | CodeQL: Run Variant Analysis |  |  |  | codeql
-278 | CodeqlOpenVariantResults | codeql_open_variant_analysis_results | CodeQL: Open Variant Analysis Results |  |  |  | codeql
-279 | CodeqlExportVariantResults | codeql_export_variant_analysis_results | CodeQL: Export Variant Analysis Results |  |  |  | codeql
-280 | CodeqlCopyVariantRepoList | codeql_copy_variant_repo_list | CodeQL: Copy Variant Analysis Repository List |  |  |  | codeql
-281 | CodeqlViewVariantLogs | codeql_view_variant_logs | CodeQL: View Variant Analysis Logs |  |  |  | codeql
-282 | CodeqlRunTests | codeql_run_tests | CodeQL: Run Tests |  |  |  | codeql
-283 | CodeqlDebugQuery | codeql_debug_query | CodeQL: Debug Query |  |  |  | codeql
-284 | CodeqlDebugSelection | codeql_debug_selection | CodeQL: Debug Selection |  |  |  | codeql
-285 | CodeqlResultsUp | codeql_results_up | CodeQL: Previous Result |  |  |  | codeql
-286 | CodeqlResultsDown | codeql_results_down | CodeQL: Next Result |  |  |  | codeql
-287 | CodeqlResultsLeft | codeql_results_left | CodeQL: Previous Result Column |  |  |  | codeql
-288 | CodeqlResultsRight | codeql_results_right | CodeQL: Next Result Column |  |  |  | codeql
-289 | SheetSortByColumn | sheet_sort_by_column | Sheet: Sort by Column |  |  |  |
-290 | CodeqlQuickEval | codeql_quick_eval | CodeQL: Quick Evaluation |  |  |  | codeql
-291 | CodeqlQuickEvalCount | codeql_quick_eval_count | CodeQL: Quick Evaluation Count |  |  |  | codeql
-292 | CodeqlViewAst | codeql_view_ast | CodeQL: View AST |  |  |  | codeql
-293 | CodeqlOpenModelEditor | codeql_open_model_editor | CodeQL: Open Model Editor |  |  |  | codeql
-294 | CodeqlModelEndpoint | codeql_model_endpoint | CodeQL: Model Endpoint |  |  |  | codeql
-295 | CodeqlOpenReferencedFile | codeql_open_referenced_file | CodeQL: Open Referenced File |  |  |  | codeql
-296 | CodeqlViewAlertsCsv | codeql_view_alerts_csv | CodeQL: View Alerts (CSV) |  |  |  | codeql
-297 | CodeqlViewAlertsSarif | codeql_view_alerts_sarif | CodeQL: View Alerts (SARIF) |  |  |  | codeql
-298 | CodeqlViewResultsCsv | codeql_view_results_csv | CodeQL: View Results (CSV) |  |  |  | codeql
-299 | CodeqlShowResultSet | codeql_show_result_set | CodeQL: Show Result Set |  |  |  | codeql
-300 | CodeqlViewCfg | codeql_view_cfg | CodeQL: View CFG |  |  |  | codeql
-301 | CodeqlRunAllQueries | codeql_run_all_queries | CodeQL: Run All Queries in Workspace |  |  |  | codeql
-302 | CodeqlRunSelectedQueries | codeql_run_selected_queries | CodeQL: Run Queries in Selected Files |  |  |  | codeql
-303 | CodeqlCancelRunningQuery | codeql_cancel_running_query | CodeQL: Cancel Running Query |  |  |  | codeql
-304 | CodeqlAcceptTestOutput | codeql_accept_test_output | CodeQL: Accept Test Output |  |  |  | codeql
-305 | CodeqlFocusSideBar | codeql_focus_side_bar | CodeQL: Focus Side Bar |  |  |  | codeql
-306 | CodeqlOpenResultsDirectory | codeql_open_results_directory | CodeQL: Open Query Results Directory |  |  |  | codeql
-307 | RunTestAtCursor | run_test_at_cursor | Testing: Run Test at Cursor |  | Cmd+K Enter | Ctrl+K Enter |
-308 | TestingRunAll | testing_run_all | Testing: Run All Tests |  |  |  |
-309 | TestingRunFile | testing_run_file | Testing: Run Tests in Current File |  |  |  |
-310 | TestingRerunFailed | testing_rerun_failed | Testing: Rerun Failed Tests |  |  |  |
-311 | TestingRerunLast | testing_rerun_last | Testing: Rerun Last Run |  |  |  |
-312 | DebugTestAtCursor | debug_test_at_cursor | Testing: Debug Test at Cursor |  | Cmd+K Shift+Enter | Ctrl+K Shift+Enter |
-313 | ToggleSideBar | toggle_side_bar | View: Toggle Primary Side Bar | layout | Cmd+B | Ctrl+B | layout
-314 | ToggleAutoHideSideBar | toggle_auto_hide_side_bar | View: Toggle Auto-Hide Side Bar | layout |  |  | layout
-315 | ToggleSecondarySideBar | toggle_secondary_side_bar | View: Toggle Secondary Side Bar | layout | Cmd+Opt+B | Ctrl+Alt+B | layout
-316 | ToggleZenMode | toggle_zen_mode | View: Toggle Zen Mode | layout | Cmd+K Z | Ctrl+K Z | layout
-317 | ToggleCenteredLayout | toggle_centered_layout | View: Toggle Centered Layout | layout |  |  | layout
-318 | ToggleTerminal | toggle_terminal | View: Toggle Terminal | layout | Ctrl+J | Ctrl+J | layout
-319 | ToggleActivityBar | toggle_activity_bar | View: Toggle Activity Bar Visibility | layout |  |  | layout
-320 | ToggleStatusBar | toggle_status_bar | View: Toggle Status Bar Visibility | layout |  |  | layout
-321 | ToggleSideBarPosition | toggle_side_bar_position | View: Toggle Primary Side Bar Position | layout |  |  | layout
-322 | SetPanelAlignment | set_panel_alignment | View: Set Panel Alignment… | layout |  |  | layout
-323 | SetQuickInputPosition | set_quick_input_position | View: Set Quick Input Position… | layout |  |  | layout
-324 | CustomizeLayout | customize_layout | View: Customize Layout… | layout |  |  | layout
-325 | FocusTerminal | focus_terminal | Terminal: Focus Terminal |  | Cmd+Shift+T | Super+Shift+T | skips-the-shell
-326 | ShowProblems | show_problems | View: Show Problems |  | Cmd+Shift+M | Ctrl+Shift+M |
-327 | ShowOutput | show_output | View: Show Output |  | Cmd+Shift+U | Ctrl+Shift+U |
-328 | OutputSelectChannel | output_select_channel | Output: Select Channel… |  |  |  |
-329 | ShowPorts | show_ports | View: Show Ports |  |  |  |
-330 | ShowCaptures | show_captures | View: Show Captures |  |  |  |
-331 | ToggleMinimap | toggle_minimap | View: Toggle Minimap | layout | Cmd+Opt+M | Ctrl+Alt+M | layout
-332 | ProblemsCheckProject | problems_check_project | Problems: Check Whole Project |  |  |  |
-333 | ProblemsToggleProjectAuto | problems_toggle_project_auto | Problems: Whole-Project Check Auto-Run (Auto / On / Off) |  |  |  |
-334 | ProblemsToggleScope | problems_toggle_scope | Problems: Toggle Scope (Open Files / Whole Project) |  |  |  |
-335 | DiffToggleIgnoreWhitespace | diff_toggle_ignore_whitespace | Diff: Toggle Ignore Whitespace |  |  |  |
-336 | NewTerminal | new_terminal | Terminal: Create New Terminal |  | Cmd+T | Ctrl+Shift+T | skips-the-shell
-337 | RunSelectedText | run_selected_text | Terminal: Run Selected Text in Active Terminal |  |  |  | skips-the-shell
-338 | FocusNextTerminal | focus_next_terminal | Terminal: Focus Next Terminal |  | Cmd+] | Super+] | skips-the-shell
-339 | FocusPreviousTerminal | focus_previous_terminal | Terminal: Focus Previous Terminal |  | Cmd+[ | Super+[ | skips-the-shell
-340 | TerminalClear | terminal_clear | Terminal: Clear |  | Cmd+K K | Ctrl+K K | skips-the-shell
-341 | TerminalRename | terminal_rename | Terminal: Rename |  | Cmd+K R | Ctrl+K R | skips-the-shell
-342 | TerminalKill | terminal_kill | Terminal: Kill the Active Terminal Instance |  |  |  | skips-the-shell
-343 | TerminalSplit | terminal_split | Terminal: Split Terminal |  |  |  | skips-the-shell
-344 | TerminalNewWithProfile | terminal_new_with_profile | Terminal: Create New Terminal (With Profile) |  |  |  | skips-the-shell
-345 | TerminalQuickSelect | terminal_quick_select | Terminal: Quick Select |  | Ctrl+Shift+Space | Ctrl+Shift+Space | skips-the-shell
-346 | TerminalCopyMode | terminal_copy_mode | Terminal: Enter Copy Mode |  | Ctrl+Shift+Y | Ctrl+Shift+Y | skips-the-shell
-347 | TerminalCommandHistory | terminal_command_history | Terminal: Show Command History |  | Ctrl+Shift+H | Ctrl+Shift+H | skips-the-shell
-348 | TerminalOpenScrollback | terminal_open_scrollback | Terminal: Open Scrollback in Editor |  | Cmd+K D | Ctrl+K D | skips-the-shell
-349 | StartDebugging | start_debugging | Debug: Start Debugging |  | F5 | F5 |
-350 | SelectDebugConfig | select_debug_config | Debug: Select and Start Debugging |  |  |  |
-351 | AddDebugConfig | add_debug_config | Debug: Add Configuration… |  |  |  |
-352 | StopDebugging | stop_debugging | Debug: Stop Debugging |  | Shift+F5 | Shift+F5 |
-353 | PauseDebugging | pause_debugging | Debug: Pause |  | F6 | F6 |
-354 | SwitchDebugSession | switch_debug_session | Debug: Switch Session |  | Cmd+Opt+Shift+G | Ctrl+Alt+Shift+G |
-355 | RestartDebugging | restart_debugging | Debug: Restart |  | Shift+Cmd+F5 | Shift+Ctrl+F5 |
-356 | ToggleBreakpoint | toggle_breakpoint | Debug: Toggle Breakpoint |  | F9 | F9 |
-357 | EditBreakpointCondition | edit_breakpoint_condition | Debug: Add Conditional Breakpoint |  | Shift+F9 | Shift+F9 |
-358 | EditLogpoint | edit_logpoint | Debug: Add Logpoint |  | Shift+Alt+F9 | Shift+Alt+F9 |
-359 | ShowIncomingCalls | show_incoming_calls | Calls: Show Incoming Calls |  | Cmd+K H | Ctrl+K H |
-360 | ShowOutgoingCalls | show_outgoing_calls | Calls: Show Outgoing Calls |  | Cmd+K Shift+H | Ctrl+K Shift+H |
-361 | ShowSupertypes | show_supertypes | Types: Show Supertypes |  | Cmd+K Shift+U | Ctrl+K Shift+U |
-362 | ShowSubtypes | show_subtypes | Types: Show Subtypes |  | Cmd+K Shift+D | Ctrl+K Shift+D |
-363 | ToggleCodeLens | toggle_code_lens | Editor: Toggle CodeLens |  |  |  |
-364 | RunCodeLens | run_code_lens | Editor: Run CodeLens on This Line |  | Cmd+K Shift+E | Ctrl+K Shift+E |
-365 | DebugAddHitCountBreakpoint | debug_add_hit_count_breakpoint | Debug: Add Hit Count Breakpoint |  |  |  |
-366 | DebugAddFunctionBreakpoint | debug_add_function_breakpoint | Debug: Add Function Breakpoint |  |  |  |
-367 | DebugRemoveFunctionBreakpoints | debug_remove_function_breakpoints | Debug: Remove All Function Breakpoints |  |  |  |
-368 | DebugRunToCursor | debug_run_to_cursor | Debug: Run to Cursor |  | Ctrl+F10 | Ctrl+F10 |
-369 | DebugBreakOnValueChange | debug_break_on_value_change | Debug: Break When Value Changes |  |  |  |
-370 | DebugRemoveDataBreakpoints | debug_remove_data_breakpoints | Debug: Remove All Data Breakpoints |  |  |  |
-371 | OpenSearchEditor | open_search_editor | Search: Open Results in Editor |  | Cmd+K Shift+F | Ctrl+K Shift+F |
-372 | RerunSearchEditor | rerun_search_editor | Search Editor: Rerun |  | Cmd+K Shift+R | Ctrl+K Shift+R |
-373 | RebaseAbort | rebase_abort | Rebase: Abort |  |  |  |
-374 | GitContinueOperation | git_continue_operation | Git: Continue Rebase, Cherry-Pick or Revert |  |  |  |
-375 | GitSkipOperation | git_skip_operation | Git: Skip Commit (Rebase, Cherry-Pick or Revert) |  |  |  |
-376 | GitAbortOperation | git_abort_operation | Git: Abort Merge, Rebase, Cherry-Pick, Revert or Bisect |  |  |  |
-377 | GitCreateTag | git_create_tag | Git: Create Tag |  |  |  |
-378 | GitPushTags | git_push_tags | Git: Push Tags |  |  |  |
-379 | GitDeleteRemoteTag | git_delete_remote_tag | Git: Delete Remote Tag |  |  |  |
-380 | GitCommit | git_commit | Git: Commit |  |  |  |
-381 | GitPush | git_push | Git: Push |  |  |  |
-382 | GitPull | git_pull | Git: Pull |  |  |  |
-383 | GitSync | git_sync | Git: Sync |  |  |  |
-384 | GitCheckoutTo | git_checkout_to | Git: Checkout to… |  |  |  |
-385 | GitStash | git_stash | Git: Stash |  |  |  |
-386 | GitShowSourceControlActions | git_show_source_control_actions | Git: Show Source Control Actions |  | Cmd+K Shift+A | Ctrl+K Shift+A |
-387 | GitShowCommitActions | git_show_commit_actions | Git: Show Commit Actions |  | Cmd+K Shift+C | Ctrl+K Shift+C |
-388 | GitOpenChanges | git_open_changes | Git: Open Changes |  | Enter in Source Control | Enter in Source Control |
-389 | GitStageChanges | git_stage_changes | Git: Stage Changes |  | S in Source Control | S in Source Control |
-390 | GitUnstageChanges | git_unstage_changes | Git: Unstage Changes |  | U in Source Control | U in Source Control |
-391 | GitDiscardChanges | git_discard_changes | Git: Discard Changes |  | D in Source Control | D in Source Control |
-392 | GitRefresh | git_refresh | Git: Refresh |  | R in Source Control | R in Source Control |
-393 | GitInitializeRepository | git_initialize_repository | Git: Initialize Repository |  | Enter in Source Control | Enter in Source Control |
-394 | ToggleTerminalSuggestions | toggle_terminal_suggestions | Terminal: Toggle Command Suggestions |  |  |  | skips-the-shell
-395 | ToggleScreenReader | toggle_screen_reader | Accessibility: Toggle Screen Reader Mode |  |  |  |
-396 | OpenKeyboardShortcuts | open_keyboard_shortcuts | Preferences: Open Keyboard Shortcuts |  | Cmd+K Cmd+S | Ctrl+K Ctrl+S |
-397 | SwitchProfile | switch_profile | Profiles: Switch Profile |  |  |  |
-398 | ToggleInlineSuggestions | toggle_inline_suggestions | Editor: Toggle Inline Suggestions |  | Cmd+K Shift+G | Ctrl+K Shift+G |
-399 | StepOver | step_over | Debug: Step Over |  | F10 | F10 |
-400 | ShowContextMenu | show_context_menu | View: Show Context Menu |  | Shift+F10 | Shift+F10 |
-401 | ContinueDebugging | continue | Debug: Continue |  | F5 | F5 |
-402 | StepInto | step_into | Debug: Step Into |  | F11 | F11 |
-403 | StepOut | step_out | Debug: Step Out |  | Shift+F11 | Shift+F11 |
-404 | StepIntoTarget | step_into_target | Debug: Step Into Target |  |  |  |
-405 | ToggleRaisedExceptions | toggle_raised_exceptions | Debug: Toggle Break on Raised Exceptions |  | Alt+F9 | Alt+F9 |
-406 | AttachPythonProcess | attach_python_process | Debug: Attach to Python Process |  | Ctrl+F5 | Ctrl+F5 |
-407 | RunTask | run_task | Tasks: Run Task |  |  |  |
-408 | RunBuildTask | run_build_task | Tasks: Run Build Task |  | Cmd+Shift+B | Ctrl+Shift+B |
-409 | RerunLastTask | rerun_last_task | Tasks: Rerun Last Task |  |  |  |
-410 | ColorTheme | color_theme | Preferences: Color Theme |  | Cmd+K Cmd+T | Ctrl+K Ctrl+T |
-411 | KeyboardShortcuts | keyboard_shortcuts | Help: Keyboard Shortcuts Reference |  | F1 | F1 |
-412 | UpdateCroft | update_croft | Help: Update croft (Relaunch or Rebuild) |  | Cmd+Shift+F9 | Ctrl+Shift+F9 |
-413 | OpenSettings | open_settings | Preferences: Open Settings |  |  |  |
-414 | OpenSettingsEditor | open_settings_editor | Preferences: Open Settings (UI) |  |  |  |
-415 | OpenSettingsJson | open_settings_json | Preferences: Open Settings (JSON) |  |  |  |
-416 | OpenWorkspaceSettingsJson | open_workspace_settings_json | Preferences: Open Workspace Settings (JSON) |  |  |  |
-417 | OpenWorkspaceSettingsLocalJson | open_workspace_settings_local_json | Preferences: Open Workspace Settings — Local (JSON) |  |  |  |
-418 | OpenKeybindingsJson | open_keybindings_json | Preferences: Open Keyboard Shortcuts (JSON) |  |  |  |
-419 | ConfigureSnippets | configure_snippets | Preferences: Configure User Snippets |  |  |  |
-420 | OpenTriggersJson | open_triggers_json | Preferences: Open Terminal Triggers (JSON) |  |  |  |
-421 | OpenAgentsJson | open_agents_json | Preferences: Open Agent Lanes (JSON) |  |  |  |
-422 | OpenMatchersJson | open_matchers_json | Preferences: Open Problem Matchers (JSON) |  |  |  |
-423 | ToggleTerminalTimestamps | toggle_terminal_timestamps | Terminal: Toggle Timestamps |  |  |  | skips-the-shell
-424 | ToggleLogHighlight | toggle_log_highlight | Log: Toggle Highlighting (tailspin) |  |  |  |
-425 | CollapseTerminalPane | collapse_terminal_pane | Terminal: Collapse Pane |  | Cmd+K [ | Ctrl+K [ | skips-the-shell
-426 | RestoreTerminalPanes | restore_terminal_panes | Terminal: Restore All Collapsed Panes |  | Cmd+K ] | Ctrl+K ] | skips-the-shell
-427 | ToggleSecretRedaction | toggle_secret_redaction | Terminal: Toggle Secret Redaction |  |  |  | skips-the-shell
-428 | RevealRedactedSecrets | reveal_redacted_secrets | Terminal: Reveal Redacted Secrets for 10s |  |  |  | skips-the-shell
-429 | SearchFromTerminal | search_from_terminal | Terminal: Search & Replace from Last grep/rg |  |  |  | skips-the-shell
-430 | SessionParticipants | session_participants | Session: Participants |  | Cmd+K A | Ctrl+K A |
-431 | SessionDetach | session_detach | Session: Detach |  | Cmd+K Shift+Q | Ctrl+K Shift+Q |
-432 | CollabCancelStream | collab_cancel_stream | Collab: Cancel AI Stream |  | Cmd+K X | Ctrl+K X |
-433 | AskNavigator | navigator_ask | Navigator: Ask About Line or Selection |  | Cmd+K Q | Ctrl+K Q |
-434 | AskNavigatorAboutCapture | captures_ask_navigator | Captures: Ask Navigator About This Line |  |  |  |
-435 | OpenWorkspaceOnSshHost | remote_open_workspace_on_ssh_host | Remote: Open Workspace on This Pane's Host |  |  |  |
-436 | ScrubHistory | scm_scrub_history | Source Control: Scrub History |  |  |  |
-437 | DebugInstallDelve | debug_install_delve | Debug: Install Go Debugger (delve) |  |  |  |
-438 | RemoteSyncConfigNow | remote_sync_config_now | Remote: Sync Config Now |  |  |  |
-439 | DropToLocal | drop_to_local | Remote: Drop to Local |  | Cmd+K L | Ctrl+K L |
-440 | StopAutoApprove | agents_stop_auto_approve | Agents: Stop Auto-Approving |  |  |  |
-441 | ScrubOpenHere | scm_scrub_open_here | Source Control: Open Scrubbed File Here |  |  |  |
-442 | ScrubDiffToWorkingTree | scm_scrub_diff_working_tree | Source Control: Diff Scrubbed File to Working Tree |  |  |  |
-443 | FleetRun | terminal_fleet_run | Terminal: Fleet Run |  |  |  | skips-the-shell
-444 | OpenAsSymbolTab | editor_open_symbol_tab | Editor: Open Symbol as Its Own Tab |  | Cmd+K Shift+V | Ctrl+K Shift+V |
-445 | LoadReviewThreads | review_load_threads | Review: Load PR Comments for This File |  |  |  |
-446 | ReviewAddComment | review_add_comment | Review: Add Comment on This Line |  |  |  |
-447 | ReviewSubmit | review_submit | Review: Submit Review |  |  |  |
-448 | ReviewToggleResolved | review_toggle_resolved | Review: Resolve or Unresolve Thread |  |  |  |
-449 | ReviewDiscardPending | review_discard_pending | Review: Discard Pending Comments |  |  |  |
-450 | ExportCommentsToPr | scm_export_comments_to_pr | Source Control: Export Comments to Pull Request |  |  |  |
-451 | NoteAdd | note_add | Notes: Add Note on This Line |  | Cmd+K N | Ctrl+K N |
-452 | NoteDelete | note_delete | Notes: Delete Note |  |  |  |
-453 | ToggleSessionRecording | session_toggle_recording | Session: Record Terminal as Asciicast |  |  |  |
-454 | NewWorktreeLane | agent_new_worktree_lane | Agent: New Worktree Lane |  | Cmd+K Shift+L | Ctrl+K Shift+L |
-455 | ReviewPullRequest | review_pull_request | Source Control: Review Pull Request |  |  |  |
-456 | CloseWorktreeLane | agent_close_worktree_lane | Agent: Close Worktree Lane |  |  |  |
-457 | DiffWorktreeLane | agent_diff_worktree_lane | Agent: Diff Lane Against Its Base |  |  |  |
-458 | MarkAgentLaneReviewed | agents_mark_reviewed | Agents: Mark Changed Files Reviewed |  |  |  |
-459 | ShowAgentLane | agents_show_lane | Agents: Show Changed Files |  |  |  |
-460 | OpenAgentLaneSection | agents_open_lane | Agents: Open Agent Lane |  |  |  |
-461 | MarkAgentFileReviewed | agents_mark_file_reviewed | Agents: Mark This File Reviewed |  |  |  |
-462 | DiffAgentFileSinceReview | agents_diff_since_review | Agents: Diff This File Since Review |  |  |  |
-463 | PickAgentLaneFile | agents_pick_changed_file | Agents: Review a Changed File… |  |  |  |
-464 | FixProblemWithNavigator | problems_fix_navigator | Problems: Fix With Navigator |  |  |  |
-465 | SendHttpRequest | http_send_request | HTTP: Send Request Under Caret |  | Cmd+Enter | Ctrl+Enter |
-466 | CopyHttpRequestAsCurl | http_copy_curl | HTTP: Copy Request as curl |  |  |  |
-467 | SwitchHttpEnvironment | http_switch_environment | HTTP: Switch Environment |  |  |  |
-468 | YieldToNavigator | navigator_yield | Navigator: Yield the Turn |  | Cmd+K Y | Ctrl+K Y |
-469 | ToggleNavigator | navigator_toggle | Navigator: Activate or Deactivate |  |  |  |
-470 | ClearNavigatorNotes | navigator_clear_notes | Navigator: Clear Comments |  |  |  |
-471 | ToggleProactiveNavigator | navigator_toggle_proactive | Navigator: Toggle Proactive Comments |  |  |  |
-472 | NextComment | navigator_next_comment | Navigator: Next Comment |  | F4 | F4 |
-473 | IgnoreComment | navigator_ignore_comment | Navigator: Ignore Comment |  | Shift+F4 | Shift+F4 |
+172 | SplitEditorUp | split_editor_up | View: Split Editor Up |  | Cmd+K Cmd+\ | Ctrl+K \ |
+173 | SplitEditorDown | split_editor_down | View: Split Editor Down |  | Cmd+K Opt+↓ | Ctrl+K Alt+↓ |
+174 | SplitEditorLeft | split_editor_left | View: Split Editor Left |  | Cmd+K Opt+← | Ctrl+K Alt+← |
+175 | SplitEditorInGroup | split_editor_in_group | View: Split Editor in Group |  | Cmd+K Shift+Cmd+\ | Ctrl+K Shift+Ctrl+\ |
+176 | MoveEditorToAboveGroup | move_editor_to_above_group | View: Move Editor into Group Above |  | Cmd+K Shift+↑ | Ctrl+K Shift+↑ |
+177 | MoveEditorToBelowGroup | move_editor_to_below_group | View: Move Editor into Group Below |  | Cmd+K Shift+↓ | Ctrl+K Shift+↓ |
+178 | MoveEditorToLeftGroup | move_editor_to_left_group | View: Move Editor into Left Group |  | Cmd+K Shift+← | Ctrl+K Shift+← |
+179 | MoveEditorToRightGroup | move_editor_to_right_group | View: Move Editor into Right Group |  | Cmd+K Shift+→ | Ctrl+K Shift+→ |
+180 | MoveEditorToNewWindow | move_editor_to_new_window | View: Move Editor into New Window |  | Cmd+K Shift+O | Ctrl+K Shift+O |
+181 | CopyEditorToNewWindow | copy_editor_to_new_window | View: Copy Editor into New Window |  | Cmd+K O | Ctrl+K O |
+182 | RevealActiveFileInExplorer | reveal_active_file_in_explorer | File: Reveal Active File in Explorer View |  | Cmd+K E | Ctrl+K E |
+183 | FocusLeftEditorGroup | focus_left_editor_group | View: Focus Left Editor Group |  | Cmd+Opt+← | Super+Alt+← |
+184 | FocusRightEditorGroup | focus_right_editor_group | View: Focus Right Editor Group |  | Cmd+Opt+→ | Super+Alt+→ |
+185 | QuickOpen | quick_open | Go to File |  | Cmd+P | Ctrl+P |
+186 | TakeTheTour | help_take_the_tour | Help: Take the Tour |  |  |  |
+187 | SponsorCroft | help_sponsor_croft | Help: Sponsor croft |  |  |  |
+188 | SarifNextResult | sarif_next_result | SARIF: Next Result |  |  |  |
+189 | SarifPreviousResult | sarif_previous_result | SARIF: Previous Result |  |  |  |
+190 | SarifOpenCodeScanning | sarif_open_code_scanning | SARIF: Open GitHub Code Scanning Analysis |  |  |  |
+191 | SarifLoadCodeScanning | sarif_load_code_scanning | SARIF: Load Code Scanning Results for This Branch |  |  |  |
+192 | GoToSymbol | go_to_symbol | Go to Symbol in Editor |  | Cmd+Shift+O | Ctrl+Shift+O |
+193 | GoToWorkspaceSymbol | go_to_workspace_symbol | Go to Symbol in Workspace |  | Cmd+P # | Ctrl+P # |
+194 | NavigateBack | navigate_back | Go Back |  | Ctrl+- | Ctrl+- |
+195 | NavigateForward | navigate_forward | Go Forward |  | Ctrl+Shift+- | Ctrl+Shift+- |
+196 | GoToLastEditLocation | go_to_last_edit_location | Go to Last Edit Location |  | Cmd+K Cmd+Q | Ctrl+K Ctrl+Q |
+197 | ToggleVimMode | toggle_vim_mode | Toggle Vim Mode |  | Cmd+E | Super+E |
+198 | MacroStartStopRecording | macro_record | Macro: Start/Stop Recording |  |  |  |
+199 | MacroReplayLast | macro_replay_last | Macro: Replay Last |  |  |  |
+200 | MacroReplayTimes | macro_replay_times | Macro: Replay N Times… |  |  |  |
+201 | ShowExplorer | show_explorer | View: Show Explorer |  | Cmd+Shift+E | Ctrl+Shift+E |
+202 | FocusBreadcrumbs | breadcrumbs_focus_and_select | View: Focus and Select Breadcrumbs |  | Cmd+Shift+. | Ctrl+Shift+. |
+203 | ShowSearch | show_search | View: Show Search |  | Cmd+Shift+F | Ctrl+Shift+F |
+204 | ReplaceInFiles | replace_in_files | Search: Replace in Files |  | Cmd+Shift+H | Ctrl+Shift+H |
+205 | SearchToggleMatchCase | search_toggle_match_case | Search: Toggle Match Case |  | Alt+C | Alt+C |
+206 | SearchToggleWholeWord | search_toggle_whole_word | Search: Toggle Match Whole Word |  | Alt+W | Alt+W |
+207 | SearchToggleRegex | search_toggle_regex | Search: Toggle Use Regular Expression |  | Alt+R | Alt+R |
+208 | SearchTogglePreserveCase | search_toggle_preserve_case | Search: Toggle Preserve Case |  | Alt+P | Alt+P |
+209 | SearchToggleDetails | search_toggle_details | Search: Toggle Search Details |  | Alt+D | Alt+D |
+210 | ShowSourceControl | show_source_control | View: Show Source Control |  | Cmd+Shift+S | Ctrl+Shift+S |
+211 | AddWorkspaceFolder | add_workspace_folder | Workspaces: Add Folder to Workspace |  |  |  |
+212 | RemoveWorkspaceFolder | remove_workspace_folder | Workspaces: Remove Folder from Workspace |  |  |  |
+213 | SaveWorkspaceAs | save_workspace_as | Workspaces: Save Workspace As |  |  |  |
+214 | OpenWorkspaceFromFile | open_workspace_from_file | Workspaces: Open Workspace from File |  |  |  |
+215 | ReopenAsHex | reopen_as_hex | File: Reopen as Hex |  |  |  |
+216 | ReopenAsPreview | reopen_as_preview | File: Reopen as Preview |  |  |  |
+217 | ReopenAsText | reopen_as_text | File: Reopen as Text |  |  |  |
+218 | NotebookRunAll | notebook_run_all | Notebook: Run All Cells |  |  |  |
+219 | NotebookInterrupt | notebook_interrupt | Notebook: Interrupt Kernel |  |  |  |
+220 | NotebookRestart | notebook_restart | Notebook: Restart Kernel |  |  |  |
+221 | NotebookSelectKernel | notebook_select_kernel | Notebook: Select Kernel |  |  |  |
+222 | RestartLanguageServers | restart_language_servers | Language Servers: Restart All | restart language server, restart ts server, restart lsp |  |  |
+223 | RestartLanguageServersForFile | restart_language_servers_for_file | Language Servers: Restart for This File | restart language server, restart ts server, restart lsp |  |  |
+224 | TestingRunWithCoverage | testing_run_with_coverage | Testing: Run All Tests with Coverage |  |  |  |
+225 | CoverageClear | coverage_clear | Coverage: Clear |  |  |  |
+226 | TestingInstallCoverageTool | testing_install_coverage_tool | Testing: Install Coverage Tool |  |  |  |
+227 | TestingShowCoverageReport | testing_show_coverage_report | Testing: Show Coverage Report |  |  |  |
+228 | DeveloperShowMemoryUsage | developer_show_memory_usage | Developer: Show Memory Usage |  |  |  |
+229 | ToggleScreencastMode | toggle_screencast_mode | Developer: Toggle Screencast Mode |  | Shift+F8 | Shift+F8 |
+230 | RunTestAtCursorWithCoverage | run_test_at_cursor_with_coverage | Testing: Run Test at Cursor with Coverage |  |  |  |
+231 | TestingToggleWatchAll | testing_toggle_watch_all | Testing: Toggle Watch All Tests |  |  |  |
+232 | TestingGoToFirstFailure | testing_go_to_first_failure | Testing: Go to First Failure |  |  |  |
+233 | TestingCancelRun | testing_cancel_run | Testing: Cancel Test Run |  |  |  |
+234 | HexFindNext | hex_find_next | Hex: Find Next |  | F3 | F3 |
+235 | SheetInsertRowBelow | sheet_insert_row_below | Sheet: Insert Row Below |  |  |  |
+236 | SheetDeleteRow | sheet_delete_row | Sheet: Delete Row |  |  |  |
+237 | SheetInsertColRight | sheet_insert_col_right | Sheet: Insert Column Right |  |  |  |
+238 | SheetDeleteCol | sheet_delete_col | Sheet: Delete Column |  |  |  |
+239 | MediaOpenExternal | media_open_external | Media: Open in System Player |  |  |  |
+240 | ShowRunDebug | show_run_debug | View: Show Run and Debug |  | Cmd+Shift+D | Ctrl+Shift+D |
+241 | ShowRemote | show_remote | View: Show Remote |  | Cmd+Shift+R | Ctrl+Shift+R |
+242 | ShowExtensions | show_extensions | View: Show Extensions |  | Cmd+Shift+X | Ctrl+Shift+X |
+243 | CompareExtensionsWithVscode | compare_extensions_with_vscode | Extensions: Compare with VS Code |  |  |  |
+244 | ShowTesting | show_testing | View: Show Testing |  | Cmd+K B | Ctrl+K B |
+245 | ShowCodeQL | show_codeql | View: Show CodeQL |  |  |  | codeql
+246 | CodeqlRunQuery | codeql_run_query | CodeQL: Run Query on Selected Database |  |  |  | codeql
+247 | CodeqlRunQuerySuite | codeql_run_query_suite | CodeQL: Run Query Suite |  |  |  | codeql
+248 | CodeqlRemoveDatabase | codeql_remove_database | CodeQL: Remove Database |  |  |  | codeql
+249 | CodeqlRenameDatabase | codeql_rename_database | CodeQL: Rename Database |  |  |  | codeql
+250 | CodeqlSortDatabases | codeql_sort_databases | CodeQL: Sort Databases |  |  |  | codeql
+251 | CodeqlRevealDatabase | codeql_reveal_database | CodeQL: Reveal Database in Explorer |  |  |  | codeql
+252 | CodeqlUpgradeDatabase | codeql_upgrade_database | CodeQL: Upgrade Database |  |  |  | codeql
+253 | CodeqlClearCache | codeql_clear_cache | CodeQL: Clear Cache |  |  |  | codeql
+254 | CodeqlTrimCache | codeql_trim_cache | CodeQL: Trim Cache |  |  |  | codeql
+255 | CodeqlTrimCacheToOverlay | codeql_trim_cache_to_overlay_base | CodeQL: Trim Cache to Overlay Base |  |  |  | codeql
+256 | CodeqlAddDatabaseSource | codeql_add_database_source | CodeQL: Add Database Source to Workspace |  |  |  | codeql
+257 | CodeqlDeleteUnusedDatabases | codeql_delete_unused_databases | CodeQL: Delete Unused Databases |  |  |  | codeql
+258 | CodeqlRemoveHistory | codeql_remove_history | CodeQL: Remove Query History Entry |  |  |  | codeql
+259 | CodeqlRenameHistory | codeql_rename_history | CodeQL: Rename Query History Entry |  |  |  | codeql
+260 | CodeqlSortHistory | codeql_sort_history | CodeQL: Sort Query History |  |  |  | codeql
+261 | CodeqlViewQuery | codeql_view_query | CodeQL: View Query |  |  |  | codeql
+262 | CodeqlCreateQuery | codeql_create_query | CodeQL: Create Query |  |  |  | codeql
+263 | CodeqlRunPack | codeql_run_pack | CodeQL: Run Queries in Pack |  |  |  | codeql
+264 | CodeqlRunQueryOnDatabases | codeql_run_query_on_databases | CodeQL: Run Query on Multiple Databases |  |  |  | codeql
+265 | CodeqlCancelQueue | codeql_cancel_queue | CodeQL: Cancel Queued Queries |  |  |  | codeql
+266 | CodeqlCopyVersion | codeql_copy_version_information | CodeQL: Copy Version Information |  |  |  | codeql
+267 | CodeqlDownloadCli | codeql_download_cli | CodeQL: Download CLI |  |  |  | codeql
+268 | CodeqlCheckCliUpdates | codeql_check_for_cli_updates | CodeQL: Check for CLI Updates |  |  |  | codeql
+269 | CodeqlInstallPackDependencies | codeql_install_pack_dependencies | CodeQL: Install Pack Dependencies |  |  |  | codeql
+270 | CodeqlDownloadPacks | codeql_download_packs | CodeQL: Download Packs |  |  |  | codeql
+271 | CodeqlRunPublishedPack | codeql_run_published_pack | CodeQL: Run Queries in Published Pack |  |  |  | codeql
+272 | CodeqlQuickQuery | codeql_quick_query | CodeQL: Quick Query |  |  |  | codeql
+273 | CodeqlCompareResults | codeql_compare_query_results | CodeQL: Compare Query Results |  |  |  | codeql
+274 | CodeqlShowEvaluatorLog | codeql_show_evaluator_log | CodeQL: Show Evaluator Log (Raw JSON) |  |  |  | codeql
+275 | CodeqlShowEvaluatorLogSummary | codeql_show_evaluator_log_summary | CodeQL: Show Evaluator Log (Summary Text) |  |  |  | codeql
+276 | CodeqlShowEvaluatorLogViewer | codeql_show_evaluator_log_viewer | CodeQL: Show Evaluator Log (Viewer) |  |  |  | codeql
+277 | CodeqlShowQueryLog | codeql_show_query_log | CodeQL: Show Query Log |  |  |  | codeql
+278 | CodeqlComparePerformance | codeql_compare_performance | CodeQL: Compare Performance |  |  |  | codeql
+279 | CodeqlPreviewQueryHelp | codeql_preview_query_help | CodeQL: Preview Query Help |  |  |  | codeql
+280 | CodeqlExportResults | codeql_export_results | CodeQL: Export Results |  |  |  | codeql
+281 | CodeqlSetUpController | codeql_set_up_controller_repository | CodeQL: Set Up Controller Repository |  |  |  | codeql
+282 | CodeqlAddVariantRepo | codeql_add_variant_analysis_repository | CodeQL: Add Variant Analysis Repository |  |  |  | codeql
+283 | CodeqlAddVariantList | codeql_add_variant_analysis_list | CodeQL: Add Variant Analysis Repository List |  |  |  | codeql
+284 | CodeqlAddVariantOwner | codeql_add_variant_analysis_owner | CodeQL: Add Variant Analysis Owner |  |  |  | codeql
+285 | CodeqlVariantCodeSearch | codeql_add_repositories_with_code_search | CodeQL: Add Repositories with GitHub Code Search |  |  |  | codeql
+286 | CodeqlOpenVariantConfig | codeql_open_variant_analysis_config | CodeQL: Open Variant Analysis Config File |  |  |  | codeql
+287 | CodeqlOpenVariantOnGithub | codeql_open_variant_analysis_on_github | CodeQL: Open Variant Analysis Repository on GitHub |  |  |  | codeql
+288 | CodeqlRunVariantAnalysis | codeql_run_variant_analysis | CodeQL: Run Variant Analysis |  |  |  | codeql
+289 | CodeqlOpenVariantResults | codeql_open_variant_analysis_results | CodeQL: Open Variant Analysis Results |  |  |  | codeql
+290 | CodeqlExportVariantResults | codeql_export_variant_analysis_results | CodeQL: Export Variant Analysis Results |  |  |  | codeql
+291 | CodeqlCopyVariantRepoList | codeql_copy_variant_repo_list | CodeQL: Copy Variant Analysis Repository List |  |  |  | codeql
+292 | CodeqlViewVariantLogs | codeql_view_variant_logs | CodeQL: View Variant Analysis Logs |  |  |  | codeql
+293 | CodeqlRunTests | codeql_run_tests | CodeQL: Run Tests |  |  |  | codeql
+294 | CodeqlDebugQuery | codeql_debug_query | CodeQL: Debug Query |  |  |  | codeql
+295 | CodeqlDebugSelection | codeql_debug_selection | CodeQL: Debug Selection |  |  |  | codeql
+296 | CodeqlResultsUp | codeql_results_up | CodeQL: Previous Result |  |  |  | codeql
+297 | CodeqlResultsDown | codeql_results_down | CodeQL: Next Result |  |  |  | codeql
+298 | CodeqlResultsLeft | codeql_results_left | CodeQL: Previous Result Column |  |  |  | codeql
+299 | CodeqlResultsRight | codeql_results_right | CodeQL: Next Result Column |  |  |  | codeql
+300 | SheetSortByColumn | sheet_sort_by_column | Sheet: Sort by Column |  |  |  |
+301 | CodeqlQuickEval | codeql_quick_eval | CodeQL: Quick Evaluation |  |  |  | codeql
+302 | CodeqlQuickEvalCount | codeql_quick_eval_count | CodeQL: Quick Evaluation Count |  |  |  | codeql
+303 | CodeqlViewAst | codeql_view_ast | CodeQL: View AST |  |  |  | codeql
+304 | CodeqlOpenModelEditor | codeql_open_model_editor | CodeQL: Open Model Editor |  |  |  | codeql
+305 | CodeqlModelEndpoint | codeql_model_endpoint | CodeQL: Model Endpoint |  |  |  | codeql
+306 | CodeqlOpenReferencedFile | codeql_open_referenced_file | CodeQL: Open Referenced File |  |  |  | codeql
+307 | CodeqlViewAlertsCsv | codeql_view_alerts_csv | CodeQL: View Alerts (CSV) |  |  |  | codeql
+308 | CodeqlViewAlertsSarif | codeql_view_alerts_sarif | CodeQL: View Alerts (SARIF) |  |  |  | codeql
+309 | CodeqlViewResultsCsv | codeql_view_results_csv | CodeQL: View Results (CSV) |  |  |  | codeql
+310 | CodeqlShowResultSet | codeql_show_result_set | CodeQL: Show Result Set |  |  |  | codeql
+311 | CodeqlViewCfg | codeql_view_cfg | CodeQL: View CFG |  |  |  | codeql
+312 | CodeqlRunAllQueries | codeql_run_all_queries | CodeQL: Run All Queries in Workspace |  |  |  | codeql
+313 | CodeqlRunSelectedQueries | codeql_run_selected_queries | CodeQL: Run Queries in Selected Files |  |  |  | codeql
+314 | CodeqlCancelRunningQuery | codeql_cancel_running_query | CodeQL: Cancel Running Query |  |  |  | codeql
+315 | CodeqlAcceptTestOutput | codeql_accept_test_output | CodeQL: Accept Test Output |  |  |  | codeql
+316 | CodeqlFocusSideBar | codeql_focus_side_bar | CodeQL: Focus Side Bar |  |  |  | codeql
+317 | CodeqlOpenResultsDirectory | codeql_open_results_directory | CodeQL: Open Query Results Directory |  |  |  | codeql
+318 | RunTestAtCursor | run_test_at_cursor | Testing: Run Test at Cursor |  | Cmd+K Enter | Ctrl+K Enter |
+319 | TestingRunAll | testing_run_all | Testing: Run All Tests |  |  |  |
+320 | TestingRunFile | testing_run_file | Testing: Run Tests in Current File |  |  |  |
+321 | TestingRerunFailed | testing_rerun_failed | Testing: Rerun Failed Tests |  |  |  |
+322 | TestingRerunLast | testing_rerun_last | Testing: Rerun Last Run |  |  |  |
+323 | DebugTestAtCursor | debug_test_at_cursor | Testing: Debug Test at Cursor |  | Cmd+K Shift+Enter | Ctrl+K Shift+Enter |
+324 | ToggleSideBar | toggle_side_bar | View: Toggle Primary Side Bar | layout | Cmd+B | Ctrl+B | layout
+325 | ToggleAutoHideSideBar | toggle_auto_hide_side_bar | View: Toggle Auto-Hide Side Bar | layout |  |  | layout
+326 | ToggleSecondarySideBar | toggle_secondary_side_bar | View: Toggle Secondary Side Bar | layout | Cmd+Opt+B | Ctrl+Alt+B | layout
+327 | ToggleZenMode | toggle_zen_mode | View: Toggle Zen Mode | layout | Cmd+K Z | Ctrl+K Z | layout
+328 | ToggleCenteredLayout | toggle_centered_layout | View: Toggle Centered Layout | layout |  |  | layout
+329 | ToggleTerminal | toggle_terminal | View: Toggle Terminal | layout | Ctrl+J | Ctrl+J | layout
+330 | ToggleActivityBar | toggle_activity_bar | View: Toggle Activity Bar Visibility | layout |  |  | layout
+331 | ToggleStatusBar | toggle_status_bar | View: Toggle Status Bar Visibility | layout |  |  | layout
+332 | ToggleSideBarPosition | toggle_side_bar_position | View: Toggle Primary Side Bar Position | layout |  |  | layout
+333 | SetPanelAlignment | set_panel_alignment | View: Set Panel Alignment… | layout |  |  | layout
+334 | SetQuickInputPosition | set_quick_input_position | View: Set Quick Input Position… | layout |  |  | layout
+335 | CustomizeLayout | customize_layout | View: Customize Layout… | layout |  |  | layout
+336 | FocusTerminal | focus_terminal | Terminal: Focus Terminal |  | Cmd+Shift+T | Super+Shift+T | skips-the-shell
+337 | ShowProblems | show_problems | View: Show Problems |  | Cmd+Shift+M | Ctrl+Shift+M |
+338 | ShowOutput | show_output | View: Show Output |  | Cmd+Shift+U | Ctrl+Shift+U |
+339 | OutputSelectChannel | output_select_channel | Output: Select Channel… |  |  |  |
+340 | ShowPorts | show_ports | View: Show Ports |  |  |  |
+341 | ShowCaptures | show_captures | View: Show Captures |  |  |  |
+342 | ToggleMinimap | toggle_minimap | View: Toggle Minimap | layout | Cmd+Opt+M | Ctrl+Alt+M | layout
+343 | ToggleMinimapSide | toggle_minimap_side | View: Toggle Minimap Side |  | Cmd+K Shift+M | Ctrl+K Shift+M |
+344 | ProblemsCheckProject | problems_check_project | Problems: Check Whole Project |  |  |  |
+345 | ProblemsToggleProjectAuto | problems_toggle_project_auto | Problems: Whole-Project Check Auto-Run (Auto / On / Off) |  |  |  |
+346 | ProblemsToggleScope | problems_toggle_scope | Problems: Toggle Scope (Open Files / Whole Project) |  |  |  |
+347 | DiffToggleIgnoreWhitespace | diff_toggle_ignore_whitespace | Diff: Toggle Ignore Whitespace |  |  |  |
+348 | NewTerminal | new_terminal | Terminal: Create New Terminal |  | Cmd+T | Ctrl+Shift+T | skips-the-shell
+349 | RunSelectedText | run_selected_text | Terminal: Run Selected Text in Active Terminal |  |  |  | skips-the-shell
+350 | FocusNextTerminal | focus_next_terminal | Terminal: Focus Next Terminal |  | Cmd+] | Super+] | skips-the-shell
+351 | FocusPreviousTerminal | focus_previous_terminal | Terminal: Focus Previous Terminal |  | Cmd+[ | Super+[ | skips-the-shell
+352 | TerminalClear | terminal_clear | Terminal: Clear |  | Cmd+K K | Ctrl+K K | skips-the-shell
+353 | TerminalRename | terminal_rename | Terminal: Rename |  | Cmd+K R | Ctrl+K R | skips-the-shell
+354 | TerminalKill | terminal_kill | Terminal: Kill the Active Terminal Instance |  |  |  | skips-the-shell
+355 | TerminalSplit | terminal_split | Terminal: Split Terminal |  |  |  | skips-the-shell
+356 | TerminalNewWithProfile | terminal_new_with_profile | Terminal: Create New Terminal (With Profile) |  |  |  | skips-the-shell
+357 | TerminalQuickSelect | terminal_quick_select | Terminal: Quick Select |  | Ctrl+Shift+Space | Ctrl+Shift+Space | skips-the-shell
+358 | TerminalCopyMode | terminal_copy_mode | Terminal: Enter Copy Mode |  | Ctrl+Shift+Y | Ctrl+Shift+Y | skips-the-shell
+359 | TerminalCommandHistory | terminal_command_history | Terminal: Show Command History |  | Ctrl+Shift+H | Ctrl+Shift+H | skips-the-shell
+360 | TerminalOpenScrollback | terminal_open_scrollback | Terminal: Open Scrollback in Editor |  | Cmd+K D | Ctrl+K D | skips-the-shell
+361 | StartDebugging | start_debugging | Debug: Start Debugging |  | F5 | F5 |
+362 | SelectDebugConfig | select_debug_config | Debug: Select and Start Debugging |  |  |  |
+363 | AddDebugConfig | add_debug_config | Debug: Add Configuration… |  |  |  |
+364 | StopDebugging | stop_debugging | Debug: Stop Debugging |  | Shift+F5 | Shift+F5 |
+365 | PauseDebugging | pause_debugging | Debug: Pause |  | F6 | F6 |
+366 | SwitchDebugSession | switch_debug_session | Debug: Switch Session |  | Cmd+Opt+Shift+G | Ctrl+Alt+Shift+G |
+367 | RestartDebugging | restart_debugging | Debug: Restart |  | Shift+Cmd+F5 | Shift+Ctrl+F5 |
+368 | ToggleBreakpoint | toggle_breakpoint | Debug: Toggle Breakpoint |  | F9 | F9 |
+369 | EditBreakpointCondition | edit_breakpoint_condition | Debug: Add Conditional Breakpoint |  | Shift+F9 | Shift+F9 |
+370 | EditLogpoint | edit_logpoint | Debug: Add Logpoint |  | Shift+Alt+F9 | Shift+Alt+F9 |
+371 | ShowIncomingCalls | show_incoming_calls | Calls: Show Incoming Calls |  | Cmd+K H | Ctrl+K H |
+372 | ShowOutgoingCalls | show_outgoing_calls | Calls: Show Outgoing Calls |  | Cmd+K Shift+H | Ctrl+K Shift+H |
+373 | ShowSupertypes | show_supertypes | Types: Show Supertypes |  | Cmd+K Shift+U | Ctrl+K Shift+U |
+374 | ShowSubtypes | show_subtypes | Types: Show Subtypes |  | Cmd+K Shift+D | Ctrl+K Shift+D |
+375 | ToggleCodeLens | toggle_code_lens | Editor: Toggle CodeLens |  |  |  |
+376 | RunCodeLens | run_code_lens | Editor: Run CodeLens on This Line |  | Cmd+K Shift+E | Ctrl+K Shift+E |
+377 | DebugAddHitCountBreakpoint | debug_add_hit_count_breakpoint | Debug: Add Hit Count Breakpoint |  |  |  |
+378 | DebugAddFunctionBreakpoint | debug_add_function_breakpoint | Debug: Add Function Breakpoint |  |  |  |
+379 | DebugRemoveFunctionBreakpoints | debug_remove_function_breakpoints | Debug: Remove All Function Breakpoints |  |  |  |
+380 | DebugRunToCursor | debug_run_to_cursor | Debug: Run to Cursor |  | Ctrl+F10 | Ctrl+F10 |
+381 | DebugBreakOnValueChange | debug_break_on_value_change | Debug: Break When Value Changes |  |  |  |
+382 | DebugRemoveDataBreakpoints | debug_remove_data_breakpoints | Debug: Remove All Data Breakpoints |  |  |  |
+383 | OpenSearchEditor | open_search_editor | Search: Open Results in Editor |  | Cmd+K Shift+F | Ctrl+K Shift+F |
+384 | RerunSearchEditor | rerun_search_editor | Search Editor: Rerun |  | Cmd+K Shift+R | Ctrl+K Shift+R |
+385 | RebaseAbort | rebase_abort | Rebase: Abort |  |  |  |
+386 | GitContinueOperation | git_continue_operation | Git: Continue Rebase, Cherry-Pick or Revert |  |  |  |
+387 | GitSkipOperation | git_skip_operation | Git: Skip Commit (Rebase, Cherry-Pick or Revert) |  |  |  |
+388 | GitAbortOperation | git_abort_operation | Git: Abort Merge, Rebase, Cherry-Pick, Revert or Bisect |  |  |  |
+389 | GitCreateTag | git_create_tag | Git: Create Tag |  |  |  |
+390 | GitPushTags | git_push_tags | Git: Push Tags |  |  |  |
+391 | GitDeleteRemoteTag | git_delete_remote_tag | Git: Delete Remote Tag |  |  |  |
+392 | GitCommit | git_commit | Git: Commit |  |  |  |
+393 | GitPush | git_push | Git: Push |  |  |  |
+394 | GitPull | git_pull | Git: Pull |  |  |  |
+395 | GitSync | git_sync | Git: Sync |  |  |  |
+396 | GitCheckoutTo | git_checkout_to | Git: Checkout to… |  |  |  |
+397 | GitStash | git_stash | Git: Stash |  |  |  |
+398 | GitShowSourceControlActions | git_show_source_control_actions | Git: Show Source Control Actions |  | Cmd+K Shift+A | Ctrl+K Shift+A |
+399 | GitShowCommitActions | git_show_commit_actions | Git: Show Commit Actions |  | Cmd+K Shift+C | Ctrl+K Shift+C |
+400 | GitOpenChanges | git_open_changes | Git: Open Changes |  | Enter in Source Control | Enter in Source Control |
+401 | GitStageChanges | git_stage_changes | Git: Stage Changes |  | S in Source Control | S in Source Control |
+402 | GitUnstageChanges | git_unstage_changes | Git: Unstage Changes |  | U in Source Control | U in Source Control |
+403 | GitDiscardChanges | git_discard_changes | Git: Discard Changes |  | D in Source Control | D in Source Control |
+404 | GitRefresh | git_refresh | Git: Refresh |  | R in Source Control | R in Source Control |
+405 | GitInitializeRepository | git_initialize_repository | Git: Initialize Repository |  | Enter in Source Control | Enter in Source Control |
+406 | ToggleTerminalSuggestions | toggle_terminal_suggestions | Terminal: Toggle Command Suggestions |  |  |  | skips-the-shell
+407 | ToggleScreenReader | toggle_screen_reader | Accessibility: Toggle Screen Reader Mode |  |  |  |
+408 | OpenKeyboardShortcuts | open_keyboard_shortcuts | Preferences: Open Keyboard Shortcuts |  | Cmd+K Cmd+S | Ctrl+K Ctrl+S |
+409 | SwitchProfile | switch_profile | Profiles: Switch Profile |  |  |  |
+410 | ToggleInlineSuggestions | toggle_inline_suggestions | Editor: Toggle Inline Suggestions |  | Cmd+K Shift+G | Ctrl+K Shift+G |
+411 | StepOver | step_over | Debug: Step Over |  | F10 | F10 |
+412 | ShowContextMenu | show_context_menu | View: Show Context Menu |  | Shift+F10 | Shift+F10 |
+413 | ContinueDebugging | continue | Debug: Continue |  | F5 | F5 |
+414 | StepInto | step_into | Debug: Step Into |  | F11 | F11 |
+415 | StepOut | step_out | Debug: Step Out |  | Shift+F11 | Shift+F11 |
+416 | StepIntoTarget | step_into_target | Debug: Step Into Target |  |  |  |
+417 | ToggleRaisedExceptions | toggle_raised_exceptions | Debug: Toggle Break on Raised Exceptions |  | Alt+F9 | Alt+F9 |
+418 | AttachPythonProcess | attach_python_process | Debug: Attach to Python Process |  | Ctrl+F5 | Ctrl+F5 |
+419 | RunTask | run_task | Tasks: Run Task |  |  |  |
+420 | RunBuildTask | run_build_task | Tasks: Run Build Task |  | Cmd+Shift+B | Ctrl+Shift+B |
+421 | RerunLastTask | rerun_last_task | Tasks: Rerun Last Task |  |  |  |
+422 | ColorTheme | color_theme | Preferences: Color Theme |  | Cmd+K Cmd+T | Ctrl+K Ctrl+T |
+423 | KeyboardShortcuts | keyboard_shortcuts | Help: Keyboard Shortcuts Reference |  | F1 | F1 |
+424 | UpdateCroft | update_croft | Help: Update croft (Relaunch or Rebuild) |  | Cmd+Shift+F9 | Ctrl+Shift+F9 |
+425 | OpenSettings | open_settings | Preferences: Open Settings |  |  |  |
+426 | OpenSettingsEditor | open_settings_editor | Preferences: Open Settings (UI) |  |  |  |
+427 | OpenSettingsJson | open_settings_json | Preferences: Open Settings (JSON) |  |  |  |
+428 | OpenWorkspaceSettingsJson | open_workspace_settings_json | Preferences: Open Workspace Settings (JSON) |  |  |  |
+429 | OpenWorkspaceSettingsLocalJson | open_workspace_settings_local_json | Preferences: Open Workspace Settings — Local (JSON) |  |  |  |
+430 | OpenKeybindingsJson | open_keybindings_json | Preferences: Open Keyboard Shortcuts (JSON) |  |  |  |
+431 | ConfigureSnippets | configure_snippets | Preferences: Configure User Snippets |  |  |  |
+432 | OpenTriggersJson | open_triggers_json | Preferences: Open Terminal Triggers (JSON) |  |  |  |
+433 | OpenAgentsJson | open_agents_json | Preferences: Open Agent Lanes (JSON) |  |  |  |
+434 | OpenMatchersJson | open_matchers_json | Preferences: Open Problem Matchers (JSON) |  |  |  |
+435 | ToggleTerminalTimestamps | toggle_terminal_timestamps | Terminal: Toggle Timestamps |  |  |  | skips-the-shell
+436 | ToggleLogHighlight | toggle_log_highlight | Log: Toggle Highlighting (tailspin) |  |  |  |
+437 | CollapseTerminalPane | collapse_terminal_pane | Terminal: Collapse Pane |  | Cmd+K [ | Ctrl+K [ | skips-the-shell
+438 | RestoreTerminalPanes | restore_terminal_panes | Terminal: Restore All Collapsed Panes |  | Cmd+K ] | Ctrl+K ] | skips-the-shell
+439 | ToggleSecretRedaction | toggle_secret_redaction | Terminal: Toggle Secret Redaction |  |  |  | skips-the-shell
+440 | RevealRedactedSecrets | reveal_redacted_secrets | Terminal: Reveal Redacted Secrets for 10s |  |  |  | skips-the-shell
+441 | SearchFromTerminal | search_from_terminal | Terminal: Search & Replace from Last grep/rg |  |  |  | skips-the-shell
+442 | SessionParticipants | session_participants | Session: Participants |  | Cmd+K A | Ctrl+K A |
+443 | SessionDetach | session_detach | Session: Detach |  | Cmd+K Shift+Q | Ctrl+K Shift+Q |
+444 | CollabCancelStream | collab_cancel_stream | Collab: Cancel AI Stream |  | Cmd+K X | Ctrl+K X |
+445 | AskNavigator | navigator_ask | Navigator: Ask About Line or Selection |  | Cmd+K Q | Ctrl+K Q |
+446 | AskNavigatorAboutCapture | captures_ask_navigator | Captures: Ask Navigator About This Line |  |  |  |
+447 | OpenWorkspaceOnSshHost | remote_open_workspace_on_ssh_host | Remote: Open Workspace on This Pane's Host |  |  |  |
+448 | ScrubHistory | scm_scrub_history | Source Control: Scrub History |  |  |  |
+449 | DebugInstallDelve | debug_install_delve | Debug: Install Go Debugger (delve) |  |  |  |
+450 | RemoteSyncConfigNow | remote_sync_config_now | Remote: Sync Config Now |  |  |  |
+451 | DropToLocal | drop_to_local | Remote: Drop to Local |  | Cmd+K L | Ctrl+K L |
+452 | StopAutoApprove | agents_stop_auto_approve | Agents: Stop Auto-Approving |  |  |  |
+453 | ScrubOpenHere | scm_scrub_open_here | Source Control: Open Scrubbed File Here |  |  |  |
+454 | ScrubDiffToWorkingTree | scm_scrub_diff_working_tree | Source Control: Diff Scrubbed File to Working Tree |  |  |  |
+455 | FleetRun | terminal_fleet_run | Terminal: Fleet Run |  |  |  | skips-the-shell
+456 | OpenAsSymbolTab | editor_open_symbol_tab | Editor: Open Symbol as Its Own Tab |  | Cmd+K Shift+V | Ctrl+K Shift+V |
+457 | LoadReviewThreads | review_load_threads | Review: Load PR Comments for This File |  |  |  |
+458 | ReviewAddComment | review_add_comment | Review: Add Comment on This Line |  |  |  |
+459 | ReviewSubmit | review_submit | Review: Submit Review |  |  |  |
+460 | ReviewToggleResolved | review_toggle_resolved | Review: Resolve or Unresolve Thread |  |  |  |
+461 | ReviewDiscardPending | review_discard_pending | Review: Discard Pending Comments |  |  |  |
+462 | ExportCommentsToPr | scm_export_comments_to_pr | Source Control: Export Comments to Pull Request |  |  |  |
+463 | NoteAdd | note_add | Notes: Add Note on This Line |  | Cmd+K N | Ctrl+K N |
+464 | NoteDelete | note_delete | Notes: Delete Note |  |  |  |
+465 | ToggleSessionRecording | session_toggle_recording | Session: Record Terminal as Asciicast |  |  |  |
+466 | NewWorktreeLane | agent_new_worktree_lane | Agent: New Worktree Lane |  | Cmd+K Shift+L | Ctrl+K Shift+L |
+467 | ReviewPullRequest | review_pull_request | Source Control: Review Pull Request |  |  |  |
+468 | CloseWorktreeLane | agent_close_worktree_lane | Agent: Close Worktree Lane |  |  |  |
+469 | DiffWorktreeLane | agent_diff_worktree_lane | Agent: Diff Lane Against Its Base |  |  |  |
+470 | MarkAgentLaneReviewed | agents_mark_reviewed | Agents: Mark Changed Files Reviewed |  |  |  |
+471 | ShowAgentLane | agents_show_lane | Agents: Show Changed Files |  |  |  |
+472 | OpenAgentLaneSection | agents_open_lane | Agents: Open Agent Lane |  |  |  |
+473 | MarkAgentFileReviewed | agents_mark_file_reviewed | Agents: Mark This File Reviewed |  |  |  |
+474 | DiffAgentFileSinceReview | agents_diff_since_review | Agents: Diff This File Since Review |  |  |  |
+475 | PickAgentLaneFile | agents_pick_changed_file | Agents: Review a Changed File… |  |  |  |
+476 | FixProblemWithNavigator | problems_fix_navigator | Problems: Fix With Navigator |  |  |  |
+477 | SendHttpRequest | http_send_request | HTTP: Send Request Under Caret |  | Cmd+Enter | Ctrl+Enter |
+478 | CopyHttpRequestAsCurl | http_copy_curl | HTTP: Copy Request as curl |  |  |  |
+479 | SwitchHttpEnvironment | http_switch_environment | HTTP: Switch Environment |  |  |  |
+480 | YieldToNavigator | navigator_yield | Navigator: Yield the Turn |  | Cmd+K Y | Ctrl+K Y |
+481 | ToggleNavigator | navigator_toggle | Navigator: Activate or Deactivate |  |  |  |
+482 | ClearNavigatorNotes | navigator_clear_notes | Navigator: Clear Comments |  |  |  |
+483 | ToggleProactiveNavigator | navigator_toggle_proactive | Navigator: Toggle Proactive Comments |  |  |  |
+484 | NextComment | navigator_next_comment | Navigator: Next Comment |  | F4 | F4 |
+485 | IgnoreComment | navigator_ignore_comment | Navigator: Ignore Comment |  | Shift+F4 | Shift+F4 |
 # Customize Layout, in the popup's order
 layout | CustomizeLayout
 layout | ToggleActivityBar

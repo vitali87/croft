@@ -2021,6 +2021,24 @@ impl App {
         }
     }
 
+    /// Put the minimap strip on `side` of the editor: the Side submenu's
+    /// rows, and View: Toggle Minimap Side (#871).
+    pub(super) fn set_minimap_side(&mut self, side: MinimapSide) {
+        self.minimap_side = side;
+        // The strip jumps columns: evict the old placement so it doesn't
+        // ghost, and force a rebake at the new position.
+        self.disable_minimap_image();
+    }
+
+    /// View: Toggle Minimap Side (`Cmd+K Shift+M`, #871): the strip to the
+    /// editor's other edge.
+    pub(super) fn toggle_minimap_side(&mut self) {
+        self.set_minimap_side(match self.minimap_side {
+            MinimapSide::Left => MinimapSide::Right,
+            MinimapSide::Right => MinimapSide::Left,
+        });
+    }
+
     /// Show/hide the editor minimap (⌥⌘M, the minimap right-click menu, the
     /// Customize Layout menu, and the "View: Toggle Minimap" palette command
     /// all route here). Hiding evicts the cached strip image so it can't ghost.

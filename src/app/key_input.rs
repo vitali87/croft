@@ -312,6 +312,39 @@ impl App {
                 self.split_editor_dir(editor_layout::SplitDir::Vertical, false);
                 true
             }
+            // Cmd+K Shift+arrow: move the active tab into the group on that
+            // side, or into a new group there (View: Move Editor into Left
+            // Group and its siblings, #871). VS Code binds none of the four;
+            // its Cmd+K Shift+Cmd+← / → (move the tab within its group) keep
+            // the Cmd, so they stay free. Before the Cmd+K → arm, which
+            // ignores Shift.
+            KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
+                if shifted && plain && !cmd_held =>
+            {
+                self.move_active_editor(match key.code {
+                    KeyCode::Left => editor_layout::Dir::Left,
+                    KeyCode::Right => editor_layout::Dir::Right,
+                    KeyCode::Up => editor_layout::Dir::Up,
+                    _ => editor_layout::Dir::Down,
+                });
+                true
+            }
+            // Cmd+K Opt+arrow: split the editor toward that side, as
+            // Cmd+Opt+arrow focuses the group there (#871): Opt+↓ and Opt+←
+            // are View: Split Editor Down / Left, Opt+↑ and Opt+→ the same
+            // as Split Up and Split Right. Cmd may still be held from the
+            // leader.
+            KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down if !plain && !shifted => {
+                match key.code {
+                    KeyCode::Up => self.split_editor_dir(editor_layout::SplitDir::Vertical, false),
+                    KeyCode::Down => self.split_editor_dir(editor_layout::SplitDir::Vertical, true),
+                    KeyCode::Left => {
+                        self.split_editor_dir(editor_layout::SplitDir::Horizontal, false)
+                    }
+                    _ => self.split_editor(),
+                }
+                true
+            }
             // Cmd+K →: close the editors to the right of the active tab.
             KeyCode::Right if plain => {
                 self.close_tabs_to_right(self.editor.active_index());
@@ -374,11 +407,7 @@ impl App {
             }
             // Cmd+K E: reveal the active file in the Explorer tree.
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'e') => {
-                if let Some(path) = self.editor.path.clone() {
-                    self.reveal_in_explorer(path);
-                } else {
-                    self.status = String::from("Reveal in Explorer View: no active file");
-                }
+                self.reveal_active_file_in_explorer();
                 true
             }
             // Cmd+K Shift+H: outgoing calls (what does this call?). Must
@@ -490,6 +519,12 @@ impl App {
                     self.show_terminal = true;
                 }
                 self.begin_rename_terminal(self.active_terminal);
+                true
+            }
+            // Cmd+K Shift+M: View: Toggle Minimap Side (#871), the strip to
+            // the editor's other edge. Before the case-insensitive M arm.
+            KeyCode::Char(c) if shifted && plain && !cmd_held && c.eq_ignore_ascii_case(&'m') => {
+                self.toggle_minimap_side();
                 true
             }
             // Cmd+K M: maximize the active terminal pane / restore the even

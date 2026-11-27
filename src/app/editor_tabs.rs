@@ -1927,6 +1927,16 @@ impl App {
         self.status = format!("Copied relative path: {text}{}", landing.note());
     }
 
+    /// File: Reveal Active File in Explorer View (`Cmd+K E`): the active
+    /// tab's file, selected in the Explorer.
+    pub(super) fn reveal_active_file_in_explorer(&mut self) {
+        if let Some(path) = self.editor.path.clone() {
+            self.reveal_in_explorer(path);
+        } else {
+            self.status = String::from("Reveal in Explorer View: no active file");
+        }
+    }
+
     /// Reveal `path` (an editor tab's file) in the Explorer tree: switch the
     /// side bar to the Explorer, expand the file's parent folders, select its
     /// row, and focus the tree. Shared by the tab context menu and the

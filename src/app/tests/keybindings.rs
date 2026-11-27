@@ -2733,6 +2733,51 @@ fn cmd_k_shift_backslash_chord_splits_in_group() {
     );
 }
 
+/// Cmd+K then the leader's second key, as the chord tests above press it.
+fn cmd_k_then(app: &mut App, second: KeyEvent) {
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(app.cmd_k_leader.is_some(), "Cmd+K arms the chord leader");
+    app.handle_key(second).unwrap();
+}
+
+/// Cmd+K Opt+arrow splits toward that side (#871), as Cmd+Opt+arrow focuses
+/// the group there: the new group is on the arrow's side and has focus.
+#[test]
+fn cmd_k_opt_arrows_split_the_editor_toward_the_arrow() {
+    for (arrow, dir, first) in [
+        (KeyCode::Up, editor_layout::SplitDir::Vertical, true),
+        (KeyCode::Down, editor_layout::SplitDir::Vertical, false),
+        (KeyCode::Left, editor_layout::SplitDir::Horizontal, true),
+        (KeyCode::Right, editor_layout::SplitDir::Horizontal, false),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_open_file(tmp.path(), "a.txt", "hi");
+        cmd_k_then(&mut app, key(arrow, KeyModifiers::ALT));
+        assert_eq!(app.editor_layout.root_split_dir(), Some(dir), "{arrow:?}");
+        assert_eq!(
+            app.editor_layout.active_dfs_index(),
+            if first { 0 } else { 1 },
+            "Cmd+K Opt+{arrow:?}: the new group is on that side"
+        );
+    }
+}
+
+/// Cmd+K Shift+M is View: Toggle Minimap Side (#871): each press moves the
+/// strip to the other edge.
+#[test]
+fn cmd_k_shift_m_moves_the_minimap_to_the_other_edge() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "hi");
+    let start = app.minimap_side;
+    let shift_m = key(KeyCode::Char('M'), KeyModifiers::SHIFT);
+    cmd_k_then(&mut app, shift_m);
+    assert!(app.minimap_side != start, "the first press moves it");
+    assert!(!app.terminal_maximized, "not Cmd+K M's terminal maximize");
+    cmd_k_then(&mut app, shift_m);
+    assert!(app.minimap_side == start, "the second press moves it back");
+}
+
 #[test]
 fn editor_split_key_is_cmd_backslash_only() {
     assert!(is_editor_split_key(key(

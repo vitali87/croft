@@ -542,6 +542,36 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "",
             },
             ShortcutEntry {
+                keys: "Cmd+K Cmd+\\ / Cmd+K Opt+↓ / Cmd+K Opt+←",
+                description: "Split the editor up / down / left: the active file in a new group on that side; Cmd+K Opt+↑ / → split up / right too (palette: View: Split Editor Up / Down / Left)",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd+K Shift+Cmd+\\",
+                description: "A second view of the active file beside it in the same group (palette: View: Split Editor in Group)",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd+K Shift+← / Cmd+K Shift+→ / Cmd+K Shift+↑ / Cmd+K Shift+↓",
+                description: "Move the active tab into the group on that side, opening one there if there is none (palette: View: Move Editor into Left / Right Group, Group Above / Below)",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd+K O / Cmd+K Shift+O",
+                description: "Copy / move the active file into a new window, macOS only (palette: View: Copy / Move Editor into New Window)",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd+K E",
+                description: "Show the active file in the Explorer, its row selected (palette: File: Reveal Active File in Explorer View)",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd+K Shift+M",
+                description: "Move the minimap to the editor's other edge (palette: View: Toggle Minimap Side)",
+                handler: "",
+            },
+            ShortcutEntry {
                 keys: "Cmd+K Shift+X",
                 description: "Close the other tabs of this group, keeping pinned and unsaved ones (palette: View: Close Other Editors in Group)",
                 handler: "",
