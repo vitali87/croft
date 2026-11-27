@@ -856,9 +856,9 @@ impl App {
                             .stdin(std::process::Stdio::null())
                             .stdout(std::process::Stdio::null())
                             .stderr(std::process::Stdio::null());
-                        crate::review_ops::retry_while_busy(
+                        crate::proc::retry_while_busy(
                             || probe.status(),
-                            |r| r.as_ref().is_err_and(crate::review_ops::text_file_busy),
+                            |r| r.as_ref().is_err_and(crate::proc::text_file_busy),
                         )
                         .err()
                         .map(|e| crate::gh::spawn_error(&e, Some(root)))
@@ -1786,7 +1786,7 @@ impl App {
         let root = self.active_workspace_root();
         let mut cmd = std::process::Command::new(&self.gh_program);
         cmd.args(args).current_dir(&root);
-        let out = crate::review_ops::output_retrying_busy(&mut cmd)
+        let out = crate::proc::output_retrying_busy(&mut cmd)
             .map_err(|e| crate::gh::spawn_error(&e, Some(root.as_path())))?;
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         if out.status.success() {
@@ -1827,10 +1827,10 @@ pub(super) fn bounded_output(
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
-    let mut child = crate::review_ops::retry_while_busy(
+    let mut child = crate::proc::retry_while_busy(
         || cmd.spawn(),
         |r| {
-            r.as_ref().is_err_and(crate::review_ops::text_file_busy)
+            r.as_ref().is_err_and(crate::proc::text_file_busy)
                 && std::time::Instant::now() < deadline
         },
     )
