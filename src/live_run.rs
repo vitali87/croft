@@ -469,15 +469,17 @@ fn run(job: &Job) -> Result<Report, String> {
     let mut source = job.lines.join("\n");
     source.push('\n');
     let limit = RUN_BUDGET + KILL_GRACE;
-    // Its own process group, so the kill at the deadline also takes down
-    // anything the script started (a server, `sleep` in a subprocess). The
-    // source goes in on stdin only as fast as the interpreter reads it, and
-    // stderr is drained while it runs, so neither a script that never reads
-    // nor one that floods stderr can hold the run past the deadline.
+    // A session of its own, so what the script started (a server, `sleep`
+    // in a subprocess) is killed with it when it ends, on time or at the
+    // deadline: Live Run re-runs on every pause in typing, and each run left
+    // one more behind (#2776). The source goes in on stdin only as fast as
+    // the interpreter reads it, and stderr is drained while it runs, so
+    // neither a script that never reads nor one that floods stderr can hold
+    // the run past the deadline.
     crate::proc::Bounded {
         stdout: crate::proc::Keep::Nothing,
         stderr: crate::proc::Keep::Tail(STDERR_TAIL),
-        apart: crate::proc::Apart::Group,
+        apart: crate::proc::Apart::Session,
         limit,
         retry_busy: false,
     }
@@ -716,5 +718,65 @@ mod tests {
         let r = run(&job).expect("reports instead of being killed");
         assert!(started.elapsed() < RUN_BUDGET);
         assert_eq!(r.notes[&2][0].0, "n = 4");
+    }
+
+    /// What a script starts and leaves running is killed when its run ends,
+    /// not left behind: Live Run re-runs the file on every pause in typing,
+    /// so a script that starts a server would otherwise leave one more each
+    /// time (#2776).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn what_a_script_leaves_running_is_killed_when_it_ends() {
+        let Ok(out) = Command::new("python3").arg("--version").output() else {
+            return;
+        };
+        if !out.status.success() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("helper.pid");
+        let job = Job {
+            path: dir.path().join("server.py"),
+            lines: vec![
+                String::from("import subprocess"),
+                String::from(
+                    "p = subprocess.Popen(['sleep', '30'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)",
+                ),
+                format!(
+                    "open({:?}, 'w').write(str(p.pid))",
+                    pid_file.display().to_string()
+                ),
+                String::from("n = 1"),
+            ],
+            python: PathBuf::from("python3"),
+        };
+        run(&job).expect("the script reports");
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        let alive = |pid: i32| {
+            // SAFETY: signal 0 only asks whether the process exists.
+            let exists = unsafe { libc::kill(pid, 0) } == 0;
+            let zombie = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    let after = stat.rsplit_once(')')?.1.to_owned();
+                    after.split_whitespace().next().map(|state| state == "Z")
+                })
+                .unwrap_or(false);
+            exists && !zombie
+        };
+        while alive(pid) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let left = alive(pid);
+        if left {
+            // SAFETY: a plain signal to the helper this test's script started.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(!left, "the script's helper outlived its run");
     }
 }
