@@ -75,14 +75,16 @@ impl App {
     /// visible run is the consent, as for a coverage tool. Without Go there
     /// is nothing to run it with, so it says that instead.
     pub(in crate::app) fn install_delve(&mut self) {
-        if !crate::dap::install::go_on_path() {
+        let Some(go) = crate::proc::find::go() else {
             self.status = crate::dap::install::dlv_missing_message(false);
             return;
-        }
+        };
         match crate::widgets::terminal::PtyTerminal::new(self.roots.primary()) {
             Ok(mut term) => {
                 term.set_manual_name(Some(String::from("delve install")));
-                term.write_input(format!("{}\r", crate::dap::install::DLV_INSTALL).as_bytes());
+                term.write_input(
+                    format!("{}\r", crate::dap::install::dlv_install_command(&go)).as_bytes(),
+                );
                 self.insert_terminal(term);
                 self.show_terminal = true;
                 self.focus_pane(Pane::Terminal);

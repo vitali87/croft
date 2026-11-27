@@ -7,13 +7,7 @@ use super::*;
 /// Homebrew put it — absolute for the same GUI-stripped-PATH reason as
 /// [`cargo_cmd`].
 pub(super) fn go_binary() -> PathBuf {
-    let path_dirs = std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
-        .unwrap_or_default();
-    let dirs = path_dirs
-        .into_iter()
-        .chain(["/usr/local/go/bin", "/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from));
-    crate::proc::find::first_in("go", dirs).unwrap_or_else(|| PathBuf::from("go"))
+    crate::proc::find::go().unwrap_or_else(|| PathBuf::from("go"))
 }
 
 /// `go test -json <args>` in `root` (#264).

@@ -50,6 +50,27 @@ pub(crate) fn on_path(name: &str) -> Option<PathBuf> {
     on_path_in(name, std::env::var_os("PATH").as_deref())
 }
 
+/// Where Go's installers put `go` when croft's `PATH` lacks it (#2807): the
+/// official installer's folder, then Homebrew's and the usual local prefix.
+/// A launcher's `PATH` often has none of them.
+const GO_HOMES: [&str; 3] = ["/usr/local/go/bin", "/opt/homebrew/bin", "/usr/local/bin"];
+
+/// The `go` every feature uses (#2807): the Testing view's `go test`, the
+/// Go language server's install and the Go debugger's all ask here, so a Go
+/// that runs tests also installs gopls and delve.
+pub(crate) fn go() -> Option<PathBuf> {
+    go_in(
+        std::env::var_os("PATH").as_deref(),
+        &GO_HOMES.map(PathBuf::from),
+    )
+}
+
+/// [`go`] on the `PATH` value `path_var`, then in `homes`.
+pub(crate) fn go_in(path_var: Option<&OsStr>, homes: &[PathBuf]) -> Option<PathBuf> {
+    let on_path = path_var.map(std::env::split_paths).into_iter().flatten();
+    first_in("go", on_path.chain(homes.iter().cloned()))
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -100,5 +121,22 @@ mod tests {
         );
         assert_eq!(on_path_in("cargo", None), None);
         assert_eq!(first_in("cargo", [&first]), None);
+    }
+
+    /// #2807: Go is found on PATH first, then where its installers put it,
+    /// so a launcher's PATH without the official installer's folder still
+    /// finds the Go installed there.
+    #[test]
+    fn go_is_found_on_path_then_where_its_installers_put_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (on_path, official) = (tmp.path().join("bin"), tmp.path().join("go/bin"));
+        file(&official.join("go"), 0o755);
+        let path_var = std::env::join_paths([&on_path]).unwrap();
+        let homes = [official.clone()];
+        assert_eq!(go_in(Some(&path_var), &homes), Some(official.join("go")));
+        assert_eq!(go_in(None, &homes), Some(official.join("go")));
+        file(&on_path.join("go"), 0o755);
+        assert_eq!(go_in(Some(&path_var), &homes), Some(on_path.join("go")));
+        assert_eq!(go_in(None, &[]), None);
     }
 }

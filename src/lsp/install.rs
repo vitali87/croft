@@ -374,7 +374,7 @@ pub fn provisioned_command(name: &str, provision: &Provision) -> Option<(String,
 /// npm and uv report their own missing tools once an install is tried.
 pub(crate) fn missing_installer(provision: &Provision) -> Option<&'static str> {
     match provision {
-        Provision::Go { .. } if !crate::lsp::manager::is_on_path("go") => Some("go"),
+        Provision::Go { .. } if crate::proc::find::go().is_none() => Some("go"),
         _ => None,
     }
 }
@@ -1097,11 +1097,13 @@ pub fn ensure_in_background(config: &ServerConfig, provision: &Provision) {
 /// pinned release needs one (unless `GOTOOLCHAIN=local` forbids it, which
 /// fails here with go's own explanation in the log and OUTPUT).
 fn run_go_install(name: &'static str, language: Language, package: &str, version: Option<&str>) {
-    if !crate::lsp::manager::is_on_path("go") {
+    // The Go the Testing view runs, found where its installers put it too
+    // (#2807): not on croft's PATH is no reason to say Go is missing.
+    let Some(go) = crate::proc::find::go() else {
         log_file::log(&format!("lsp[{name}] cannot auto-install: no `go` found"));
         set_status(format!("{name} unavailable: install Go (go not found)"));
         return;
-    }
+    };
     let Some(gobin) = servers_dir().map(|d| go_bin_dir(&d, name, version)) else {
         return;
     };
@@ -1120,7 +1122,7 @@ fn run_go_install(name: &'static str, language: Language, package: &str, version
         &format!("{name}: go install {spec}"),
     );
     set_status(format!("Installing {name} (go install)"));
-    let output = Command::new("go")
+    let output = Command::new(&go)
         .arg("install")
         .arg(&spec)
         .env("GOBIN", &gobin)

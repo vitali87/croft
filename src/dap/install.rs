@@ -501,12 +501,35 @@ pub fn find_dlv(
 /// delve refuses a Go older than it supports (1.27 wants Go 1.25 or later),
 /// so Go 1.24 and older get delve 1.25.2, the last release that takes them,
 /// and anything newer gets `@latest`. Wrapped in `sh -c`, since it is typed
-/// into whatever shell the pane runs, fish included.
-pub const DLV_INSTALL: &str = "sh -c 'case \"$(go env GOVERSION)\" in go1.[0-9]|go1.[0-9].*|go1.1[0-9]*|go1.2[0-4]*) v=v1.25.2 ;; *) v=latest ;; esac; GOBIN=\"$HOME/.croft/servers/go\" go install github.com/go-delve/delve/cmd/dlv@$v'";
+/// into whatever shell the pane runs, fish included. It runs `go`, the Go
+/// croft found ([`crate::proc::find::go`], #2807), by its path: the pane's
+/// shell may not have the official installer's folder on its `PATH`.
+pub fn dlv_install_command(go: &Path) -> String {
+    let go = sh_double_quoted(&go.to_string_lossy());
+    let script = format!(
+        "case \"$({go} env GOVERSION)\" in go1.[0-9]|go1.[0-9].*|go1.1[0-9]*|go1.2[0-4]*) v=v1.25.2 ;; *) v=latest ;; esac; GOBIN=\"$HOME/.croft/servers/go\" {go} install github.com/go-delve/delve/cmd/dlv@$v"
+    );
+    format!("sh -c '{}'", script.replace('\'', "'\\''"))
+}
 
-/// Whether the `go` toolchain is on PATH: installing delve needs it.
+/// `text` in double quotes for `sh`, with what is special inside them
+/// escaped.
+fn sh_double_quoted(text: &str) -> String {
+    let mut quoted = String::from("\"");
+    for c in text.chars() {
+        if matches!(c, '"' | '\\' | '$' | '`') {
+            quoted.push('\\');
+        }
+        quoted.push(c);
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// Whether there is a Go to install delve with: the one every feature
+/// uses ([`crate::proc::find::go`], #2807).
 pub fn go_on_path() -> bool {
-    which("go")
+    crate::proc::find::go().is_some()
 }
 
 /// Why Go debugging cannot start, and the next step. Without Go there is
@@ -600,10 +623,11 @@ mod tests {
             )
             .unwrap();
             std::fs::set_permissions(&go, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // Not on PATH: the command names the Go croft found (#2807).
             let ok = std::process::Command::new("sh")
                 .arg("-c")
-                .arg(DLV_INSTALL)
-                .env("PATH", format!("{}:/usr/bin:/bin", tmp.path().display()))
+                .arg(dlv_install_command(&go))
+                .env("PATH", "/usr/bin:/bin")
                 .env("HOME", tmp.path())
                 .status()
                 .unwrap()
@@ -660,8 +684,12 @@ mod tests {
         let without = dlv_missing_message(false);
         assert!(without.contains("installing delve needs Go"));
         assert!(without.contains("https://go.dev/dl"));
-        // The install lands where find_dlv looks last.
-        assert!(DLV_INSTALL.contains("GOBIN=\"$HOME/.croft/servers/go\" go install "));
+        // The install lands where find_dlv looks last, built by the Go
+        // croft found.
+        assert!(
+            dlv_install_command(Path::new("/usr/local/go/bin/go"))
+                .contains("GOBIN=\"$HOME/.croft/servers/go\" \"/usr/local/go/bin/go\" install ")
+        );
     }
 
     /// An empty program at `path` that can run.
