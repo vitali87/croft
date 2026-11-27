@@ -11,10 +11,11 @@ pub fn push_current_branch(root: &Path) -> Result<String, String> {
     let path_str = root
         .to_str()
         .ok_or_else(|| "non-utf8 workspace path".to_string())?;
-    let mut cmd = crate::proc::command("git");
-    cmd.args(["-C", path_str, "push"]);
-    never_prompt(&mut cmd);
-    let output = cmd
+    let output = Git::new()
+        .at(path_str)
+        .arg("push")
+        .never_prompting()
+        .into_command()
         .output()
         .map_err(|e| format!("failed to spawn git: {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
