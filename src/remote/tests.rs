@@ -172,7 +172,7 @@ fn a_read_still_keeps_ssh_off_the_terminal() {
     let mut cmd = ssh_socket_read(&bin.path().join("ctl"), "box", "cat && echo done >&2");
     assert!(cmd.get_args().any(|a| a == "-n"));
     // Started as croft starts its reads, waiting out "Text file busy" (#2560).
-    let out = crate::review_ops::spawn_retrying_busy(&mut cmd)
+    let out = crate::proc::spawn_retrying_busy(&mut cmd)
         .and_then(std::process::Child::wait_with_output)
         .unwrap();
     assert!(out.stdout.is_empty());

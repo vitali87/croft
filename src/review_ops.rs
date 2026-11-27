@@ -132,46 +132,6 @@ fn gh_error(out: &std::process::Output) -> String {
     err.trim().lines().next().unwrap_or("gh failed").to_string()
 }
 
-/// Spawn `cmd`, trying again for a moment while its program is "Text file
-/// busy" (ETXTBSY). A file just written is busy while any process forked
-/// meanwhile still holds the write descriptor, until that child execs,
-/// which takes microseconds. A freshly installed or updated `gh` can hit it,
-/// and a test's stand-in script hits it whenever another test forks.
-pub(crate) fn spawn_retrying_busy(cmd: &mut Command) -> std::io::Result<std::process::Child> {
-    retry_while_busy(|| cmd.spawn(), |r| r.as_ref().is_err_and(text_file_busy))
-}
-
-/// [`Command::output`] through [`spawn_retrying_busy`]: stdin closed, stdout
-/// and stderr captured, waiting out a moment of "Text file busy".
-pub(crate) fn output_retrying_busy(cmd: &mut Command) -> std::io::Result<std::process::Output> {
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    spawn_retrying_busy(cmd)?.wait_with_output()
-}
-
-/// Whether a spawn failed because its program is "Text file busy" (ETXTBSY).
-pub(crate) fn text_file_busy(e: &std::io::Error) -> bool {
-    const ETXTBSY: i32 = 26;
-    e.raw_os_error() == Some(ETXTBSY)
-}
-
-/// Call `attempt` again, 10 ms apart and at most 50 more times, while `busy`
-/// says its result is a moment of "Text file busy". Nothing `attempt` takes
-/// is held across the pause, so a caller that spawns under a lock lets
-/// others in between tries.
-pub(crate) fn retry_while_busy<R>(mut attempt: impl FnMut() -> R, busy: impl Fn(&R) -> bool) -> R {
-    let mut tries = 0;
-    loop {
-        let result = attempt();
-        if tries >= 50 || !busy(&result) {
-            return result;
-        }
-        tries += 1;
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-}
-
 fn gh(program: &str, root: &Path, args: &[&str], stdin: Option<&str>) -> Result<String, String> {
     let mut cmd = Command::new(program);
     cmd.args(args)
@@ -183,8 +143,8 @@ fn gh(program: &str, root: &Path, args: &[&str], stdin: Option<&str>) -> Result<
         } else {
             Stdio::null()
         });
-    let mut child =
-        spawn_retrying_busy(&mut cmd).map_err(|e| crate::gh::spawn_error(&e, Some(root)))?;
+    let mut child = crate::proc::spawn_retrying_busy(&mut cmd)
+        .map_err(|e| crate::gh::spawn_error(&e, Some(root)))?;
     if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
         let _ = pipe.write_all(input.as_bytes());
     }
@@ -423,7 +383,7 @@ mod tests {
         });
         let mut cmd = Command::new(&path);
         cmd.stdout(Stdio::piped());
-        let out = spawn_retrying_busy(&mut cmd)
+        let out = crate::proc::spawn_retrying_busy(&mut cmd)
             .unwrap()
             .wait_with_output()
             .unwrap();

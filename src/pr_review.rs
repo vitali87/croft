@@ -201,7 +201,7 @@ pub fn run_gh(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    let mut child = crate::review_ops::spawn_retrying_busy(&mut cmd)
+    let mut child = crate::proc::spawn_retrying_busy(&mut cmd)
         .map_err(|e| crate::gh::spawn_error(&e, Some(cwd)))?;
     // Drained while it runs: a log larger than a pipe buffer would
     // otherwise block gh on its write until the deadline.

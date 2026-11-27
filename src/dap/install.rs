@@ -201,7 +201,7 @@ pub(crate) fn run_bounded(mut cmd: Command, timeout: Duration) -> Option<String>
     // A program written a moment ago (a test's stand-in interpreter) is "Text
     // file busy" while another thread's forked child still holds its write
     // descriptor; that read as "no version" instead of waiting it out.
-    let mut child = crate::review_ops::spawn_retrying_busy(
+    let mut child = crate::proc::spawn_retrying_busy(
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null()),

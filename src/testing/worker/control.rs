@@ -48,7 +48,7 @@ impl RunControl {
     pub(super) fn spawn(&self, request: u64, cmd: &mut Command) -> Option<std::io::Result<Child>> {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
-        crate::review_ops::retry_while_busy(
+        crate::proc::retry_while_busy(
             || {
                 let mut running = self.running();
                 if self.is_cancelled(request) {
@@ -60,7 +60,7 @@ impl RunControl {
                 }
                 Some(child)
             },
-            |r| matches!(r, Some(Err(e)) if crate::review_ops::text_file_busy(e)),
+            |r| matches!(r, Some(Err(e)) if crate::proc::text_file_busy(e)),
         )
     }
 

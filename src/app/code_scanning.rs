@@ -820,7 +820,7 @@ impl App {
                 cmd.args(github::analyses_args(git_ref))
                     .current_dir(&root)
                     .stdin(std::process::Stdio::null());
-                let out = crate::review_ops::output_retrying_busy(&mut cmd)
+                let out = crate::proc::output_retrying_busy(&mut cmd)
                     .map_err(|e| crate::gh::spawn_error(&e, Some(root.as_path())))?;
                 if crate::gh::signed_out(out.status) {
                     return Err(String::from(crate::gh::SIGNED_OUT));
@@ -937,7 +937,7 @@ impl App {
                     cmd.args(crate::sarif::github::sarif_args(a.id))
                         .current_dir(&root)
                         .stdin(std::process::Stdio::null());
-                    let out = crate::review_ops::output_retrying_busy(&mut cmd)
+                    let out = crate::proc::output_retrying_busy(&mut cmd)
                         .map_err(|e| crate::gh::spawn_error(&e, Some(root.as_path())))?;
                     if crate::gh::signed_out(out.status) {
                         return Err(String::from(crate::gh::SIGNED_OUT));

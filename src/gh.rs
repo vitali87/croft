@@ -56,7 +56,7 @@ fn succeeds(program: &str, args: &[&str]) -> Result<bool, String> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    crate::review_ops::spawn_retrying_busy(&mut cmd)
+    crate::proc::spawn_retrying_busy(&mut cmd)
         .and_then(|mut child| child.wait())
         .map(|status| status.success())
         .map_err(|e| spawn_error(&e, None))
@@ -95,7 +95,7 @@ fn any_host_signed_in(program: &str) -> Result<bool, String> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let out = crate::review_ops::spawn_retrying_busy(&mut cmd)
+    let out = crate::proc::spawn_retrying_busy(&mut cmd)
         .and_then(|child| child.wait_with_output())
         .map_err(|e| spawn_error(&e, None))?;
     let says = |b: &[u8]| String::from_utf8_lossy(b).contains("Logged in to");

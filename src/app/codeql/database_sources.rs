@@ -293,7 +293,7 @@ impl App {
                     "--jq",
                     ".[].language",
                 ]);
-                let out = crate::review_ops::output_retrying_busy(&mut cmd).map_err(|e| {
+                let out = crate::proc::output_retrying_busy(&mut cmd).map_err(|e| {
                     format!(
                         "Could not look up {repo}'s CodeQL databases: {}",
                         crate::gh::spawn_error(&e, None)
@@ -338,7 +338,7 @@ impl App {
             .stdin(std::process::Stdio::null())
             .stdout(file)
             .stderr(std::process::Stdio::piped());
-        let out = crate::review_ops::spawn_retrying_busy(&mut cmd)
+        let out = crate::proc::spawn_retrying_busy(&mut cmd)
             .and_then(std::process::Child::wait_with_output)
             .map_err(|e| {
                 let _ = std::fs::remove_file(&tmp);

@@ -7,7 +7,7 @@
 //! named.
 
 use std::ffi::OsString;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 #[cfg(test)]
 pub(crate) mod record;
@@ -25,6 +25,46 @@ pub fn program(name: &str) -> OsString {
 /// A [`Command`] for [`program`]`(name)`.
 pub fn command(name: &str) -> Command {
     Command::new(program(name))
+}
+
+/// Spawn `cmd`, trying again for a moment while its program is "Text file
+/// busy" (ETXTBSY). A file just written is busy while any process forked
+/// meanwhile still holds the write descriptor, until that child execs,
+/// which takes microseconds. A freshly installed or updated `gh` can hit it,
+/// and a test's stand-in script hits it whenever another test forks.
+pub(crate) fn spawn_retrying_busy(cmd: &mut Command) -> std::io::Result<std::process::Child> {
+    retry_while_busy(|| cmd.spawn(), |r| r.as_ref().is_err_and(text_file_busy))
+}
+
+/// [`Command::output`] through [`spawn_retrying_busy`]: stdin closed, stdout
+/// and stderr captured, waiting out a moment of "Text file busy".
+pub(crate) fn output_retrying_busy(cmd: &mut Command) -> std::io::Result<std::process::Output> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    spawn_retrying_busy(cmd)?.wait_with_output()
+}
+
+/// Whether a spawn failed because its program is "Text file busy" (ETXTBSY).
+pub(crate) fn text_file_busy(e: &std::io::Error) -> bool {
+    const ETXTBSY: i32 = 26;
+    e.raw_os_error() == Some(ETXTBSY)
+}
+
+/// Call `attempt` again, 10 ms apart and at most 50 more times, while `busy`
+/// says its result is a moment of "Text file busy". Nothing `attempt` takes
+/// is held across the pause, so a caller that spawns under a lock lets
+/// others in between tries.
+pub(crate) fn retry_while_busy<R>(mut attempt: impl FnMut() -> R, busy: impl Fn(&R) -> bool) -> R {
+    let mut tries = 0;
+    loop {
+        let result = attempt();
+        if tries >= 50 || !busy(&result) {
+            return result;
+        }
+        tries += 1;
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 #[cfg(test)]
@@ -49,7 +89,6 @@ pub(crate) fn stand_in(name: &str, path: std::path::PathBuf) {
 #[cfg(all(test, unix))]
 pub(crate) fn stand_in_script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
-    use std::process::Stdio;
     let path = dir.join(name);
     std::fs::write(
         &path,
@@ -57,7 +96,7 @@ pub(crate) fn stand_in_script(dir: &std::path::Path, name: &str, body: &str) -> 
     )
     .unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let ready = crate::review_ops::retry_while_busy(
+    let ready = retry_while_busy(
         || {
             Command::new(&path)
                 .arg("--stand-in-ready")
@@ -66,7 +105,7 @@ pub(crate) fn stand_in_script(dir: &std::path::Path, name: &str, body: &str) -> 
                 .stderr(Stdio::null())
                 .status()
         },
-        |r| r.as_ref().is_err_and(crate::review_ops::text_file_busy),
+        |r| r.as_ref().is_err_and(text_file_busy),
     );
     assert!(
         ready.as_ref().is_ok_and(|s| s.success()),
