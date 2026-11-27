@@ -393,24 +393,22 @@ pub fn pick_theme<'a>(
 
 /// Download the `.vsix` for `id` into `dir`, returning the file's path.
 pub fn download_vsix(id: &ExtensionId, dir: &Path) -> Result<PathBuf> {
-    use std::io::Read;
     let url = match id.vsix_url() {
         Some(url) => url,
         None => resolve_open_vsx_download(id)?,
     };
     let resp = get_checked(&url).with_context(|| format!("downloading {url}"))?;
     let dest = dir.join(format!("{}.{}.vsix", id.publisher, id.name));
-    let mut bytes = Vec::new();
-    resp.into_reader()
-        .take(MAX_VSIX_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .context("reading the .vsix body")?;
-    if bytes.len() as u64 > MAX_VSIX_BYTES {
-        bail!(
-            "refusing a .vsix larger than {} bytes — that is not a theme",
-            MAX_VSIX_BYTES
-        );
-    }
+    let bytes = crate::net::read_capped(resp.into_reader(), MAX_VSIX_BYTES).map_err(|e| {
+        if crate::net::too_large(&e) {
+            anyhow::anyhow!(
+                "refusing a .vsix larger than {} bytes — that is not a theme",
+                MAX_VSIX_BYTES
+            )
+        } else {
+            anyhow::Error::new(e).context("reading the .vsix body")
+        }
+    })?;
     let bytes = gunzip_if_needed(bytes)?;
     std::fs::write(&dest, &bytes).with_context(|| format!("writing {}", dest.display()))?;
     Ok(dest)
@@ -626,13 +624,11 @@ fn get_checked(url: &str) -> Result<ureq::Response> {
 /// elsewhere would otherwise walk the download straight off the boundary
 /// `parse_ref` exists to draw.
 fn resolve_open_vsx_download(id: &ExtensionId) -> Result<String> {
-    use std::io::Read;
     let meta_url = id.metadata_url();
     let resp = get_checked(&meta_url).with_context(|| format!("looking up {meta_url}"))?;
-    let mut body = String::new();
-    resp.into_reader()
-        .take(MAX_MEMBER_BYTES + 1)
-        .read_to_string(&mut body)
+    let body = crate::net::read_capped(resp.into_reader(), MAX_MEMBER_BYTES)
+        .map_err(anyhow::Error::new)
+        .and_then(|bytes| String::from_utf8(bytes).map_err(anyhow::Error::new))
         .context("reading the Open VSX metadata")?;
     let doc: serde_json::Value =
         serde_json::from_str(&body).context("parsing the Open VSX metadata")?;

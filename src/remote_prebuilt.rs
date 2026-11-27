@@ -159,10 +159,7 @@ pub fn parse_sha256sums(text: &str, name: &str) -> Option<String> {
     })
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::Digest;
-    format!("{:x}", sha2::Sha256::digest(bytes))
-}
+use crate::net::sha256_hex;
 
 /// The `croft-<triple>/croft` binary out of a release `archive` (gzip'd tar).
 /// Any link entry refuses the archive: a release of one binary has no
@@ -212,7 +209,7 @@ pub fn prepare(
         std::fs::read_to_string(&signed)
             .ok()
             .and_then(|s| Signature::parse(&s)),
-    ) && sha256_hex(&bytes) == expected.trim()
+    ) && crate::net::sha256_matches(&bytes, &expected)
     {
         return Ok((binary, Signature::Verified));
     }
@@ -236,8 +233,8 @@ pub fn prepare(
     let expected = parse_sha256sums(&sums, &name)
         .ok_or_else(|| anyhow!("SHA256SUMS for v{version} does not list {name}"))?;
     let archive = get(&archive_url).context("downloading the release archive")?;
-    let actual = sha256_hex(&archive);
-    if actual != expected {
+    if !crate::net::sha256_matches(&archive, &expected) {
+        let actual = sha256_hex(&archive);
         bail!("{name} does not match SHA256SUMS (got {actual}, expected {expected}); refusing it");
     }
     let bytes = unpack_binary(&archive, triple)?;
@@ -312,20 +309,19 @@ pub fn http_get(url: &str) -> Result<Vec<u8>> {
         }
         Err(e) => return Err(anyhow::Error::new(e).context(format!("GET {url}"))),
     };
-    let mut bytes = Vec::new();
     // A connection that drops mid-download is the network going away too,
     // not a refusal of what was fetched (#1844).
-    resp.into_reader()
-        .take(MAX_ARCHIVE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| Unreachable {
-            url: url.to_string(),
-            detail: e.to_string(),
-        })?;
-    if bytes.len() as u64 > MAX_ARCHIVE_BYTES {
-        bail!("{url} is larger than {MAX_ARCHIVE_BYTES} bytes; refusing it");
-    }
-    Ok(bytes)
+    crate::net::read_capped(resp.into_reader(), MAX_ARCHIVE_BYTES).map_err(|e| {
+        if crate::net::too_large(&e) {
+            anyhow!("{url} is larger than {MAX_ARCHIVE_BYTES} bytes; refusing it")
+        } else {
+            Unreachable {
+                url: url.to_string(),
+                detail: e.to_string(),
+            }
+            .into()
+        }
+    })
 }
 
 #[cfg(test)]

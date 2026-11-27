@@ -850,18 +850,9 @@ fn digest_verdict(sha256: &[(&str, &str)], key: &str, bytes: &[u8]) -> Result<()
     // Such a manifest is a mistake and is refused, as a partial map is.
     match sha256.iter().find(|(k, _)| *k == key) {
         None => Err("the manifest's digest list does not cover this platform's download"),
-        Some((_, expected)) if sha256_matches(bytes, expected) => Ok(()),
+        Some((_, expected)) if crate::net::sha256_matches(bytes, expected) => Ok(()),
         Some(_) => Err("checksum mismatch"),
     }
-}
-
-/// Whether `bytes` hash to `expected` (hex SHA-256, either case). An empty
-/// or malformed expectation never matches: a gate that passes on a typo is
-/// no gate.
-pub(crate) fn sha256_matches(bytes: &[u8], expected: &str) -> bool {
-    use sha2::Digest;
-    let expected = expected.trim().to_ascii_lowercase();
-    expected.len() == 64 && format!("{:x}", sha2::Sha256::digest(bytes)) == expected
 }
 
 /// First regular file named `name` under `dir`, depth-first. Links are
@@ -2252,32 +2243,6 @@ mod tests {
         assert_eq!(
             found, bin,
             "`<servers>/alpha/csvlens/csvlens` is where the key points"
-        );
-    }
-
-    /// The checksum gate is the only thing between a download and an
-    /// executable; it must reject a mismatch and accept the true digest.
-    #[test]
-    fn sha256_matches_only_the_true_digest() {
-        let bytes = b"csvlens release bytes";
-        // A well-formed digest that is NOT this input's: the real one is
-        // computed below, and the two must differ for the test to mean
-        // anything.
-        let decoy = "8b0fa3ee6b2b3d3b0a0a4f3f6d2d7d5f1a4f0d6b3d5b1f0e3a4b7c2d9e8f1a0b";
-        assert!(!sha256_matches(
-            bytes,
-            "0000000000000000000000000000000000000000000000000000000000000000"
-        ));
-        assert!(!sha256_matches(bytes, ""));
-        let real = {
-            use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(bytes))
-        };
-        assert_ne!(real, decoy, "the decoy is not this input's digest");
-        assert!(sha256_matches(bytes, &real), "the true digest is accepted");
-        assert!(
-            sha256_matches(bytes, &real.to_uppercase()),
-            "case does not matter"
         );
     }
 

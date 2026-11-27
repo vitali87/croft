@@ -22,7 +22,6 @@
 //! no network calls and shows only the bundled catalog (fail-closed).
 
 use std::collections::BTreeSet;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
@@ -155,11 +154,10 @@ fn write_cache(bytes: &[u8]) -> std::io::Result<()> {
 /// GET `url` into memory, capped at [`MAX_FETCH_BYTES`].
 fn http_get(url: &str) -> Result<Vec<u8>> {
     let resp = crate::net::get(url).timeout(FETCH_TIMEOUT).call()?;
-    let mut buf = Vec::new();
-    resp.into_reader()
-        .take(MAX_FETCH_BYTES)
-        .read_to_end(&mut buf)?;
-    Ok(buf)
+    Ok(crate::net::read_capped(
+        resp.into_reader(),
+        MAX_FETCH_BYTES,
+    )?)
 }
 
 /// Fetch `index.json` + `index.json.sig`, verify the signature against the baked

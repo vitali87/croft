@@ -734,15 +734,15 @@ pub(crate) fn stage_at(dir: &Path, name: &str, bytes: &[u8]) -> anyhow::Result<P
 /// and reading one byte more can. Split out of `run` because that argument is
 /// an off-by-one nobody could test through stdin.
 fn read_capped<R: std::io::Read>(reader: R, cap: u64) -> anyhow::Result<Vec<u8>> {
-    use std::io::Read as _;
-    let mut buf = Vec::new();
-    let read = reader.take(cap + 1).read_to_end(&mut buf)? as u64;
-    if read > cap {
-        anyhow::bail!(
-            "more than {cap} bytes arrived on stdin; write it to a file and view that instead"
-        );
-    }
-    Ok(buf)
+    crate::net::read_capped(reader, cap).map_err(|e| {
+        if crate::net::too_large(&e) {
+            anyhow::anyhow!(
+                "more than {cap} bytes arrived on stdin; write it to a file and view that instead"
+            )
+        } else {
+            e.into()
+        }
+    })
 }
 
 /// The reply to a probe whose file is no longer open in any tab (#620).
