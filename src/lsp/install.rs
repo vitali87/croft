@@ -1522,26 +1522,21 @@ const NODE_PROBE_MARKER: &str = "__CROFT_NODE__";
 /// touch croft's tty; stdin is `/dev/null` and stdout is captured. A timeout
 /// guards against a pathological init file that never returns.
 fn detached_shell_node_dir() -> Option<PathBuf> {
-    use std::sync::mpsc;
-    use std::time::Duration;
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(run_detached_node_probe());
-    });
-    match rx.recv_timeout(Duration::from_secs(15)) {
-        Ok(result) => result,
-        Err(_) => {
-            log_file::log("lsp[vtsls] node shell-probe timed out");
-            None
-        }
+    let dir = node_dir_from_probe(node_probe_command(), std::time::Duration::from_secs(15));
+    if dir.is_none() {
+        log_file::log("lsp[vtsls] node shell-probe found no node within 15s");
     }
+    dir
 }
 
-fn run_detached_node_probe() -> Option<PathBuf> {
-    let out = node_probe_command().output().ok()?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let path = parse_node_probe(&stdout)?;
-    let node = Path::new(path);
+/// The directory of the `node` that `probe`, a [`node_probe_command`],
+/// reports. A probe still running after `timeout` is killed with everything
+/// it started (#2755): its shell leads a session of its own, and an init
+/// file that hangs would otherwise keep it, and what it waits on, running
+/// for as long as croft does.
+fn node_dir_from_probe(probe: Command, timeout: std::time::Duration) -> Option<PathBuf> {
+    let out = crate::dap::install::run_bounded(probe, timeout)?;
+    let node = Path::new(parse_node_probe(&out)?);
     if !node.is_file() {
         return None;
     }
@@ -2507,6 +2502,50 @@ mod tests {
             parse_node_probe(stdout),
             Some("/Users/x/.nvm/versions/node/v23.7.0/bin/node")
         );
+    }
+
+    #[test]
+    fn a_probe_that_never_finishes_is_killed_with_what_it_started() {
+        use std::os::unix::process::CommandExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let pids = tmp.path().join("pids");
+        // A shell in a session of its own, as the real probe runs, whose
+        // init hangs on a command it started.
+        let mut probe = Command::new("sh");
+        probe.arg("-c").arg(format!(
+            "sleep 30 & echo $$ $! > {}; wait",
+            pids.display()
+        ));
+        unsafe {
+            probe.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        assert_eq!(
+            node_dir_from_probe(probe, std::time::Duration::from_millis(300)),
+            None
+        );
+        let pids: Vec<i32> = std::fs::read_to_string(&pids)
+            .expect("the probe started")
+            .split_whitespace()
+            .map(|p| p.parse().unwrap())
+            .collect();
+        assert_eq!(pids.len(), 2, "the shell and what it waits on");
+        // Killed and not yet reaped by whoever inherited it is gone too.
+        let gone = |pid: i32| {
+            unsafe { libc::kill(pid, 0) } != 0
+                || std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                    stat.rsplit(')').next().is_some_and(|rest| rest.trim_start().starts_with('Z'))
+                })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !pids.iter().all(|&p| gone(p)) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        for pid in pids {
+            assert!(gone(pid), "process {pid} still runs after the probe gave up");
+        }
     }
 
     #[test]

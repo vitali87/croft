@@ -1,0 +1,1 @@
+fix: When croft asks your login shell where `node` is, for a JavaScript or TypeScript language server or the JavaScript debugger, a shell that never finishes is now stopped with everything it started once croft stops waiting, instead of running on for as long as croft does (#2755).
