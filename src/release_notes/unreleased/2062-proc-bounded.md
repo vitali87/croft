@@ -1,0 +1,1 @@
+refactor: A program croft waits for now runs through one type in `src/proc.rs` that states what is kept of each output, whether the program runs apart from croft's terminal, and how long it may take; notification commands and the VS Code extension listing use it first (#2062). Nothing changes in use.

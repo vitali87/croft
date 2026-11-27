@@ -661,37 +661,30 @@ pub fn installed_via_code() -> Vec<String> {
     installed_via(cmd, LIST_TIMEOUT)
 }
 
+/// The most of `code --list-extensions`'s answer croft reads: far past any
+/// real list of ids, so a longer answer is no list at all.
+const LIST_CAP: usize = 1024 * 1024;
+
 /// [`installed_via_code`] over an explicit command and bound, for tests.
-pub fn installed_via(mut cmd: std::process::Command, timeout: std::time::Duration) -> Vec<String> {
-    let Ok(mut child) = cmd
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    else {
+///
+/// Answered or wedged, the command must not outlive the call: it runs on the
+/// render thread, and is killed at the bound and reaped off-thread, since a
+/// child in uninterruptible sleep cannot be killed and a synchronous wait
+/// would wedge the frame after all.
+pub fn installed_via(cmd: std::process::Command, timeout: std::time::Duration) -> Vec<String> {
+    let ran = crate::proc::Bounded {
+        stdout: crate::proc::Keep::All { cap: LIST_CAP },
+        stderr: crate::proc::Keep::Nothing,
+        detached: false,
+        limit: timeout,
+        retry_busy: false,
+    }
+    .run(cmd);
+    let Ok(ran) = ran else {
         return Vec::new();
     };
-    let Some(mut stdout) = child.stdout.take() else {
-        return Vec::new();
-    };
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = std::io::Read::read_to_end(&mut stdout, &mut buf);
-        let _ = tx.send(buf);
-    });
-    let out = rx.recv_timeout(timeout).ok();
-    // Answered or wedged, it must not outlive the call holding a pipe open.
-    // The reap runs off-thread: a child in uninterruptible sleep cannot be
-    // killed, and a synchronous wait() would wedge the frame after all.
-    let _ = child.kill();
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
-    let Some(out) = out else {
-        return Vec::new();
-    };
-    String::from_utf8_lossy(&out)
+    ran.stdout
+        .text()
         .lines()
         .map(str::trim)
         .filter(|l| l.contains('.'))

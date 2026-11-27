@@ -5,12 +5,19 @@
 //! program's place for its own thread with [`stand_in`]. In a release build
 //! the name passes straight through, so croft runs exactly the program it
 //! named.
+//!
+//! A program croft waits for runs through [`Bounded`], which states what
+//! is kept of each output, whether it runs apart from croft's terminal and
+//! how long it may take.
 
 use std::ffi::OsString;
 use std::process::{Command, Stdio};
 
+mod bounded;
 #[cfg(test)]
 pub(crate) mod record;
+
+pub(crate) use bounded::{Bounded, Keep, Kept, RunError};
 
 /// The program croft starts for `name`: `name` itself, or in a test the
 /// stand-in this thread put in its place.
