@@ -195,7 +195,9 @@ fn resolve_node_via_login_shell() -> Option<String> {
 /// When it is done the child is killed with its process group: a probe
 /// started by `setsid` ([`crate::lsp::install::node_probe_command`]) leads
 /// one, and whatever its rc started, such as a command that hangs, goes with
-/// it (#2755). A child that leads no group is killed alone.
+/// it (#2755). A child that leads no group is killed alone. It returns by
+/// `timeout` even when the child cannot die yet: the child is reaped on a
+/// thread of its own.
 pub(crate) fn run_bounded(mut cmd: Command, timeout: Duration) -> Option<String> {
     use std::io::Read;
     // A program written a moment ago (a test's stand-in interpreter) is "Text
@@ -223,7 +225,13 @@ pub(crate) fn run_bounded(mut cmd: Command, timeout: Duration) -> Option<String>
         }
     }
     let _ = child.kill();
-    let _ = child.wait();
+    // Reaped on a thread of its own: a child stuck in I/O that cannot be
+    // interrupted, such as an rc reading a dead network mount, dies only
+    // once that I/O returns, and the caller must not wait for it. The
+    // language servers probe from their one command loop.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
     out
 }
 
