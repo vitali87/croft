@@ -16,15 +16,16 @@ impl App {
         self.debug_named_test(name);
     }
 
-    /// The runner for a test in the focused file under `root` (#1408): the
+    /// The runner for a test in the test file `file` under `root` (#1408): the
     /// one for the file's language, so a pytest test in a maturin crate
     /// debugs under debugpy, not as a cargo test binary.
-    pub(in crate::app) fn test_runner_for_focused_file(
+    pub(in crate::app) fn test_runner_for_file(
         &self,
         root: &Path,
+        file: Option<&Path>,
     ) -> Option<crate::testing::worker::Runner> {
         let runners = crate::testing::worker::runners_for(&self.extensions_dir(), root);
-        crate::testing::worker::runner_for_file(&runners, self.editor.path.as_deref())
+        crate::testing::worker::runner_for_file(&runners, file)
     }
 
     /// Hand the test `name` to the debugger — the M6 wedge: pytest runs as a
@@ -40,6 +41,14 @@ impl App {
     }
 
     pub(in crate::app) fn debug_named_test_now(&mut self, name: String) {
+        let file = self.editor.path.clone();
+        self.debug_test_in(name, file);
+    }
+
+    /// Debug the test `name` in the test file `file`: the file it was asked
+    /// for in, kept for a launch that waits for its debugger (#2803), so a
+    /// file opened meanwhile does not change which test runs.
+    pub(in crate::app) fn debug_test_in(&mut self, name: String, file: Option<PathBuf>) {
         use std::collections::BTreeMap;
         let root = self.tree.root.clone();
         // #373: if the last run of this test failed and named a place in
@@ -55,14 +64,12 @@ impl App {
             .iter()
             .map(|(p, lines)| (p.clone(), self.editor.source_breakpoints(p, lines)))
             .collect();
-        match self.test_runner_for_focused_file(&root) {
+        match self.test_runner_for_file(&root, file.as_deref()) {
             Some(crate::testing::worker::Runner::Pytest) => {
                 // The interpreter F5 and Live Run pick, from the test file's
                 // folder up (#864), not only a root `.venv`; refused before
                 // any setup when debugpy cannot run under it.
-                let test_dir = self
-                    .editor
-                    .path
+                let test_dir = file
                     .as_deref()
                     .and_then(Path::parent)
                     .filter(|dir| dir.starts_with(&root))
@@ -71,12 +78,13 @@ impl App {
                 let project_py =
                     debuggee_python(&test_dir, &root, std::env::var_os("PATH").as_deref());
                 let project_found = project_py.is_some();
-                let adapter_py = match crate::dap::install::ensure_debug_venv() {
-                    Ok(py) => py,
-                    Err(e) => {
-                        self.debug_error(format!("Debugger setup failed: {e}"));
-                        return;
-                    }
+                let Some(adapter_py) = self.debug_python_or_park(|| ParkedLaunch::Test {
+                    name: name.clone(),
+                    file: file.clone(),
+                }) else {
+                    // Armed again when the test starts.
+                    self.disarm_failure_breakpoint();
+                    return;
                 };
                 let project_py = project_py.unwrap_or_else(|| adapter_py.clone());
                 let mut request =
@@ -88,7 +96,7 @@ impl App {
                 if let Some(cfg) = test_config {
                     let ctx = crate::dap::configs::SubstCtx {
                         workspace_folder: root.clone(),
-                        file: self.editor.path.clone(),
+                        file: file.clone(),
                         inputs: cfg.answers.clone(),
                         folders: self.workspace_folders(),
                     };
@@ -153,7 +161,7 @@ impl App {
                 }
                 // The file the gesture happened in narrows the harness: a
                 // lib test and an integration test can share a bare fn name.
-                let source = self.editor.path.clone();
+                let source = file.clone();
                 self.start_test_binary_build(root, name, source);
             }
             Some(crate::testing::worker::Runner::Go) => {

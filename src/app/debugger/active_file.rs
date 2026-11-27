@@ -77,8 +77,10 @@ impl App {
     pub(in crate::app) fn start_debug_session(&mut self) {
         use crate::dap::session::AdapterKind;
         // Same as every other launch path: a parked older launch must not
-        // fire later and replace this one (#567).
+        // fire later and replace this one (#567), nor one waiting for its
+        // debugger to be set up (#2803).
         self.pending_debug_launch = None;
+        self.forget_parked_setup_launches();
         self.debug_build = None;
         // Zero-config "Debug active file" declares no postDebugTask.
         self.debug_post_tasks.clear();
@@ -92,19 +94,10 @@ impl App {
             .unwrap_or("")
             .to_ascii_lowercase();
         match crate::dap::registry::adapter_for_extension(&ext) {
-            Some(AdapterKind::Debugpy) => {}
-            Some(AdapterKind::LldbDap) => {
-                self.start_lldb_debug_session(&path);
-                return;
-            }
-            Some(AdapterKind::JsDebug) => {
-                self.start_js_debug_session(&path);
-                return;
-            }
-            Some(AdapterKind::Delve) => {
-                self.start_delve_debug_session(&path);
-                return;
-            }
+            Some(AdapterKind::Debugpy) => self.start_python_debug_session(&path),
+            Some(AdapterKind::LldbDap) => self.start_lldb_debug_session(&path),
+            Some(AdapterKind::JsDebug) => self.start_js_debug_session(&path),
+            Some(AdapterKind::Delve) => self.start_delve_debug_session(&path),
             None => {
                 // An executable binary (e.g. a compiled `target/debug/app`) can
                 // be debugged directly by lldb-dap with no build step.
@@ -121,12 +114,17 @@ impl App {
                         "No debugger for .{ext} files (Python, JS/TS, Rust, C/C++ are supported)"
                     ));
                 }
-                return;
             }
         }
+    }
+
+    /// Debug the Python file at `path` under debugpy: the adapter runs from
+    /// croft's debug venv, built on a job the first time (#2803), and the
+    /// program under the interpreter Run would use.
+    pub(in crate::app) fn start_python_debug_session(&mut self, path: &Path) {
         let debug_root = self
             .roots
-            .owning_root(&path)
+            .owning_root(path)
             .unwrap_or_else(|| self.roots.primary())
             .to_path_buf();
         // The debug venv hosts only the adapter; the program runs under
@@ -144,12 +142,9 @@ impl App {
                 return;
             }
         };
-        let py = match crate::dap::install::ensure_debug_venv() {
-            Ok(py) => py,
-            Err(e) => {
-                self.debug_error(format!("Debugger setup failed: {e}"));
-                return;
-            }
+        let Some(py) = self.debug_python_or_park(|| ParkedLaunch::PythonFile(path.to_path_buf()))
+        else {
+            return;
         };
         let program_py = program_py.unwrap_or_else(|| py.clone());
         let breakpoints = self.collect_editor_breakpoints();
@@ -159,7 +154,7 @@ impl App {
             &py_str,
             &adapter_args,
             &debug_root,
-            &path,
+            path,
             &program_py,
             breakpoints,
             false,
@@ -223,23 +218,15 @@ impl App {
     }
 
     /// Launch a vscode-js-debug session for a `.js`/`.ts` file run under Node.
-    /// Provisions the js-debug server on first use, then drives the shared DAP
+    /// Provisions node and the js-debug server on a job on first use (#2803),
+    /// then drives the shared DAP
     /// session machinery (which transparently spawns the parent + child
     /// connections js-debug requires). TypeScript binds via source maps.
     pub(in crate::app) fn start_js_debug_session(&mut self, path: &Path) {
-        let node = match crate::dap::install::node_program() {
-            Ok(n) => n,
-            Err(e) => {
-                self.debug_error(format!("{e}"));
-                return;
-            }
-        };
-        let server = match crate::dap::install::ensure_js_debug() {
-            Ok(s) => s,
-            Err(e) => {
-                self.debug_error(format!("Debugger setup failed: {e}"));
-                return;
-            }
+        let Some((node, server)) =
+            self.debug_js_or_park(|| ParkedLaunch::JsFile(path.to_path_buf()))
+        else {
+            return;
         };
         let breakpoints = self.collect_editor_breakpoints();
         let debug_root = self

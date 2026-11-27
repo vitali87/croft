@@ -199,6 +199,7 @@ impl App {
             self.debug_stop();
         }
         self.pending_debug_launch = None;
+        self.forget_parked_setup_launches();
         self.debug_build = None;
         self.pending_cargo_launches.clear();
         // A new run: the previous run's cleanup is not this one's.
@@ -350,8 +351,13 @@ impl App {
                             ))
                         })
                 } else {
-                    match crate::dap::install::ensure_debug_venv() {
-                        Ok(py) => {
+                    let Some(py) = self.debug_python_or_park(|| {
+                        ParkedLaunch::Resolved(Box::new(rc.clone()), slot)
+                    }) else {
+                        return;
+                    };
+                    {
+                        {
                             let adapter_args =
                                 vec![String::from("-m"), String::from("debugpy.adapter")];
                             let program_py = config_project_python(
@@ -382,10 +388,6 @@ impl App {
                                 request,
                                 breakpoints,
                             )
-                        }
-                        Err(e) => {
-                            self.debug_error(format!("Debugger setup failed: {e}"));
-                            return;
                         }
                     }
                 }
@@ -489,19 +491,10 @@ impl App {
                     return;
                 }
                 let browser = configs::browser_type(&rc.type_name).is_some();
-                let node = match crate::dap::install::node_program() {
-                    Ok(n) => n,
-                    Err(e) => {
-                        self.debug_error(format!("{e}"));
-                        return;
-                    }
-                };
-                let server = match crate::dap::install::ensure_js_debug() {
-                    Ok(s) => s,
-                    Err(e) => {
-                        self.debug_error(format!("Debugger setup failed: {e}"));
-                        return;
-                    }
+                let Some((node, server)) =
+                    self.debug_js_or_park(|| ParkedLaunch::Resolved(Box::new(rc.clone()), slot))
+                else {
+                    return;
                 };
                 let mut request = configs::js_request(&rc);
                 // A browser croft has no screen for would open where no one

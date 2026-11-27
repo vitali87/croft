@@ -174,8 +174,10 @@ impl App {
         }
         self.debug_sessions.clear();
         // A `cargo` build still running for a launch (#1392) must not start
-        // its debuggee after the user stopped debugging.
+        // its debuggee after the user stopped debugging, nor a launch
+        // waiting for its debugger to be set up (#2803).
         self.pending_cargo_launches.clear();
+        self.forget_parked_setup_launches();
         self.debug_compound = None;
         // A C/C++ build still running must not launch once it finishes
         // (#1359): Stop means stop.

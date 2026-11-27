@@ -19,6 +19,7 @@ mod events;
 mod inline_values;
 mod launch;
 mod python;
+mod setup;
 mod view;
 mod watches;
 pub(super) use adapters::lldb_dap_missing_message;
@@ -45,6 +46,8 @@ pub(super) use python::debuggee_python_note;
 pub(super) use python::launch_request_python;
 pub(super) use python::project_python_for;
 use python::*;
+pub(super) use setup::DebugSetup;
+use setup::ParkedLaunch;
 
 /// Grace before the post-teardown js-debug orphan sweep runs, letting a
 /// just-killed server's detached watchdog reparent to init so the sweep can
@@ -85,6 +88,9 @@ pub(super) enum MemberOutcome {
     /// Its `cargo` build is running (#1392); it joins the set when the
     /// build lands.
     Building,
+    /// Its debugger is being set up on a job (#2803); it joins the set when
+    /// that is done.
+    Preparing,
     /// Not started: it declares a `preLaunchTask` of its own, and croft's
     /// parking is one-at-a-time, so the task cannot be run as part of a set.
     /// Launching regardless would debug whatever the last build left behind.

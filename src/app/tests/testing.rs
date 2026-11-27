@@ -864,11 +864,14 @@ fn debug_test_in_a_maturin_crate_follows_the_files_language() {
         .open_pinned(&root.join("tests/test_api.py"))
         .unwrap();
     assert_eq!(
-        app.test_runner_for_focused_file(&root),
+        app.test_runner_for_file(&root, app.editor.path.as_deref()),
         Some(Runner::Pytest)
     );
     app.editor.open_pinned(&root.join("src/lib.rs")).unwrap();
-    assert_eq!(app.test_runner_for_focused_file(&root), Some(Runner::Cargo));
+    assert_eq!(
+        app.test_runner_for_file(&root, app.editor.path.as_deref()),
+        Some(Runner::Cargo)
+    );
 }
 
 /// #1408, negative: a one-language folder keeps its one runner whatever
@@ -883,7 +886,7 @@ fn a_one_language_folder_keeps_its_runner_for_any_file() {
     let mut app = App::new(root.clone()).unwrap();
     app.editor.open_pinned(&root.join("notes.rs")).unwrap();
     assert_eq!(
-        app.test_runner_for_focused_file(&root),
+        app.test_runner_for_file(&root, app.editor.path.as_deref()),
         Some(Runner::Pytest)
     );
 }

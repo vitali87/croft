@@ -6603,3 +6603,141 @@ fn a_click_on_a_debug_row_puts_the_keyboard_on_it() {
     left_click(&mut app, x, y);
     assert_eq!(app.run_debug.row_cursor, Some(payload));
 }
+
+/// A stand-in for the debugger tooling (#2803): nothing is ready until a
+/// launch has it prepared, and preparing waits until the test lets it go,
+/// then makes `will_be` ready, or fails with `fail`.
+struct HeldTooling {
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    ready: std::sync::Mutex<Option<crate::dap::install::Ready>>,
+    will_be: crate::dap::install::Ready,
+    fail: Option<String>,
+    prepared: std::sync::atomic::AtomicUsize,
+}
+
+impl crate::dap::install::DebugTooling for HeldTooling {
+    fn ready(&self, _: crate::dap::install::Tooling) -> Option<crate::dap::install::Ready> {
+        self.ready.lock().unwrap().clone()
+    }
+
+    fn prepare(&self, _: crate::dap::install::Tooling) -> Result<(), String> {
+        self.prepared
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.release.lock().unwrap().recv();
+        if let Some(why) = &self.fail {
+            return Err(why.clone());
+        }
+        *self.ready.lock().unwrap() = Some(self.will_be.clone());
+        Ok(())
+    }
+}
+
+/// An app with `name` open in a fresh folder and the debugger tooling held
+/// by a [`HeldTooling`]; the sender lets its preparing go.
+fn app_with_held_tooling(
+    name: &str,
+    will_be: impl FnOnce(&Path) -> crate::dap::install::Ready,
+    fail: Option<&str>,
+) -> (
+    tempfile::TempDir,
+    App,
+    std::sync::Arc<HeldTooling>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let file = root.join(name);
+    std::fs::write(&file, "print('hi')\n").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let tooling = std::sync::Arc::new(HeldTooling {
+        release: std::sync::Mutex::new(rx),
+        ready: std::sync::Mutex::new(None),
+        will_be: will_be(&root),
+        fail: fail.map(String::from),
+        prepared: std::sync::atomic::AtomicUsize::new(0),
+    });
+    app.debug_tooling = tooling.clone();
+    (tmp, app, tooling, tx)
+}
+
+/// Poll the debugger setups until one settles.
+fn settle_debug_setup(app: &mut App) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !app.poll_debug_setups() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the debugger setup never settled"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// #2803: F5 on a Python file whose debugger is not set up yet returns at
+/// once, saying it is setting the debugger up, and the session starts when
+/// the setup job answers. A second F5 meanwhile waits on the same job.
+#[test]
+fn a_python_debug_launch_waits_for_its_debugger_off_the_ui_thread() {
+    let (_tmp, mut app, tooling, release) = app_with_held_tooling(
+        "main.py",
+        |root| crate::dap::install::Ready::Python(root.join("no-such-python")),
+        None,
+    );
+    app.start_debug_session();
+    assert_eq!(app.status, "Setting up the Python debugger…");
+    assert!(app.debug_sessions.is_empty());
+    app.start_debug_session();
+    assert_eq!(app.status, "Setting up the Python debugger…");
+    release.send(()).unwrap();
+    settle_debug_setup(&mut app);
+    assert_eq!(
+        tooling.prepared.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "both launches waited on one setup"
+    );
+    // The launch ran once its venv was ready: the stand-in interpreter does
+    // not exist, so starting the adapter is what fails.
+    assert!(
+        app.status.starts_with("Failed to start debugger"),
+        "{}",
+        app.status
+    );
+}
+
+/// #2803: Stop while a launch waits for its debugger drops the launch; the
+/// setup still finishes, for the next F5.
+#[test]
+fn stopping_drops_a_launch_waiting_for_its_debugger() {
+    let (_tmp, mut app, _tooling, release) = app_with_held_tooling(
+        "main.py",
+        |root| crate::dap::install::Ready::Python(root.join("no-such-python")),
+        None,
+    );
+    app.start_debug_session();
+    app.debug_stop_by_user();
+    app.status.clear();
+    release.send(()).unwrap();
+    settle_debug_setup(&mut app);
+    assert_eq!(app.status, "", "nothing launched after Stop");
+}
+
+/// #2803: a JavaScript debugger that cannot be set up says why once the
+/// job answers, and F5 never waited for it.
+#[test]
+fn a_js_debug_launch_says_why_its_debugger_could_not_be_set_up() {
+    let (_tmp, mut app, _tooling, release) = app_with_held_tooling(
+        "main.js",
+        |root| crate::dap::install::Ready::Js {
+            node: String::from("node"),
+            server: root.join("dapDebugServer.js"),
+        },
+        Some("Debugger setup failed: offline"),
+    );
+    app.start_debug_session();
+    assert_eq!(app.status, "Setting up the JavaScript debugger…");
+    release.send(()).unwrap();
+    settle_debug_setup(&mut app);
+    assert_eq!(app.status, "Debugger setup failed: offline");
+    assert!(app.run_debug.feedback_is_error);
+}

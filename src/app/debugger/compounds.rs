@@ -257,11 +257,14 @@ impl App {
         // made "N of M started" name an N the user does not have.
         let before = self.debug_sessions.len();
         let building = self.pending_cargo_launches.len();
+        let preparing = self.parked_setup_launches();
         self.launch_resolved_into_set(rc);
         if self.debug_sessions.len() > before {
             MemberOutcome::Launched
         } else if self.pending_cargo_launches.len() > building {
             MemberOutcome::Building
+        } else if self.parked_setup_launches() > preparing {
+            MemberOutcome::Preparing
         } else {
             MemberOutcome::Failed
         }
@@ -281,6 +284,7 @@ impl App {
     ) {
         self.debug_stop();
         self.pending_debug_launch = None;
+        self.forget_parked_setup_launches();
         let root = self.active_workspace_root();
         let tasks = crate::tasks::discover_tasks(&root);
         let task = match crate::tasks::find_task(tasks, task_label) {
@@ -394,30 +398,53 @@ impl App {
         // this set (#567). The task-gated path reaches here via `take()`, so
         // this only ever drops a STALE parking.
         self.pending_debug_launch = None;
+        self.forget_parked_setup_launches();
         self.debug_build = None;
         let total = members.len();
         let mut started = 0usize;
         let mut building: Vec<String> = Vec::new();
+        let mut preparing: Vec<String> = Vec::new();
         let mut unrun: Vec<String> = Vec::new();
         for cfg in members {
             match self.launch_member_into_set(&cfg) {
                 MemberOutcome::Launched => started += 1,
                 MemberOutcome::Building => building.push(cfg.name.clone()),
+                MemberOutcome::Preparing => preparing.push(cfg.name.clone()),
                 MemberOutcome::TaskUnrun => unrun.push(cfg.name.clone()),
                 MemberOutcome::Failed => {}
             }
+        }
+        if started == 0 && building.is_empty() && !preparing.is_empty() {
+            // Every member that could start waits for its debugger to be
+            // set up (#2803): each joins the set when that is done.
+            self.debug_compound = Some(compound.clone());
+            let waiting = format!(
+                "setting up the debugger for {} \u{2014} sessions start when it is ready",
+                preparing.join(", ")
+            );
+            self.run_debug.feedback = Some(format!("compound {compound}: {waiting}"));
+            self.run_debug.feedback_is_error = preparing.len() != total;
+            self.status = format!("compound \"{compound}\": {waiting}");
+            return;
         }
         if started == 0 && !building.is_empty() {
             // Every member that could start is still building with cargo
             // (#1392): each joins the set when its build lands.
             self.debug_compound = Some(compound.clone());
+            // Members waiting for their debugger to be set up (#2803) join
+            // the same way, and are named with them.
+            let also = if preparing.is_empty() {
+                String::new()
+            } else {
+                format!("; setting up the debugger for {}", preparing.join(", "))
+            };
             self.run_debug.feedback = Some(format!(
-                "compound {compound}: building {} \u{2014} sessions start when cargo finishes",
+                "compound {compound}: building {}{also} \u{2014} sessions start when cargo finishes",
                 building.join(", ")
             ));
-            self.run_debug.feedback_is_error = building.len() != total;
+            self.run_debug.feedback_is_error = building.len() + preparing.len() != total;
             self.status = format!(
-                "compound \"{compound}\": building {} \u{2014} sessions start when cargo finishes",
+                "compound \"{compound}\": building {}{also} \u{2014} sessions start when cargo finishes",
                 building.join(", ")
             );
             return;
@@ -460,7 +487,14 @@ impl App {
             // Not failed: they join the set when their cargo builds land.
             running = format!("{running}; building {}", building.join(", "));
         }
-        let started = started + building.len();
+        if !preparing.is_empty() {
+            // Not failed either: they join it once their debugger is set up.
+            running = format!(
+                "{running}; setting up the debugger for {}",
+                preparing.join(", ")
+            );
+        }
+        let started = started + building.len() + preparing.len();
         self.run_debug.feedback = Some(if started == total {
             format!("Debugging compound {compound}: {running}")
         } else if unrun.is_empty() {

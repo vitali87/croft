@@ -77,9 +77,10 @@ pub fn python_version(python: &Path) -> Option<PyVersion> {
 }
 
 /// Ensure the debug venv exists with debugpy, creating it via `uv` on first use.
-/// Returns the venv interpreter path. Blocking: the first call shells out to
-/// `uv venv` + `uv pip install debugpy` (a few seconds); subsequent calls are a
-/// cheap existence check.
+/// Returns the venv interpreter path. Slow the first time: it shells out to
+/// `uv venv` + `uv pip install debugpy`, each for at most [`SETUP_STEP_LIMIT`],
+/// so a launch runs it on a job, never on the UI thread ([`DebugTooling`],
+/// #2803); later calls are a cheap existence check.
 pub fn ensure_debug_venv() -> Result<PathBuf> {
     let home =
         std::env::var_os("HOME").context("$HOME unset; cannot locate ~/.croft/debug-venv")?;
@@ -94,42 +95,152 @@ pub fn ensure_debug_venv() -> Result<PathBuf> {
 /// uv the language servers use (#2804): on PATH, else croft's own copy or
 /// one where uv's installer puts it.
 fn ensure_debug_venv_in(home: &Path, path_var: Option<&std::ffi::OsStr>) -> Result<PathBuf> {
-    let dir = home.join(".croft").join("debug-venv");
-    let py = dir.join("bin").join("python");
+    let py = debug_venv_python_in(home);
     if py.exists() {
         return Ok(py);
     }
+    // One build at a time: a launch made while another prepares the venv
+    // waits for it, then finds it built, instead of a second `uv venv`
+    // writing over the first.
+    static BUILDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _building = BUILDING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if py.exists() {
+        return Ok(py);
+    }
+    let dir = home.join(".croft").join("debug-venv");
     let uv = crate::lsp::install::uv_program_on(Some(home), path_var)
         .context("uv is not installed; install it (https://docs.astral.sh/uv) to debug Python")?;
-
-    // .output(), never .status(): uv paints progress bars on stderr, and an
+    // Never on croft's terminal: uv paints progress bars on stderr, and an
     // inherited TTY would spray them over the running TUI (same class as the
     // pdftoppm trailer-dictionary spray).
-    let venv = Command::new(&uv)
-        .args(["venv", "-p", PYTHON_VERSION])
-        .arg(&dir)
-        .output()
-        .context("running `uv venv`")?;
-    if !venv.status.success() {
-        bail!(
-            "`uv venv -p {PYTHON_VERSION}` failed (is CPython {PYTHON_VERSION} available?): {}",
-            String::from_utf8_lossy(&venv.stderr).trim()
-        );
+    let mut venv = Command::new(&uv);
+    venv.args(["venv", "-p", PYTHON_VERSION]).arg(&dir);
+    setup_step(&mut venv, "`uv venv`", |why| {
+        format!(
+            "`uv venv -p {PYTHON_VERSION}` failed (is CPython {PYTHON_VERSION} available?): {why}"
+        )
+    })?;
+    let mut pip = Command::new(&uv);
+    pip.args(["pip", "install", "--python"])
+        .arg(&py)
+        .arg("debugpy");
+    setup_step(&mut pip, "`uv pip install debugpy`", |why| {
+        format!("`uv pip install debugpy` failed: {why}")
+    })?;
+    Ok(py)
+}
+
+/// The debug venv's interpreter under the home folder `home`.
+fn debug_venv_python_in(home: &Path) -> PathBuf {
+    home.join(".croft")
+        .join("debug-venv")
+        .join("bin")
+        .join("python")
+}
+
+/// The longest one step of preparing a debugger may take (#2803): a venv
+/// built, debugpy or js-debug downloaded. Far past any of them on a working
+/// network; a stalled one ends with that said instead of a debugger that
+/// never starts.
+pub(crate) const SETUP_STEP_LIMIT: Duration = Duration::from_secs(300);
+
+/// Run one setup step, `cmd`, called `what`, for at most
+/// [`SETUP_STEP_LIMIT`]; a failing exit is reported through `failed`, given
+/// the end of what the step printed to stderr.
+fn setup_step(cmd: &mut Command, what: &str, failed: impl FnOnce(&str) -> String) -> Result<()> {
+    use crate::proc::{Apart, Bounded, Keep, RunError};
+    let ran = Bounded {
+        stdout: Keep::Nothing,
+        stderr: Keep::Tail(16 * 1024),
+        apart: Apart::No,
+        limit: SETUP_STEP_LIMIT,
+        retry_busy: true,
+    }
+    .run(cmd);
+    match ran {
+        Ok(ran) if ran.status.success() => Ok(()),
+        Ok(ran) => bail!(failed(ran.stderr.text().trim())),
+        Err(RunError::TimedOut) => bail!("{what} took longer than {}s", SETUP_STEP_LIMIT.as_secs()),
+        Err(RunError::Spawn(e)) => Err(e).context(format!("running {what}")),
+        Err(RunError::TooLong { .. }) => bail!("{what} printed more than croft keeps"),
+        Err(RunError::Wait(e) | RunError::Pipe(e)) => Err(e).context(format!("waiting on {what}")),
+    }
+}
+
+/// The tooling a debug launch can need prepared before it starts (#2803).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Tooling {
+    /// The debug venv, with debugpy, for Python.
+    Python,
+    /// `node` and the js-debug server, for JavaScript and TypeScript.
+    Js,
+}
+
+impl Tooling {
+    /// What the status bar says while it is prepared.
+    pub(crate) fn preparing(self) -> &'static str {
+        match self {
+            Tooling::Python => "Setting up the Python debugger…",
+            Tooling::Js => "Setting up the JavaScript debugger…",
+        }
+    }
+}
+
+/// A launch's tooling, prepared.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Ready {
+    /// The debug venv's interpreter, which runs `-m debugpy.adapter`.
+    Python(PathBuf),
+    /// `node` and the js-debug server it runs.
+    Js { node: String, server: PathBuf },
+}
+
+/// What a debug launch needs from this machine before it starts (#2803):
+/// whether that is ready now, a check of a few files the UI thread makes,
+/// and the slow work that makes it so (a venv built, node asked of the login
+/// shell, js-debug downloaded), which runs on a job. A test puts a stand-in
+/// in its place.
+pub(crate) trait DebugTooling: Send + Sync {
+    /// `tooling`, when it is ready without waiting on anything.
+    fn ready(&self, tooling: Tooling) -> Option<Ready>;
+    /// Make `tooling` ready; or what to tell the user when it cannot be.
+    fn prepare(&self, tooling: Tooling) -> std::result::Result<(), String>;
+}
+
+/// This machine's debugger tooling.
+pub(crate) struct MachineTooling;
+
+impl DebugTooling for MachineTooling {
+    fn ready(&self, tooling: Tooling) -> Option<Ready> {
+        match tooling {
+            Tooling::Python => {
+                let home = std::env::var_os("HOME")?;
+                let py = debug_venv_python_in(Path::new(&home));
+                py.exists().then_some(Ready::Python(py))
+            }
+            Tooling::Js => {
+                let server = js_debug_server_path(&js_debug_dir()?);
+                let node = known_node()?;
+                server.exists().then_some(Ready::Js { node, server })
+            }
+        }
     }
 
-    let pip = Command::new(&uv)
-        .args(["pip", "install", "--python"])
-        .arg(&py)
-        .arg("debugpy")
-        .output()
-        .context("running `uv pip install debugpy`")?;
-    if !pip.status.success() {
-        bail!(
-            "`uv pip install debugpy` failed: {}",
-            String::from_utf8_lossy(&pip.stderr).trim()
-        );
+    fn prepare(&self, tooling: Tooling) -> std::result::Result<(), String> {
+        match tooling {
+            Tooling::Python => ensure_debug_venv()
+                .map(drop)
+                .map_err(|e| format!("Debugger setup failed: {e}")),
+            Tooling::Js => {
+                node_program().map_err(|e| e.to_string())?;
+                ensure_js_debug()
+                    .map(drop)
+                    .map_err(|e| format!("Debugger setup failed: {e}"))
+            }
+        }
     }
-    Ok(py)
 }
 
 /// `~/.croft/js-debug`, the install root for the vscode-js-debug server.
@@ -154,14 +265,36 @@ fn js_debug_server_path(dir: &Path) -> PathBuf {
 /// the lazy loader. This mirrors how Zed resolves the shell environment for
 /// GUI/launcher-started processes. Errors with an actionable hint when node
 /// genuinely cannot be found.
+///
+/// A node the login shell named is kept for the rest of the process, so
+/// only the first launch waits for the shell (#2803).
 pub fn node_program() -> Result<String> {
-    if which("node") {
-        return Ok(String::from("node"));
+    if let Some(node) = known_node() {
+        return Ok(node);
     }
     if let Some(path) = resolve_node_via_login_shell() {
+        *SHELL_NODE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path.clone());
         return Ok(path);
     }
     bail!("`node` not found on PATH; install Node.js to debug JavaScript/TypeScript")
+}
+
+/// The node the login shell named, once it has (#2803).
+static SHELL_NODE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// A node known without asking a shell: one on PATH, or the one the login
+/// shell named earlier, while it is still there.
+fn known_node() -> Option<String> {
+    if which("node") {
+        return Some(String::from("node"));
+    }
+    SHELL_NODE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .filter(|path| Path::new(path).is_file())
 }
 
 /// The directory containing the resolved node binary, when it is an absolute
@@ -237,11 +370,20 @@ fn which(bin: &str) -> bool {
 
 /// Ensure the vscode-js-debug server is installed, downloading + extracting the
 /// pinned release tarball on first use. Returns the path to `dapDebugServer.js`.
-/// Blocking: the first call downloads ~1.2 MB and shells out to `tar`; later
-/// calls are a cheap existence check. Mirrors [`ensure_debug_venv`].
+/// Slow the first time: it downloads ~1.2 MB and shells out to `tar`, each for
+/// at most [`SETUP_STEP_LIMIT`], on a launch's setup job (#2803); later calls
+/// are a cheap existence check. Mirrors [`ensure_debug_venv`].
 pub fn ensure_js_debug() -> Result<PathBuf> {
     let dir = js_debug_dir().context("$HOME unset; cannot locate ~/.croft/js-debug")?;
     let server = js_debug_server_path(&dir);
+    if server.exists() {
+        return Ok(server);
+    }
+    // One download at a time; a second launch waits, then finds it.
+    static FETCHING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _fetching = FETCHING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if server.exists() {
         return Ok(server);
     }
@@ -255,20 +397,13 @@ pub fn ensure_js_debug() -> Result<PathBuf> {
 
     // The asset extracts a top-level `js-debug/` directory; -C lands it under
     // ~/.croft/js-debug so the server is at js-debug/src/dapDebugServer.js.
-    let tar = Command::new("tar")
-        .arg("-xzf")
-        .arg(&tarball)
-        .arg("-C")
-        .arg(&dir)
-        .output()
-        .context("running `tar -xzf` on the js-debug release")?;
+    let mut tar = Command::new("tar");
+    tar.arg("-xzf").arg(&tarball).arg("-C").arg(&dir);
+    let extracted = setup_step(&mut tar, "`tar -xzf` on the js-debug release", |why| {
+        format!("extracting the js-debug release failed: {why}")
+    });
     let _ = std::fs::remove_file(&tarball);
-    if !tar.status.success() {
-        bail!(
-            "extracting the js-debug release failed: {}",
-            String::from_utf8_lossy(&tar.stderr).trim()
-        );
-    }
+    extracted?;
     if !server.exists() {
         bail!("js-debug release did not contain dapDebugServer.js (layout changed?)");
     }
@@ -280,6 +415,7 @@ pub fn ensure_js_debug() -> Result<PathBuf> {
 /// URL 302s to a CDN).
 fn download_to_file(url: &str, dest: &Path) -> Result<()> {
     let resp = crate::net::get(url)
+        .timeout(SETUP_STEP_LIMIT)
         .call()
         .context("downloading js-debug release")?;
     let bytes = crate::net::read_capped(resp.into_reader(), MAX_JS_DEBUG_BYTES)
