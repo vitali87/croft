@@ -503,92 +503,6 @@ const SETTLE_TICK: std::time::Duration = std::time::Duration::from_millis(5);
 /// order of magnitude beyond anything a page render produces.
 const EXIT_POLL_TICK: std::time::Duration = std::time::Duration::from_millis(5);
 
-/// `O_NONBLOCK` onto one descriptor, reporting whether it is set now.
-///
-/// This is the whole of `set_nonblocking`'s unix arm, which does nothing but
-/// hand it a descriptor. It exists as a seam because provoking the fcntl
-/// failure through a live `ChildStderr` means closing the fd under the
-/// handle, which trips Rust's IO-safety check and aborts the process instead
-/// of failing an assertion - so the test drives the failure path here and the
-/// success path through `set_nonblocking`, and between them every line of
-/// both is executed.
-#[cfg(unix)]
-fn set_nonblocking_on(fd: std::os::fd::RawFd) -> bool {
-    // `EINTR` is a signal arriving mid-call, not a verdict about the
-    // descriptor: retrying is the documented response, and treating it as
-    // permanent would disable the in-loop drain over a transient the next
-    // call resolves - reintroducing the pipe-full stall this change removes.
-    // Bounded rather than unbounded, so a pathological signal storm cannot
-    // spin here instead of getting on with the render.
-    fn retry_on_eintr(mut call: impl FnMut() -> libc::c_int) -> libc::c_int {
-        for _ in 0..4 {
-            let rc = call();
-            if rc >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-                return rc;
-            }
-        }
-        -1
-    }
-
-    // SAFETY: both calls only read and set the status flags of `fd`, and
-    // neither takes ownership of it. An invalid `fd` is reported as EBADF
-    // rather than being undefined.
-    unsafe {
-        let flags = retry_on_eintr(|| libc::fcntl(fd, libc::F_GETFL));
-        if flags < 0 {
-            return false;
-        }
-        retry_on_eintr(|| libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK)) >= 0
-    }
-}
-
-/// Put the pipe in non-blocking mode so a read returns what is there rather
-/// than waiting for more (#553).
-///
-/// Reports whether the pipe is actually non-blocking now, because the answer
-/// decides whether the caller may read BEFORE the child is reaped. A blocking
-/// read there waits on a renderer that is still running, and the budget and
-/// the kill path both sit after it - so a failed `fcntl` would reinstate the
-/// exact hang this change removes. Callers must not drain a pipe this
-/// returned `false` for until the child has exited.
-///
-/// With no pipe at all the answer is `true`: there is nothing to block on,
-/// and every drain returns at once on `None`.
-///
-/// Off unix the fd type does not exist, so no pipe is ever made non-blocking
-/// and a real pipe always answers `false` - the caller then keeps to the
-/// single after-exit read.
-fn set_nonblocking(pipe: Option<&std::process::ChildStderr>) -> bool {
-    #[cfg(unix)]
-    {
-        let Some(pipe) = pipe else {
-            // No pipe is vacuously safe to drain: `drain_available` returns
-            // at once on `None`, so it can never block.
-            return true;
-        };
-        use std::os::fd::AsRawFd;
-        set_nonblocking_on(pipe.as_raw_fd())
-    }
-    #[cfg(not(unix))]
-    {
-        // No fd type, so nothing is made non-blocking and a real pipe must
-        // answer `false`. The caller then skips the in-loop drain, which
-        // trades one hazard for a smaller one: a renderer writing more than a
-        // pipeful before exiting can stall on a full buffer, where the unix
-        // path would have drained it. The alternative is worse - a blocking
-        // read BEFORE `try_wait` waits on a live renderer and takes the
-        // budget and the kill path down with it, so the stall would be
-        // unbounded rather than bounded by the budget.
-        //
-        // Reachable only on a non-unix target, and croft has none: there is
-        // no Windows job in ci.yml and no windows dependency in Cargo.toml,
-        // and the PDF path documents WSL2 - itself unix - as the Windows
-        // story. Worth fixing with an overlapped/thread reader if that ever
-        // changes; not worth a reader thread on every platform today.
-        pipe.is_none()
-    }
-}
-
 /// Append everything the pipe has RIGHT NOW, and stop.
 ///
 /// The point of the whole change (#553): after the renderer exits, whatever
@@ -774,7 +688,7 @@ fn run_pdftoppm(
     // budget check and kill path never run - worse than the buffer pressure
     // the in-loop drain exists to relieve, so it is skipped rather than
     // risked. The after-exit drain is unaffected: the child is gone by then.
-    let nonblocking = set_nonblocking(stderr_pipe.as_ref());
+    let nonblocking = crate::proc::set_nonblocking(stderr_pipe.as_ref());
     let mut stderr_bytes: Vec<u8> = Vec::new();
     let deadline = std::time::Instant::now() + budget;
     let status = loop {
@@ -1811,47 +1725,5 @@ Pages:          12\nEncrypted:      no\nPage size:      612 x 792 pts\n";
             text, "Syntax Error: no trailer",
             "the renderer's own line must survive the blocking path"
         );
-    }
-
-    /// `set_nonblocking` must REPORT the outcome, because the caller reads
-    /// the pipe before reaping the child and only a non-blocking pipe makes
-    /// that read safe. A bare `true` would pass the live-pipe case, so the
-    /// bad-descriptor case is what gives the assertion teeth: the two
-    /// together pin a return value that actually tracks the fcntl.
-    ///
-    /// The failure is provoked on a RAW fd rather than a real pipe, because
-    /// closing one out from under a `ChildStderr` aborts the process under
-    /// Rust's IO-safety checks - which would "detect" a regression by
-    /// crashing rather than failing, and abort a passing run just as readily.
-    #[cfg(unix)]
-    #[test]
-    fn set_nonblocking_reports_whether_the_pipe_is_now_non_blocking() {
-        let mut child = std::process::Command::new("sh")
-            .args(["-c", "exit 0"])
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn");
-        let pipe = child.stderr.take().expect("piped stderr");
-
-        // A live pipe: the fcntl pair succeeds and the answer is yes.
-        assert!(
-            set_nonblocking(Some(&pipe)),
-            "a live pipe must report non-blocking"
-        );
-
-        // -1 is never a valid descriptor, so F_GETFL fails with EBADF - the
-        // same branch a real fcntl failure takes. `set_nonblocking`'s unix
-        // arm is a call to this and nothing else, so this IS its failure
-        // path, reached without closing an fd under a live handle.
-        assert!(
-            !set_nonblocking_on(-1),
-            "a bad descriptor must report failure, not be ignored"
-        );
-
-        // And the no-pipe case the doc promises, so the contract is pinned on
-        // every input shape rather than only the one with a pipe.
-        assert!(set_nonblocking(None), "no pipe means nothing to block on");
-
-        let _ = child.wait();
     }
 }

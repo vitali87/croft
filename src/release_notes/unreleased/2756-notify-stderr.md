@@ -1,0 +1,1 @@
+fix: A notification command that writes a lot to its error output is no longer killed after 30 seconds as if it were slow: croft reads that output while the command runs, so the command can finish, and its failure message keeps the end of that output, where the command says why it failed (#2756).
