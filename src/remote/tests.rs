@@ -2755,3 +2755,56 @@ fn a_pull_finishes_when_tar_prints_more_than_a_pipe_holds() {
     let calls = std::fs::read_to_string(&log).unwrap_or_default();
     assert!(calls.contains("tar -x"), "the archive was sent: {calls}");
 }
+
+/// #2792: an install inside croft places the prebuilt binary without
+/// touching the terminal, which belongs to croft's screen or the remote
+/// session: the remote steps and the copy get an empty stdin and their
+/// output goes into the install log.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_install_inside_croft_places_the_prebuilt_off_the_terminal() {
+    let bin = tempfile::tempdir().unwrap();
+    let ssh_runs = crate::proc::record_runs(bin.path(), "ssh");
+    let rsync_runs = crate::proc::record_runs(bin.path(), "rsync");
+    let binary = bin.path().join("croft");
+    std::fs::write(&binary, "binary").unwrap();
+    let ssh = SshControl {
+        host: String::from("box"),
+        socket_dir: bin.path().to_path_buf(),
+        socket_path: bin.path().join("ctl"),
+    };
+    let lane = crate::remote_bulk::BulkLane::new(crate::remote_bulk::LaneMode::SharedMux, 0);
+    // Each stand-in also says it ran: that line must reach the install log,
+    // not croft's terminal.
+    for name in ["ssh", "rsync"] {
+        let recorder = std::fs::read_to_string(bin.path().join(name)).unwrap();
+        let body: String = recorder.lines().skip(2).map(|l| format!("{l}\n")).collect();
+        crate::proc::stand_in_script(bin.path(), name, &format!("{body}echo {name} step ran\n"));
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    place_prebuilt(
+        &ssh,
+        &binary,
+        "stamp",
+        &mut |b| ship_prebuilt_logged(&lane, &ssh, b, &tx),
+        &mut |step| run_command_streaming(step, &tx),
+    )
+    .unwrap();
+    let ssh_lines = ssh_runs.lines();
+    let rsync_lines = rsync_runs.lines();
+    assert_eq!(ssh_lines.len(), 2, "mkdir and activate: {ssh_lines:?}");
+    assert_eq!(rsync_lines.len(), 1, "one copy: {rsync_lines:?}");
+    for run in ssh_lines.iter().chain(&rsync_lines) {
+        assert!(
+            run.ends_with("| stdin /dev/null | stdout pipe | stderr pipe"),
+            "{run}"
+        );
+    }
+    drop(tx);
+    let logged: Vec<String> = rx.iter().collect();
+    assert_eq!(
+        logged,
+        ["ssh step ran", "rsync step ran", "ssh step ran"],
+        "each step's output went into the install log"
+    );
+}

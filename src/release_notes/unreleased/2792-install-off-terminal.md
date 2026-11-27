@@ -1,0 +1,1 @@
+fix: installing croft on a remote from inside croft no longer draws ssh and rsync output over the screen or swallows keys typed meanwhile: the prebuilt install's steps now report into the install log, as the rest of the install does (#2792).
