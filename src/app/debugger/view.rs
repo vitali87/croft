@@ -136,7 +136,7 @@ impl App {
                 }
             }
             KeyCode::Enter | KeyCode::Char(' ') => match row.kind {
-                DebugRowKind::Breakpoint { index } => self.breakpoint_list_click(index, false),
+                DebugRowKind::Breakpoint { index, .. } => self.breakpoint_list_click(index, false),
                 _ => self.debug_panel_click(idx),
             },
             // Delete removes, as VS Code's Delete (Cmd+Backspace on a Mac)
@@ -153,7 +153,10 @@ impl App {
                         // row that took it, as a VS Code list's do.
                         self.run_debug.row_cursor = Some(idx);
                     }
-                    DebugRowKind::Breakpoint { index } => self.breakpoint_list_click(index, true),
+                    DebugRowKind::Breakpoint { index, .. } => {
+                        self.breakpoint_list_click(index, true);
+                        self.run_debug.row_cursor = Some(idx);
+                    }
                     _ => {}
                 }
             }
@@ -296,7 +299,7 @@ impl App {
             return (
                 true,
                 status,
-                breakpoint_section_rows(self.breakpoint_items().len()),
+                breakpoint_section_rows(&self.breakpoint_items()),
             );
         }
         let mut rows = Vec::new();
@@ -400,7 +403,7 @@ impl App {
             kind: DebugRowKind::WatchAdd,
         });
         // Last, so `sync_breakpoint_list` can swap it without a rebuild.
-        rows.extend(breakpoint_section_rows(self.breakpoint_items().len()));
+        rows.extend(breakpoint_section_rows(&self.breakpoint_items()));
         let status = self
             .run_debug
             .feedback

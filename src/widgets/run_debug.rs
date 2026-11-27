@@ -349,8 +349,14 @@ pub enum DebugRowKind {
     /// The trailing "+ Add Expression" affordance row of the WATCH section.
     WatchAdd,
     /// A breakpoint (#250): `index` into [`RunDebugPanel::breakpoints`].
-    /// Clicking the row jumps to it; the `✕` removes it.
-    Breakpoint { index: usize },
+    /// Clicking the row jumps to it; the `✕` removes it. `path` and `line`
+    /// (1-based) say which breakpoint it is, so the keyboard's row follows
+    /// it when one above it goes (#2748).
+    Breakpoint {
+        index: usize,
+        path: PathBuf,
+        line: usize,
+    },
 }
 
 /// One breakpoint as the BREAKPOINTS list shows it (#250), filled by the app
@@ -426,7 +432,14 @@ fn same_row(a: &DebugRow, b: &DebugRow) -> bool {
         ) => x == y && ex == ey && a.indent == b.indent,
         (K::Watch { expression: x, .. }, K::Watch { expression: y, .. }) => x == y,
         (K::WatchAdd, K::WatchAdd) => true,
-        (K::Breakpoint { index: x }, K::Breakpoint { index: y }) => x == y,
+        (
+            K::Breakpoint {
+                path: x, line: i, ..
+            },
+            K::Breakpoint {
+                path: y, line: j, ..
+            },
+        ) => x == y && i == j,
         _ => false,
     }
 }
@@ -1201,7 +1214,7 @@ impl RunDebugPanel {
                         self.watch_remove_rects.push((row_y, rx, *index));
                     }
                 }
-                DebugRowKind::Breakpoint { index } => {
+                DebugRowKind::Breakpoint { index, .. } => {
                     let indent = (row.indent as u16) * 2;
                     breakpoint_rows.push((*index, inner.x + indent, row_y, right));
                 }
@@ -1747,6 +1760,42 @@ mod tests {
         panel.row_cursor = Some(4);
         panel.replace_rows(rows());
         assert_eq!(panel.row_cursor, Some(4), "still second's `value`");
+    }
+
+    /// #2748: a breakpoint row is its breakpoint, not its place in the list.
+    /// One removed above it leaves the keyboard on the same breakpoint, and
+    /// when its own breakpoint goes the prompt has the keys again.
+    #[test]
+    fn the_row_cursor_follows_its_breakpoint() {
+        let header = DebugRow {
+            indent: 0,
+            kind: DebugRowKind::Header {
+                title: String::from("BREAKPOINTS"),
+            },
+        };
+        let breakpoints = |lines: &[usize]| {
+            let mut rows = vec![header.clone()];
+            rows.extend(lines.iter().enumerate().map(|(index, &line)| DebugRow {
+                indent: 1,
+                kind: DebugRowKind::Breakpoint {
+                    index,
+                    path: PathBuf::from("/w/s.py"),
+                    line,
+                },
+            }));
+            rows
+        };
+        let mut panel = RunDebugPanel::new();
+        panel.debug_active = true;
+        panel.debug_rows = breakpoints(&[3, 7, 9]);
+        panel.row_cursor = Some(2);
+        panel.replace_rows(breakpoints(&[7, 9]));
+        assert_eq!(panel.row_cursor, Some(1), "still line 7, now first");
+        panel.replace_rows(breakpoints(&[9]));
+        assert_eq!(
+            panel.row_cursor, None,
+            "line 7 is gone: the prompt has the keys"
+        );
     }
 
     /// Every row of `line` wrapped to `width`.

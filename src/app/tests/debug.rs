@@ -6464,7 +6464,14 @@ fn app_with_debug_rows(root: &Path) -> App {
                 title: "BREAKPOINTS".into(),
             },
         ),
-        row(1, DebugRowKind::Breakpoint { index: 0 }),
+        row(
+            1,
+            DebugRowKind::Breakpoint {
+                index: 0,
+                path: root.join("s.py"),
+                line: 2,
+            },
+        ),
     ];
     draw(&mut app, 120, 40);
     app

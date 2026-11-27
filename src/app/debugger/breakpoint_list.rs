@@ -6,10 +6,10 @@ use super::*;
 /// The BREAKPOINTS section of the debug tree (#250): a header and one row per
 /// breakpoint, or nothing when there are none.
 pub(in crate::app) fn breakpoint_section_rows(
-    count: usize,
+    items: &[crate::widgets::run_debug::BreakpointItem],
 ) -> Vec<crate::widgets::run_debug::DebugRow> {
     use crate::widgets::run_debug::{DebugRow, DebugRowKind};
-    if count == 0 {
+    if items.is_empty() {
         return Vec::new();
     }
     let mut rows = vec![DebugRow {
@@ -18,9 +18,13 @@ pub(in crate::app) fn breakpoint_section_rows(
             title: String::from("BREAKPOINTS"),
         },
     }];
-    rows.extend((0..count).map(|index| DebugRow {
+    rows.extend(items.iter().enumerate().map(|(index, item)| DebugRow {
         indent: 1,
-        kind: DebugRowKind::Breakpoint { index },
+        kind: DebugRowKind::Breakpoint {
+            index,
+            path: item.path.clone(),
+            line: item.line,
+        },
     }));
     rows
 }
@@ -74,16 +78,19 @@ impl App {
         if items == self.run_debug.breakpoints {
             return;
         }
-        let n = items.len();
+        let section = breakpoint_section_rows(&items);
         self.run_debug.breakpoints = items;
         if self.run_debug.debug_active {
-            let rows = &mut self.run_debug.debug_rows;
+            // Through `replace_rows`, so the keyboard's row stays on its own
+            // breakpoint when one above it goes (#2748).
+            let mut rows = self.run_debug.debug_rows.clone();
             if let Some(pos) = rows.iter().position(
                 |r| matches!(&r.kind, DebugRowKind::Header { title } if title == "BREAKPOINTS"),
             ) {
                 rows.truncate(pos);
             }
-            rows.extend(breakpoint_section_rows(n));
+            rows.extend(section);
+            self.run_debug.replace_rows(rows);
         }
     }
 
