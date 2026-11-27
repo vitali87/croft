@@ -88,7 +88,7 @@ pub(super) fn handle_pull_request(
     // copies file or directory equivalently in one round trip and
     // sidesteps OpenSSH 9.x scp/sftp's realpath check on the
     // destination, which kept failing on freshly-mkdir'd dirs.
-    let mut tar = match Command::new("tar")
+    let mut tar = match crate::proc::command("tar")
         .env("COPYFILE_DISABLE", "1")
         .args(pull_tar_args(parent, basename))
         .stdout(Stdio::piped())
@@ -108,6 +108,16 @@ pub(super) fn handle_pull_request(
             return;
         }
     };
+    // Read while both run: a tar blocked writing a full stderr pipe never
+    // finishes its stdout, so ssh never sees the end of its input and the
+    // relay waits on it for good (#2795).
+    let tar_stderr = tar.stderr.take().map(|mut err| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut err, &mut bytes);
+            bytes
+        })
+    });
     let tar_stdout = match tar.stdout.take() {
         Some(s) => s,
         None => {
@@ -146,7 +156,13 @@ pub(super) fn handle_pull_request(
         }
     };
     let ssh_out = ssh_recv.wait_with_output();
-    let tar_out = tar.wait_with_output();
+    let tar_out = tar.wait().map(|status| std::process::Output {
+        status,
+        stdout: Vec::new(),
+        stderr: tar_stderr
+            .and_then(|reader| reader.join().ok())
+            .unwrap_or_default(),
+    });
     match (tar_out, ssh_out) {
         (Ok(t), Ok(s)) if t.status.success() && s.status.success() => {
             let touch = format!("touch {}/.ok", shell_quote(&dest_dir));
