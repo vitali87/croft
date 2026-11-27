@@ -1399,6 +1399,53 @@ fn parse_relay_request_clipboard_requires_id_only() {
     }
 }
 
+/// A remote croft's copy is brought home: its payload lands on this
+/// machine's clipboard and its file is removed from the remote inbox.
+#[cfg(unix)]
+#[test]
+fn a_relay_copy_lands_on_this_clipboard_and_leaves_no_file() {
+    let bin = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    fake_ssh(bin.path(), home.path());
+    let inbox = home.path().join("inbox");
+    std::fs::create_dir(&inbox).unwrap();
+    let file = inbox.join("copy-1-1.txt");
+    std::fs::write(&file, "copied text").unwrap();
+    super::handle_copy_request(
+        "box",
+        &bin.path().join("ctl"),
+        inbox.to_str().unwrap(),
+        "copy-1-1",
+    );
+    assert_eq!(
+        crate::clipboard::read_string().as_deref(),
+        Some("copied text")
+    );
+    assert!(!file.exists(), "the payload's file is removed");
+}
+
+/// A payload past the cap is dropped whole, never pasted half-formed, and
+/// its file is still removed.
+#[cfg(unix)]
+#[test]
+fn a_relay_copy_past_the_cap_is_dropped() {
+    let bin = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    fake_ssh(bin.path(), home.path());
+    let inbox = home.path().join("inbox");
+    std::fs::create_dir(&inbox).unwrap();
+    let file = inbox.join("copy-1-2.txt");
+    std::fs::write(&file, "x".repeat(super::MAX_COPY_PAYLOAD_BYTES + 1)).unwrap();
+    super::handle_copy_request(
+        "box",
+        &bin.path().join("ctl"),
+        inbox.to_str().unwrap(),
+        "copy-1-2",
+    );
+    assert_eq!(crate::clipboard::read_string(), None);
+    assert!(!file.exists(), "the payload's file is removed");
+}
+
 #[test]
 fn parse_relay_request_copy_carries_only_an_id() {
     match super::parse_relay_request("copy\tcopy-7") {

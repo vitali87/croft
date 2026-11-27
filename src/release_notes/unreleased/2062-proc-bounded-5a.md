@@ -1,0 +1,1 @@
+refactor: The video poster frame, the pull request number lookup and the remote clipboard copy now run through `proc::Bounded`, croft's one type for a program it waits for (#2062). Nothing changes in use.

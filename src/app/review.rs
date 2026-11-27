@@ -1813,49 +1813,29 @@ impl App {
 }
 
 /// Run `cmd` for at most `budget`, collecting stdout; None when it could not
-/// start or ran out of time (it is then killed and reaped). For the few
-/// short commands that still run on the UI thread. A program just written,
-/// such as a freshly installed `gh`, is waited out while it is "Text file
-/// busy" (#2422), as croft's other `gh` calls do, and that wait comes out of
-/// the same budget.
+/// start, ran out of time (it is then killed and reaped), or answered more
+/// than [`BOUNDED_OUTPUT_CAP`]. For the few short commands that still run on
+/// the UI thread. A program just written, such as a freshly installed `gh`,
+/// is waited out while it is "Text file busy" (#2422), as croft's other `gh`
+/// calls do, and that wait comes out of the same budget.
 pub(super) fn bounded_output(
     cmd: &mut std::process::Command,
     budget: std::time::Duration,
 ) -> Option<(std::process::ExitStatus, Vec<u8>)> {
-    use std::io::Read;
-    let deadline = std::time::Instant::now() + budget;
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
-    let mut child = crate::proc::retry_while_busy(
-        || cmd.spawn(),
-        |r| {
-            r.as_ref().is_err_and(crate::proc::text_file_busy)
-                && std::time::Instant::now() < deadline
+    let ran = crate::proc::Bounded {
+        stdout: crate::proc::Keep::All {
+            cap: BOUNDED_OUTPUT_CAP,
         },
-    )
-    .ok()?;
-    let mut stdout = child.stdout.take()?;
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        let _ = tx.send(buf);
-    });
-    let bytes = rx
-        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-        .ok();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return bytes.map(|b| (status, b)),
-            Ok(None) if bytes.is_some() && std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
+        stderr: crate::proc::Keep::Nothing,
+        detached: false,
+        limit: budget,
+        retry_busy: true,
     }
+    .run(cmd)
+    .ok()?;
+    Some((ran.status, ran.stdout.into_bytes()))
 }
+
+/// The most of a short command's answer [`bounded_output`] takes: far past
+/// a pull request's number, so a longer answer is no answer at all.
+const BOUNDED_OUTPUT_CAP: usize = 1024 * 1024;

@@ -362,9 +362,11 @@ pub fn to_markdown(path: &Path, info: &MediaInfo, scratch: &Path) -> String {
     md
 }
 
+/// How long ffmpeg may take to pull a video's poster frame.
+const POSTER_LIMIT: std::time::Duration = std::time::Duration::from_secs(3);
+
 fn poster_frame(path: &Path, scratch: &Path) -> Option<std::path::PathBuf> {
     use std::hash::{Hash as _, Hasher as _};
-    use std::process::{Command, Stdio};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     path.hash(&mut h);
     let meta = std::fs::metadata(path).ok()?;
@@ -386,35 +388,26 @@ fn poster_frame(path: &Path, scratch: &Path) -> Option<std::path::PathBuf> {
         std::process::id(),
         h.finish()
     ));
-    // Bounded (#202 review): poll with try_wait and kill+reap on the
-    // deadline, so a wedged ffmpeg cannot stall the open. First open of
-    // a given video only - the poster is hash-cached thereafter.
-    let mut child = Command::new("ffmpeg")
-        .args(["-y", "-loglevel", "quiet", "-ss", "1", "-i"])
-        .arg(path)
-        .args(["-frames:v", "1"])
-        .arg(&tmp)
-        .stdin(Stdio::null())
-        // Never the inherited tty: this runs mid-session, and anything a
-        // child writes there paints raw bytes over the TUI frame.
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    let ok = loop {
-        match child.try_wait() {
-            Ok(Some(st)) => break st.success(),
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(30));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break false;
-            }
-        }
-    };
+    // Bounded (#202 review): a wedged ffmpeg is killed at the limit, so it
+    // cannot stall the open. First open of a given video only - the poster
+    // is hash-cached thereafter. Its output goes nowhere, never the
+    // inherited tty: this runs mid-session, and anything a child writes
+    // there paints raw bytes over the TUI frame.
+    let ok = crate::proc::Bounded {
+        stdout: crate::proc::Keep::Nothing,
+        stderr: crate::proc::Keep::Nothing,
+        detached: false,
+        limit: POSTER_LIMIT,
+        retry_busy: false,
+    }
+    .run(
+        std::process::Command::new("ffmpeg")
+            .args(["-y", "-loglevel", "quiet", "-ss", "1", "-i"])
+            .arg(path)
+            .args(["-frames:v", "1"])
+            .arg(&tmp),
+    )
+    .is_ok_and(|ran| ran.status.success());
     // Rename-on-success (#202 review): a killed or failed ffmpeg can
     // leave a partial file, which must never be served from the cache.
     if ok && tmp.is_file() && std::fs::rename(&tmp, &out).is_ok() {

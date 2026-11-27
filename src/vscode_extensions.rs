@@ -671,7 +671,7 @@ const LIST_CAP: usize = 1024 * 1024;
 /// render thread, and is killed at the bound and reaped off-thread, since a
 /// child in uninterruptible sleep cannot be killed and a synchronous wait
 /// would wedge the frame after all.
-pub fn installed_via(cmd: std::process::Command, timeout: std::time::Duration) -> Vec<String> {
+pub fn installed_via(mut cmd: std::process::Command, timeout: std::time::Duration) -> Vec<String> {
     let ran = crate::proc::Bounded {
         stdout: crate::proc::Keep::All { cap: LIST_CAP },
         stderr: crate::proc::Keep::Nothing,
@@ -679,7 +679,7 @@ pub fn installed_via(cmd: std::process::Command, timeout: std::time::Duration) -
         limit: timeout,
         retry_busy: false,
     }
-    .run(cmd);
+    .run(&mut cmd);
     let Ok(ran) = ran else {
         return Vec::new();
     };
