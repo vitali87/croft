@@ -10,7 +10,7 @@
 //! itself is attach's (PEP 768), not launch's.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -82,9 +82,11 @@ pub fn python_version(python: &Path) -> Option<PyVersion> {
     if from_cfg.is_some() {
         return from_cfg;
     }
-    let mut probe = Command::new(python);
-    probe.args(["-c", "import sys; print('%d.%d' % sys.version_info[:2])"]);
-    let out = run_bounded(probe, Duration::from_secs(5))?;
+    let out = run_probe(
+        Command::new(python).args(["-c", "import sys; print('%d.%d' % sys.version_info[:2])"]),
+        Duration::from_secs(5),
+        false,
+    )?;
     PyVersion::parse(&out)
 }
 
@@ -177,63 +179,47 @@ pub fn node_bin_dir(node: &str) -> Option<PathBuf> {
 /// install uses (#2064): an attached interactive shell can take croft's
 /// terminal, and a line printed by the rc would read as the path.
 fn resolve_node_via_login_shell() -> Option<String> {
-    let out = run_bounded(
-        crate::lsp::install::node_probe_command(),
+    let out = run_probe(
+        &mut crate::lsp::install::node_probe_command(),
         Duration::from_secs(8),
+        true,
     )?;
     let path = crate::lsp::install::parse_node_probe(&out)?;
     Path::new(path).is_file().then(|| path.to_string())
 }
 
-/// Run `cmd` capturing stdout, killing it if it outlives `timeout`
-/// (a login shell with a chatty/blocking rc must never wedge croft). Stdout is
-/// drained *while* the child runs: an rc that prints more than the OS pipe
-/// buffer would otherwise block in write() and never exit. Returns the
-/// captured stdout, decoded lossily so one stray byte from an rc cannot hide
-/// the rest, `None` on timeout or spawn failure.
+/// Run a probe, `cmd`, to its exit or `timeout`: a program asked one
+/// question whose answer it prints last, such as a login shell asked where
+/// `node` is (a shell with a chatty or blocking rc must never wedge croft).
+/// Returns the end of its stdout, decoded lossily so one stray byte from an
+/// rc cannot hide the rest, or `None` when it could not start or outlived
+/// `timeout`.
 ///
-/// When it is done the child is killed with its process group: a probe
-/// started by `setsid` ([`crate::lsp::install::node_probe_command`]) leads
-/// one, and whatever its rc started, such as a command that hangs, goes with
-/// it (#2755). A child that leads no group is killed alone. It returns by
-/// `timeout` even when the child cannot die yet: the child is reaped on a
-/// thread of its own.
-pub(crate) fn run_bounded(mut cmd: Command, timeout: Duration) -> Option<String> {
-    use std::io::Read;
+/// Its stdout is read as it runs, so an rc that prints more than a pipe
+/// holds cannot block the probe, and only the last [`PROBE_TAIL`] bytes are
+/// kept, where the answer is. One that runs `detached`, as the node probe
+/// does ([`crate::lsp::install::node_probe_command`]), is killed with
+/// everything it started once croft is done with it, at its exit or at
+/// `timeout`, so whatever its rc left running goes with it (#2755).
+pub(crate) fn run_probe(cmd: &mut Command, timeout: Duration, detached: bool) -> Option<String> {
     // A program written a moment ago (a test's stand-in interpreter) is "Text
     // file busy" while another thread's forked child still holds its write
     // descriptor; that read as "no version" instead of waiting it out.
-    let mut child = crate::proc::spawn_retrying_busy(
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null()),
-    )
-    .ok()?;
-    let mut stdout = child.stdout.take()?;
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
-    });
-    let out = rx.recv_timeout(timeout).ok();
-    // Before the wait, so the group's id cannot have been reused: the child
-    // is not reaped yet. No group has the id of a child that leads none.
-    if let Ok(pid) = i32::try_from(child.id()) {
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
-        }
+    let ran = crate::proc::Bounded {
+        stdout: crate::proc::Keep::Tail(PROBE_TAIL),
+        stderr: crate::proc::Keep::Nothing,
+        detached,
+        limit: timeout,
+        retry_busy: true,
     }
-    let _ = child.kill();
-    // Reaped on a thread of its own: a child stuck in I/O that cannot be
-    // interrupted, such as an rc reading a dead network mount, dies only
-    // once that I/O returns, and the caller must not wait for it. The
-    // language servers probe from their one command loop.
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
-    out
+    .run(cmd)
+    .ok()?;
+    Some(ran.stdout.text())
 }
+
+/// How much of a probe's stdout [`run_probe`] keeps: its last 64 KiB, which
+/// hold its answer after any rc chatter before it.
+pub(crate) const PROBE_TAIL: usize = 64 * 1024;
 
 /// Whether `bin` resolves on PATH (a `command -v` check via the shell-less
 /// `which`-style scan of PATH entries).
@@ -464,11 +450,15 @@ mod tests {
     /// deadlocks until the timeout and reports node as missing. Output must
     /// be drained while the child runs.
     #[test]
-    fn run_bounded_survives_output_larger_than_the_pipe_buffer() {
-        let mut sh = Command::new("/bin/sh");
-        sh.args(["-c", "yes croft | head -c 200000"]);
-        let out = run_bounded(sh, Duration::from_secs(3));
-        assert_eq!(out.map(|s| s.len()), Some(200000));
+    fn a_probe_survives_output_larger_than_the_pipe_buffer() {
+        let out = run_probe(
+            Command::new("/bin/sh").args(["-c", "yes croft | head -c 200000; echo answer"]),
+            Duration::from_secs(3),
+            false,
+        )
+        .expect("the probe answers");
+        assert_eq!(out.len(), PROBE_TAIL, "only the end is kept");
+        assert!(out.ends_with("answer\n"), "{:?}", &out[out.len() - 20..]);
     }
 
     #[test]
