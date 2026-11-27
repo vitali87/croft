@@ -187,6 +187,7 @@ editor | ctrl+k right | status="No tabs to the right to close"
 editor | ctrl+k s | status="Selected main.rs for compare"
 editor | ctrl+k shift+\ | groups=0,0+60x40[*main.rs] *60,0+60x40[*main.rs]
 editor | ctrl+k shift+a | focus=side side=SourceControl scm=""@0 +focus +menu("Pull" > "Pull")
+editor | ctrl+k shift+b | status="No bookmarks (Cmd+Opt+Shift+K sets one)"
 editor | ctrl+k shift+c | focus=side side=SourceControl scm=""@0 +focus +menu("Commit & Push" > "Commit & Push")
 editor | ctrl+k shift+d | status="Type hierarchy: no language server for this file"
 editor | ctrl+k shift+down | status="Move: the editor is already a single group"
@@ -246,7 +247,7 @@ editor | ctrl+shift+l | caret=4:13 sel=4:8-4:13 carets=1:35-1:40,5:7-5:12,6:19-6
 editor | ctrl+shift+m | focus=panel panel=Problems
 editor | ctrl+shift+n | -
 editor | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-editor | ctrl+shift+p | status="Command Palette: 408 commands — Esc to close" +palette("" @0 > "Move Line Up")
+editor | ctrl+shift+p | status="Command Palette: 409 commands — Esc to close" +palette("" @0 > "Move Line Up")
 editor | ctrl+shift+pagedown | status="Move: the editor is already the last tab"
 editor | ctrl+shift+pageup | status="Move: the editor is already the first tab"
 editor | ctrl+shift+r | focus=side side=Remote
@@ -466,6 +467,7 @@ selection | ctrl+k right | status="No tabs to the right to close"
 selection | ctrl+k s | status="Selected main.rs for compare"
 selection | ctrl+k shift+\ | groups=0,0+60x40[*main.rs] *60,0+60x40[*main.rs] sel=-
 selection | ctrl+k shift+a | focus=side side=SourceControl scm=""@0 +focus +menu("Pull" > "Pull")
+selection | ctrl+k shift+b | status="No bookmarks (Cmd+Opt+Shift+K sets one)"
 selection | ctrl+k shift+c | focus=side side=SourceControl scm=""@0 +focus +menu("Commit & Push" > "Commit & Push")
 selection | ctrl+k shift+d | status="Type hierarchy: no language server for this file"
 selection | ctrl+k shift+down | status="Move: the editor is already a single group"
@@ -525,7 +527,7 @@ selection | ctrl+shift+l | carets=1:35-1:40,5:7-5:12,6:19-6:24 status="Selected 
 selection | ctrl+shift+m | focus=panel panel=Problems
 selection | ctrl+shift+n | -
 selection | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-selection | ctrl+shift+p | status="Command Palette: 408 commands — Esc to close" +palette("" @0 > "Move Line Up")
+selection | ctrl+shift+p | status="Command Palette: 409 commands — Esc to close" +palette("" @0 > "Move Line Up")
 selection | ctrl+shift+pagedown | status="Move: the editor is already the last tab"
 selection | ctrl+shift+pageup | status="Move: the editor is already the first tab"
 selection | ctrl+shift+r | focus=side side=Remote
@@ -745,6 +747,7 @@ explorer | ctrl+k right | status="No tabs to the right to close"
 explorer | ctrl+k s | status="Selected main.rs for compare"
 explorer | ctrl+k shift+\ | focus=editor groups=0,0+60x40[*main.rs] *60,0+60x40[*main.rs]
 explorer | ctrl+k shift+a | side=SourceControl scm=""@0 +focus +menu("Pull" > "Pull")
+explorer | ctrl+k shift+b | status="No bookmarks (Cmd+Opt+Shift+K sets one)"
 explorer | ctrl+k shift+c | side=SourceControl scm=""@0 +focus +menu("Commit & Push" > "Commit & Push")
 explorer | ctrl+k shift+d | status="Type hierarchy: no language server for this file"
 explorer | ctrl+k shift+down | status="Move: the editor is already a single group"
@@ -804,7 +807,7 @@ explorer | ctrl+shift+l | -
 explorer | ctrl+shift+m | focus=panel panel=Problems
 explorer | ctrl+shift+n | +prompt("New Folder in ." "")
 explorer | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-explorer | ctrl+shift+p | status="Command Palette: 408 commands — Esc to close" +palette("" @0 > "Move Line Up")
+explorer | ctrl+shift+p | status="Command Palette: 409 commands — Esc to close" +palette("" @0 > "Move Line Up")
 explorer | ctrl+shift+pagedown | tree=./+,.vscode/,docs/,main.rs > main.rs marked=.,.vscode,docs,main.rs
 explorer | ctrl+shift+pageup | tree=./+,.vscode/,docs/,main.rs > . marked=.
 explorer | ctrl+shift+r | side=Remote
@@ -1023,6 +1026,7 @@ terminal | ctrl+k right | typed=0:"\u{b}\u{1b}[C"
 terminal | ctrl+k s | typed=0:"\u{b}s"
 terminal | ctrl+k shift+\ | typed=0:"\u{b}\\"
 terminal | ctrl+k shift+a | typed=0:"\u{b}A"
+terminal | ctrl+k shift+b | typed=0:"\u{b}B"
 terminal | ctrl+k shift+c | typed=0:"\u{b}C"
 terminal | ctrl+k shift+d | typed=0:"\u{b}D"
 terminal | ctrl+k shift+down | typed=0:"\u{b}\u{1b}[1;2B"
@@ -1082,7 +1086,7 @@ terminal | ctrl+shift+l | typed=0:"\u{c}"
 terminal | ctrl+shift+m | panel=Problems
 terminal | ctrl+shift+n | typed=0:"\u{e}"
 terminal | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-terminal | ctrl+shift+p | status="Command Palette: 408 commands — Esc to close" +palette("" @0 > "Move Line Up")
+terminal | ctrl+shift+p | status="Command Palette: 409 commands — Esc to close" +palette("" @0 > "Move Line Up")
 terminal | ctrl+shift+pagedown | -
 terminal | ctrl+shift+pageup | -
 terminal | ctrl+shift+r | focus=side side=Remote
@@ -1302,6 +1306,7 @@ search | ctrl+k right | status="No tabs to the right to close"
 search | ctrl+k s | status="Selected main.rs for compare"
 search | ctrl+k shift+\ | focus=editor groups=0,0+60x40[*main.rs] *60,0+60x40[*main.rs] search="total" hits=4@0
 search | ctrl+k shift+a | side=SourceControl search="total" hits=4@0 scm=""@0 +focus +menu("Pull" > "Pull")
+search | ctrl+k shift+b | status="No bookmarks (Cmd+Opt+Shift+K sets one)"
 search | ctrl+k shift+c | side=SourceControl search="total" hits=4@0 scm=""@0 +focus +menu("Commit & Push" > "Commit & Push")
 search | ctrl+k shift+d | status="Type hierarchy: no language server for this file"
 search | ctrl+k shift+down | status="Move: the editor is already a single group"
@@ -1361,7 +1366,7 @@ search | ctrl+shift+l | status="Search: unhandled Ctrl+L"
 search | ctrl+shift+m | focus=panel panel=Problems search="total" hits=4@0
 search | ctrl+shift+n | status="Search: unhandled Ctrl+N"
 search | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-search | ctrl+shift+p | status="Command Palette: 408 commands — Esc to close" +palette("" @0 > "Move Line Up")
+search | ctrl+shift+p | status="Command Palette: 409 commands — Esc to close" +palette("" @0 > "Move Line Up")
 search | ctrl+shift+pagedown | -
 search | ctrl+shift+pageup | -
 search | ctrl+shift+r | side=Remote search="total" hits=4@0
@@ -1581,6 +1586,7 @@ scm | ctrl+k right | status="No tabs to the right to close"
 scm | ctrl+k s | status="Selected main.rs for compare"
 scm | ctrl+k shift+\ | focus=editor groups=0,0+60x40[*main.rs] *60,0+60x40[*main.rs] scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
 scm | ctrl+k shift+a | +menu("Pull" > "Pull")
+scm | ctrl+k shift+b | status="No bookmarks (Cmd+Opt+Shift+K sets one)"
 scm | ctrl+k shift+c | +menu("Commit & Push" > "Commit & Push")
 scm | ctrl+k shift+d | status="Type hierarchy: no language server for this file"
 scm | ctrl+k shift+down | status="Move: the editor is already a single group"
@@ -1640,7 +1646,7 @@ scm | ctrl+shift+l | -
 scm | ctrl+shift+m | focus=panel panel=Problems scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
 scm | ctrl+shift+n | -
 scm | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-scm | ctrl+shift+p | status="Command Palette: 408 commands — Esc to close" +palette("" @0 > "Move Line Up")
+scm | ctrl+shift+p | status="Command Palette: 409 commands — Esc to close" +palette("" @0 > "Move Line Up")
 scm | ctrl+shift+pagedown | -
 scm | ctrl+shift+pageup | -
 scm | ctrl+shift+r | side=Remote scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
@@ -1861,6 +1867,7 @@ palette | ctrl+k right | -
 palette | ctrl+k s | ~palette("s" @1 > "File: Save")
 palette | ctrl+k shift+\ | ~palette("\\" @1 > "")
 palette | ctrl+k shift+a | ~palette("A" @1 > "Fold All")
+palette | ctrl+k shift+b | ~palette("B" @1 > "Git: Open Commit for Line")
 palette | ctrl+k shift+c | ~palette("C" @1 > "Git: Commit")
 palette | ctrl+k shift+d | ~palette("D" @1 > "Delete Line")
 palette | ctrl+k shift+down | ~palette("" @0 > "Move Line Down")
@@ -2143,6 +2150,7 @@ confirm | ctrl+k right | -
 confirm | ctrl+k s | tabs=*main.rs files=27L#afbd942b +quit -unsaved
 confirm | ctrl+k shift+\ | -
 confirm | ctrl+k shift+a | -
+confirm | ctrl+k shift+b | -
 confirm | ctrl+k shift+c | -
 confirm | ctrl+k shift+d | +quit -unsaved
 confirm | ctrl+k shift+down | -
