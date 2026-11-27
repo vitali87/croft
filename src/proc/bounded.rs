@@ -391,7 +391,9 @@ mod tests {
     }
 
     /// Whether `pid` is gone: no longer running, or only a zombie waiting for
-    /// a reaper on another thread.
+    /// a reaper on another thread. Linux only, like the one test that asks:
+    /// it reads `/proc`, and on macOS an unused helper fails the build.
+    #[cfg(target_os = "linux")]
     fn gone(pid: i32) -> bool {
         // SAFETY: signal 0 only asks whether the process exists.
         let signalled = unsafe { libc::kill(pid, 0) };
@@ -405,6 +407,8 @@ mod tests {
                 .unwrap_or(true)
     }
 
+    /// [`gone`] within five seconds.
+    #[cfg(target_os = "linux")]
     fn wait_gone(pid: i32) -> bool {
         let until = Instant::now() + Duration::from_secs(5);
         while Instant::now() < until {
