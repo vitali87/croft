@@ -5,22 +5,25 @@
 //! from croft's terminal, how long it may take, and whether a moment of
 //! "Text file busy" is waited out. Every field is written at each call, so no
 //! call inherits the standard library's defaults, which differ between
-//! `output()` and `spawn()`. Its stdin is always empty: a program croft waits
-//! on never reads croft's own input.
+//! `output()` and `spawn()`. Its stdin is empty, or the input croft hands it
+//! ([`Bounded::run_fed`]): a program croft waits on never reads croft's own
+//! input.
 //!
-//! Both outputs are read in the loop that waits for the program, with no
-//! thread and without ever waiting on a pipe (#2756). croft wakes as soon as
-//! either has output, so a program is read as fast as it writes and never
-//! stalls on a full pipe, and a helper it leaves running with a pipe still
-//! open cannot hold croft past the program's own exit. At the limit the
-//! program is killed, together with everything it started when it runs
+//! Both outputs are read, and the input written, in the loop that waits for
+//! the program, with no thread and without ever waiting on a pipe (#2756).
+//! croft wakes as soon as either output has something or the input has room,
+//! so a program is read as fast as it writes and fed as fast as it reads, and
+//! never stalls on a full pipe; a helper it leaves running with a pipe still
+//! open cannot hold croft past the program's own exit, nor a program that
+//! stops reading its input hold croft past the limit (#2766). At the limit
+//! the program is killed, together with everything it started when it runs
 //! apart.
 //!
 //! croft builds only for unix (several modules import `std::os::unix`
 //! unconditionally), so this reads its pipes through unix descriptors.
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -29,10 +32,10 @@ use std::time::{Duration, Instant};
 /// The longest croft waits between checks of the program and the clock.
 const LONGEST_WAIT: Duration = Duration::from_millis(50);
 
-/// The most one read of a stream takes before croft checks the program and
-/// the clock again, so a program that never stops writing is still killed at
-/// its limit: past it the program waits on the pipe, not croft on the
-/// program. It is also the largest a pipe grows by default on Linux
+/// The most one read of a stream, or one write of the input, takes before
+/// croft checks the program and the clock again, so a program that never
+/// stops writing, or reads as fast as croft writes, is still killed at its
+/// limit: past it the program waits on the pipe, not croft on the program. It is also the largest a pipe grows by default on Linux
 /// (`/proc/sys/fs/pipe-max-size`), so the one read after the program exits
 /// takes all it left there.
 const DRAIN_LIMIT: usize = 1024 * 1024;
@@ -173,10 +176,26 @@ impl Bounded {
     /// leaves running may hold a stream open and write on, and croft does
     /// not wait for that.
     pub(crate) fn run(self, cmd: &mut Command) -> Result<Ran, RunError> {
+        self.run_with(cmd, None)
+    }
+
+    /// [`Self::run`], handing the program `input` on its stdin, which closes
+    /// once all of it is written. A program that exits or closes its stdin
+    /// before reading it all is not an error: what it did with its input is
+    /// its own answer, given by its exit status and output.
+    pub(crate) fn run_fed(self, cmd: &mut Command, input: &[u8]) -> Result<Ran, RunError> {
+        self.run_with(cmd, Some(input))
+    }
+
+    fn run_with(self, cmd: &mut Command, input: Option<&[u8]>) -> Result<Ran, RunError> {
         let deadline = Instant::now() + self.limit;
-        cmd.stdin(Stdio::null())
-            .stdout(self.stdout.stdio())
-            .stderr(self.stderr.stdio());
+        cmd.stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(self.stdout.stdio())
+        .stderr(self.stderr.stdio());
         if self.detached {
             // SAFETY: `setsid` is async-signal-safe, the only kind of call
             // allowed between fork and exec, and touches no memory of
@@ -209,16 +228,20 @@ impl Bounded {
             self.stderr,
             Stream::Stderr,
         );
-        let mut pipes = match (stdout, stderr) {
-            (Ok(stdout), Ok(stderr)) => [stdout, stderr],
-            (Err(e), _) | (_, Err(e)) => {
+        let feed = Feed::new(
+            child.stdin.take().map(OwnedFd::from),
+            input.unwrap_or_default(),
+        );
+        let (mut pipes, mut feed) = match (stdout, stderr, feed) {
+            (Ok(stdout), Ok(stderr), Ok(feed)) => ([stdout, stderr], feed),
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
                 stop(child, self.detached);
                 return Err(RunError::Pipe(e));
             }
         };
         let mut quiet = 0u32;
         loop {
-            let mut heard = false;
+            let mut heard = feed.write();
             for pipe in &mut pipes {
                 match pipe.drain() {
                     Ok(took) => heard |= took,
@@ -249,7 +272,7 @@ impl Bounded {
                         return Err(RunError::TimedOut);
                     }
                     quiet = if heard { 0 } else { quiet.saturating_add(1) };
-                    wait_for_output(&pipes, pause(quiet).min(deadline - now));
+                    wait_for_pipes(&pipes, &feed, pause(quiet).min(deadline - now));
                 }
                 Err(e) => {
                     stop(child, self.detached);
@@ -339,26 +362,91 @@ impl Pipe {
     }
 }
 
+/// The input croft hands a program, written only as fast as the pipe takes
+/// it, so a program that stops reading cannot hold croft.
+struct Feed<'a> {
+    /// Until all of it is written, or the program will read no more: closing
+    /// it is the end of the program's input.
+    file: Option<File>,
+    left: &'a [u8],
+}
+
+impl<'a> Feed<'a> {
+    /// The input pipe on `fd`, switched to writes that return at once, as
+    /// [`Pipe::new`] does and for the same reason. Empty input closes it at
+    /// once.
+    fn new(fd: Option<OwnedFd>, input: &'a [u8]) -> std::io::Result<Self> {
+        if let Some(fd) = &fd
+            && !super::set_nonblocking_on(fd.as_raw_fd())
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            file: fd.map(File::from).filter(|_| !input.is_empty()),
+            left: input,
+        })
+    }
+
+    /// Write what the pipe takes now, up to [`DRAIN_LIMIT`], and close it
+    /// once all is written. Reports whether it wrote anything.
+    fn write(&mut self) -> bool {
+        let Some(file) = self.file.as_mut() else {
+            return false;
+        };
+        let mut written = 0;
+        let mut done = false;
+        while written < DRAIN_LIMIT {
+            match file.write(self.left) {
+                Ok(n) if n > 0 => {
+                    written += n;
+                    self.left = &self.left[n..];
+                    if self.left.is_empty() {
+                        done = true;
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                // The program closed its stdin, or the pipe failed: it reads
+                // no more, and the rest of its input is dropped.
+                Ok(_) | Err(_) => {
+                    done = true;
+                    break;
+                }
+            }
+        }
+        if done {
+            self.file = None;
+        }
+        written > 0
+    }
+}
+
 /// Wait up to `wait`, waking as soon as a stream croft reads has output or
-/// ends, so a program that writes fast is read as fast as it writes.
-fn wait_for_output(pipes: &[Pipe], wait: Duration) {
-    let mut ready: Vec<libc::pollfd> = pipes
+/// ends, or the input croft writes has room, so a program that writes fast
+/// is read as fast as it writes, and one that reads fast fed as fast.
+fn wait_for_pipes(pipes: &[Pipe], feed: &Feed, wait: Duration) {
+    let reads = pipes
         .iter()
         .filter_map(|pipe| pipe.file.as_ref())
-        .map(|file| libc::pollfd {
+        .map(|file| (file, libc::POLLIN));
+    let writes = feed.file.as_ref().map(|file| (file, libc::POLLOUT));
+    let mut ready: Vec<libc::pollfd> = reads
+        .chain(writes)
+        .map(|(file, events)| libc::pollfd {
             fd: file.as_raw_fd(),
-            events: libc::POLLIN,
+            events,
             revents: 0,
         })
         .collect();
     if ready.is_empty() {
-        // No stream left to wake on: only the program's exit is awaited.
+        // No pipe left to wake on: only the program's exit is awaited.
         std::thread::sleep(wait);
         return;
     }
     let ms = libc::c_int::try_from(wait.as_millis()).unwrap_or(libc::c_int::MAX);
     // SAFETY: `ready` holds `ready.len()` initialised `pollfd`s on descriptors
-    // the pipes own, which outlive the call. An interrupted or failed poll only
+    // the pipes and the feed own, which outlive the call. An interrupted or failed poll only
     // ends this wait early; the caller checks the program and the clock either
     // way.
     unsafe { libc::poll(ready.as_mut_ptr(), ready.len() as libc::nfds_t, ms) };
@@ -496,8 +584,8 @@ mod tests {
         assert_eq!(ran.stderr.text(), "err\n");
     }
 
-    /// A stream kept as nothing goes to `/dev/null`, and stdin is always
-    /// empty, whatever the command said before.
+    /// A stream kept as nothing goes to `/dev/null`, and stdin is empty
+    /// unless croft feeds it, whatever the command said before.
     #[cfg(target_os = "linux")]
     #[test]
     fn its_input_and_an_unkept_stream_are_null() {
@@ -736,5 +824,66 @@ mod tests {
         assert!(text.starts_with('é'), "{text}");
         assert!(text.ends_with("éz"));
         assert!(!text.contains('\u{fffd}'));
+    }
+
+    /// Input larger than a pipe holds goes in whole while the program's
+    /// answer, as large, comes out: neither side waits on the other.
+    #[test]
+    fn fed_input_larger_than_a_pipe_passes_through_whole() {
+        let input: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let ran = bounded(
+            Keep::All {
+                cap: 8 * 1024 * 1024,
+            },
+            Keep::Nothing,
+            Duration::from_secs(10),
+        )
+        .run_fed(&mut sh("exec cat"), &input)
+        .unwrap();
+        assert!(ran.status.success());
+        assert!(ran.stdout.into_bytes() == input);
+    }
+
+    /// Empty input is the end of input at once, so a program reading to the
+    /// end finishes.
+    #[test]
+    fn empty_fed_input_ends_at_once() {
+        let ran = bounded(
+            Keep::All { cap: 1024 },
+            Keep::Nothing,
+            Duration::from_secs(5),
+        )
+        .run_fed(&mut sh("cat; echo end"), b"")
+        .unwrap();
+        assert!(ran.status.success());
+        assert_eq!(ran.stdout.text(), "end\n");
+    }
+
+    /// A program that exits without reading its input answers as usual: the
+    /// input it left is dropped, not an error.
+    #[test]
+    fn a_program_that_reads_none_of_its_input_still_answers() {
+        let input = vec![b'x'; 4 * 1024 * 1024];
+        let ran = bounded(
+            Keep::All { cap: 1024 },
+            Keep::Nothing,
+            Duration::from_secs(5),
+        )
+        .run_fed(&mut sh("echo done"), &input)
+        .unwrap();
+        assert!(ran.status.success());
+        assert_eq!(ran.stdout.text(), "done\n");
+    }
+
+    /// A program that stops reading its input never holds croft: it is
+    /// killed at the limit like any other (#2766).
+    #[test]
+    fn a_program_that_stops_reading_its_input_is_killed_at_the_limit() {
+        let input = vec![b'x'; 4 * 1024 * 1024];
+        let started = Instant::now();
+        let run = bounded(Keep::Nothing, Keep::Nothing, Duration::from_millis(300))
+            .run_fed(&mut sh("exec sleep 30"), &input);
+        assert!(matches!(run, Err(RunError::TimedOut)), "{run:?}");
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 }
