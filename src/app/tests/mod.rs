@@ -25,7 +25,6 @@ mod input;
 #[cfg(target_os = "linux")]
 mod key_ledger;
 mod keybindings;
-#[cfg(target_os = "linux")]
 mod keyboard_routes;
 mod layout;
 mod lsp;
