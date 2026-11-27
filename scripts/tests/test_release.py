@@ -1203,16 +1203,47 @@ class Workflows(unittest.TestCase):
     """A rule nothing enforces is a suggestion: the steps themselves, taken
     from the workflow files, run against throwaway repos."""
 
-    def gate(self, repo: Repo) -> subprocess.CompletedProcess[str]:
+    def gate(self, repo: Repo, **env: str) -> subprocess.CompletedProcess[str]:
         run(repo.path, "git", "update-ref", "refs/remotes/origin/main", "main")
         return subprocess.run(
             ["bash", "-c", step_script(CI, GATE_STEP)],
             cwd=repo.path,
-            env={**os.environ, "PR_BASE_REF": "main"},
+            env={**os.environ, "PR_BASE_REF": "main", "PR_BASE_SHA": "", **env},
             capture_output=True,
             text=True,
             check=False,
         )
+
+    def work_with_a_fragment(self, tmp: str) -> Repo:
+        """A repo whose `work` branch, off `main`, ships a change with notes."""
+        repo = Repo(Path(tmp))
+        with_scripts(repo)
+        repo.commit()
+        repo.branch()
+        repo.write("src/lib.rs", SHIPPED.replace("/ 2", "/ 3"))
+        repo.write("src/release_notes/unreleased/860-width.md", "fix: Width.\n")
+        repo.commit()
+        return repo
+
+    def test_the_ci_step_compares_with_the_stacked_on_commit_once_its_branch_is_gone(self):
+        """A stacked pull request's base branch is deleted when it merges, and
+        a run that waited in the queue past that found no `origin/<base>` and
+        failed before looking at the change (#2774). It compares with the
+        commit the pull request was stacked on instead."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self.work_with_a_fragment(tmp)
+            stacked_on = run(repo.path, "git", "rev-parse", "main").strip()
+            out = self.gate(repo, PR_BASE_REF="merged-and-deleted", PR_BASE_SHA=stacked_on)
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+
+    def test_the_ci_step_compares_with_the_base_branch_while_it_is_there(self):
+        """Negative: while the branch exists it is what the step compares
+        with, wherever the event's commit points: a base that moved since the
+        event is compared at its head."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self.work_with_a_fragment(tmp)
+            out = self.gate(repo, PR_BASE_SHA="0" * 40)
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
 
     def test_the_ci_step_refuses_a_version_bump_and_wants_a_fragment(self):
         with tempfile.TemporaryDirectory() as tmp:
