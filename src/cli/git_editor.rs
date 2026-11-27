@@ -4,8 +4,9 @@
 /// The user's own `sequence.editor` for the repository git is running in,
 /// if they set one (#620).
 pub(super) fn configured_sequence_editor() -> Option<String> {
-    let out = crate::proc::command("git")
+    let out = crate::git::Git::new()
         .args(["config", "--get", "sequence.editor"])
+        .into_command()
         .stderr(std::process::Stdio::null())
         .output()
         .ok()?;
@@ -18,8 +19,9 @@ pub(super) fn configured_sequence_editor() -> Option<String> {
 /// `None` when git names none (a dumb terminal with no editor set): git
 /// fails there, so no editor is invented. git's own reason reaches stderr.
 pub(super) fn git_editor() -> Option<String> {
-    crate::proc::command("git")
+    crate::git::Git::new()
         .args(["var", "GIT_EDITOR"])
+        .into_command()
         .stderr(std::process::Stdio::inherit())
         .output()
         .ok()
