@@ -65,6 +65,11 @@ impl SshAuth {
         cmd.arg("-T");
         cmd.arg("-o");
         cmd.arg("BatchMode=no");
+        // Reaching the host and its greeting only, not the login: an
+        // unreachable host fails in 10 s, as `croft remote` does, instead of
+        // waiting out the system's TCP timeout (#2796).
+        cmd.arg("-o");
+        cmd.arg("ConnectTimeout=10");
         cmd.arg("-o");
         cmd.arg("ServerAliveInterval=15");
         cmd.arg(host);
@@ -365,6 +370,30 @@ pub fn classify_prompt(line: &str) -> Option<PromptKind> {
 
 #[cfg(test)]
 mod tests {
+
+    /// #2796: the dialog's connection gives up on an unreachable host after
+    /// 10 s, as the terminal's does, rather than the system's TCP timeout.
+    #[cfg(unix)]
+    #[test]
+    fn the_dialog_connection_has_a_connect_timeout() {
+        let bin = tempfile::tempdir().unwrap();
+        let log = bin.path().join("ssh-args");
+        crate::proc::stand_in_script(
+            bin.path(),
+            "ssh",
+            &format!("echo \"$*\" > '{}'\nsleep 5\n", log.display()),
+        );
+        let mut auth = SshAuth::start("example-host").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !log.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let args = std::fs::read_to_string(&log).unwrap_or_default();
+        auth.cancel();
+        assert!(args.contains("-o ConnectTimeout=10"), "{args}");
+        assert!(args.trim_end().ends_with("example-host"), "{args}");
+    }
     use super::*;
 
     #[test]
