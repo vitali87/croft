@@ -105,14 +105,22 @@ pub struct Job {
 }
 
 /// How long a run may take before the save it holds goes ahead without it.
+/// Prettier is stopped then too, rather than left running (#2766).
 const TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The most of Prettier's answer croft keeps: far past any formatted file,
+/// there only so a runaway program cannot fill croft's memory.
+const OUTPUT_CAP: usize = 1 << 30;
+
+/// The end of Prettier's error output croft keeps, for the message.
+const ERROR_TAIL: usize = 64 * 1024;
 
 impl Job {
     pub fn spawn(bin: PathBuf, path: PathBuf, sent: String) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
         let (file, text) = (path.clone(), sent.clone());
         std::thread::spawn(move || {
-            let _ = tx.send(run(&bin, &file, &text));
+            let _ = tx.send(run(&bin, &file, &text, TIMEOUT));
         });
         Self {
             path,
@@ -130,45 +138,57 @@ impl Job {
                 Some(Err(String::from("it stopped without a reply")))
             }
             Err(TryRecvError::Empty) if now.duration_since(self.started) > TIMEOUT => {
-                Some(Err(format!("it took longer than {}s", TIMEOUT.as_secs())))
+                Some(Err(took_too_long(TIMEOUT)))
             }
             Err(TryRecvError::Empty) => None,
         }
     }
 }
 
-/// Run `bin --stdin-filepath file` over `text`. Prettier resolves the config
-/// and `.prettierignore` from that path, so cwd is the file's folder.
-fn run(bin: &Path, file: &Path, text: &str) -> Result<String, String> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-    let mut cmd = Command::new(bin);
-    cmd.arg("--stdin-filepath")
-        .arg(file)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+fn took_too_long(limit: Duration) -> String {
+    format!("it took longer than {}s", limit.as_secs())
+}
+
+/// Run `bin --stdin-filepath file` over `text`, stopping it at `limit`.
+/// Prettier resolves the config and `.prettierignore` from that path, so cwd
+/// is the file's folder. It runs apart from croft's terminal, so stopping it
+/// stops whatever its launcher started too.
+fn run(bin: &Path, file: &Path, text: &str, limit: Duration) -> Result<String, String> {
+    use crate::proc::{Bounded, Keep, RunError};
+    let mut cmd = std::process::Command::new(bin);
+    cmd.arg("--stdin-filepath").arg(file);
     if let Some(dir) = file.parent() {
         cmd.current_dir(dir);
     }
-    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
-    // Prettier reads all of stdin before it writes, so this cannot deadlock.
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(text.as_bytes())
-            .map_err(|e| e.to_string())?;
+    let ran = Bounded {
+        stdout: Keep::All { cap: OUTPUT_CAP },
+        stderr: Keep::Tail(ERROR_TAIL),
+        detached: true,
+        limit,
+        retry_busy: false,
     }
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let first = stderr
+    .run_fed(&mut cmd, text.as_bytes())
+    .map_err(|e| match e {
+        RunError::TimedOut => took_too_long(limit),
+        RunError::TooLong { cap, .. } => format!("its output passed {} MiB", cap >> 20),
+        RunError::Spawn(e) | RunError::Wait(e) | RunError::Pipe(e) => e.to_string(),
+    })?;
+    if !ran.status.success() {
+        let stderr = ran.stderr.text();
+        // A cut tail opens partway through a line: it is not the first.
+        let whole = if ran.stderr.cut() {
+            stderr.split_once('\n').map_or("", |(_, rest)| rest)
+        } else {
+            &stderr
+        };
+        let first = whole
             .lines()
             .map(str::trim)
             .find(|l| !l.is_empty())
             .unwrap_or("no output");
         return Err(first.trim_start_matches("[error] ").to_string());
     }
-    String::from_utf8(out.stdout)
+    String::from_utf8(ran.stdout.into_bytes())
         .map(|s| s.replace("\r\n", "\n"))
         .map_err(|_| String::from("its output was not UTF-8"))
 }
@@ -291,6 +311,83 @@ mod tests {
         let tmp = project(&[(".prettierrc", "{}"), BIN, ("main.rs", ""), ("x.py", "")]);
         assert_eq!(for_file(&tmp.path().join("main.rs")), None);
         assert_eq!(for_file(&tmp.path().join("x.py")), None);
+    }
+
+    /// A stand-in Prettier: `script` as an executable shell script.
+    fn stand_in(dir: &Path, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("prettier");
+        std::fs::write(&bin, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    #[test]
+    fn prettier_formats_text_larger_than_a_pipe_from_its_stdin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = stand_in(tmp.path(), "exec cat");
+        let text = "const a = 1;\r\n".repeat(64 * 1024);
+        let formatted = run(
+            &bin,
+            &tmp.path().join("a.ts"),
+            &text,
+            Duration::from_secs(10),
+        );
+        assert_eq!(formatted, Ok("const a = 1;\n".repeat(64 * 1024)));
+    }
+
+    #[test]
+    fn prettier_failing_reports_its_first_error_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = stand_in(
+            tmp.path(),
+            "cat >/dev/null; echo >&2; echo '[error] a.ts: SyntaxError: x' >&2; echo more >&2; exit 2",
+        );
+        let failed = run(&bin, &tmp.path().join("a.ts"), "x", Duration::from_secs(10));
+        assert_eq!(failed, Err(String::from("a.ts: SyntaxError: x")));
+    }
+
+    #[test]
+    fn prettier_answering_bytes_that_are_not_text_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = stand_in(tmp.path(), "cat >/dev/null; printf '\\377'");
+        let refused = run(&bin, &tmp.path().join("a.ts"), "x", Duration::from_secs(10));
+        assert_eq!(refused, Err(String::from("its output was not UTF-8")));
+    }
+
+    /// A Prettier that never answers is stopped at the limit: the save it
+    /// held already went ahead without it, and it no longer runs on
+    /// unseen (#2766).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prettier_that_never_answers_is_stopped_at_the_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("pid");
+        let bin = stand_in(
+            tmp.path(),
+            &format!("echo $$ > '{}'; exec sleep 30", pid_file.display()),
+        );
+        let started = Instant::now();
+        let failed = run(
+            &bin,
+            &tmp.path().join("a.ts"),
+            "x",
+            Duration::from_millis(300),
+        );
+        assert_eq!(failed, Err(took_too_long(Duration::from_millis(300))));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        // SAFETY: signal 0 only asks whether the process exists.
+        while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // SAFETY: as above.
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "Prettier still runs");
     }
 
     fn lines(s: &str) -> Vec<String> {
