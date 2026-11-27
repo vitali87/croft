@@ -3114,7 +3114,10 @@ pub struct App {
     code_scan_asks: Vec<crate::jobs::Job<code_scanning::CodeScanAnswer>>,
     /// The SARIF result a code scanning dismissal is for (#577): its log's
     /// path and its run and result indices, marked suppressed on success.
-    dismiss_target: Option<(PathBuf, usize, usize)>,
+    dismiss_target: Option<code_scanning::DismissTarget>,
+    /// The workspace folder the code scanning analysis picker was filled
+    /// from, which the analysis picked is fetched from (#2786).
+    code_scan_picker_root: Option<PathBuf>,
     /// The SARIF location a Locate prompt is open for (#577): its URI and
     /// the 1-based line and column to land on.
     sarif_locate_pending: Option<(String, i64, i64)>,
@@ -5046,6 +5049,7 @@ impl App {
             gh_limit: code_scanning::CODE_SCAN_GH_LIMIT,
             code_scan_asks: Vec::new(),
             dismiss_target: None,
+            code_scan_picker_root: None,
             sarif_locate_pending: None,
             sarif_download: None,
             sarif_fetch: fetch_sarif_source,
