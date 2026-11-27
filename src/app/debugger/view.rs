@@ -40,9 +40,20 @@ pub(in crate::app) fn push_variable_rows(
 impl App {
     pub(in crate::app) fn handle_run_debug_key(&mut self, key: KeyEvent) {
         // While a session is live the panel is a REPL: text edits the prompt and
-        // Enter evaluates it. Esc always leaves the view.
+        // Enter evaluates it. Esc leaves the view. Tab and Shift+Tab hand the
+        // keys to the rows above (#2748), which have keys of their own.
         if self.run_debug.debug_active {
+            if self.run_debug.row_cursor.is_some() {
+                self.handle_debug_rows_key(key);
+                return;
+            }
             match key.code {
+                KeyCode::Tab => {
+                    self.run_debug.enter_rows(false);
+                }
+                KeyCode::BackTab => {
+                    self.run_debug.enter_rows(true);
+                }
                 KeyCode::Esc => self.set_sidebar_view(SidebarView::Explorer),
                 KeyCode::Enter => {
                     self.debug_repl_submit();
@@ -63,6 +74,86 @@ impl App {
             KeyCode::Enter => self.run_debug_button_action(),
             _ => {}
         }
+    }
+
+    /// A key while a row of the debug tree has the keys (#2748), as VS
+    /// Code's VARIABLES, WATCH and CALL STACK lists take them: the arrows,
+    /// Home / End and PageUp / PageDown move the cursor, Left / Right close
+    /// and open a variable or scope, Enter and Space do what a click on the
+    /// row does, Delete removes a watch or breakpoint. Tab, Shift+Tab and Esc
+    /// give the prompt the keys back, and typing goes to the prompt.
+    fn handle_debug_rows_key(&mut self, key: KeyEvent) {
+        use crate::widgets::run_debug::DebugRowKind;
+        let Some(idx) = self.run_debug.row_cursor else {
+            return;
+        };
+        let Some(row) = self.run_debug.debug_rows.get(idx).cloned() else {
+            return;
+        };
+        let page = self.run_debug.row_page();
+        let open = match &row.kind {
+            DebugRowKind::Variable {
+                expandable: true,
+                expanded,
+                ..
+            } => Some(*expanded),
+            DebugRowKind::Scope { open, .. } => *open,
+            _ => None,
+        };
+        match key.code {
+            KeyCode::Up => self.run_debug.move_row_cursor(-1),
+            KeyCode::Down => self.run_debug.move_row_cursor(1),
+            KeyCode::PageUp => self.run_debug.move_row_cursor(-page),
+            KeyCode::PageDown => self.run_debug.move_row_cursor(page),
+            KeyCode::Home => {
+                self.run_debug.enter_rows(false);
+            }
+            KeyCode::End => {
+                self.run_debug.enter_rows(true);
+            }
+            // Open a closed variable or scope; on an open one, step to its
+            // first child, as a VS Code tree does.
+            KeyCode::Right => match open {
+                Some(false) => self.debug_panel_click(idx),
+                Some(true) => self.run_debug.move_row_cursor(1),
+                None => {}
+            },
+            // Close an open variable or scope; elsewhere, step to the row
+            // it sits under.
+            KeyCode::Left => {
+                if open == Some(true) {
+                    self.debug_panel_click(idx);
+                } else if let Some(parent) = (0..idx).rev().find(|&i| {
+                    self.run_debug.debug_rows[i].indent < row.indent
+                        && !matches!(
+                            self.run_debug.debug_rows[i].kind,
+                            DebugRowKind::Header { .. }
+                        )
+                }) {
+                    self.run_debug.row_cursor = Some(parent);
+                    self.run_debug.scroll_row_cursor_into_view();
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => match row.kind {
+                DebugRowKind::Breakpoint { index } => self.breakpoint_list_click(index, false),
+                _ => self.debug_panel_click(idx),
+            },
+            KeyCode::Delete | KeyCode::Backspace => match row.kind {
+                DebugRowKind::Watch { index, .. } => {
+                    self.remove_watch_expression(index);
+                    self.refresh_debug_panel();
+                }
+                DebugRowKind::Breakpoint { index } => self.breakpoint_list_click(index, true),
+                _ => {}
+            },
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Esc => self.run_debug.row_cursor = None,
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.run_debug.row_cursor = None;
+                self.run_debug.repl_input.push(c);
+            }
+            _ => {}
+        }
+        self.run_debug.settle_row_cursor();
     }
 
     pub(in crate::app) fn refresh_run_debug(&mut self) {
@@ -146,12 +237,14 @@ impl App {
             if self.run_debug.debug_scroll > max_scroll {
                 self.run_debug.debug_scroll = max_scroll;
             }
+            self.run_debug.settle_row_cursor();
             // Show the console tail (most recent output / REPL lines).
             let n = self.debug_console.len();
             self.run_debug.console_tail = self.debug_console[n.saturating_sub(50)..].to_vec();
         } else {
             self.run_debug.debug_rows.clear();
             self.run_debug.debug_scroll = 0;
+            self.run_debug.row_cursor = None;
             self.run_debug.repl_input.clear();
             // Retain the just-ended session's console output until the next run;
             // otherwise the idle Run panel shows nothing.

@@ -29,6 +29,8 @@ const DBG_LOC: Color = Color::Rgb(0x6b, 0x76, 0x89); // file:line / dim console
 const DBG_PILL_BG: Color = Color::Rgb(0x0e, 0x7e, 0x76); // status pill
 const DBG_PILL_FG: Color = Color::Rgb(0xdf, 0xfd, 0xf7);
 const DBG_FRAME_SEL_FG: Color = Color::Rgb(0xff, 0xff, 0xff);
+/// The keyboard's row (#2748): Source Control's list selection colour.
+const DBG_CURSOR_BG: Color = Color::Rgb(0x26, 0x4f, 0x78);
 const DBG_FIELD_BG: Color = Color::Rgb(0x0d, 0x11, 0x17); // REPL input field fill
 const DBG_PLACEHOLDER: Color = Color::Rgb(0x4b, 0x55, 0x63); // ghost hint text
 
@@ -423,6 +425,10 @@ pub struct RunDebugPanel {
     debug_control_rects: Vec<(u16, u16, DebugControl)>,
     pub debug_rows: Vec<DebugRow>,
     pub debug_scroll: usize,
+    /// The row the keyboard is on (#2748), an index into `debug_rows`, or
+    /// `None` while the expression prompt has the keys. Never a section
+    /// header: [`Self::settle_row_cursor`] keeps it off them.
+    pub row_cursor: Option<usize>,
     /// Screen y of the first rendered debug row and how many rows were drawn,
     /// recorded each frame so a click can be mapped to a row index.
     pub last_debug_row_y0: u16,
@@ -475,6 +481,7 @@ impl RunDebugPanel {
             debug_control_rects: Vec::new(),
             debug_rows: Vec::new(),
             debug_scroll: 0,
+            row_cursor: None,
             last_debug_row_y0: 0,
             last_debug_rows_shown: 0,
             console_tail: Vec::new(),
@@ -591,6 +598,112 @@ impl RunDebugPanel {
         } else {
             None
         }
+    }
+
+    /// Whether the keyboard cursor can rest on row `idx`: any row but a
+    /// section header (#2748).
+    fn takes_cursor(&self, idx: usize) -> bool {
+        self.debug_rows
+            .get(idx)
+            .is_some_and(|row| !matches!(row.kind, DebugRowKind::Header { .. }))
+    }
+
+    /// The nearest row the cursor can rest on from `from` on, looking down
+    /// (or up), `from` itself included.
+    fn cursor_row_from(&self, from: usize, down: bool) -> Option<usize> {
+        if down {
+            (from..self.debug_rows.len()).find(|&i| self.takes_cursor(i))
+        } else {
+            (0..=from.min(self.debug_rows.len().saturating_sub(1)))
+                .rev()
+                .find(|&i| self.takes_cursor(i))
+        }
+    }
+
+    /// Give the rows the keys (#2748): the cursor on the first row, or the
+    /// last with `last`. False, and the prompt keeps the keys, when no row
+    /// can take the cursor.
+    pub fn enter_rows(&mut self, last: bool) -> bool {
+        let row = if last {
+            self.debug_rows
+                .len()
+                .checked_sub(1)
+                .and_then(|end| self.cursor_row_from(end, false))
+        } else {
+            self.cursor_row_from(0, true)
+        };
+        self.row_cursor = row;
+        self.scroll_row_cursor_into_view();
+        row.is_some()
+    }
+
+    /// Put the row cursor on row `idx`, a row a click landed on, when the
+    /// cursor can rest there: mouse and keyboard agree on the row, as in VS
+    /// Code's lists.
+    pub fn put_row_cursor(&mut self, idx: usize) {
+        if self.takes_cursor(idx) {
+            self.row_cursor = Some(idx);
+        }
+    }
+
+    /// Move the row cursor `by` rows, down for a positive count, past the
+    /// headers, stopping at the first and last rows.
+    pub fn move_row_cursor(&mut self, by: isize) {
+        let Some(at) = self.row_cursor else {
+            return;
+        };
+        let target = at
+            .saturating_add_signed(by)
+            .min(self.debug_rows.len().saturating_sub(1));
+        let down = by > 0;
+        self.row_cursor = self
+            .cursor_row_from(target, down)
+            .or_else(|| self.cursor_row_from(target, !down))
+            .or(Some(at));
+        self.scroll_row_cursor_into_view();
+    }
+
+    /// How many rows one PageUp / PageDown moves: the rows drawn last frame.
+    pub fn row_page(&self) -> isize {
+        self.last_debug_rows_shown.max(1) as isize
+    }
+
+    /// Scroll so the cursor row is among the rows drawn.
+    pub fn scroll_row_cursor_into_view(&mut self) {
+        let Some(at) = self.row_cursor else {
+            return;
+        };
+        let shown = self.last_debug_rows_shown.max(1);
+        if at < self.debug_scroll {
+            self.debug_scroll = at;
+        } else if at >= self.debug_scroll + shown {
+            self.debug_scroll = at + 1 - shown;
+        }
+    }
+
+    /// After the rows are rebuilt (#2748): a cursor past the end, or on a
+    /// row that became a header, moves to the nearest row that takes it,
+    /// and with no such row the prompt has the keys again.
+    pub fn settle_row_cursor(&mut self) {
+        if !self.debug_active {
+            self.row_cursor = None;
+            return;
+        }
+        let Some(at) = self.row_cursor else {
+            return;
+        };
+        let at = at.min(self.debug_rows.len().saturating_sub(1));
+        self.row_cursor = self
+            .cursor_row_from(at, false)
+            .or_else(|| self.cursor_row_from(at, true));
+        self.scroll_row_cursor_into_view();
+    }
+
+    /// The screen row the cursor row was drawn on last frame, if it was.
+    pub fn row_cursor_y(&self) -> Option<u16> {
+        let at = self.row_cursor?;
+        let offset = at.checked_sub(self.debug_scroll)?;
+        (offset < self.last_debug_rows_shown).then(|| self.last_debug_row_y0 + offset as u16)
     }
 
     pub fn set_active_file(&mut self, path: Option<PathBuf>) {
@@ -1020,6 +1133,21 @@ impl RunDebugPanel {
             self.put_breakpoint(buf, index, x, row_y, right);
         }
         self.last_debug_rows_shown = shown;
+        // The keyboard's row (#2748), lit as Source Control lights its list's
+        // while the panel has focus.
+        if self.focused
+            && let Some(cursor_y) = self.row_cursor_y()
+        {
+            buf.set_style(
+                Rect {
+                    x: inner.x,
+                    y: cursor_y,
+                    width: inner.width,
+                    height: 1,
+                },
+                Style::default().bg(self.theme.ui(DBG_CURSOR_BG)),
+            );
+        }
 
         // Bottom-up: the input field is the last row, the "DEBUG CONSOLE" label
         // the row above it, and any console output sits above that.
@@ -1082,16 +1210,16 @@ impl RunDebugPanel {
                 bg,
             ),
         );
+        // The block cursor marks the insertion point while the prompt has
+        // the keys; while a row has them (#2748) the field shows none.
+        let caret = if self.row_cursor.is_none() {
+            Style::default().bg(self.theme.ui(DBG_ACCENT))
+        } else {
+            with_bg(Style::default(), bg)
+        };
         if self.repl_input.is_empty() {
             // Block cursor at the insertion point, then the ghost placeholder.
-            let after_cursor = put(
-                buf,
-                caret_end,
-                field_y,
-                right,
-                " ",
-                Style::default().bg(self.theme.ui(DBG_ACCENT)),
-            );
+            let after_cursor = put(buf, caret_end, field_y, right, " ", caret);
             put(
                 buf,
                 after_cursor,
@@ -1114,14 +1242,7 @@ impl RunDebugPanel {
                 &self.repl_input,
                 with_bg(Style::default().fg(self.theme.ui(DBG_NAME)), bg),
             );
-            put(
-                buf,
-                input_end,
-                field_y,
-                right,
-                " ",
-                Style::default().bg(self.theme.ui(DBG_ACCENT)),
-            );
+            put(buf, input_end, field_y, right, " ", caret);
         }
     }
 

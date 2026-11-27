@@ -6327,3 +6327,220 @@ fn cargo_launches_queue_per_compound_member_and_stop_drops_them() {
     app.debug_stop_by_user();
     assert!(app.pending_cargo_launches.is_empty());
 }
+
+/// Press `code` with no modifiers in the Run and Debug side bar.
+fn press_in_run_debug(app: &mut App, code: KeyCode) {
+    app.handle_key(key(code, KeyModifiers::NONE)).unwrap();
+}
+
+/// #2748: paused in a real session, the keyboard reaches a variable's
+/// menu: Tab hands the rows the keys, the arrows walk to `payload`, past
+/// the section headers, and Show Context Menu opens the menu a right-click
+/// on the row opens, whose Add to Watch then runs from the keys.
+#[test]
+fn the_keyboard_walks_to_a_variable_and_adds_it_to_watch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(mut app) = app_paused_with_a_payload(tmp.path(), false) else {
+        return;
+    };
+    app.sidebar_view = SidebarView::RunDebug;
+    app.show_tree = true;
+    app.focus_pane(Pane::Tree);
+    draw(&mut app, 120, 40);
+    let payload = debug_row_index(&app, "payload").unwrap();
+    press_in_run_debug(&mut app, KeyCode::Tab);
+    let first = app
+        .run_debug
+        .row_cursor
+        .expect("Tab hands the rows the keys");
+    assert!(!matches!(
+        app.run_debug.debug_rows[first].kind,
+        crate::widgets::run_debug::DebugRowKind::Header { .. }
+    ));
+    while app.run_debug.row_cursor != Some(payload) {
+        let before = app.run_debug.row_cursor;
+        press_in_run_debug(&mut app, KeyCode::Down);
+        assert_ne!(app.run_debug.row_cursor, before, "Down moves on to payload");
+    }
+    app.handle_key(key(KeyCode::F(10), KeyModifiers::SHIFT))
+        .unwrap();
+    let menu = app
+        .context_menu
+        .as_ref()
+        .expect("Shift+F10 opens the row's menu");
+    let labels: Vec<String> = menu
+        .items
+        .iter()
+        .filter_map(|e| match e {
+            MenuEntry::Item { label, .. } => Some(label.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(labels, ["Copy Value", "Copy as Expression", "Add to Watch"]);
+    press_in_run_debug(&mut app, KeyCode::Down);
+    press_in_run_debug(&mut app, KeyCode::Down);
+    press_in_run_debug(&mut app, KeyCode::Enter);
+    assert_eq!(app.watch_exprs, ["payload"]);
+}
+
+/// Debug rows standing in for a paused session's (#2748): two section
+/// headers around a frame, a scope and two variables, then a watch, the
+/// add row and a breakpoint.
+fn app_with_debug_rows(root: &Path) -> App {
+    use crate::widgets::run_debug::{DebugRow, DebugRowKind};
+    let mut app = App::new(root.to_path_buf()).unwrap();
+    app.sidebar_view = SidebarView::RunDebug;
+    app.show_tree = true;
+    app.focus_pane(Pane::Tree);
+    let row = |indent, kind| DebugRow { indent, kind };
+    let variable = |name: &str| DebugRowKind::Variable {
+        reference: 0,
+        expandable: false,
+        expanded: false,
+        name: name.into(),
+        value: "1".into(),
+        type_name: "int".into(),
+        evaluate_name: Some(name.into()),
+    };
+    let file = root.join("s.py");
+    std::fs::write(&file, "a = 1\nb = 2\n").unwrap();
+    app.editor.breakpoints.entry(file).or_default().insert(2);
+    app.sync_breakpoint_list();
+    app.watch_exprs = vec![String::from("a + b")];
+    app.run_debug.debug_active = true;
+    app.run_debug.debug_rows = vec![
+        row(
+            0,
+            DebugRowKind::Header {
+                title: "CALL STACK".into(),
+            },
+        ),
+        row(
+            1,
+            DebugRowKind::Frame {
+                id: 1,
+                selected: true,
+                name: "main".into(),
+                location: "s.py:2".into(),
+            },
+        ),
+        row(
+            0,
+            DebugRowKind::Header {
+                title: "VARIABLES".into(),
+            },
+        ),
+        row(
+            1,
+            DebugRowKind::Scope {
+                name: "Locals".into(),
+                index: 0,
+                open: None,
+            },
+        ),
+        row(2, variable("a")),
+        row(2, variable("b")),
+        row(
+            0,
+            DebugRowKind::Header {
+                title: "WATCH".into(),
+            },
+        ),
+        row(
+            1,
+            DebugRowKind::Watch {
+                index: 0,
+                expression: "a + b".into(),
+                value: "3".into(),
+                available: true,
+                changed: false,
+                pending: false,
+            },
+        ),
+        row(1, DebugRowKind::WatchAdd),
+        row(
+            0,
+            DebugRowKind::Header {
+                title: "BREAKPOINTS".into(),
+            },
+        ),
+        row(1, DebugRowKind::Breakpoint { index: 0 }),
+    ];
+    draw(&mut app, 120, 40);
+    app
+}
+
+/// #2748: the debug rows' own keys. Tab and Shift+Tab enter at the first
+/// and last row, the arrows, Home and End skip the section headers, Left
+/// steps up to the row a variable sits under, and Esc, Tab or typing give
+/// the prompt the keys back, the typing landing in it.
+#[test]
+fn the_debug_rows_move_past_their_headers_and_hand_the_keys_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_debug_rows(tmp.path());
+    let cursor = |app: &App| app.run_debug.row_cursor;
+    assert_eq!(cursor(&app), None, "the prompt has the keys at first");
+    press_in_run_debug(&mut app, KeyCode::Tab);
+    assert_eq!(cursor(&app), Some(1), "Tab: the frame, under its header");
+    press_in_run_debug(&mut app, KeyCode::Down);
+    assert_eq!(cursor(&app), Some(3), "Down skips the VARIABLES header");
+    press_in_run_debug(&mut app, KeyCode::Down);
+    press_in_run_debug(&mut app, KeyCode::Down);
+    assert_eq!(cursor(&app), Some(5));
+    press_in_run_debug(&mut app, KeyCode::Left);
+    assert_eq!(cursor(&app), Some(3), "Left: the scope `b` sits under");
+    press_in_run_debug(&mut app, KeyCode::End);
+    assert_eq!(cursor(&app), Some(10), "End: the breakpoint");
+    press_in_run_debug(&mut app, KeyCode::Up);
+    assert_eq!(cursor(&app), Some(8), "Up skips the BREAKPOINTS header");
+    press_in_run_debug(&mut app, KeyCode::Home);
+    assert_eq!(cursor(&app), Some(1));
+    press_in_run_debug(&mut app, KeyCode::Up);
+    assert_eq!(cursor(&app), Some(1), "the first row stays put");
+    press_in_run_debug(&mut app, KeyCode::Esc);
+    assert_eq!(cursor(&app), None, "Esc: back to the prompt");
+    assert!(app.sidebar_view == SidebarView::RunDebug, "the view stays");
+    app.handle_key(key(KeyCode::BackTab, KeyModifiers::SHIFT))
+        .unwrap();
+    assert_eq!(cursor(&app), Some(10), "Shift+Tab enters at the last row");
+    press_in_run_debug(&mut app, KeyCode::Char('x'));
+    assert_eq!(cursor(&app), None, "typing goes to the prompt");
+    assert_eq!(app.run_debug.repl_input, "x");
+}
+
+/// #2748: Delete on a watch stops watching it, and on a breakpoint removes
+/// it, as the rows' `✕` do.
+#[test]
+fn delete_on_a_debug_row_removes_its_watch_or_breakpoint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_debug_rows(tmp.path());
+    press_in_run_debug(&mut app, KeyCode::Tab);
+    app.run_debug.row_cursor = Some(7);
+    press_in_run_debug(&mut app, KeyCode::Delete);
+    assert!(app.watch_exprs.is_empty(), "the watch is gone");
+    let mut app = app_with_debug_rows(tmp.path());
+    press_in_run_debug(&mut app, KeyCode::BackTab);
+    assert_eq!(app.run_debug.row_cursor, Some(10));
+    press_in_run_debug(&mut app, KeyCode::Delete);
+    assert!(app.editor.breakpoints.is_empty(), "the breakpoint is gone");
+}
+
+/// #2748: a click on a row puts the keyboard there too, as in VS Code.
+#[test]
+fn a_click_on_a_debug_row_puts_the_keyboard_on_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(mut app) = app_paused_with_a_payload(tmp.path(), false) else {
+        return;
+    };
+    app.sidebar_view = SidebarView::RunDebug;
+    app.show_tree = true;
+    app.focus_pane(Pane::Tree);
+    draw(&mut app, 120, 40);
+    let payload = debug_row_index(&app, "payload").unwrap();
+    let y = (0..40)
+        .find(|&y| app.run_debug.debug_row_at(y) == Some(payload))
+        .expect("payload's row is drawn");
+    let x = app.run_debug.last_area.x + 3;
+    left_click(&mut app, x, y);
+    assert_eq!(app.run_debug.row_cursor, Some(payload));
+}

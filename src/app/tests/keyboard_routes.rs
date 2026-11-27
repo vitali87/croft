@@ -5,21 +5,19 @@
 //!
 //! Every right-click menu is one of the #2742 ledgers, and [`MENUS`] says
 //! for each how the keyboard reaches its rows. Show Context Menu
-//! (`Shift+F10`, #2744) opens six of them, so their rows are reached with
-//! the menu's own keys. The other five are opened by their scenes in
+//! (`Shift+F10`, #2744) opens seven of them, so their rows are reached with
+//! the menu's own keys. The other four are opened by their scenes in
 //! `right_click.rs`, and every row there must name a key the keyboard
 //! reaches it by: the hint `shortcut_for` draws beside it (the key ledger
-//! presses every advertised hint), or the palette command
-//! `menu_action_command` says it runs.
+//! presses every advertised hint), the palette command
+//! `menu_action_command` says it runs, or one of [`COMMAND_ROUTES`].
 //!
 //! Source Control's controls are the panel's hit areas: every field of
 //! `SourceControlPanel` that records a `Rect` a click lands on. Each is in
 //! [`SCM_CONTROLS`] with its route, or in [`SCM_NOT_CONTROLS`] with why it
 //! takes no click of its own.
 //!
-//! What has no route yet is in [`NO_ROUTE_YET`] with the step or issue that
-//! gives it one. That list can only shrink: an entry no menu holds any more
-//! fails, so a route that lands takes its entry with it.
+//! A row or control with no keyboard route fails: it ships with one.
 
 use super::*;
 use crate::command_registry::Command;
@@ -51,10 +49,7 @@ const MENUS: [MenuRoute; 11] = [
     ("right-click-capture", None),
     ("right-click-problem", None),
     ("right-click-minimap", Some(right_click::the_minimap_menu)),
-    (
-        "right-click-debug-row",
-        Some(right_click::the_debug_row_menus),
-    ),
+    ("right-click-debug-row", None),
     ("right-click-outline", Some(right_click::the_outline_menu)),
     ("right-click-tab", Some(right_click::the_tab_menus)),
     ("right-click-gutter", Some(right_click::the_gutter_menus)),
@@ -68,31 +63,6 @@ const COMMAND_ROUTES: &[(&str, &str, &str)] = &[(
     "the Side rows pick an edge; the toggle moves the strip to the other one, \
      and picking the edge it is on changes nothing",
 )];
-
-/// Right-click actions the keyboard cannot reach yet, by variant, with what
-/// gives them a route. Only shrinks.
-const NO_ROUTE_YET: &[(&str, &str)] = &[
-    (
-        "CopyDebugValue",
-        "#871 step 7d: Run and Debug rows from the keyboard",
-    ),
-    (
-        "CopyDebugExpression",
-        "#871 step 7d: Run and Debug rows from the keyboard",
-    ),
-    (
-        "AddDebugWatch",
-        "#871 step 7d: Run and Debug rows from the keyboard",
-    ),
-    (
-        "RemoveDebugWatch",
-        "#871 step 7d: Run and Debug rows from the keyboard",
-    ),
-    (
-        "CopyCallStack",
-        "#871 step 7d: Run and Debug rows from the keyboard",
-    ),
-];
 
 /// An action's variant name, as its `Debug` form starts.
 fn variant(action: &MenuAction) -> String {
@@ -193,13 +163,7 @@ fn every_right_click_row_has_a_keyboard_route() {
                 let routed = shortcut_for(&action).is_some()
                     || menu_action_command(&action).is_some()
                     || COMMAND_ROUTES.iter().any(|(v, _, _)| *v == name);
-                let waiting = NO_ROUTE_YET.iter().any(|(a, _)| *a == name);
-                if routed && waiting {
-                    wrong.push(format!(
-                        "`{name}` has a key now: remove it from NO_ROUTE_YET"
-                    ));
-                }
-                if !routed && !waiting {
+                if !routed {
                     wrong.push(format!(
                         "{spot}: \"{label}\" (`{name}`) has no keyboard route; give \
                          it a key `shortcut_for` shows, or open its menu with Shift+F10"
@@ -213,14 +177,6 @@ fn every_right_click_row_has_a_keyboard_route() {
         if !held.contains(*name) {
             wrong.push(format!(
                 "COMMAND_ROUTES names `{name}`, which no such menu holds"
-            ));
-        }
-    }
-    for (name, why) in NO_ROUTE_YET {
-        if !held.contains(*name) {
-            wrong.push(format!(
-                "`{name}` ({why}) is listed as unreachable but no such menu holds it \
-                 any more: remove it from NO_ROUTE_YET"
             ));
         }
     }

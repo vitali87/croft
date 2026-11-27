@@ -2263,6 +2263,7 @@ impl App {
                             self.remove_watch_expression(widx);
                             self.refresh_debug_panel();
                         } else if let Some(idx) = self.run_debug.debug_row_at(m.row) {
+                            self.run_debug.put_row_cursor(idx);
                             self.debug_panel_click(idx);
                         }
                     } else if self.run_debug.click_button(m.column, m.row) {

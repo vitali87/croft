@@ -1,0 +1,1 @@
+feature: the Run and Debug panel's rows take the keys, as VS Code's VARIABLES, WATCH and CALL STACK lists do: `Tab` from the prompt, the arrows, `Enter` and `Delete`, and `Shift+F10` opens a row's menu, so Copy Value, Add to Watch and the rest no longer need the mouse (#2748).
