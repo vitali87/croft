@@ -381,29 +381,55 @@ pub struct DebugRow {
     pub kind: DebugRowKind,
 }
 
-/// Row `idx` and the rows it sits under, nearest first, up to its section
-/// header (#2748): each is the closest row above with less indent. Two
-/// fields named `value` under different objects differ here, so the
-/// keyboard's row is matched by this whole path, not by its own row alone.
-fn row_path(rows: &[DebugRow], idx: usize) -> Vec<usize> {
-    let mut path = vec![idx];
-    let mut indent = rows[idx].indent;
-    for i in (0..idx).rev() {
-        if indent == 0 {
-            break;
-        }
-        if rows[i].indent < indent {
-            path.push(i);
-            indent = rows[i].indent;
+/// Each row's parent (#2748): the closest row above it with less indent,
+/// `None` for a section header. One pass, so a rebuild of a long list of
+/// variables stays linear.
+fn row_parents(rows: &[DebugRow]) -> Vec<Option<usize>> {
+    let mut open: Vec<usize> = Vec::new();
+    rows.iter()
+        .enumerate()
+        .map(|(i, row)| {
+            while open.last().is_some_and(|&j| rows[j].indent >= row.indent) {
+                open.pop();
+            }
+            let parent = if row.indent == 0 {
+                None
+            } else {
+                open.last().copied()
+            };
+            open.push(i);
+            parent
+        })
+        .collect()
+}
+
+/// Whether row `i` of `rows` is row `j` of `old` with the same rows above
+/// it, up to its section header (#2748). Two fields named `value` under
+/// different objects differ here. Each step checks the row itself first,
+/// so a row that differs costs one comparison.
+fn same_path(
+    (rows, parents): (&[DebugRow], &[Option<usize>]),
+    i: usize,
+    (old, old_parents): (&[DebugRow], &[Option<usize>]),
+    j: usize,
+) -> bool {
+    let (mut a, mut b) = (Some(i), Some(j));
+    loop {
+        match (a, b) {
+            (None, None) => return true,
+            (Some(x), Some(y)) if same_row(&rows[x], &old[y]) => {
+                a = parents[x];
+                b = old_parents[y];
+            }
+            _ => return false,
         }
     }
-    path
 }
 
 /// Whether `a` and `b` are the same row across a rebuild (#2748): by what
 /// each shows, not where. A variable has no id of its own (every leaf's
 /// reference is 0), so its name, expression and depth stand for it, and
-/// [`row_path`] tells apart same-named fields under different parents.
+/// [`same_path`] tells apart same-named fields under different parents.
 fn same_row(a: &DebugRow, b: &DebugRow) -> bool {
     use DebugRowKind as K;
     match (&a.kind, &b.kind) {
@@ -763,25 +789,21 @@ impl RunDebugPanel {
     /// on: the same frame, thread, variable, watch or breakpoint, wherever
     /// the rebuild moved it. Rows come and go above it (another thread's
     /// frames, a variable opened), so the index alone would land on an
-    /// unrelated row for the next Enter or Delete. When its row is gone,
-    /// the prompt has the keys again.
+    /// unrelated row for the next Enter or Delete. Twins (an adapter's two
+    /// same-named siblings) are told apart by their order, as VS Code's
+    /// variable ids count same-named siblings. When its row is gone, the
+    /// prompt has the keys again.
     pub fn replace_rows(&mut self, rows: Vec<DebugRow>) {
-        let kept: Option<Vec<DebugRow>> = self.row_cursor.map(|at| {
-            row_path(&self.debug_rows, at)
-                .into_iter()
-                .map(|i| self.debug_rows[i].clone())
-                .collect()
-        });
-        self.debug_rows = rows;
-        self.row_cursor = kept.and_then(|path| {
-            (0..self.debug_rows.len()).find(|&i| {
-                let here = row_path(&self.debug_rows, i);
-                here.len() == path.len()
-                    && here
-                        .iter()
-                        .zip(&path)
-                        .all(|(&j, row)| same_row(&self.debug_rows[j], row))
-            })
+        let old = std::mem::replace(&mut self.debug_rows, rows);
+        self.row_cursor = self.row_cursor.filter(|&at| at < old.len()).and_then(|at| {
+            let old_parents = row_parents(&old);
+            let parents = row_parents(&self.debug_rows);
+            let was = (old.as_slice(), old_parents.as_slice());
+            let now = (self.debug_rows.as_slice(), parents.as_slice());
+            let twin = (0..at).filter(|&j| same_path(was, j, was, at)).count();
+            (0..self.debug_rows.len())
+                .filter(|&i| same_path(now, i, was, at))
+                .nth(twin)
         });
         self.settle_row_cursor();
     }
@@ -1796,6 +1818,76 @@ mod tests {
             panel.row_cursor, None,
             "line 7 is gone: the prompt has the keys"
         );
+    }
+
+    /// #2748: an adapter can list two siblings with the same name and no
+    /// expression of their own. The keyboard on the second stays on the
+    /// second, told apart by order as VS Code's variable ids are.
+    #[test]
+    fn the_row_cursor_stays_on_the_second_of_two_twins() {
+        let rows = || {
+            let variable = |name: &str| DebugRow {
+                indent: 2,
+                kind: DebugRowKind::Variable {
+                    reference: 0,
+                    expandable: false,
+                    expanded: false,
+                    name: name.into(),
+                    value: String::from("1"),
+                    type_name: String::from("int"),
+                    evaluate_name: None,
+                },
+            };
+            vec![
+                DebugRow {
+                    indent: 0,
+                    kind: DebugRowKind::Header {
+                        title: String::from("VARIABLES"),
+                    },
+                },
+                DebugRow {
+                    indent: 1,
+                    kind: DebugRowKind::Scope {
+                        name: String::from("Locals"),
+                        index: 0,
+                        open: None,
+                    },
+                },
+                variable("x"),
+                variable("x"),
+                variable("y"),
+            ]
+        };
+        let mut panel = RunDebugPanel::new();
+        panel.debug_active = true;
+        panel.debug_rows = rows();
+        panel.row_cursor = Some(3);
+        panel.replace_rows(rows());
+        assert_eq!(panel.row_cursor, Some(3), "still the second `x`");
+    }
+
+    /// #2748: a cursor past the old rows' end (a list shortened behind its
+    /// back) gives the keys to the prompt instead of crashing.
+    #[test]
+    fn a_cursor_past_the_old_rows_hands_the_keys_back() {
+        let header = DebugRow {
+            indent: 0,
+            kind: DebugRowKind::Header {
+                title: String::from("WATCH"),
+            },
+        };
+        let mut panel = RunDebugPanel::new();
+        panel.debug_active = true;
+        panel.debug_rows = vec![header.clone()];
+        panel.row_cursor = Some(4);
+        panel.replace_rows(vec![
+            header,
+            DebugRow {
+                indent: 1,
+                kind: DebugRowKind::WatchAdd,
+            },
+        ]);
+        assert_eq!(panel.row_cursor, None);
     }
 
     /// Every row of `line` wrapped to `width`.
