@@ -857,8 +857,11 @@ impl EditorTabs {
     /// How `moved`, a tab moved in from another group, lands here (#2745).
     /// A group shows a file once, as in VS Code: when one of this group's
     /// tabs already holds the file, the move ends on one tab, the copy that
-    /// keeps every unsaved edit. Each group keeps its own buffer, so both
-    /// copies can hold edits of their own; then neither can go.
+    /// holds unsaved work, by [`holds_unsaved_work`] alone. Each group keeps
+    /// its own buffer, so both copies can hold work of their own; then
+    /// neither can go. Equal text is no proof two copies are the same: a
+    /// hex or sheet tab keeps its edits outside `lines`, and a changed line
+    /// ending leaves them as they were.
     pub fn landing_for(&self, moved: &Editor) -> MoveLanding {
         let plain = |e: &Editor| e.diff.is_none() && e.symbol_view.is_none();
         let twin = moved
@@ -869,13 +872,13 @@ impl EditorTabs {
         let Some(idx) = twin else {
             return MoveLanding::New;
         };
-        let here = &self.editors[idx];
-        if here.lines == moved.lines || !moved.dirty {
-            MoveLanding::Twin(idx)
-        } else if !here.dirty {
-            MoveLanding::Replace(idx)
-        } else {
-            MoveLanding::Clash(idx)
+        match (
+            holds_unsaved_work(moved),
+            holds_unsaved_work(&self.editors[idx]),
+        ) {
+            (false, _) => MoveLanding::Twin(idx),
+            (true, false) => MoveLanding::Replace(idx),
+            (true, true) => MoveLanding::Clash(idx),
         }
     }
 

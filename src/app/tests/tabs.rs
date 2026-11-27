@@ -2826,7 +2826,29 @@ fn a_clean_tab_moved_onto_unsaved_edits_keeps_the_edits() {
     assert_eq!(app.editor.lines[0], "yfn main() {}");
 }
 
-/// #2745: when both copies hold different unsaved edits, one tab cannot
+/// #2745: unsaved work the text does not show still counts. A changed
+/// line ending leaves the lines as they were, but the moved copy holds it,
+/// so it takes the clean copy's place rather than being dropped.
+#[test]
+fn a_moved_copys_unsaved_line_ending_is_not_dropped() {
+    use crate::widgets::editor::LineEnding;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = twin_groups(tmp.path());
+    app.dispatch_menu_action(
+        MenuAction::SetLineEnding(LineEnding::Crlf),
+        tmp.path().to_path_buf(),
+    );
+    assert!(app.editor.dirty, "setup: the change is unsaved");
+    app.dispatch_menu_action(MenuAction::MoveEditorRight, tmp.path().to_path_buf());
+    let (here, _) = two_groups(&app);
+    assert_eq!(here, ["● c.rs"], "one tab, its unsaved dot showing");
+    assert!(
+        app.editor.eol == LineEnding::Crlf,
+        "the new line ending came along"
+    );
+}
+
+/// #2745: when both copies hold unsaved edits, one tab cannot
 /// keep them both: the move is refused, says why, and moves nothing.
 #[test]
 fn different_unsaved_edits_in_both_copies_refuse_the_move() {

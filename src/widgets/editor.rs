@@ -1483,13 +1483,13 @@ struct AcceptChip {
 pub enum MoveLanding {
     /// The group has no tab of the file: the tab joins it.
     New,
-    /// The group's tab at this index already holds the same text, or the
-    /// moved copy has no unsaved edits: the move ends on that tab.
+    /// The moved copy holds no unsaved work: the move ends on the group's
+    /// tab at this index.
     Twin(usize),
-    /// The moved copy holds edits the group's clean tab at this index
-    /// lacks: it takes that tab's place.
+    /// The moved copy holds unsaved work and the group's tab at this index
+    /// none: the moved copy takes that tab's place.
     Replace(usize),
-    /// Both copies hold different unsaved edits: the move is refused.
+    /// Both copies hold unsaved work: the move is refused.
     Clash(usize),
 }
 
