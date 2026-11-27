@@ -188,70 +188,65 @@ pub const GH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// Run `gh` (`program`) with `args` in `cwd` and return its stdout, or its
 /// stderr (or why it could not run, that it is not signed in, or that it
 /// timed out) as the error. Blocking: the app calls it on a worker thread.
+///
+/// Both outputs are read while it runs, so a log larger than a pipe cannot
+/// block gh on its write until the deadline, and a helper gh leaves holding
+/// them cannot keep the call waiting past gh's own exit.
 pub fn run_gh(
     program: &str,
     args: &[String],
     cwd: &std::path::Path,
     timeout: std::time::Duration,
 ) -> Result<String, String> {
-    use std::io::Read;
-    let mut cmd = std::process::Command::new(program);
-    cmd.args(args)
-        .current_dir(cwd)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let mut child = crate::proc::spawn_retrying_busy(&mut cmd)
-        .map_err(|e| crate::gh::spawn_error(&e, Some(cwd)))?;
-    // Drained while it runs: a log larger than a pipe buffer would
-    // otherwise block gh on its write until the deadline.
-    let drain = |pipe: Option<Box<dyn Read + Send>>| {
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut p) = pipe {
-                let _ = p.read_to_end(&mut buf);
-            }
-            let _ = tx.send(buf);
-        });
-        rx
-    };
-    let stdout = drain(
-        child
-            .stdout
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    let ran = crate::proc::Bounded {
+        stdout: crate::proc::Keep::All { cap: GH_OUTPUT_CAP },
+        stderr: crate::proc::Keep::Tail(GH_ERROR_TAIL),
+        detached: false,
+        limit: timeout,
+        retry_busy: true,
+    }
+    .run(
+        std::process::Command::new(program)
+            .args(args)
+            .current_dir(cwd),
     );
-    let stderr = drain(
-        child
-            .stderr
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-    );
-    let deadline = std::time::Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("{program} took longer than {}s", timeout.as_secs()));
-            }
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
-            Err(e) => return Err(format!("could not wait on {program}: {e}")),
+    let ran = match ran {
+        Ok(ran) => ran,
+        Err(crate::proc::RunError::Spawn(e)) => return Err(crate::gh::spawn_error(&e, Some(cwd))),
+        Err(crate::proc::RunError::TimedOut) => {
+            return Err(format!("{program} took longer than {}s", timeout.as_secs()));
+        }
+        Err(crate::proc::RunError::TooLong { .. }) => {
+            return Err(format!(
+                "{program} answered more than {} MiB",
+                GH_OUTPUT_CAP / (1024 * 1024)
+            ));
+        }
+        Err(crate::proc::RunError::Wait(e) | crate::proc::RunError::Pipe(e)) => {
+            return Err(format!("could not wait on {program}: {e}"));
         }
     };
-    let text = |rx: std::sync::mpsc::Receiver<Vec<u8>>| {
-        String::from_utf8_lossy(&rx.recv().unwrap_or_default()).into_owned()
-    };
-    if status.success() {
-        Ok(text(stdout))
-    } else if crate::gh::signed_out(status) {
+    if ran.status.success() {
+        Ok(ran.stdout.text())
+    } else if crate::gh::signed_out(ran.status) {
         Err(String::from(crate::gh::SIGNED_OUT))
     } else {
-        Err(text(stderr).trim().to_string())
+        let text = ran.stderr.text();
+        Err(if ran.stderr.cut() {
+            format!("…{}", text.trim())
+        } else {
+            text.trim().to_string()
+        })
     }
 }
+
+/// The most of one `gh` answer croft takes: far past any log, list or SARIF
+/// file gh returns, so a longer one is refused, never cut short.
+const GH_OUTPUT_CAP: usize = 1024 * 1024 * 1024;
+
+/// How much of a failed `gh` call's error output its message keeps: the end,
+/// where gh says why.
+const GH_ERROR_TAIL: usize = 16 * 1024;
 
 static STARTUP_PR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
@@ -789,6 +784,32 @@ mod tests {
             run_gh("/bin/sh", &sh("exit 4"), &dir, t),
             Err(String::from(crate::gh::SIGNED_OUT))
         );
+    }
+
+    /// A helper gh leaves holding its output does not keep the call
+    /// waiting past gh's own exit: the answer comes back at once.
+    #[test]
+    fn gh_answers_at_its_exit_though_a_helper_holds_its_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid = dir.path().join("helper.pid");
+        let script = format!("sleep 30 & echo $! > '{}'; echo out", pid.display());
+        let started = std::time::Instant::now();
+        let out = run_gh(
+            "/bin/sh",
+            &[String::from("-c"), script],
+            dir.path(),
+            std::time::Duration::from_secs(20),
+        );
+        let took = started.elapsed();
+        if let Some(helper) = std::fs::read_to_string(&pid)
+            .ok()
+            .and_then(|h| h.trim().parse::<i32>().ok())
+        {
+            // SAFETY: a plain signal to the helper this test started.
+            unsafe { libc::kill(helper, libc::SIGKILL) };
+        }
+        assert_eq!(out.as_deref(), Ok("out\n"));
+        assert!(took < std::time::Duration::from_secs(10), "took {took:?}");
     }
 
     #[test]
