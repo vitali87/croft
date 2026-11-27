@@ -536,7 +536,7 @@ fn tab_list(tabs: &crate::widgets::editor::EditorTabs) -> String {
 
 /// The editor groups as they tile a 120x40 editor: each one's place and size
 /// and its tabs, the active group starred. `1` while there is one group.
-fn groups(app: &App) -> String {
+pub(super) fn groups(app: &App) -> String {
     let rects = app
         .editor_layout
         .leaf_rects(ratatui::layout::Rect::new(0, 0, 120, 40), 1);
@@ -877,6 +877,7 @@ fn fields(app: &App, root: &Path, read: &[String; 5], hide_ids: bool) -> Fields 
             ("quit", on(app.quit)),
             ("drop_to_local", on(app.drop_to_local)),
             ("minimap", on(app.minimap_visible)),
+            ("minimap_left", on(app.minimap_side == MinimapSide::Left)),
             ("wrap", on(ed.wrap_enabled())),
             ("zen", on(app.zen_mode)),
             ("aux", on(app.secondary_side_bar_visible)),

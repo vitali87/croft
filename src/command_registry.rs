@@ -1046,6 +1046,64 @@ commands! {
         title: "View: Split Editor",
         hint: "Cmd+\\",
     }
+    /// The editor tab menu's Split & Move rows as VS Code's commands
+    /// (#871): each acts on the active tab, so the keyboard reaches what
+    /// the tab menu does.
+    SplitEditorUp {
+        id: "split_editor_up",
+        title: "View: Split Editor Up",
+        hint: "Cmd+K Cmd+\\",
+    }
+    SplitEditorDown {
+        id: "split_editor_down",
+        title: "View: Split Editor Down",
+        hint: "Cmd+K Opt+↓",
+    }
+    SplitEditorLeft {
+        id: "split_editor_left",
+        title: "View: Split Editor Left",
+        hint: "Cmd+K Opt+←",
+    }
+    SplitEditorInGroup {
+        id: "split_editor_in_group",
+        title: "View: Split Editor in Group",
+        hint: "Cmd+K Shift+Cmd+\\",
+    }
+    MoveEditorToAboveGroup {
+        id: "move_editor_to_above_group",
+        title: "View: Move Editor into Group Above",
+        hint: "Cmd+K Shift+↑",
+    }
+    MoveEditorToBelowGroup {
+        id: "move_editor_to_below_group",
+        title: "View: Move Editor into Group Below",
+        hint: "Cmd+K Shift+↓",
+    }
+    MoveEditorToLeftGroup {
+        id: "move_editor_to_left_group",
+        title: "View: Move Editor into Left Group",
+        hint: "Cmd+K Shift+←",
+    }
+    MoveEditorToRightGroup {
+        id: "move_editor_to_right_group",
+        title: "View: Move Editor into Right Group",
+        hint: "Cmd+K Shift+→",
+    }
+    MoveEditorToNewWindow {
+        id: "move_editor_to_new_window",
+        title: "View: Move Editor into New Window",
+        hint: "Cmd+K Shift+O",
+    }
+    CopyEditorToNewWindow {
+        id: "copy_editor_to_new_window",
+        title: "View: Copy Editor into New Window",
+        hint: "Cmd+K O",
+    }
+    RevealActiveFileInExplorer {
+        id: "reveal_active_file_in_explorer",
+        title: "File: Reveal Active File in Explorer View",
+        hint: "Cmd+K E",
+    }
     /// View: Focus Left / Right Editor Group (#843): Cmd+Opt+Left / Right,
     /// which have no `Ctrl` form off macOS.
     FocusLeftEditorGroup {
@@ -1951,6 +2009,13 @@ commands! {
         id: "toggle_minimap",
         title: "View: Toggle Minimap",
         hint: "Cmd+Opt+M",
+    }
+    /// The minimap's Side submenu from the keyboard (#871): moves the strip
+    /// to the editor's other edge.
+    ToggleMinimapSide {
+        id: "toggle_minimap_side",
+        title: "View: Toggle Minimap Side",
+        hint: "Cmd+K Shift+M",
     }
     /// Run the whole-project checker and put its findings in PROBLEMS (#256).
     ProblemsCheckProject {

@@ -145,6 +145,8 @@ editor | ctrl+k [ | status="Cannot collapse the last expanded terminal"
 editor | ctrl+k \ | groups=*0,0+120x20[*main.rs] 0,20+120x20[*main.rs]
 editor | ctrl+k ] | status="No collapsed terminal panes"
 editor | ctrl+k a | status="Not a persistent session (start one with `croft attach`)"
+editor | ctrl+k alt+down | groups=0,0+120x20[*main.rs] *0,20+120x20[*main.rs]
+editor | ctrl+k alt+left | groups=*0,0+60x40[*main.rs] 60,0+60x40[*main.rs]
 editor | ctrl+k b | focus=side side=Testing
 editor | ctrl+k c | status="Compare with Selected: nothing selected yet"
 editor | ctrl+k ctrl+/ | folded=1-2
@@ -165,6 +167,7 @@ editor | ctrl+k ctrl+l | caret=3:8 folded=4-7
 editor | ctrl+k ctrl+m | status="No bookmarks (Cmd+Opt+Shift+K sets one)"
 editor | ctrl+k ctrl+q | status="No edits this session"
 editor | ctrl+k ctrl+s | +list("KeyboardShortcuts " @0 > "Move Line Up  ·  Alt+↑")
+editor | ctrl+k ctrl+shift+\ | groups=0,0+60x40[*main.rs] *60,0+60x40[*main.rs]
 editor | ctrl+k ctrl+t | +menu("  Croft Black" > "✔ Croft Loch")
 editor | ctrl+k d | tabs=main.rs,*terminal-<pid>-<pane>-scrollback.log text=0L#811c9dc5 caret=0:0 status="Opened 1 scrollback lines as a rendered log"
 editor | ctrl+k e | focus=side status="Revealed main.rs in Explorer" tree=./+,.vscode/,docs/,main.rs > main.rs
@@ -186,20 +189,25 @@ editor | ctrl+k shift+\ | groups=0,0+60x40[*main.rs] *60,0+60x40[*main.rs]
 editor | ctrl+k shift+a | focus=side side=SourceControl scm=""@0 +focus +menu("Pull" > "Pull")
 editor | ctrl+k shift+c | focus=side side=SourceControl scm=""@0 +focus +menu("Commit & Push" > "Commit & Push")
 editor | ctrl+k shift+d | status="Type hierarchy: no language server for this file"
+editor | ctrl+k shift+down | status="Move: the editor is already a single group"
 editor | ctrl+k shift+e | status="No code lens on this line"
 editor | ctrl+k shift+enter | status="No test runner detected in this workspace"
 editor | ctrl+k shift+f | tabs=main.rs,*Search Editor text=3L#6cabf539 caret=0:0 status="Search Editor: type a query on the first line, then Cmd+K Shift+R"
 editor | ctrl+k shift+h | status="Call hierarchy: no language server for this file"
 editor | ctrl+k shift+i | status=" excluded from broadcast input"
 editor | ctrl+k shift+l | +input("New worktree lane" "" @0)
+editor | ctrl+k shift+left | status="Move: the editor is already a single group"
+editor | ctrl+k shift+m | +minimap_left
 editor | ctrl+k shift+n | status="The key combination (Ctrl+K, Shift+N) is not a command."
 editor | ctrl+k shift+o | status="New Window failed: opening a new window is only supported on macOS"
 editor | ctrl+k shift+p | status="Tab is already kept open"
 editor | ctrl+k shift+q | status="Not attached to a persistent session: nothing to detach from"
 editor | ctrl+k shift+r | status="Not a Search Editor"
+editor | ctrl+k shift+right | status="Move: the editor is already a single group"
 editor | ctrl+k shift+s | status="Selected main.rs for compare"
 editor | ctrl+k shift+t | status="No recently closed terminals"
 editor | ctrl+k shift+u | status="Type hierarchy: no language server for this file"
+editor | ctrl+k shift+up | status="Move: the editor is already a single group"
 editor | ctrl+k shift+v | tabs=main.rs,*main · main.rs scroll=3:0 status="Opened main as its own tab"
 editor | ctrl+k shift+w | status="No closed tabs to reopen"
 editor | ctrl+k shift+x | status="No other tabs to close"
@@ -238,7 +246,7 @@ editor | ctrl+shift+l | caret=4:13 sel=4:8-4:13 carets=1:35-1:40,5:7-5:12,6:19-6
 editor | ctrl+shift+m | focus=panel panel=Problems
 editor | ctrl+shift+n | -
 editor | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-editor | ctrl+shift+p | status="Command Palette: 396 commands — Esc to close" +palette("" @0 > "Move Line Up")
+editor | ctrl+shift+p | status="Command Palette: 408 commands — Esc to close" +palette("" @0 > "Move Line Up")
 editor | ctrl+shift+pagedown | status="Move: the editor is already the last tab"
 editor | ctrl+shift+pageup | status="Move: the editor is already the first tab"
 editor | ctrl+shift+r | focus=side side=Remote
@@ -416,6 +424,8 @@ selection | ctrl+k [ | status="Cannot collapse the last expanded terminal"
 selection | ctrl+k \ | groups=*0,0+120x20[*main.rs] 0,20+120x20[*main.rs] sel=-
 selection | ctrl+k ] | status="No collapsed terminal panes"
 selection | ctrl+k a | status="Not a persistent session (start one with `croft attach`)"
+selection | ctrl+k alt+down | groups=0,0+120x20[*main.rs] *0,20+120x20[*main.rs] sel=-
+selection | ctrl+k alt+left | groups=*0,0+60x40[*main.rs] 60,0+60x40[*main.rs] sel=-
 selection | ctrl+k b | focus=side side=Testing
 selection | ctrl+k c | status="Compare with Selected: nothing selected yet"
 selection | ctrl+k ctrl+/ | folded=1-2
@@ -436,6 +446,7 @@ selection | ctrl+k ctrl+l | caret=3:11 folded=4-7
 selection | ctrl+k ctrl+m | status="No bookmarks (Cmd+Opt+Shift+K sets one)"
 selection | ctrl+k ctrl+q | status="No edits this session"
 selection | ctrl+k ctrl+s | +list("KeyboardShortcuts " @0 > "Move Line Up  ·  Alt+↑")
+selection | ctrl+k ctrl+shift+\ | groups=0,0+60x40[*main.rs] *60,0+60x40[*main.rs] sel=-
 selection | ctrl+k ctrl+t | +menu("  Croft Black" > "✔ Croft Loch")
 selection | ctrl+k d | tabs=main.rs,*terminal-<pid>-<pane>-scrollback.log text=0L#811c9dc5 caret=0:0 sel=- status="Opened 1 scrollback lines as a rendered log"
 selection | ctrl+k e | focus=side status="Revealed main.rs in Explorer" tree=./+,.vscode/,docs/,main.rs > main.rs
@@ -457,20 +468,25 @@ selection | ctrl+k shift+\ | groups=0,0+60x40[*main.rs] *60,0+60x40[*main.rs] se
 selection | ctrl+k shift+a | focus=side side=SourceControl scm=""@0 +focus +menu("Pull" > "Pull")
 selection | ctrl+k shift+c | focus=side side=SourceControl scm=""@0 +focus +menu("Commit & Push" > "Commit & Push")
 selection | ctrl+k shift+d | status="Type hierarchy: no language server for this file"
+selection | ctrl+k shift+down | status="Move: the editor is already a single group"
 selection | ctrl+k shift+e | status="No code lens on this line"
 selection | ctrl+k shift+enter | status="No test runner detected in this workspace"
 selection | ctrl+k shift+f | tabs=main.rs,*Search Editor text=3L#6cabf539 caret=0:0 sel=- status="Search Editor: type a query on the first line, then Cmd+K Shift+R"
 selection | ctrl+k shift+h | status="Call hierarchy: no language server for this file"
 selection | ctrl+k shift+i | status=" excluded from broadcast input"
 selection | ctrl+k shift+l | +input("New worktree lane" "" @0)
+selection | ctrl+k shift+left | status="Move: the editor is already a single group"
+selection | ctrl+k shift+m | +minimap_left
 selection | ctrl+k shift+n | status="The key combination (Ctrl+K, Shift+N) is not a command."
 selection | ctrl+k shift+o | status="New Window failed: opening a new window is only supported on macOS"
 selection | ctrl+k shift+p | status="Tab is already kept open"
 selection | ctrl+k shift+q | status="Not attached to a persistent session: nothing to detach from"
 selection | ctrl+k shift+r | status="Not a Search Editor"
+selection | ctrl+k shift+right | status="Move: the editor is already a single group"
 selection | ctrl+k shift+s | status="Selected main.rs for compare"
 selection | ctrl+k shift+t | status="No recently closed terminals"
 selection | ctrl+k shift+u | status="Type hierarchy: no language server for this file"
+selection | ctrl+k shift+up | status="Move: the editor is already a single group"
 selection | ctrl+k shift+v | tabs=main.rs,*main · main.rs sel=- scroll=3:0 status="Opened main as its own tab"
 selection | ctrl+k shift+w | status="No closed tabs to reopen"
 selection | ctrl+k shift+x | status="No other tabs to close"
@@ -509,7 +525,7 @@ selection | ctrl+shift+l | carets=1:35-1:40,5:7-5:12,6:19-6:24 status="Selected 
 selection | ctrl+shift+m | focus=panel panel=Problems
 selection | ctrl+shift+n | -
 selection | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-selection | ctrl+shift+p | status="Command Palette: 396 commands — Esc to close" +palette("" @0 > "Move Line Up")
+selection | ctrl+shift+p | status="Command Palette: 408 commands — Esc to close" +palette("" @0 > "Move Line Up")
 selection | ctrl+shift+pagedown | status="Move: the editor is already the last tab"
 selection | ctrl+shift+pageup | status="Move: the editor is already the first tab"
 selection | ctrl+shift+r | focus=side side=Remote
@@ -687,6 +703,8 @@ explorer | ctrl+k [ | status="Cannot collapse the last expanded terminal"
 explorer | ctrl+k \ | focus=editor groups=*0,0+120x20[*main.rs] 0,20+120x20[*main.rs]
 explorer | ctrl+k ] | status="No collapsed terminal panes"
 explorer | ctrl+k a | status="Not a persistent session (start one with `croft attach`)"
+explorer | ctrl+k alt+down | focus=editor groups=0,0+120x20[*main.rs] *0,20+120x20[*main.rs]
+explorer | ctrl+k alt+left | focus=editor groups=*0,0+60x40[*main.rs] 60,0+60x40[*main.rs]
 explorer | ctrl+k b | side=Testing
 explorer | ctrl+k c | status="Compare with Selected: nothing selected yet"
 explorer | ctrl+k ctrl+/ | folded=1-2
@@ -707,6 +725,7 @@ explorer | ctrl+k ctrl+l | caret=3:8 folded=4-7
 explorer | ctrl+k ctrl+m | status="No bookmarks (Cmd+Opt+Shift+K sets one)"
 explorer | ctrl+k ctrl+q | status="No edits this session"
 explorer | ctrl+k ctrl+s | +list("KeyboardShortcuts " @0 > "Move Line Up  ·  Alt+↑")
+explorer | ctrl+k ctrl+shift+\ | focus=editor groups=0,0+60x40[*main.rs] *60,0+60x40[*main.rs]
 explorer | ctrl+k ctrl+t | +menu("  Croft Black" > "✔ Croft Loch")
 explorer | ctrl+k d | focus=editor tabs=main.rs,*terminal-<pid>-<pane>-scrollback.log text=0L#811c9dc5 caret=0:0 status="Opened 1 scrollback lines as a rendered log"
 explorer | ctrl+k e | status="Revealed main.rs in Explorer"
@@ -728,20 +747,25 @@ explorer | ctrl+k shift+\ | focus=editor groups=0,0+60x40[*main.rs] *60,0+60x40[
 explorer | ctrl+k shift+a | side=SourceControl scm=""@0 +focus +menu("Pull" > "Pull")
 explorer | ctrl+k shift+c | side=SourceControl scm=""@0 +focus +menu("Commit & Push" > "Commit & Push")
 explorer | ctrl+k shift+d | status="Type hierarchy: no language server for this file"
+explorer | ctrl+k shift+down | status="Move: the editor is already a single group"
 explorer | ctrl+k shift+e | status="No code lens on this line"
 explorer | ctrl+k shift+enter | status="No test runner detected in this workspace"
 explorer | ctrl+k shift+f | focus=editor tabs=main.rs,*Search Editor text=3L#6cabf539 caret=0:0 status="Search Editor: type a query on the first line, then Cmd+K Shift+R"
 explorer | ctrl+k shift+h | status="Call hierarchy: no language server for this file"
 explorer | ctrl+k shift+i | status=" excluded from broadcast input"
 explorer | ctrl+k shift+l | +input("New worktree lane" "" @0)
+explorer | ctrl+k shift+left | status="Move: the editor is already a single group"
+explorer | ctrl+k shift+m | +minimap_left
 explorer | ctrl+k shift+n | status="The key combination (Ctrl+K, Shift+N) is not a command."
 explorer | ctrl+k shift+o | status="New Window failed: opening a new window is only supported on macOS"
 explorer | ctrl+k shift+p | status="Tab is already kept open"
 explorer | ctrl+k shift+q | status="Not attached to a persistent session: nothing to detach from"
 explorer | ctrl+k shift+r | status="Not a Search Editor"
+explorer | ctrl+k shift+right | status="Move: the editor is already a single group"
 explorer | ctrl+k shift+s | status="Selected main.rs for compare"
 explorer | ctrl+k shift+t | status="No recently closed terminals"
 explorer | ctrl+k shift+u | status="Type hierarchy: no language server for this file"
+explorer | ctrl+k shift+up | status="Move: the editor is already a single group"
 explorer | ctrl+k shift+v | focus=editor tabs=main.rs,*main · main.rs scroll=3:0 status="Opened main as its own tab"
 explorer | ctrl+k shift+w | status="No closed tabs to reopen"
 explorer | ctrl+k shift+x | status="No other tabs to close"
@@ -780,7 +804,7 @@ explorer | ctrl+shift+l | -
 explorer | ctrl+shift+m | focus=panel panel=Problems
 explorer | ctrl+shift+n | +prompt("New Folder in ." "")
 explorer | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-explorer | ctrl+shift+p | status="Command Palette: 396 commands — Esc to close" +palette("" @0 > "Move Line Up")
+explorer | ctrl+shift+p | status="Command Palette: 408 commands — Esc to close" +palette("" @0 > "Move Line Up")
 explorer | ctrl+shift+pagedown | tree=./+,.vscode/,docs/,main.rs > main.rs marked=.,.vscode,docs,main.rs
 explorer | ctrl+shift+pageup | tree=./+,.vscode/,docs/,main.rs > . marked=.
 explorer | ctrl+shift+r | side=Remote
@@ -957,6 +981,8 @@ terminal | ctrl+k [ | typed=0:"\u{b}["
 terminal | ctrl+k \ | typed=0:"\u{b}\\"
 terminal | ctrl+k ] | typed=0:"\u{b}]"
 terminal | ctrl+k a | typed=0:"\u{b}a"
+terminal | ctrl+k alt+down | typed=0:"\u{b}\u{1b}[1;3B"
+terminal | ctrl+k alt+left | typed=0:"\u{b}\u{1b}b"
 terminal | ctrl+k b | typed=0:"\u{b}b"
 terminal | ctrl+k c | typed=0:"\u{b}c"
 terminal | ctrl+k ctrl+/ | typed=0:"\u{b}\u{1f}"
@@ -977,6 +1003,7 @@ terminal | ctrl+k ctrl+l | typed=0:"\u{b}\u{c}"
 terminal | ctrl+k ctrl+m | typed=0:"\u{b}\r"
 terminal | ctrl+k ctrl+q | typed=0:"\u{b}\u{11}"
 terminal | ctrl+k ctrl+s | status="Saved <root>/main.rs" typed=0:"\u{b}"
+terminal | ctrl+k ctrl+shift+\ | typed=0:"\u{b}\u{1c}"
 terminal | ctrl+k ctrl+t | typed=0:"\u{b}\u{14}"
 terminal | ctrl+k d | typed=0:"\u{b}d"
 terminal | ctrl+k e | typed=0:"\u{b}e"
@@ -998,20 +1025,25 @@ terminal | ctrl+k shift+\ | typed=0:"\u{b}\\"
 terminal | ctrl+k shift+a | typed=0:"\u{b}A"
 terminal | ctrl+k shift+c | typed=0:"\u{b}C"
 terminal | ctrl+k shift+d | typed=0:"\u{b}D"
+terminal | ctrl+k shift+down | typed=0:"\u{b}\u{1b}[1;2B"
 terminal | ctrl+k shift+e | typed=0:"\u{b}E"
 terminal | ctrl+k shift+enter | typed=0:"\u{b}\r"
 terminal | ctrl+k shift+f | typed=0:"\u{b}F"
 terminal | ctrl+k shift+h | typed=0:"\u{b}H"
 terminal | ctrl+k shift+i | typed=0:"\u{b}I"
 terminal | ctrl+k shift+l | typed=0:"\u{b}L"
+terminal | ctrl+k shift+left | typed=0:"\u{b}\u{1b}[1;2D"
+terminal | ctrl+k shift+m | typed=0:"\u{b}M"
 terminal | ctrl+k shift+n | typed=0:"\u{b}N"
 terminal | ctrl+k shift+o | typed=0:"\u{b}O"
 terminal | ctrl+k shift+p | typed=0:"\u{b}P"
 terminal | ctrl+k shift+q | typed=0:"\u{b}Q"
 terminal | ctrl+k shift+r | typed=0:"\u{b}R"
+terminal | ctrl+k shift+right | typed=0:"\u{b}\u{1b}[1;2C"
 terminal | ctrl+k shift+s | typed=0:"\u{b}S"
 terminal | ctrl+k shift+t | typed=0:"\u{b}T"
 terminal | ctrl+k shift+u | typed=0:"\u{b}U"
+terminal | ctrl+k shift+up | typed=0:"\u{b}\u{1b}[1;2A"
 terminal | ctrl+k shift+v | typed=0:"\u{b}V"
 terminal | ctrl+k shift+w | typed=0:"\u{b}W"
 terminal | ctrl+k shift+x | typed=0:"\u{b}X"
@@ -1050,7 +1082,7 @@ terminal | ctrl+shift+l | typed=0:"\u{c}"
 terminal | ctrl+shift+m | panel=Problems
 terminal | ctrl+shift+n | typed=0:"\u{e}"
 terminal | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-terminal | ctrl+shift+p | status="Command Palette: 396 commands — Esc to close" +palette("" @0 > "Move Line Up")
+terminal | ctrl+shift+p | status="Command Palette: 408 commands — Esc to close" +palette("" @0 > "Move Line Up")
 terminal | ctrl+shift+pagedown | -
 terminal | ctrl+shift+pageup | -
 terminal | ctrl+shift+r | focus=side side=Remote
@@ -1228,6 +1260,8 @@ search | ctrl+k [ | status="Cannot collapse the last expanded terminal"
 search | ctrl+k \ | focus=editor groups=*0,0+120x20[*main.rs] 0,20+120x20[*main.rs] search="total" hits=4@0
 search | ctrl+k ] | status="No collapsed terminal panes"
 search | ctrl+k a | status="Not a persistent session (start one with `croft attach`)"
+search | ctrl+k alt+down | focus=editor groups=0,0+120x20[*main.rs] *0,20+120x20[*main.rs] search="total" hits=4@0
+search | ctrl+k alt+left | focus=editor groups=*0,0+60x40[*main.rs] 60,0+60x40[*main.rs] search="total" hits=4@0
 search | ctrl+k b | side=Testing search="total" hits=4@0
 search | ctrl+k c | status="Compare with Selected: nothing selected yet"
 search | ctrl+k ctrl+/ | folded=1-2
@@ -1248,6 +1282,7 @@ search | ctrl+k ctrl+l | caret=3:8 folded=4-7
 search | ctrl+k ctrl+m | status="No bookmarks (Cmd+Opt+Shift+K sets one)"
 search | ctrl+k ctrl+q | status="No edits this session"
 search | ctrl+k ctrl+s | +list("KeyboardShortcuts " @0 > "Move Line Up  ·  Alt+↑")
+search | ctrl+k ctrl+shift+\ | focus=editor groups=0,0+60x40[*main.rs] *60,0+60x40[*main.rs] search="total" hits=4@0
 search | ctrl+k ctrl+t | +menu("  Croft Black" > "✔ Croft Loch")
 search | ctrl+k d | focus=editor tabs=main.rs,*terminal-<pid>-<pane>-scrollback.log text=0L#811c9dc5 caret=0:0 status="Opened 1 scrollback lines as a rendered log" search="total" hits=4@0
 search | ctrl+k e | side=Explorer status="Revealed main.rs in Explorer" tree=./+,.vscode/,docs/,main.rs > main.rs search="total" hits=4@0
@@ -1269,20 +1304,25 @@ search | ctrl+k shift+\ | focus=editor groups=0,0+60x40[*main.rs] *60,0+60x40[*m
 search | ctrl+k shift+a | side=SourceControl search="total" hits=4@0 scm=""@0 +focus +menu("Pull" > "Pull")
 search | ctrl+k shift+c | side=SourceControl search="total" hits=4@0 scm=""@0 +focus +menu("Commit & Push" > "Commit & Push")
 search | ctrl+k shift+d | status="Type hierarchy: no language server for this file"
+search | ctrl+k shift+down | status="Move: the editor is already a single group"
 search | ctrl+k shift+e | status="No code lens on this line"
 search | ctrl+k shift+enter | status="No test runner detected in this workspace"
 search | ctrl+k shift+f | focus=editor tabs=main.rs,*Search: total text=9L#c0995ee4 caret=0:0 status="Search Editor: 4 result(s)" search="total" hits=4@0
 search | ctrl+k shift+h | status="Call hierarchy: no language server for this file"
 search | ctrl+k shift+i | status=" excluded from broadcast input"
 search | ctrl+k shift+l | +input("New worktree lane" "" @0)
+search | ctrl+k shift+left | status="Move: the editor is already a single group"
+search | ctrl+k shift+m | +minimap_left
 search | ctrl+k shift+n | status="The key combination (Ctrl+K, Shift+N) is not a command."
 search | ctrl+k shift+o | status="New Window failed: opening a new window is only supported on macOS"
 search | ctrl+k shift+p | status="Tab is already kept open"
 search | ctrl+k shift+q | status="Not attached to a persistent session: nothing to detach from"
 search | ctrl+k shift+r | status="Not a Search Editor"
+search | ctrl+k shift+right | status="Move: the editor is already a single group"
 search | ctrl+k shift+s | status="Selected main.rs for compare"
 search | ctrl+k shift+t | status="No recently closed terminals"
 search | ctrl+k shift+u | status="Type hierarchy: no language server for this file"
+search | ctrl+k shift+up | status="Move: the editor is already a single group"
 search | ctrl+k shift+v | focus=editor tabs=main.rs,*main · main.rs scroll=3:0 status="Opened main as its own tab" search="total" hits=4@0
 search | ctrl+k shift+w | status="No closed tabs to reopen"
 search | ctrl+k shift+x | status="No other tabs to close"
@@ -1321,7 +1361,7 @@ search | ctrl+shift+l | status="Search: unhandled Ctrl+L"
 search | ctrl+shift+m | focus=panel panel=Problems search="total" hits=4@0
 search | ctrl+shift+n | status="Search: unhandled Ctrl+N"
 search | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-search | ctrl+shift+p | status="Command Palette: 396 commands — Esc to close" +palette("" @0 > "Move Line Up")
+search | ctrl+shift+p | status="Command Palette: 408 commands — Esc to close" +palette("" @0 > "Move Line Up")
 search | ctrl+shift+pagedown | -
 search | ctrl+shift+pageup | -
 search | ctrl+shift+r | side=Remote search="total" hits=4@0
@@ -1499,6 +1539,8 @@ scm | ctrl+k [ | status="Cannot collapse the last expanded terminal"
 scm | ctrl+k \ | focus=editor groups=*0,0+120x20[*main.rs] 0,20+120x20[*main.rs] scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
 scm | ctrl+k ] | status="No collapsed terminal panes"
 scm | ctrl+k a | status="Not a persistent session (start one with `croft attach`)"
+scm | ctrl+k alt+down | focus=editor groups=0,0+120x20[*main.rs] *0,20+120x20[*main.rs] scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+k alt+left | focus=editor groups=*0,0+60x40[*main.rs] 60,0+60x40[*main.rs] scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
 scm | ctrl+k b | side=Testing scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
 scm | ctrl+k c | status="Compare with Selected: nothing selected yet"
 scm | ctrl+k ctrl+/ | folded=1-2
@@ -1519,6 +1561,7 @@ scm | ctrl+k ctrl+l | caret=3:8 folded=4-7
 scm | ctrl+k ctrl+m | status="No bookmarks (Cmd+Opt+Shift+K sets one)"
 scm | ctrl+k ctrl+q | status="No edits this session"
 scm | ctrl+k ctrl+s | +list("KeyboardShortcuts " @0 > "Move Line Up  ·  Alt+↑")
+scm | ctrl+k ctrl+shift+\ | focus=editor groups=0,0+60x40[*main.rs] *60,0+60x40[*main.rs] scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
 scm | ctrl+k ctrl+t | +menu("  Croft Black" > "✔ Croft Loch")
 scm | ctrl+k d | focus=editor tabs=main.rs,*terminal-<pid>-<pane>-scrollback.log text=0L#811c9dc5 caret=0:0 status="Opened 1 scrollback lines as a rendered log" scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
 scm | ctrl+k e | side=Explorer status="Revealed main.rs in Explorer" tree=./+,.git/,.vscode/,docs/,main.rs,todo.txt > main.rs scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
@@ -1540,20 +1583,25 @@ scm | ctrl+k shift+\ | focus=editor groups=0,0+60x40[*main.rs] *60,0+60x40[*main
 scm | ctrl+k shift+a | +menu("Pull" > "Pull")
 scm | ctrl+k shift+c | +menu("Commit & Push" > "Commit & Push")
 scm | ctrl+k shift+d | status="Type hierarchy: no language server for this file"
+scm | ctrl+k shift+down | status="Move: the editor is already a single group"
 scm | ctrl+k shift+e | status="No code lens on this line"
 scm | ctrl+k shift+enter | status="No test runner detected in this workspace"
 scm | ctrl+k shift+f | focus=editor tabs=main.rs,*Search Editor text=3L#6cabf539 caret=0:0 status="Search Editor: type a query on the first line, then Cmd+K Shift+R" scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
 scm | ctrl+k shift+h | status="Call hierarchy: no language server for this file"
 scm | ctrl+k shift+i | status=" excluded from broadcast input"
 scm | ctrl+k shift+l | +input("New worktree lane" "" @0)
+scm | ctrl+k shift+left | status="Move: the editor is already a single group"
+scm | ctrl+k shift+m | +minimap_left
 scm | ctrl+k shift+n | status="The key combination (Ctrl+K, Shift+N) is not a command."
 scm | ctrl+k shift+o | status="New Window failed: opening a new window is only supported on macOS"
 scm | ctrl+k shift+p | status="Tab is already kept open"
 scm | ctrl+k shift+q | status="Not attached to a persistent session: nothing to detach from"
 scm | ctrl+k shift+r | status="Not a Search Editor"
+scm | ctrl+k shift+right | status="Move: the editor is already a single group"
 scm | ctrl+k shift+s | status="Selected main.rs for compare"
 scm | ctrl+k shift+t | status="No recently closed terminals"
 scm | ctrl+k shift+u | status="Type hierarchy: no language server for this file"
+scm | ctrl+k shift+up | status="Move: the editor is already a single group"
 scm | ctrl+k shift+v | focus=editor tabs=main.rs,*main · main.rs scroll=3:0 status="Opened main as its own tab" scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
 scm | ctrl+k shift+w | status="No closed tabs to reopen"
 scm | ctrl+k shift+x | status="No other tabs to close"
@@ -1592,7 +1640,7 @@ scm | ctrl+shift+l | -
 scm | ctrl+shift+m | focus=panel panel=Problems scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
 scm | ctrl+shift+n | -
 scm | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-scm | ctrl+shift+p | status="Command Palette: 396 commands — Esc to close" +palette("" @0 > "Move Line Up")
+scm | ctrl+shift+p | status="Command Palette: 408 commands — Esc to close" +palette("" @0 > "Move Line Up")
 scm | ctrl+shift+pagedown | -
 scm | ctrl+shift+pageup | -
 scm | ctrl+shift+r | side=Remote scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
@@ -1771,6 +1819,8 @@ palette | ctrl+k [ | ~palette("[" @1 > "")
 palette | ctrl+k \ | ~palette("\\" @1 > "")
 palette | ctrl+k ] | ~palette("]" @1 > "")
 palette | ctrl+k a | ~palette("a" @1 > "Fold All")
+palette | ctrl+k alt+down | ~palette("" @0 > "Move Line Down")
+palette | ctrl+k alt+left | -
 palette | ctrl+k b | ~palette("b" @1 > "Git: Open Commit for Line")
 palette | ctrl+k c | ~palette("c" @1 > "Git: Commit")
 palette | ctrl+k ctrl+/ | -
@@ -1791,6 +1841,7 @@ palette | ctrl+k ctrl+l | -
 palette | ctrl+k ctrl+m | -
 palette | ctrl+k ctrl+q | -
 palette | ctrl+k ctrl+s | -
+palette | ctrl+k ctrl+shift+\ | -
 palette | ctrl+k ctrl+t | -
 palette | ctrl+k d | ~palette("d" @1 > "Delete Line")
 palette | ctrl+k e | ~palette("e" @1 > "Kill to End of Line")
@@ -1812,6 +1863,7 @@ palette | ctrl+k shift+\ | ~palette("\\" @1 > "")
 palette | ctrl+k shift+a | ~palette("A" @1 > "Fold All")
 palette | ctrl+k shift+c | ~palette("C" @1 > "Git: Commit")
 palette | ctrl+k shift+d | ~palette("D" @1 > "Delete Line")
+palette | ctrl+k shift+down | ~palette("" @0 > "Move Line Down")
 palette | ctrl+k shift+e | ~palette("E" @1 > "Kill to End of Line")
 palette | ctrl+k shift+enter | tabs=*● main.rs text=15L#614ba9a0 caret=3:8 status="" -palette
 palette | ctrl+k shift+f | ~palette("F" @1 > "Quick Fix")
@@ -1819,14 +1871,18 @@ palette | ctrl+k shift+g | ~palette("G" @1 > "Go Back")
 palette | ctrl+k shift+h | ~palette("H" @1 > "Git: Stage Hunk")
 palette | ctrl+k shift+i | ~palette("I" @1 > "Replace in File")
 palette | ctrl+k shift+l | ~palette("L" @1 > "View: Toggle Primary Side Bar")
+palette | ctrl+k shift+left | -
+palette | ctrl+k shift+m | ~palette("M" @1 > "Move Line Up")
 palette | ctrl+k shift+n | ~palette("N" @1 > "Go to Next Change")
 palette | ctrl+k shift+o | ~palette("O" @1 > "View: Keep Editor")
 palette | ctrl+k shift+p | ~palette("P" @1 > "Git: Push")
 palette | ctrl+k shift+q | ~palette("Q" @1 > "Quick Fix")
 palette | ctrl+k shift+r | ~palette("R" @1 > "Redo")
+palette | ctrl+k shift+right | -
 palette | ctrl+k shift+s | ~palette("S" @1 > "File: Save")
 palette | ctrl+k shift+t | ~palette("T" @1 > "Toggle Fold")
 palette | ctrl+k shift+u | ~palette("U" @1 > "Undo")
+palette | ctrl+k shift+up | -
 palette | ctrl+k shift+v | ~palette("V" @1 > "Toggle Vim Mode")
 palette | ctrl+k shift+w | ~palette("W" @1 > "File: Save with Sudo")
 palette | ctrl+k shift+x | ~palette("X" @1 > "Quick Fix")
@@ -2045,6 +2101,8 @@ confirm | ctrl+k [ | -
 confirm | ctrl+k \ | -
 confirm | ctrl+k ] | -
 confirm | ctrl+k a | -
+confirm | ctrl+k alt+down | -
+confirm | ctrl+k alt+left | -
 confirm | ctrl+k b | -
 confirm | ctrl+k c | -
 confirm | ctrl+k ctrl+/ | -
@@ -2065,6 +2123,7 @@ confirm | ctrl+k ctrl+l | -
 confirm | ctrl+k ctrl+m | -
 confirm | ctrl+k ctrl+q | -
 confirm | ctrl+k ctrl+s | -
+confirm | ctrl+k ctrl+shift+\ | -
 confirm | ctrl+k ctrl+t | -
 confirm | ctrl+k d | +quit -unsaved
 confirm | ctrl+k e | -
@@ -2086,6 +2145,7 @@ confirm | ctrl+k shift+\ | -
 confirm | ctrl+k shift+a | -
 confirm | ctrl+k shift+c | -
 confirm | ctrl+k shift+d | +quit -unsaved
+confirm | ctrl+k shift+down | -
 confirm | ctrl+k shift+e | -
 confirm | ctrl+k shift+enter | tabs=*main.rs files=27L#afbd942b +quit -unsaved
 confirm | ctrl+k shift+f | -
@@ -2093,14 +2153,18 @@ confirm | ctrl+k shift+g | -
 confirm | ctrl+k shift+h | -
 confirm | ctrl+k shift+i | -
 confirm | ctrl+k shift+l | -
+confirm | ctrl+k shift+left | -
+confirm | ctrl+k shift+m | -
 confirm | ctrl+k shift+n | status="Cancelled: did not quit" -unsaved
 confirm | ctrl+k shift+o | -
 confirm | ctrl+k shift+p | -
 confirm | ctrl+k shift+q | -
 confirm | ctrl+k shift+r | -
+confirm | ctrl+k shift+right | -
 confirm | ctrl+k shift+s | tabs=*main.rs files=27L#afbd942b +quit -unsaved
 confirm | ctrl+k shift+t | -
 confirm | ctrl+k shift+u | -
+confirm | ctrl+k shift+up | -
 confirm | ctrl+k shift+v | -
 confirm | ctrl+k shift+w | -
 confirm | ctrl+k shift+x | -

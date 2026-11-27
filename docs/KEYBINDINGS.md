@@ -131,6 +131,10 @@ Per platform:
 | (box focused) `Enter` | Send the reply to the navigator |
 | (box focused) `Esc` | Leave the box and return to the buffer |
 | `Cmd+K` `→` | Close the tabs to the right of the active one; unsaved tabs stay open |
+| `Cmd+K` `Cmd+\` / `Cmd+K` `Opt+↓` / `Cmd+K` `Opt+←` | Split the editor up / down / left: the active file in a new group on that side. `Cmd+K` `Opt+↑` and `Cmd+K` `Opt+→` split up and right too, as `Cmd+Opt+←` / `→` focus the group on that side |
+| `Cmd+K` `Shift+Cmd+\` | Split in Group: a second view of the active file beside it, in the same group |
+| `Cmd+K` `Shift+←` / `Cmd+K` `Shift+→` / `Cmd+K` `Shift+↑` / `Cmd+K` `Shift+↓` | Move the active tab into the group on that side, opening a group there if there is none |
+| `Cmd+K` `Shift+M` | Move the minimap to the editor's other edge |
 | `Cmd+K` `S` | Select the active file as the compare anchor |
 | `Cmd+K` `C` | Diff the active file against the compare anchor |
 | `Cmd+K` `W` | Close all editor tabs in every split, keeping pinned and unsaved tabs. `Cmd+K` `Shift+W` reopens them |
@@ -315,6 +319,12 @@ Every choice except the side-bar / panel visibility persists across launches in 
 | Output: Select Channel… | palette only | Pick an OUTPUT channel and show it |
 | View: Close Other Editors in Group | `Cmd`+`K` `Shift`+`X` | The tab menu's **Close Others**: close every other tab of the focused group except pinned tabs; other splits are untouched |
 | View: Close Editors to the Right in Group / View: Close Saved Editors in Group / View: Close All Editors | `Cmd`+`K` `→` / `Cmd`+`K` `U` / `Cmd`+`K` `W` | The tab menu's **Close to the Right**, **Close Saved** and **Close All** on the active tab (Close All covers every split) |
+| View: Split Editor Up / View: Split Editor Down / View: Split Editor Left | `Cmd`+`K` `Cmd`+`\` / `Cmd`+`K` `Opt`+`↓` / `Cmd`+`K` `Opt`+`←` | The tab menu's **Split Up**, **Split Down** and **Split Left** (under **Split & Move**) on the active tab |
+| View: Split Editor in Group | `Cmd`+`K` `Shift`+`Cmd`+`\` | The tab menu's **Split in Group** on the active tab |
+| View: Move Editor into Group Above / Group Below / Left Group / Right Group | `Cmd`+`K` `Shift`+`↑` / `Shift`+`↓` / `Shift`+`←` / `Shift`+`→` | The tab menu's **Move Above**, **Move Below**, **Move Left** and **Move Right**: the active tab into the group on that side, or a new group there |
+| View: Copy Editor into New Window / View: Move Editor into New Window | `Cmd`+`K` `O` / `Cmd`+`K` `Shift`+`O` | The tab menu's **Copy into New Window** / **Move into New Window** on the active tab (macOS only) |
+| File: Reveal Active File in Explorer View | `Cmd`+`K` `E` | The tab menu's **Reveal in Explorer View** on the active tab |
+| View: Toggle Minimap Side | `Cmd`+`K` `Shift`+`M` | The minimap menu's **Side** rows: the strip to the editor's other edge |
 | View: Pin Editor / View: Unpin Editor | `Cmd`+`K` `P` | The tab menu's **Pin** / **Unpin** on the active tab; the palette lists only the one that applies |
 | View: Keep Editor | `Cmd`+`K` `Shift`+`P` | The tab menu's **Keep Open**: the preview tab stays when the next file opens (also found as "keep open") |
 

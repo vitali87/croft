@@ -60,28 +60,18 @@ const MENUS: [MenuRoute; 11] = [
     ("right-click-gutter", Some(right_click::the_gutter_menus)),
 ];
 
+/// Right-click actions whose row runs no command, but which a palette
+/// command reaches all the same, by variant: (variant, command id, why).
+const COMMAND_ROUTES: &[(&str, &str, &str)] = &[(
+    "SetMinimapSide",
+    "toggle_minimap_side",
+    "the Side rows pick an edge; the toggle moves the strip to the other one, \
+     and picking the edge it is on changes nothing",
+)];
+
 /// Right-click actions the keyboard cannot reach yet, by variant, with what
 /// gives them a route. Only shrinks.
 const NO_ROUTE_YET: &[(&str, &str)] = &[
-    ("SplitEditorLeft", "#871 step 7b: View: Split Editor Left"),
-    ("SplitEditorDown", "#871 step 7b: View: Split Editor Down"),
-    (
-        "MoveEditorUp",
-        "#871 step 7b: View: Move Editor into Group Above",
-    ),
-    (
-        "MoveEditorDown",
-        "#871 step 7b: View: Move Editor into Group Below",
-    ),
-    (
-        "MoveEditorLeft",
-        "#871 step 7b: View: Move Editor into Left Group",
-    ),
-    (
-        "MoveEditorRight",
-        "#871 step 7b: View: Move Editor into Right Group",
-    ),
-    ("SetMinimapSide", "#871 step 7c: View: Toggle Minimap Side"),
     (
         "CopyDebugValue",
         "#871 step 7d: Run and Debug rows from the keyboard",
@@ -200,8 +190,9 @@ fn every_right_click_row_has_a_keyboard_route() {
             for (label, action) in items {
                 let name = variant(&action);
                 held.insert(name.clone());
-                let routed =
-                    shortcut_for(&action).is_some() || menu_action_command(&action).is_some();
+                let routed = shortcut_for(&action).is_some()
+                    || menu_action_command(&action).is_some()
+                    || COMMAND_ROUTES.iter().any(|(v, _, _)| *v == name);
                 let waiting = NO_ROUTE_YET.iter().any(|(a, _)| *a == name);
                 if routed && waiting {
                     wrong.push(format!(
@@ -215,6 +206,14 @@ fn every_right_click_row_has_a_keyboard_route() {
                     ));
                 }
             }
+        }
+    }
+    for (name, id, _) in COMMAND_ROUTES {
+        check_route(Route::Command(id), name, &mut wrong);
+        if !held.contains(*name) {
+            wrong.push(format!(
+                "COMMAND_ROUTES names `{name}`, which no such menu holds"
+            ));
         }
     }
     for (name, why) in NO_ROUTE_YET {
@@ -282,4 +281,146 @@ fn every_source_control_control_has_a_keyboard_route() {
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Three saved tabs in one group, the last active, and, with `split`, the
+/// group split to the right first, with the three tabs' group active, so
+/// the moves have a neighbour. Two apps over one folder draw the same tabs.
+fn three_tabs(root: &Path, split: bool) -> App {
+    let names = ["a.rs", "b.rs", "c.rs"];
+    for name in names {
+        std::fs::write(root.join(name), "fn main() {}\n").unwrap();
+    }
+    let mut app = App::new(root.to_path_buf()).unwrap();
+    for name in names {
+        app.editor.open_pinned(&root.join(name)).unwrap();
+    }
+    if split {
+        // Back to the left group, which keeps all three tabs.
+        app.split_editor();
+        app.focus_editor_group(true);
+    }
+    app
+}
+
+/// The tab menu's Split and Move rows and the palette commands routed for
+/// them (#871 step 7b) leave the same editor groups, the same focus and the
+/// same status, from one group and from a split: the command is the row,
+/// reached from the keyboard.
+#[test]
+fn a_tab_row_and_its_command_leave_the_same_groups() {
+    let rows = [
+        MenuAction::SplitEditorUp,
+        MenuAction::SplitEditorDown,
+        MenuAction::SplitEditorLeft,
+        MenuAction::SplitInGroup,
+        MenuAction::MoveEditorUp,
+        MenuAction::MoveEditorDown,
+        MenuAction::MoveEditorLeft,
+        MenuAction::MoveEditorRight,
+    ];
+    for split in [false, true] {
+        for action in &rows {
+            let cmd = menu_action_command(action).expect("the row runs a command");
+            let tmp = tempfile::tempdir().unwrap();
+            let mut by_row = three_tabs(tmp.path(), split);
+            let mut by_command = three_tabs(tmp.path(), split);
+            let before = key_ledger::groups(&by_row);
+            by_row.dispatch_menu_action(action.clone(), tmp.path().to_path_buf());
+            by_command.run_command(cmd);
+            let after = key_ledger::groups(&by_row);
+            let at = format!("{action:?} as {cmd:?}, split first: {split}");
+            assert_ne!(after, before, "{at}: the row changes the groups");
+            assert_eq!(key_ledger::groups(&by_command), after, "{at}");
+            assert!(by_command.focus == by_row.focus, "{at}: focus");
+            assert_eq!(by_command.status, by_row.status, "{at}: status");
+        }
+    }
+}
+
+/// File: Reveal Active File in Explorer View does what the tab menu's
+/// Reveal in Explorer View row does on the active tab: the Explorer shows,
+/// with the file's row selected and the tree focused.
+#[test]
+fn reveal_active_file_in_explorer_is_the_tab_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut by_row = three_tabs(tmp.path(), false);
+    let mut by_command = three_tabs(tmp.path(), false);
+    for app in [&mut by_row, &mut by_command] {
+        app.set_sidebar_view(SidebarView::Search);
+        app.focus_pane(Pane::Editor);
+    }
+    let path = by_row.editor.path.clone().expect("c.rs is active");
+    by_row.dispatch_menu_action(MenuAction::RevealInExplorer(path), tmp.path().to_path_buf());
+    by_command.run_command(crate::widgets::command_palette::Command::RevealActiveFileInExplorer);
+    let picked = |app: &App| {
+        app.tree
+            .selected_path()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+    };
+    assert_eq!(
+        picked(&by_row).as_deref(),
+        Some("c.rs"),
+        "the row reveals c.rs"
+    );
+    assert_eq!(picked(&by_command), picked(&by_row));
+    assert!(by_command.sidebar_view == SidebarView::Explorer);
+    assert!(by_command.focus == by_row.focus && by_row.focus == Pane::Tree);
+}
+
+/// With no file to reveal, the command says so rather than doing nothing.
+#[test]
+fn reveal_active_file_in_explorer_without_a_file_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::RevealActiveFileInExplorer);
+    assert_eq!(app.status, "Reveal in Explorer View: no active file");
+}
+
+/// View: Move / Copy Editor into New Window run the tab rows' code on the
+/// active tab: an unsaved buffer gets the rows' own refusal (no window is
+/// opened from a test).
+#[test]
+fn the_new_window_commands_are_the_tab_rows() {
+    use crate::widgets::command_palette::Command as Cmd;
+    for (action, cmd) in [
+        (MenuAction::MoveIntoNewWindow(0), Cmd::MoveEditorToNewWindow),
+        (MenuAction::CopyIntoNewWindow(0), Cmd::CopyEditorToNewWindow),
+    ] {
+        assert_eq!(menu_action_command(&action), Some(cmd));
+        let tmp = tempfile::tempdir().unwrap();
+        let mut by_row = App::new(tmp.path().to_path_buf()).unwrap();
+        let mut by_command = App::new(tmp.path().to_path_buf()).unwrap();
+        by_row.dispatch_menu_action(action.clone(), tmp.path().to_path_buf());
+        by_command.run_command(cmd);
+        assert!(
+            by_row.status.contains("save the file first"),
+            "{action:?}: {}",
+            by_row.status
+        );
+        assert_eq!(by_command.status, by_row.status, "{cmd:?}");
+    }
+}
+
+/// View: Toggle Minimap Side moves the strip to the edge it is not on, as
+/// picking that edge in the minimap menu's Side rows does.
+#[test]
+fn toggle_minimap_side_picks_the_other_edge() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut by_row = App::new(tmp.path().to_path_buf()).unwrap();
+    let mut by_command = App::new(tmp.path().to_path_buf()).unwrap();
+    for side in [MinimapSide::Left, MinimapSide::Right] {
+        assert!(
+            by_command.minimap_side != side,
+            "setup: {side:?} is the other edge"
+        );
+        by_row.dispatch_menu_action(MenuAction::SetMinimapSide(side), tmp.path().to_path_buf());
+        by_command.run_command(crate::widgets::command_palette::Command::ToggleMinimapSide);
+        assert!(
+            by_command.minimap_side == side,
+            "the toggle lands on {side:?}"
+        );
+        assert!(by_row.minimap_side == side);
+    }
 }

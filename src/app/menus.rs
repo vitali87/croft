@@ -42,6 +42,12 @@ pub(super) fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::SplitEditor => Some("⌘\\"),
         MenuAction::SplitEditorUp => Some("⌘K ⌘\\"),
         MenuAction::SplitInGroup => Some("⌘K ⇧⌘\\"),
+        MenuAction::SplitEditorDown => Some("⌘K ⌥↓"),
+        MenuAction::SplitEditorLeft => Some("⌘K ⌥←"),
+        MenuAction::MoveEditorUp => Some("⌘K ⇧↑"),
+        MenuAction::MoveEditorDown => Some("⌘K ⇧↓"),
+        MenuAction::MoveEditorLeft => Some("⌘K ⇧←"),
+        MenuAction::MoveEditorRight => Some("⌘K ⇧→"),
         MenuAction::FocusGroupLeft => Some("⌥⌘←"),
         MenuAction::FocusGroupRight => Some("⌥⌘→"),
         MenuAction::CopyIntoNewWindow(_) => Some("⌘K O"),
@@ -138,14 +144,6 @@ pub(super) fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         | MenuAction::SetLineEnding(_)
         | MenuAction::SetEncoding(_)
         | MenuAction::SetIndentStyle(_) => None,
-        // The editor-group moves and splits in the tab menu: croft binds
-        // none of them, and the palette's group moves carry no chord either.
-        MenuAction::SplitEditorLeft
-        | MenuAction::SplitEditorDown
-        | MenuAction::MoveEditorUp
-        | MenuAction::MoveEditorDown
-        | MenuAction::MoveEditorLeft
-        | MenuAction::MoveEditorRight => None,
         // Copy Permalink and Open on Remote (#1610): their palette commands
         // carry no chord either.
         MenuAction::CopyPermalink | MenuAction::OpenOnRemote => None,
@@ -177,6 +175,19 @@ pub(super) fn menu_action_command(
         MenuAction::TerminalCommandHistory => Cmd::TerminalCommandHistory,
         MenuAction::OpenScrollbackInEditor => Cmd::TerminalOpenScrollback,
         MenuAction::CloseOtherTabs(_) => Cmd::CloseOtherEditors,
+        // The tab menu's Split & Move rows (#871): their palette commands
+        // act on the active tab, as the rows act on theirs.
+        MenuAction::SplitEditorUp => Cmd::SplitEditorUp,
+        MenuAction::SplitEditorDown => Cmd::SplitEditorDown,
+        MenuAction::SplitEditorLeft => Cmd::SplitEditorLeft,
+        MenuAction::SplitInGroup => Cmd::SplitEditorInGroup,
+        MenuAction::MoveEditorUp => Cmd::MoveEditorToAboveGroup,
+        MenuAction::MoveEditorDown => Cmd::MoveEditorToBelowGroup,
+        MenuAction::MoveEditorLeft => Cmd::MoveEditorToLeftGroup,
+        MenuAction::MoveEditorRight => Cmd::MoveEditorToRightGroup,
+        MenuAction::MoveIntoNewWindow(_) => Cmd::MoveEditorToNewWindow,
+        MenuAction::CopyIntoNewWindow(_) => Cmd::CopyEditorToNewWindow,
+        MenuAction::RevealInExplorer(_) => Cmd::RevealActiveFileInExplorer,
         _ => return None,
     })
 }
@@ -1570,12 +1581,7 @@ impl App {
                 }
             }
             MenuAction::ToggleMinimap => self.toggle_minimap(),
-            MenuAction::SetMinimapSide(side) => {
-                self.minimap_side = side;
-                // The strip jumps columns: evict the old placement so it
-                // doesn't ghost, and force a rebake at the new position.
-                self.disable_minimap_image();
-            }
+            MenuAction::SetMinimapSide(side) => self.set_minimap_side(side),
             MenuAction::SetLanguage(lang) => {
                 self.editor.pick_language(lang);
                 self.status = format!("Language Mode: {}", self.editor.language_label());

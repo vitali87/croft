@@ -149,6 +149,42 @@ fn off_the_strip_tab_commands_still_act_on_the_active_tab() {
     assert_eq!(tab_names(&app), ["a.py"], "from the keyboard too");
 }
 
+/// #2747: a tab-strip binding for Move or Copy into New Window acts on the
+/// clicked tab, as every other tab command does. Over SSH neither can open a
+/// window, so the refusal tells which tab each took: the clicked untitled
+/// tab has no file to hand over, while the active a.py would be refused for
+/// SSH.
+#[test]
+fn a_tab_strip_binding_opens_the_clicked_tab_in_a_new_window() {
+    use crossterm::event::MouseButton;
+    for command in ["move_editor_to_new_window", "copy_editor_to_new_window"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.new_untitled_file();
+        let f = tmp.path().join("a.py");
+        std::fs::write(&f, "a\n").unwrap();
+        app.editor.open_pinned(&f).unwrap();
+        app.is_remote = true;
+        app.keymap = crate::keymap::Keymap::from_json(&format!(
+            r#"[{{"key": "middle_click", "command": "{command}", "when": "tab_strip"}}]"#
+        ));
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|frame| app.render(frame)).unwrap();
+        let untitled = (0..app.editor.tab_count())
+            .find(|&i| app.editor.tab_path(i).is_none())
+            .unwrap();
+        assert_ne!(untitled, app.editor.active_index(), "a background tab");
+        let cell = tab_cell(&app, untitled);
+        press(&mut app, MouseButton::Middle, cell);
+        assert!(
+            app.status.contains("save the file first"),
+            "{command} took the clicked tab: {}",
+            app.status
+        );
+    }
+}
+
 /// #1635 negative: moving focus to another editor group showing another
 /// file is not a file switch. A history entry holds no group, so Go Back
 /// would reopen the left group's file in the focused one.

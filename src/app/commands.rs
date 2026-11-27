@@ -1445,6 +1445,19 @@ impl App {
             Cmd::MoveEditorToNextGroup => self.move_active_editor_to_adjacent_group(true),
             Cmd::MoveEditorToPreviousGroup => self.move_active_editor_to_adjacent_group(false),
             Cmd::SplitEditor => self.split_editor(),
+            Cmd::SplitEditorUp => self.split_editor_dir(editor_layout::SplitDir::Vertical, false),
+            Cmd::SplitEditorDown => self.split_editor_dir(editor_layout::SplitDir::Vertical, true),
+            Cmd::SplitEditorLeft => {
+                self.split_editor_dir(editor_layout::SplitDir::Horizontal, false)
+            }
+            Cmd::SplitEditorInGroup => self.split_in_group(),
+            Cmd::MoveEditorToAboveGroup => self.move_active_editor(editor_layout::Dir::Up),
+            Cmd::MoveEditorToBelowGroup => self.move_active_editor(editor_layout::Dir::Down),
+            Cmd::MoveEditorToLeftGroup => self.move_active_editor(editor_layout::Dir::Left),
+            Cmd::MoveEditorToRightGroup => self.move_active_editor(editor_layout::Dir::Right),
+            Cmd::MoveEditorToNewWindow => self.move_into_new_window(tab_target),
+            Cmd::CopyEditorToNewWindow => self.copy_into_new_window(tab_target),
+            Cmd::RevealActiveFileInExplorer => self.reveal_active_file_in_explorer(),
             // The chords' own moves (#843): Cmd+Opt+Left / Right have no
             // `Ctrl` form off macOS.
             Cmd::FocusLeftEditorGroup => self.focus_editor_group(true),
@@ -1980,6 +1993,7 @@ impl App {
             Cmd::SetQuickInputPosition => self.open_quick_input_position_picker(),
             Cmd::CustomizeLayout => self.open_customize_layout_menu(),
             Cmd::ToggleMinimap => self.toggle_minimap(),
+            Cmd::ToggleMinimapSide => self.toggle_minimap_side(),
             Cmd::ProblemsToggleProjectAuto => {
                 // auto -> on -> off -> auto. Cycling rather than a boolean
                 // because `auto` is a distinct answer from both, not a
