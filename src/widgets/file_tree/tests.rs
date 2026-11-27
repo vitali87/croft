@@ -2417,3 +2417,33 @@ fn affected_dir_for_event_resolves_a_root_reached_through_a_symlink() {
         Some(real.join("sub"))
     );
 }
+
+/// #2751: a wheel step and a click read in the same burst: the click meets
+/// the rows the last frame drew, not the ones the wheel has moved there
+/// before the next frame.
+#[test]
+fn a_click_after_a_wheel_step_meets_the_drawn_rows() {
+    let tmp = TempDir::new().unwrap();
+    for i in 0..40 {
+        fs::write(tmp.path().join(format!("f{i:02}.txt")), "").unwrap();
+    }
+    let mut tree = FileTree::new(tmp.path().to_path_buf());
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 30,
+        height: 10,
+    };
+    let mut buf = Buffer::empty(area);
+    (&mut tree).render(area, &mut buf);
+    let y = tree.last_inner.y + 1;
+    let drawn = tree.node_at_y(y).expect("a row is drawn there");
+    let before = tree.scroll;
+    tree.scroll_down(3);
+    assert!(tree.scroll > before, "the wheel scrolled the rows");
+    assert_eq!(
+        tree.node_at_y(y),
+        Some(drawn),
+        "the row drawn there, not the one scrolled there"
+    );
+}

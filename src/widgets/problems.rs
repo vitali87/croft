@@ -254,6 +254,10 @@ pub struct ProblemsPanel {
     rows: Vec<RenderRow>,
     first_row_y: u16,
     visible_rows: u16,
+    /// The scroll those rows were drawn with (#2751). A click is matched
+    /// against it: the screen shows it until the next frame, while a key or
+    /// wheel step read in the same burst has already moved `scroll`.
+    last_scroll: usize,
     viewport_rows: u16,
 }
 
@@ -280,6 +284,7 @@ impl ProblemsPanel {
             rows: Vec::new(),
             first_row_y: 0,
             visible_rows: 0,
+            last_scroll: 0,
             viewport_rows: 0,
         }
     }
@@ -464,7 +469,7 @@ impl ProblemsPanel {
         if offset >= self.visible_rows as usize {
             return None;
         }
-        match self.rows.get(self.scroll + offset)? {
+        match self.rows.get(self.last_scroll + offset)? {
             RenderRow::Header(g) => {
                 let group = self.groups.get(*g)?;
                 Some(ProblemHit::Header(group.path.clone()))
@@ -494,6 +499,16 @@ impl ProblemsPanel {
     /// The diagnostic on the row painted at `y`, with its file, for actions
     /// that need the whole item rather than a jump target (#374).
     pub fn diagnostic_at(&self, y: u16) -> Option<(PathBuf, ProblemItem)> {
+        self.diagnostic_at_from(y, self.last_scroll)
+    }
+
+    /// The diagnostic the next frame draws at row `y`, for what that frame
+    /// shows beside it, as a menu opened from the keyboard.
+    pub fn diagnostic_at_next_frame(&self, y: u16) -> Option<(PathBuf, ProblemItem)> {
+        self.diagnostic_at_from(y, self.scroll)
+    }
+
+    fn diagnostic_at_from(&self, y: u16, scroll: usize) -> Option<(PathBuf, ProblemItem)> {
         if self.visible_rows == 0 || y < self.first_row_y {
             return None;
         }
@@ -501,7 +516,7 @@ impl ProblemsPanel {
         if offset >= self.visible_rows as usize {
             return None;
         }
-        match self.rows.get(self.scroll + offset)? {
+        match self.rows.get(scroll + offset)? {
             RenderRow::Header(_) => None,
             // A related row stands for the diagnostic it explains.
             RenderRow::Diag(g, i) | RenderRow::Related(g, i, _) => {
@@ -723,6 +738,7 @@ impl Widget for &mut ProblemsPanel {
 
         let visible = (body.height as usize).min(self.rows.len().saturating_sub(self.scroll));
         self.visible_rows = visible as u16;
+        self.last_scroll = self.scroll;
         // Croft Loch keeps a one-cell gutter, so a row's text starts on the
         // column a terminal's text does and switching tabs doesn't jog the
         // content sideways. The hover fill still spans the whole row.
@@ -1227,6 +1243,27 @@ mod tests {
         assert_eq!(p.total_count(), 3);
         assert_eq!(p.error_count(), 2);
         assert_eq!(p.warning_count(), 1);
+    }
+
+    /// #2751: a wheel step and a click read in the same burst: the click
+    /// meets the rows the last frame drew, not the ones the wheel has moved
+    /// there before the next frame.
+    #[test]
+    fn a_click_after_a_wheel_step_meets_the_drawn_rows() {
+        let mut p = ProblemsPanel::new();
+        p.set_groups(vec![group(
+            "a.rs",
+            (1..=40)
+                .map(|line| diag(line, DiagnosticSeverity::Error, "boom"))
+                .collect(),
+        )]);
+        render(&mut p, 60, 10);
+        let drawn = p.hit_at(2);
+        assert!(drawn.is_some(), "a row is drawn there");
+        let before = p.scroll;
+        p.scroll_down(3);
+        assert!(p.scroll > before, "the wheel scrolled the rows");
+        assert_eq!(p.hit_at(2), drawn, "the row drawn there");
     }
 
     #[test]

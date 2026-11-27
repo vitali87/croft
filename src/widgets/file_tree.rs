@@ -159,6 +159,10 @@ pub struct FileTree {
     /// the name.
     pub note_counts: Arc<HashMap<PathBuf, usize>>,
     pub last_inner: Rect,
+    /// The scroll the rows were drawn with (#2751). A click is matched
+    /// against it: the screen shows it until the next frame, while a wheel
+    /// step read in the same burst has already moved `scroll`.
+    pub last_scroll: usize,
     pub last_area: Rect,
     pub last_scrollbar: Rect,
     /// The sticky band painted this frame: `(screen y, node index)` per
@@ -218,6 +222,7 @@ impl FileTree {
             note_counts: Arc::default(),
             root_badges: Arc::default(),
             last_inner: Rect::default(),
+            last_scroll: 0,
             last_area: Rect::default(),
             last_scrollbar: Rect::default(),
             sticky_rows: Vec::new(),

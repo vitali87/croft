@@ -1,0 +1,1 @@
+fix: a click that arrives together with a wheel step, or with a key that moves Run and Debug's rows, now lands on the row that was on screen, not one or more rows further. This covers the Explorer, Run and Debug, Problems, Open Editors, Outline, Search and the Remote Explorer, and matters most over SSH, where input arrives in bursts (#2751).

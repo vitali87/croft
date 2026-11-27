@@ -25,6 +25,10 @@ pub struct RemotePanel {
     pub last_area: Rect,
     pub last_inner: Rect,
     pub last_list_area: Rect,
+    /// The scroll the rows were drawn with (#2751). A click is matched
+    /// against it: the screen shows it until the next frame, while a key or
+    /// wheel step read in the same burst has already moved `scroll`.
+    pub last_scroll: usize,
     pub last_scrollbar: Rect,
     pub header_chevron_btn: Rect,
     pub header_add_btn: Rect,
@@ -59,6 +63,7 @@ impl RemotePanel {
             last_area: Rect::default(),
             last_inner: Rect::default(),
             last_list_area: Rect::default(),
+            last_scroll: 0,
             last_scrollbar: Rect::default(),
             header_chevron_btn: Rect::default(),
             header_add_btn: Rect::default(),
@@ -158,7 +163,7 @@ impl RemotePanel {
             return None;
         }
         let row = (y - self.last_list_area.y) as usize;
-        let idx = self.scroll + row;
+        let idx = self.last_scroll + row;
         self.visible.get(idx).copied()
     }
 
@@ -715,6 +720,7 @@ impl Widget for &mut RemotePanel {
         } else if sel_pos >= self.scroll + viewport {
             self.scroll = sel_pos + 1 - viewport;
         }
+        self.last_scroll = self.scroll;
 
         let scrollbar_area = Rect {
             x: self.last_list_area.x + self.last_list_area.width.saturating_sub(1),
@@ -1077,6 +1083,31 @@ mod tests {
             p.targets[idx].alias, "bravo",
             "clicking the first visible row under a filter must select the matching host, not raw targets[0]"
         );
+    }
+
+    /// #2751: a wheel step and a click read in the same burst: the click
+    /// meets the rows the last frame drew, not the ones the wheel has moved
+    /// there before the next frame.
+    #[test]
+    fn a_click_after_a_wheel_step_meets_the_drawn_rows() {
+        let names: Vec<String> = (0..30).map(|i| format!("host{i:02}")).collect();
+        let aliases: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut p = populated_panel(&aliases);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        let y = p.last_list_area.y + 1;
+        let drawn = p.target_at_y(y);
+        assert!(drawn.is_some(), "a row is drawn there");
+        let before = p.scroll;
+        p.scroll_down(3);
+        assert!(p.scroll > before, "the wheel scrolled the rows");
+        assert_eq!(p.target_at_y(y), drawn, "the row drawn there");
     }
 
     #[test]

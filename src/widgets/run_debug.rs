@@ -543,6 +543,10 @@ pub struct RunDebugPanel {
     /// recorded each frame so a click can be mapped to a row index.
     pub last_debug_row_y0: u16,
     pub last_debug_rows_shown: usize,
+    /// The scroll those rows were drawn with (#2751). A click is matched
+    /// against it: the screen shows it until the next frame, while a key or
+    /// wheel step read in the same burst has already moved `debug_scroll`.
+    pub last_debug_scroll: usize,
     /// Tail of the debug console (program output + REPL echoes/results), set by
     /// the app each refresh; rendered below the variables tree.
     pub console_tail: Vec<crate::ansi_text::AnsiLine>,
@@ -597,6 +601,7 @@ impl RunDebugPanel {
             row_cursor: None,
             last_debug_row_y0: 0,
             last_debug_rows_shown: 0,
+            last_debug_scroll: 0,
             console_tail: Vec::new(),
             repl_input: String::new(),
             last_prompt_area: Rect::default(),
@@ -708,7 +713,7 @@ impl RunDebugPanel {
         }
         let offset = (y - self.last_debug_row_y0) as usize;
         if offset < self.last_debug_rows_shown {
-            Some(self.debug_scroll + offset)
+            Some(self.last_debug_scroll + offset)
         } else {
             None
         }
@@ -998,6 +1003,7 @@ impl RunDebugPanel {
         let rows_bottom = bottom.saturating_sub(input_h + console_h);
         let rows_area_h = rows_bottom.saturating_sub(y) as usize;
         self.last_debug_row_y0 = y;
+        self.last_debug_scroll = self.debug_scroll;
 
         let mut shown = 0usize;
         // Breakpoint rows paint after the loop: `put_breakpoint` needs
@@ -2461,6 +2467,59 @@ mod tests {
         assert!(
             dump.contains("can't be run") && dump.contains("debugged"),
             "must explain why there's no button: {dump:?}"
+        );
+    }
+
+    /// #2751: a click read after a key that scrolled the rows, in the same
+    /// burst and so before the next frame, meets the rows the last frame
+    /// drew: the screen still shows them, and the key has already moved the
+    /// scroll by one.
+    #[test]
+    fn a_click_before_the_next_frame_meets_the_drawn_rows() {
+        let mut panel = RunDebugPanel::new();
+        panel.debug_active = true;
+        panel.debug_rows = std::iter::once(DebugRow {
+            indent: 0,
+            kind: DebugRowKind::Header {
+                title: String::from("VARIABLES"),
+            },
+        })
+        .chain((0..30).map(|i| DebugRow {
+            indent: 1,
+            kind: DebugRowKind::Variable {
+                reference: 0,
+                expandable: false,
+                expanded: false,
+                name: format!("v{i}"),
+                value: String::from("1"),
+                type_name: String::from("int"),
+                evaluate_name: Some(format!("v{i}")),
+            },
+        }))
+        .collect();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 16,
+        };
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        let shown = panel.last_debug_rows_shown;
+        assert!(
+            shown > 1 && shown < panel.debug_rows.len(),
+            "rows to scroll"
+        );
+        let y0 = panel.last_debug_row_y0;
+        let top = panel.debug_row_at(y0).expect("a row is drawn at the top");
+        panel.row_cursor = Some(top + shown - 1);
+        let before = panel.debug_scroll;
+        panel.move_row_cursor(1);
+        assert!(panel.debug_scroll > before, "the key scrolled the rows");
+        assert_eq!(
+            panel.debug_row_at(y0),
+            Some(top),
+            "the row drawn at the top, not the one scrolled there"
         );
     }
 

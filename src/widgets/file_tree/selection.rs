@@ -4,14 +4,25 @@
 use super::*;
 
 impl FileTree {
-    /// Map a screen y coordinate to a node index, if any. Screen rows map
-    /// straight onto consecutive node indices from the scroll offset.
+    /// The node a pointer at screen row `y` meets: the rows as the last
+    /// frame drew them (#2751), which the screen shows until the next one.
     pub fn node_at_y(&self, y: u16) -> Option<usize> {
+        self.node_at_y_from(y, self.last_scroll)
+    }
+
+    /// The node the next frame draws at screen row `y`, for what that frame
+    /// shows beside it, as a menu opened from the keyboard.
+    pub fn node_at_y_next_frame(&self, y: u16) -> Option<usize> {
+        self.node_at_y_from(y, self.scroll)
+    }
+
+    /// Screen rows map straight onto consecutive node indices from `scroll`.
+    fn node_at_y_from(&self, y: u16, scroll: usize) -> Option<usize> {
         if y < self.last_inner.y || y >= self.last_inner.y + self.last_inner.height {
             return None;
         }
         let row = (y - self.last_inner.y) as usize;
-        let idx = self.scroll + row;
+        let idx = scroll + row;
         (idx < self.nodes.len()).then_some(idx)
     }
 

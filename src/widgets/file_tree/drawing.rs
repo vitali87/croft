@@ -142,6 +142,7 @@ impl Widget for &mut FileTree {
         // Persist the node index at the top of the viewport so the next frame's
         // mapping is stable.
         self.scroll = visible.get(scroll_pos).copied().unwrap_or(0);
+        self.last_scroll = self.scroll;
         let scrollbar_area = Rect {
             x: inner.x + inner.width.saturating_sub(1),
             y: inner.y,
