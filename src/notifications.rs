@@ -446,6 +446,10 @@ pub fn deliver(sink: &NotificationSink, n: &Notification) -> Result<(), Failure>
 
 /// Run `cmd` to completion or `timeout`, whichever is first; a child that
 /// outlives the bound is killed and reported as a (transient) failure.
+///
+/// Its error output is read while it runs (#2756): a command that writes
+/// more than a pipe holds would otherwise wait on croft to read it and never
+/// exit, and be killed at the bound as if it were slow.
 fn run_bounded(
     mut cmd: std::process::Command,
     name: &str,
@@ -454,6 +458,13 @@ fn run_bounded(
     let mut child = cmd
         .spawn()
         .map_err(|e| Failure::fixed(format!("{name} not runnable: {e}")))?;
+    let stderr = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
+            String::from_utf8_lossy(&buf).into_owned()
+        })
+    });
     let started = std::time::Instant::now();
     loop {
         match child.try_wait() {
@@ -461,10 +472,9 @@ fn run_bounded(
                 if status.success() {
                     return Ok(());
                 }
-                let mut stderr = String::new();
-                if let Some(mut pipe) = child.stderr.take() {
-                    let _ = std::io::Read::read_to_string(&mut pipe, &mut stderr);
-                }
+                let stderr = stderr
+                    .and_then(|reader| reader.join().ok())
+                    .unwrap_or_default();
                 return Err(Failure::transient(format!(
                     "{name} exited {status}: {}",
                     stderr.trim()
@@ -979,6 +989,25 @@ mod tests {
             "waited {:?}",
             started.elapsed()
         );
+    }
+
+    /// #2756: a sink that writes more than a pipe holds to its error output
+    /// and exits is reported as having exited, with what it wrote last, not
+    /// killed at the bound as if it were slow.
+    #[test]
+    fn a_command_sink_with_much_error_output_is_not_killed_as_slow() {
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            "head -c 200000 /dev/zero | tr '\\0' x >&2; echo last >&2; exit 3",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+        let err = run_bounded(cmd, "/bin/sh", Duration::from_secs(5)).unwrap_err();
+        let head: String = err.message.chars().take(120).collect();
+        assert!(err.message.contains("exited"), "{head}");
+        assert!(err.message.ends_with("last"), "{head}");
     }
 
     /// A token in a webhook header, and the workspace and host in every
