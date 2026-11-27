@@ -1761,20 +1761,20 @@ impl App {
         // Asked of git itself, right before acting: Source Control's own
         // status may not have arrived yet, or be the last folder's, and
         // `git init` inside a repository nests a new one in it (#871).
-        let inside = crate::proc::command("git")
-            .arg("-C")
-            .arg(&folder)
+        let inside = crate::git::Git::new()
+            .at(&folder)
             .args(["rev-parse", "--is-inside-work-tree"])
+            .into_command()
             .output()
             .is_ok_and(|out| out.status.success());
         if inside {
             self.status = format!("{} is already in a Git repository", folder.display());
             return;
         }
-        match crate::proc::command("git")
-            .arg("-C")
-            .arg(&folder)
+        match crate::git::Git::new()
+            .at(&folder)
             .arg("init")
+            .into_command()
             .output()
         {
             Ok(out) if out.status.success() => {

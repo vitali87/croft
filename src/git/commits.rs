@@ -27,10 +27,11 @@ pub fn commit(root: &Path, message: &str) -> Result<String, String> {
         .ok_or_else(|| "non-utf8 workspace path".to_string())?;
     // A hook or signing helper that wants a terminal fails fast with its
     // own message instead of fighting croft for the screen (#1153).
-    let mut cmd = crate::proc::command("git");
-    cmd.args(["-C", path_str, "commit", flags, message]);
-    never_prompt(&mut cmd);
-    let output = cmd
+    let output = Git::new()
+        .at(path_str)
+        .args(["commit", flags, message])
+        .never_prompting()
+        .into_command()
         .output()
         .map_err(|e| format!("failed to spawn git: {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -53,12 +54,12 @@ pub fn commit(root: &Path, message: &str) -> Result<String, String> {
 /// Paths git still holds as unmerged (`UU`, `AA`, `DU`, …): the MERGE
 /// CONFLICTS group, read straight from the index.
 pub fn unmerged_paths(root: &Path) -> Vec<String> {
-    let Ok(out) = crate::proc::command("git")
-        .arg("-C")
-        .arg(root)
+    let Ok(out) = Git::new()
+        .at(root)
         // `--no-relative`: with `diff.relative` set, a subdirectory root
         // would hide the conflicts outside it, and `git add -A` stages them.
         .args(["diff", "--no-relative", "--name-only", "--diff-filter=U", "-z"])
+        .into_command()
         .output()
     else {
         return Vec::new();
@@ -95,10 +96,9 @@ pub fn refuse_unmerged(root: &Path) -> Result<(), String> {
 /// Whether the index holds anything a plain `git commit` would record: a
 /// change against HEAD, or on an unborn branch any staged file.
 pub(super) fn has_staged_changes(root: &Path) -> Result<bool, String> {
-    let output = crate::proc::command("git")
-        .arg("-C")
-        .arg(root)
-        .env("GIT_OPTIONAL_LOCKS", "0")
+    let output = Git::new()
+        .at(root)
+        .without_optional_locks()
         // `--no-relative`: with `diff.relative` set, a subdirectory root
         // would see only what is staged under it, and a commit takes it all.
         // `--ignore-submodules=none`: `diff.ignoreSubmodules` hides a staged
@@ -113,6 +113,7 @@ pub(super) fn has_staged_changes(root: &Path) -> Result<bool, String> {
             "--ignore-submodules=none",
             "--no-ext-diff",
         ])
+        .into_command()
         .output()
         .map_err(|e| format!("failed to spawn git: {e}"))?;
     match output.status.code() {
@@ -189,11 +190,11 @@ pub(super) fn refuse_conflict_markers(root: &Path, scope: Option<&[String]>) -> 
 /// attribute, and marker lines both sides already had, such as a doc
 /// showing what a conflict looks like, which would block staging forever.
 pub(super) fn leftover_conflict_markers(top: &Path, rel: &str) -> bool {
-    crate::proc::command("git")
-        .arg("-C")
-        .arg(top)
+    Git::new()
+        .at(top)
         .args(["--literal-pathspecs", "diff", "--check", "--no-color", "--"])
         .arg(rel)
+        .into_command()
         .output()
         .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("leftover conflict marker"))
 }
@@ -272,11 +273,11 @@ pub fn undo_last_commit(root: &Path) -> Result<String, String> {
 /// configured but cannot be checked (its tracking ref missing) counts as
 /// pushed, so the warning errs on the side of showing.
 pub fn head_is_on_upstream(root: &Path) -> bool {
-    let code = crate::proc::command("git")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .arg("-C")
-        .arg(root)
+    let code = Git::new()
+        .without_optional_locks()
+        .at(root)
         .args(["merge-base", "--is-ancestor", "HEAD", "@{u}"])
+        .into_command()
         .output()
         .ok()
         .and_then(|o| o.status.code());
@@ -349,11 +350,11 @@ pub fn worktree_fingerprint(root: &Path) -> String {
     let index = run_git(root, &["ls-files", "-s", "-z"]).unwrap_or_default();
     // Not `run_git`: its trim would eat the first entry's leading status
     // space (" M path"), and with it where that path starts.
-    let status = crate::proc::command("git")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .arg("-C")
-        .arg(root)
+    let status = Git::new()
+        .without_optional_locks()
+        .at(root)
         .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .into_command()
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default();
