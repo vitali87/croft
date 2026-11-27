@@ -52,11 +52,11 @@ pub(super) fn patch_path(patch: &str) -> Option<&str> {
 pub(super) fn strips_cr_on_add(root: &Path, rel: &str) -> bool {
     let hash = |input: &[u8], args: &[&str]| -> Option<String> {
         use std::io::Write as _;
-        let mut child = crate::proc::command("git")
-            .arg("-C")
-            .arg(root)
+        let mut child = Git::new()
+            .at(root)
             .args(["hash-object", "--stdin"])
             .args(args)
+            .into_command()
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -124,7 +124,7 @@ pub fn apply_patch(
     let path_str = root
         .to_str()
         .ok_or_else(|| "non-utf8 workspace path".to_string())?;
-    let mut args: Vec<&str> = vec!["-C", path_str, "apply", "--whitespace=nowarn"];
+    let mut args: Vec<&str> = vec!["apply", "--whitespace=nowarn"];
     if cached {
         args.push("--cached");
     }
@@ -191,10 +191,12 @@ pub fn apply_patch(
     crate::output::push(
         crate::output::CHANNEL_GIT,
         crate::output::OutputLevel::Info,
-        &format!("> git {} <<patch", args[2..].join(" ")),
+        &format!("> git {} <<patch", args.join(" ")),
     );
-    let mut child = crate::proc::command("git")
+    let mut child = Git::new()
+        .at(path_str)
         .args(&args)
+        .into_command()
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
