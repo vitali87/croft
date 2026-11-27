@@ -469,7 +469,7 @@ fn run_bounded(cmd: std::process::Command, name: &str, timeout: Duration) -> Res
         Err(RunError::TimedOut) => Err(Failure::transient(format!(
             "{name} did not finish within {timeout:?} and was killed"
         ))),
-        Err(RunError::Wait(e)) => Err(Failure::fixed(format!("{name}: {e}"))),
+        Err(RunError::Wait(e) | RunError::Pipe(e)) => Err(Failure::fixed(format!("{name}: {e}"))),
         // Only a stream kept whole is refused, and this keeps none whole.
         Err(RunError::TooLong { stream, cap }) => Err(Failure::fixed(format!(
             "{name} wrote more than {cap} bytes to its {stream:?}"

@@ -101,6 +101,10 @@ pub(crate) enum RunError {
     TooLong { stream: Stream, cap: usize },
     /// Asking whether it had exited failed, and it was killed.
     Wait(std::io::Error),
+    /// One of its outputs could not be switched to reads that never wait,
+    /// and it was killed: croft reads a program only that way, so a helper
+    /// holding a stream open can never hold croft past the limit.
+    Pipe(std::io::Error),
 }
 
 /// What croft kept of one stream.
@@ -186,18 +190,23 @@ impl Bounded {
             cmd.spawn()
         };
         let mut child = started.map_err(RunError::Spawn)?;
-        let mut pipes = [
-            Pipe::new(
-                child.stdout.take().map(OwnedFd::from),
-                self.stdout,
-                Stream::Stdout,
-            ),
-            Pipe::new(
-                child.stderr.take().map(OwnedFd::from),
-                self.stderr,
-                Stream::Stderr,
-            ),
-        ];
+        let stdout = Pipe::new(
+            child.stdout.take().map(OwnedFd::from),
+            self.stdout,
+            Stream::Stdout,
+        );
+        let stderr = Pipe::new(
+            child.stderr.take().map(OwnedFd::from),
+            self.stderr,
+            Stream::Stderr,
+        );
+        let mut pipes = match (stdout, stderr) {
+            (Ok(stdout), Ok(stderr)) => [stdout, stderr],
+            (Err(e), _) | (_, Err(e)) => {
+                stop(child, self.detached);
+                return Err(RunError::Pipe(e));
+            }
+        };
         let mut quiet = 0u32;
         loop {
             let mut heard = false;
@@ -250,39 +259,38 @@ fn pause(quiet: u32) -> Duration {
     Duration::from_millis(1u64 << quiet.min(6)).min(LONGEST_WAIT)
 }
 
-/// One output stream of a running program.
+/// One output stream of a running program, read without ever waiting.
 struct Pipe {
     /// Until the stream ends: every holder of its other end has closed it.
     file: Option<File>,
-    /// Whether it reads without blocking, which is what makes it safe to wait
-    /// on and read while the program runs.
-    nonblocking: bool,
     keep: Keep,
     stream: Stream,
     kept: Kept,
 }
 
 impl Pipe {
-    fn new(fd: Option<OwnedFd>, keep: Keep, stream: Stream) -> Self {
-        let nonblocking = fd
-            .as_ref()
-            .is_none_or(|fd| super::set_nonblocking_on(fd.as_raw_fd()));
-        Self {
+    /// The stream on `fd`, switched to reads that return at once. A stream
+    /// that cannot be switched is refused rather than read some other way:
+    /// any read that can wait, even one after the program exits, waits on a
+    /// helper still holding the stream, past the limit.
+    fn new(fd: Option<OwnedFd>, keep: Keep, stream: Stream) -> std::io::Result<Self> {
+        if let Some(fd) = &fd
+            && !super::set_nonblocking_on(fd.as_raw_fd())
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
             file: fd.map(File::from),
-            nonblocking,
             keep,
             stream,
             kept: Kept::default(),
-        }
+        })
     }
 
     /// While the program runs: take what the stream holds now, up to
     /// [`DRAIN_LIMIT`], and let it go once it has ended. Reports whether it
     /// took anything.
     fn drain(&mut self) -> Result<bool, RunError> {
-        if !self.nonblocking {
-            return Ok(false);
-        }
         let Some(file) = self.file.as_mut() else {
             return Ok(false);
         };
@@ -315,20 +323,10 @@ impl Pipe {
         Ok(taken > 0)
     }
 
-    /// Once the program has exited: what it wrote. A stream that would block
-    /// gets one read, as a second would wait on any helper still holding it.
+    /// Once the program has exited: what it wrote, all of which is in the
+    /// stream by now.
     fn finish(&mut self) -> Result<(), RunError> {
-        if self.nonblocking {
-            return self.drain().map(|_| ());
-        }
-        let Some(file) = self.file.as_mut() else {
-            return Ok(());
-        };
-        let mut chunk = [0u8; 8192];
-        if let Ok(n) = file.read(&mut chunk) {
-            self.kept.add(&chunk[..n], self.keep, self.stream)?;
-        }
-        Ok(())
+        self.drain().map(|_| ())
     }
 }
 
@@ -337,7 +335,6 @@ impl Pipe {
 fn wait_for_output(pipes: &[Pipe], wait: Duration) {
     let mut ready: Vec<libc::pollfd> = pipes
         .iter()
-        .filter(|pipe| pipe.nonblocking)
         .filter_map(|pipe| pipe.file.as_ref())
         .map(|file| libc::pollfd {
             fd: file.as_raw_fd(),
@@ -346,9 +343,7 @@ fn wait_for_output(pipes: &[Pipe], wait: Duration) {
         })
         .collect();
     if ready.is_empty() {
-        // Nothing to wake on. A stream that would block is not read until the
-        // program exits, so waiting on it would wake at once on a full pipe
-        // and spin.
+        // No stream left to wake on: only the program's exit is awaited.
         std::thread::sleep(wait);
         return;
     }
@@ -601,6 +596,28 @@ mod tests {
         // SAFETY: asks for this process's own session id.
         let ours = unsafe { libc::getsid(0) };
         assert_eq!(ran.stdout.text().trim(), ours.to_string());
+    }
+
+    /// A stream that cannot be switched to reads that never wait is refused,
+    /// not read some other way: any read that can wait would wait on a helper
+    /// still holding it. A path-only descriptor is a real one that refuses the
+    /// switch.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stream_that_cannot_read_without_waiting_is_refused() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let path_only = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH)
+            .open("/")
+            .unwrap();
+        let refused = Pipe::new(
+            Some(OwnedFd::from(path_only)),
+            Keep::Tail(64),
+            Stream::Stdout,
+        );
+        assert!(refused.is_err());
+        assert!(Pipe::new(None, Keep::Nothing, Stream::Stdout).is_ok());
     }
 
     /// Cutting the front of a tail lands at a whole character, so its text
