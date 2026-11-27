@@ -1,1 +1,1 @@
-fix: posting to a pull request from the review tab (a reply, resolving a thread, submitting the review) now stops after 60 seconds on a stalled network and says so, where it waited for good and every later submit was refused as already running (#2787).
+fix: posting to a pull request from the review tab (a reply, resolving a thread, submitting the review) now stops after 60 seconds in all on a stalled network and says so, where it waited for good and every later submit was refused as already running (#2787).
