@@ -1050,11 +1050,11 @@ The panel's rows take the keys too, as VS Code's VARIABLES, WATCH and CALL STACK
 
 | Key | Action |
 |-----|--------|
-| `Tab` / `Shift+Tab` (at the `❯` prompt) | Move the keys to the first / last row. `Tab`, `Shift+Tab` or `Esc` on a row hand them back to the prompt, and typing on a row goes to the prompt |
+| `Tab` / `Shift+Tab` (at the `❯` prompt) | Move the keys to the first / last row. `Tab`, `Shift+Tab`, `Esc` or a click on the prompt hand them back, and typing on a row goes to the prompt |
 | `↑` / `↓`, `Home` / `End`, `PageUp` / `PageDown` | Move between rows; section headers are skipped |
 | `→` / `←` | Expand / collapse a variable or scope; `←` elsewhere steps to the row it sits under |
 | `Enter` / `Space` | What a click on the row does: inspect a frame, expand a variable, jump to a breakpoint, add a watch |
-| `Delete` | Stop watching a WATCH row, or remove a BREAKPOINTS row |
+| `Delete` (`Cmd+Backspace` on a Mac) | Stop watching a WATCH row, or remove a BREAKPOINTS row. Plain `Backspace` edits the prompt, as typing does |
 | `Shift+F10` / Menu key | The row's right-click menu: Copy Value, Copy as Expression, Add to Watch, Remove Expression, Copy Call Stack |
 
 * Program output keeps its colours (pytest `--color=yes`, chalk, coloured logging) and long lines wrap to the panel's width. The OUTPUT channel shows it at full width, without colour codes.

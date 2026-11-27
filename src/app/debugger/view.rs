@@ -80,8 +80,9 @@ impl App {
     /// Code's VARIABLES, WATCH and CALL STACK lists take them: the arrows,
     /// Home / End and PageUp / PageDown move the cursor, Left / Right close
     /// and open a variable or scope, Enter and Space do what a click on the
-    /// row does, Delete removes a watch or breakpoint. Tab, Shift+Tab and Esc
-    /// give the prompt the keys back, and typing goes to the prompt.
+    /// row does, Delete (Cmd+Backspace on a Mac) removes a watch or
+    /// breakpoint. Tab, Shift+Tab and Esc give the prompt the keys back, and
+    /// typing, Backspace included, goes to the prompt.
     fn handle_debug_rows_key(&mut self, key: KeyEvent) {
         use crate::widgets::run_debug::DebugRowKind;
         let Some(idx) = self.run_debug.row_cursor else {
@@ -138,21 +139,32 @@ impl App {
                 DebugRowKind::Breakpoint { index } => self.breakpoint_list_click(index, false),
                 _ => self.debug_panel_click(idx),
             },
-            KeyCode::Delete | KeyCode::Backspace => match row.kind {
-                DebugRowKind::Watch { index, .. } => {
-                    self.remove_watch_expression(index);
-                    self.refresh_debug_panel();
-                    // Its row is gone: the keys stay at its place, on the
-                    // row that took it, as a VS Code list's do.
-                    self.run_debug.row_cursor = Some(idx);
+            // Delete removes, as VS Code's Delete (Cmd+Backspace on a Mac)
+            // does. Plain Backspace is an edit of what is typed: it goes to
+            // the prompt, as typing does, and never removes a row.
+            KeyCode::Delete | KeyCode::Backspace
+                if key.code == KeyCode::Delete || has_cmd(key.modifiers) =>
+            {
+                match row.kind {
+                    DebugRowKind::Watch { index, .. } => {
+                        self.remove_watch_expression(index);
+                        self.refresh_debug_panel();
+                        // Its row is gone: the keys stay at its place, on the
+                        // row that took it, as a VS Code list's do.
+                        self.run_debug.row_cursor = Some(idx);
+                    }
+                    DebugRowKind::Breakpoint { index } => self.breakpoint_list_click(index, true),
+                    _ => {}
                 }
-                DebugRowKind::Breakpoint { index } => self.breakpoint_list_click(index, true),
-                _ => {}
-            },
+            }
             KeyCode::Tab | KeyCode::BackTab | KeyCode::Esc => self.run_debug.row_cursor = None,
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.run_debug.row_cursor = None;
                 self.run_debug.repl_input.push(c);
+            }
+            KeyCode::Backspace => {
+                self.run_debug.row_cursor = None;
+                self.run_debug.repl_input.pop();
             }
             _ => {}
         }

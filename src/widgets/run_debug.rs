@@ -474,6 +474,9 @@ pub struct RunDebugPanel {
     pub console_tail: Vec<crate::ansi_text::AnsiLine>,
     /// Current REPL input line, rendered as a `❯` prompt at the panel bottom.
     pub repl_input: String,
+    /// The `❯` prompt's row painted this frame (#2748): a click there gives
+    /// the prompt the keys back from the rows. Default when none was drawn.
+    pub last_prompt_area: Rect,
     /// Top-left cell of the OSC-1337 icon overlay block. The post-draw
     /// flush in `App` reads this to emit the rasterised debug-alt PNG
     /// above the headline. `None` when the panel hasn't been laid out,
@@ -522,6 +525,7 @@ impl RunDebugPanel {
             last_debug_rows_shown: 0,
             console_tail: Vec::new(),
             repl_input: String::new(),
+            last_prompt_area: Rect::default(),
             last_icon_cell: None,
             feedback: None,
             feedback_is_error: false,
@@ -671,6 +675,11 @@ impl RunDebugPanel {
         self.row_cursor = row;
         self.scroll_row_cursor_into_view();
         row.is_some()
+    }
+
+    /// Whether a click at `(x, y)` landed on the `❯` prompt (#2748).
+    pub fn prompt_at(&self, x: u16, y: u16) -> bool {
+        self.debug_active && crate::widgets::hover::contains(self.last_prompt_area, Some((x, y)))
     }
 
     /// Put the row cursor on row `idx`, a row a click landed on, when the
@@ -1204,6 +1213,12 @@ impl RunDebugPanel {
         // Bottom-up: the input field is the last row, the "DEBUG CONSOLE" label
         // the row above it, and any console output sits above that.
         let field_y = bottom - 1;
+        self.last_prompt_area = Rect {
+            x: inner.x,
+            y: field_y,
+            width: inner.width,
+            height: 1,
+        };
         let label_y = bottom - 2;
 
         // Console: program output + REPL echoes, above the label.

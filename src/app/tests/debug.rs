@@ -6525,6 +6525,27 @@ fn delete_on_a_debug_row_removes_its_watch_or_breakpoint() {
     assert!(app.editor.breakpoints.is_empty(), "the breakpoint is gone");
 }
 
+/// #2748: Backspace on a row is an edit of what is typed, never a removal:
+/// it goes to the prompt, and the watch stays. A click on the prompt gives
+/// it the keys back too, so Backspace and Enter edit and run what is typed.
+#[test]
+fn backspace_and_a_prompt_click_go_to_the_prompt_not_the_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_debug_rows(tmp.path());
+    app.run_debug.repl_input = String::from("ab");
+    press_in_run_debug(&mut app, KeyCode::Tab);
+    app.run_debug.row_cursor = Some(7);
+    press_in_run_debug(&mut app, KeyCode::Backspace);
+    assert_eq!(app.watch_exprs, ["a + b"], "the watch stays");
+    assert_eq!(app.run_debug.row_cursor, None);
+    assert_eq!(app.run_debug.repl_input, "a", "Backspace edited the prompt");
+    press_in_run_debug(&mut app, KeyCode::Tab);
+    assert!(app.run_debug.row_cursor.is_some());
+    let area = app.run_debug.last_prompt_area;
+    left_click(&mut app, area.x + 3, area.y);
+    assert_eq!(app.run_debug.row_cursor, None, "the prompt has the keys");
+}
+
 /// #2748: a click on a row puts the keyboard there too, as in VS Code.
 #[test]
 fn a_click_on_a_debug_row_puts_the_keyboard_on_it() {
