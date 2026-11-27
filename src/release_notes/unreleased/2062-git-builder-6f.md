@@ -1,0 +1,1 @@
+refactor: the last hand-built git calls (Source Control's Initialize Repository, `croft edit`'s editor lookup, the update check) are now built through the `Git` builder, which also owns the never-prompt setup (#2062). Nothing changes in use.

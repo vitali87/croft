@@ -6,6 +6,7 @@ use std::sync::Arc;
 mod blame;
 mod branches;
 mod changes;
+mod command;
 mod commits;
 mod contents;
 mod diffs;
@@ -45,6 +46,7 @@ pub use changes::GitDecoration;
 pub use changes::query_changes;
 pub use changes::unquote_porcelain_path;
 use changes::*;
+pub(crate) use command::Git;
 pub use commits::ResetMode;
 pub use commits::checkout_detached;
 pub use commits::cherry_pick;
@@ -198,14 +200,14 @@ fn join_raw(root: &Path, raw: &[u8]) -> PathBuf {
 /// NUL-separated filenames, and `check-ignore` uses exit 1 as an answer.
 fn git_raw(root: &Path, args: &[&str], stdin_data: Option<&[u8]>) -> Option<Vec<u8>> {
     use std::io::Write;
-    let mut cmd = crate::proc::command("git");
-    cmd.arg("-C")
-        .arg(root)
+    let mut cmd = Git::new()
+        .at(root)
         // A read-only poll must never take `index.lock` out from under a user
-        // mutation — same reason `run_git` sets it.
-        .env("GIT_OPTIONAL_LOCKS", "0")
+        // mutation.
+        .without_optional_locks()
         .args(args)
-        .stdout(std::process::Stdio::piped())
+        .into_command();
+    cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .stdin(if stdin_data.is_some() {
             std::process::Stdio::piped()
@@ -254,15 +256,12 @@ fn run_git(path: &Path, args: &[&str]) -> std::io::Result<String> {
     let path_str = path
         .to_str()
         .ok_or_else(|| std::io::Error::other("non-utf8 workspace path"))?;
-    let mut cmd = crate::proc::command("git");
-    // Read-only queries must never take `.git/index.lock`: `git status` /
-    // `git diff` opportunistically rewrite the refreshed index, and that
-    // background lock races user-initiated mutations (`git add`, `git
-    // apply --cached`) into transient "index.lock exists" failures. This
-    // is exactly what git ships GIT_OPTIONAL_LOCKS for.
-    cmd.env("GIT_OPTIONAL_LOCKS", "0");
-    cmd.args(["-C", path_str]).args(args);
-    let output = cmd.output()?;
+    let output = Git::new()
+        .at(path_str)
+        .without_optional_locks()
+        .args(args)
+        .into_command()
+        .output()?;
     if !output.status.success() {
         return Err(std::io::Error::other(format!(
             "git {:?} failed with code {:?}",
@@ -271,32 +270,6 @@ fn run_git(path: &Path, args: &[&str]) -> std::io::Result<String> {
         )));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-/// Keep a git child from prompting on croft's terminal. A push or pull
-/// needing a password or an ssh passphrase opened `/dev/tty`, drew over
-/// the full-screen UI and waited for input croft never passed on. With no
-/// terminal prompt and no controlling tty, git and ssh fail at once with a
-/// message the panel shows; credential helpers and agents still work.
-fn never_prompt(cmd: &mut Command) {
-    cmd.env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(std::process::Stdio::null());
-    #[cfg(unix)]
-    detach_from_tty(cmd);
-}
-
-#[cfg(unix)]
-fn detach_from_tty(cmd: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    // SAFETY: `setsid` is async-signal-safe and the only call in the
-    // pre-exec hook; the forked child is never a process-group leader, so
-    // the call always succeeds.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
 }
 
 /// Run a mutating git subcommand and return a human-readable summary.
@@ -355,11 +328,12 @@ fn run_mutation_inner(
         crate::output::OutputLevel::Info,
         &format!("> git {}", args.join(" ")),
     );
-    let mut cmd = crate::proc::command("git");
-    cmd.args(["-C", path_str]).args(args);
-    cmd.envs(envs.iter().copied());
-    never_prompt(&mut cmd);
-    let output = cmd
+    let output = Git::new()
+        .at(path_str)
+        .args(args)
+        .envs(envs.iter().copied())
+        .never_prompting()
+        .into_command()
         .output()
         .map_err(|e| format!("failed to spawn git: {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -413,9 +387,10 @@ fn run_git_mut(dir: &Path, args: &[&str]) -> Result<(), String> {
     let Some(dir) = dir.to_str() else {
         return Err(String::from("path is not valid UTF-8"));
     };
-    let output = crate::proc::command("git")
-        .args(["-C", dir])
+    let output = Git::new()
+        .at(dir)
         .args(args)
+        .into_command()
         .output()
         .map_err(|e| e.to_string())?;
     if output.status.success() {
