@@ -31,6 +31,12 @@ impl Git {
         self
     }
 
+    /// Set `key` to `value` for this call only: `-c key=value`.
+    pub(crate) fn config(mut self, key: &str, value: &str) -> Self {
+        self.0.arg("-c").arg(format!("{key}={value}"));
+        self
+    }
+
     /// Never take a lock that only speeds git up (`GIT_OPTIONAL_LOCKS=0`).
     /// `status` and `diff` rewrite a refreshed index when they can, and that
     /// background lock raced the user's own `git add` or `git apply --cached`
@@ -47,6 +53,12 @@ impl Git {
     /// message the panel shows, and credential helpers and agents still work.
     pub(crate) fn never_prompting(mut self) -> Self {
         super::never_prompt(&mut self.0);
+        self
+    }
+
+    /// One more argument.
+    pub(crate) fn arg(mut self, arg: impl AsRef<OsStr>) -> Self {
+        self.0.arg(arg);
         self
     }
 
