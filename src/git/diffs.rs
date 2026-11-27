@@ -48,23 +48,20 @@ pub(super) fn diff_text(root: &Path, args: &[&str]) -> Result<String, String> {
     let path_str = root
         .to_str()
         .ok_or_else(|| "non-utf8 workspace path".to_string())?;
-    let mut cmd = crate::proc::command("git");
-    cmd.args(["-C", path_str]);
-    match args.split_first() {
+    let git = Git::new().at(path_str);
+    let git = match args.split_first() {
         // The patch croft parses, never the user's display settings
         // (#1447): `color.ui = always` wrapped every line in escape codes,
         // and a `diff.external` tool (difftastic) printed its own view in
         // place of the patch.
-        Some((sub, rest)) if matches!(*sub, "diff" | "show") => {
-            cmd.arg(sub)
-                .args(["--no-color", "--no-ext-diff"])
-                .args(rest);
-        }
-        _ => {
-            cmd.args(args);
-        }
-    }
-    let output = cmd
+        Some((sub, rest)) if matches!(*sub, "diff" | "show") => git
+            .arg(sub)
+            .args(["--no-color", "--no-ext-diff"])
+            .args(rest),
+        _ => git.args(args),
+    };
+    let output = git
+        .into_command()
         .output()
         .map_err(|e| format!("failed to spawn git: {e}"))?;
     if output.status.success() {

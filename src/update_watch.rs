@@ -237,14 +237,11 @@ fn git_in(dir: &str, args: &[&str]) -> Option<String> {
     // (without a worktree) makes git treat `-C`'s dir as the toplevel, which
     // would satisfy the guard in `probe_drift` by construction while HEAD
     // answers from the foreign repo — guaranteed false drift.
-    let out = crate::proc::command("git")
-        .arg("-C")
-        .arg(dir)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_COMMON_DIR")
+    let out = crate::git::Git::new()
+        .at(dir)
+        .outside_inherited_repo()
         .args(args)
+        .into_command()
         .output()
         .ok()?;
     if !out.status.success() {
