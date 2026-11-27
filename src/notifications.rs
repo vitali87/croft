@@ -449,10 +449,12 @@ pub fn deliver(sink: &NotificationSink, n: &Notification) -> Result<(), Failure>
 ///
 /// Its error output is read while it runs (#2756): a command that writes
 /// more than a pipe holds would otherwise wait on croft to read it and never
-/// exit, and be killed at the bound as if it were slow. The read never
-/// waits, so a helper the command left running with the pipe still open
-/// cannot hold croft past the command's own exit, and only the end of the
-/// output is kept, so a command that floods it cannot fill croft's memory.
+/// exit, and be killed at the bound as if it were slow. croft wakes as soon
+/// as there is output, so a command is read as fast as it writes. A read
+/// never waits, so a helper the command left running with the pipe still
+/// open cannot hold croft past the command's own exit, and only the end of
+/// the output is kept, so a command that floods it cannot fill croft's
+/// memory.
 fn run_bounded(
     mut cmd: std::process::Command,
     name: &str,
@@ -461,35 +463,23 @@ fn run_bounded(
     let mut child = cmd
         .spawn()
         .map_err(|e| Failure::fixed(format!("{name} not runnable: {e}")))?;
-    let mut stderr = child.stderr.take();
-    let nonblocking = crate::proc::set_nonblocking(stderr.as_ref());
-    let mut tail = ErrorTail::default();
+    let mut errors = ErrorPipe::new(child.stderr.take());
     let started = std::time::Instant::now();
     loop {
-        if nonblocking {
-            tail.drain(stderr.as_mut());
-        }
+        errors.drain();
         match child.try_wait() {
             Ok(Some(status)) => {
                 if status.success() {
                     return Ok(());
                 }
-                // All the command itself wrote is in the pipe now it has
-                // exited; on a pipe that would block, one read is what is
-                // safe, as a second would wait on any helper still holding
-                // it.
-                if nonblocking {
-                    tail.drain(stderr.as_mut());
-                } else {
-                    tail.read_once(stderr.as_mut());
-                }
+                errors.finish();
                 return Err(Failure::transient(format!(
                     "{name} exited {status}: {}",
-                    tail.text()
+                    errors.kept.text()
                 )));
             }
             Ok(None) if started.elapsed() < timeout => {
-                std::thread::sleep(Duration::from_millis(50));
+                errors.wait(Duration::from_millis(50));
             }
             Ok(None) => {
                 let _ = child.kill();
@@ -508,61 +498,128 @@ fn run_bounded(
 const ERROR_TAIL: usize = 16 * 1024;
 
 /// The most one drain reads, so a command that never stops writing cannot
-/// keep croft from its clock: past it the command waits on the pipe until
-/// the next drain, 50 ms on, rather than croft waiting on the command.
+/// keep croft from its clock: past it the command waits on the pipe while
+/// croft checks the time, rather than croft waiting on the command.
 const DRAIN_LIMIT: usize = 1024 * 1024;
 
-/// The end of a command's error output, read as it arrives (#2756).
+/// A command's error pipe, read as output arrives (#2756).
 #[derive(Default)]
-struct ErrorTail {
-    bytes: Vec<u8>,
-    cut: bool,
+struct ErrorPipe {
+    /// Until the pipe ends: every holder of its other end has closed it.
+    pipe: Option<std::process::ChildStderr>,
+    /// Whether the pipe reads without blocking, which is what makes it
+    /// safe to wait on and read while the command runs.
+    nonblocking: bool,
+    kept: Tail,
 }
 
-impl ErrorTail {
-    /// Take what a non-blocking pipe holds now, up to [`DRAIN_LIMIT`].
-    fn drain(&mut self, pipe: Option<&mut std::process::ChildStderr>) {
-        let Some(pipe) = pipe else {
+impl ErrorPipe {
+    fn new(pipe: Option<std::process::ChildStderr>) -> Self {
+        let nonblocking = crate::proc::set_nonblocking(pipe.as_ref());
+        Self {
+            pipe,
+            nonblocking,
+            kept: Tail::default(),
+        }
+    }
+
+    /// Wait up to `tick`, waking as soon as the pipe has output or ends, so
+    /// a command that writes fast is read as fast as it writes rather than
+    /// a pipeful a tick.
+    fn wait(&self, tick: Duration) {
+        #[cfg(unix)]
+        if self.nonblocking
+            && let Some(pipe) = &self.pipe
+        {
+            use std::os::fd::AsRawFd;
+            let mut ready = libc::pollfd {
+                fd: pipe.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ms = libc::c_int::try_from(tick.as_millis()).unwrap_or(libc::c_int::MAX);
+            // SAFETY: one `pollfd` on a descriptor the pipe owns, which
+            // outlives the call. An interrupted or failed poll only ends
+            // this wait early; the caller checks the command and the clock
+            // either way.
+            unsafe { libc::poll(&mut ready, 1, ms) };
+            return;
+        }
+        // A pipe that would block is not read until the command exits, so
+        // waiting on it would wake at once on a full pipe and spin.
+        std::thread::sleep(tick);
+    }
+
+    /// While the command runs: take what the pipe holds now, up to
+    /// [`DRAIN_LIMIT`], and let it go once it has ended.
+    fn drain(&mut self) {
+        if !self.nonblocking {
+            return;
+        }
+        let Some(pipe) = self.pipe.as_mut() else {
             return;
         };
         let mut chunk = [0u8; 8192];
         let mut taken = 0;
         while taken < DRAIN_LIMIT {
             match std::io::Read::read(pipe, &mut chunk) {
-                Ok(0) => break,
+                Ok(0) => {
+                    self.pipe = None;
+                    return;
+                }
                 Ok(n) => {
                     taken += n;
-                    self.keep(&chunk[..n]);
+                    self.kept.keep(&chunk[..n]);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
+                // A pipe that fails to read will not recover, and waiting on
+                // it would wake at once each time.
+                Err(_) => {
+                    self.pipe = None;
+                    return;
+                }
             }
         }
     }
 
-    /// One read, for a pipe that would block: after the command exits it
-    /// returns what the command wrote, where a second would wait on a helper
-    /// still holding the pipe.
-    fn read_once(&mut self, pipe: Option<&mut std::process::ChildStderr>) {
-        let Some(pipe) = pipe else {
+    /// Once the command has exited: what it wrote, all of which is in the
+    /// pipe by now. A pipe that would block gets one read, as a second would
+    /// wait on any helper still holding it.
+    fn finish(&mut self) {
+        if self.nonblocking {
+            self.drain();
+            return;
+        }
+        let Some(pipe) = self.pipe.as_mut() else {
             return;
         };
         let mut chunk = [0u8; 8192];
         if let Ok(n) = std::io::Read::read(pipe, &mut chunk) {
-            self.keep(&chunk[..n]);
+            self.kept.keep(&chunk[..n]);
         }
     }
+}
 
-    fn keep(&mut self, bytes: &[u8]) {
-        self.bytes.extend_from_slice(bytes);
+/// The end of a stream: its last [`ERROR_TAIL`] bytes, and whether its
+/// front was dropped.
+#[derive(Default)]
+struct Tail {
+    bytes: Vec<u8>,
+    cut: bool,
+}
+
+impl Tail {
+    fn keep(&mut self, new: &[u8]) {
+        self.bytes.extend_from_slice(new);
         if let Some(over) = self.bytes.len().checked_sub(ERROR_TAIL).filter(|&n| n > 0) {
             self.bytes.drain(..over);
             self.cut = true;
         }
     }
 
-    /// The kept output as text, starting `…` when its beginning was dropped,
-    /// at the first whole character.
+    /// The kept bytes as text, starting `…` when the front was dropped, at
+    /// the first whole character.
     fn text(&self) -> String {
         if !self.cut {
             return String::from_utf8_lossy(&self.bytes).trim().to_string();
@@ -1116,6 +1173,17 @@ mod tests {
         );
     }
 
+    /// #2756: a sink that writes its errors fast is read as fast as it
+    /// writes. Read a pipeful a tick, 32 MB would take 25 s on Linux's 64 KiB
+    /// pipe and be killed at the 10 s bound.
+    #[test]
+    fn a_failing_sink_that_writes_errors_fast_is_read_as_fast_as_it_writes() {
+        let cmd = sh_sink("head -c 32000000 /dev/zero | tr '\\0' x >&2; echo done >&2; exit 3");
+        let err = run_bounded(cmd, "/bin/sh", Duration::from_secs(10)).unwrap_err();
+        let head: String = err.message.chars().take(120).collect();
+        assert!(err.message.ends_with("done"), "{head}");
+    }
+
     /// #2756: a failing sink that left a helper running with its error pipe
     /// open is reported as soon as it exits, not when the helper does.
     #[test]
@@ -1154,7 +1222,7 @@ mod tests {
     /// message never opens on a broken one.
     #[test]
     fn the_kept_end_of_error_output_starts_at_a_whole_character() {
-        let mut tail = ErrorTail::default();
+        let mut tail = Tail::default();
         tail.keep("é".repeat(ERROR_TAIL / 2).as_bytes());
         tail.keep(b"z");
         let text = tail.text();
