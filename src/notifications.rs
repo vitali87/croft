@@ -449,7 +449,11 @@ pub fn deliver(sink: &NotificationSink, n: &Notification) -> Result<(), Failure>
 /// more than a pipe holds can finish rather than be killed at the bound as if
 /// it were slow, and only its end is kept for the message, where a command
 /// says why it failed.
-fn run_bounded(cmd: std::process::Command, name: &str, timeout: Duration) -> Result<(), Failure> {
+fn run_bounded(
+    mut cmd: std::process::Command,
+    name: &str,
+    timeout: Duration,
+) -> Result<(), Failure> {
     let ran = crate::proc::Bounded {
         stdout: Keep::Nothing,
         stderr: Keep::Tail(ERROR_TAIL),
@@ -457,7 +461,7 @@ fn run_bounded(cmd: std::process::Command, name: &str, timeout: Duration) -> Res
         limit: timeout,
         retry_busy: false,
     }
-    .run(cmd);
+    .run(&mut cmd);
     match ran {
         Ok(ran) if ran.status.success() => Ok(()),
         Ok(ran) => Err(Failure::transient(format!(

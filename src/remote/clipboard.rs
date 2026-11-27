@@ -135,45 +135,30 @@ pub(super) fn handle_copy_request(host: &str, socket: &Path, inbox_dir: &str, re
     // `cat` would have streamed into local memory without end.
     let limit = MAX_COPY_PAYLOAD_BYTES + 1;
     let remote_cmd = format!("head -c {limit} {quoted}; rm -f {quoted}");
-    let Ok(mut child) = crate::proc::command("ssh")
-        .arg("-S")
-        .arg(socket)
-        .arg("-o")
-        .arg("ControlMaster=no")
-        .arg(host)
-        .arg(&remote_cmd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return;
-    };
-    let Some(mut out) = child.stdout.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return;
-    };
-    // Read on a thread with a deadline: `output()` waits for EOF, and this
+    // Bounded by time as well as size: `output()` waits for EOF, and this
     // pump is single-threaded and serves every other relay verb, so one
-    // payload that never ends would stop drops, opens and forwards too.
-    let (tx, rx) = std::sync::mpsc::channel();
-    thread::spawn(move || {
-        use std::io::Read as _;
-        let mut buf = Vec::new();
-        // Bounded locally as well as remotely: the cap must not depend on the
-        // remote box having a `head` that honours -c.
-        let _ = out.by_ref().take(limit as u64).read_to_end(&mut buf);
-        let _ = tx.send(buf);
-    });
-    let payload = match rx.recv_timeout(COPY_READ_TIMEOUT) {
-        Ok(bytes) => {
-            let _ = child.wait();
-            bytes
-        }
-        Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
+    // payload that never ends would stop drops, opens and forwards too. The
+    // local cap is `limit` as well, so it does not depend on the remote box
+    // having a `head` that honours -c; a payload past it is dropped below.
+    let ran = crate::proc::Bounded {
+        stdout: crate::proc::Keep::All { cap: limit },
+        stderr: crate::proc::Keep::Nothing,
+        detached: false,
+        limit: COPY_READ_TIMEOUT,
+        retry_busy: false,
+    }
+    .run(
+        crate::proc::command("ssh")
+            .arg("-S")
+            .arg(socket)
+            .arg("-o")
+            .arg("ControlMaster=no")
+            .arg(host)
+            .arg(&remote_cmd),
+    );
+    let payload = match ran {
+        Ok(ran) => ran.stdout.into_bytes(),
+        Err(crate::proc::RunError::TimedOut) => {
             write_relay_err(
                 host,
                 socket,
@@ -183,6 +168,7 @@ pub(super) fn handle_copy_request(host: &str, socket: &Path, inbox_dir: &str, re
             );
             return;
         }
+        Err(_) => return,
     };
     if payload.is_empty() || payload.len() > MAX_COPY_PAYLOAD_BYTES {
         return;

@@ -115,6 +115,11 @@ pub(crate) struct Kept {
 }
 
 impl Kept {
+    /// The kept bytes, as the program wrote them.
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
     /// Whether the front was dropped to keep a [`Keep::Tail`].
     pub(crate) fn cut(&self) -> bool {
         self.cut
@@ -164,7 +169,7 @@ impl Bounded {
     /// What it kept is what the program wrote before it exited: a helper it
     /// leaves running may hold a stream open and write on, and croft does
     /// not wait for that.
-    pub(crate) fn run(self, mut cmd: Command) -> Result<Ran, RunError> {
+    pub(crate) fn run(self, cmd: &mut Command) -> Result<Ran, RunError> {
         let deadline = Instant::now() + self.limit;
         cmd.stdin(Stdio::null())
             .stdout(self.stdout.stdio())
@@ -427,7 +432,7 @@ mod tests {
             Keep::All { cap: 1024 },
             Duration::from_secs(5),
         )
-        .run(sh("echo out; echo err >&2; exit 3"))
+        .run(&mut sh("echo out; echo err >&2; exit 3"))
         .unwrap();
         assert_eq!(ran.status.code(), Some(3));
         assert_eq!(ran.stdout.text(), "out\n");
@@ -447,7 +452,7 @@ mod tests {
             Keep::All { cap: 1024 },
             Duration::from_secs(5),
         )
-        .run(cmd)
+        .run(&mut cmd)
         .unwrap();
         assert_eq!(ran.stderr.text(), "/dev/null /dev/null\n");
         assert!(ran.stdout.text().is_empty());
@@ -456,7 +461,7 @@ mod tests {
     #[test]
     fn a_program_that_cannot_start_is_reported_as_not_started() {
         let run = bounded(Keep::Nothing, Keep::Nothing, Duration::from_secs(5))
-            .run(Command::new("/nonexistent/croft-test-program"));
+            .run(&mut Command::new("/nonexistent/croft-test-program"));
         assert!(matches!(run, Err(RunError::Spawn(_))), "{run:?}");
     }
 
@@ -470,7 +475,7 @@ mod tests {
             Keep::Nothing,
             Duration::from_secs(20),
         )
-        .run(sh("exec yes x"));
+        .run(&mut sh("exec yes x"));
         assert!(
             matches!(
                 run,
@@ -487,7 +492,7 @@ mod tests {
     #[test]
     fn a_stream_exactly_at_its_cap_is_kept() {
         let ran = bounded(Keep::All { cap: 6 }, Keep::Nothing, Duration::from_secs(5))
-            .run(sh("printf 'abcdef'"))
+            .run(&mut sh("printf 'abcdef'"))
             .unwrap();
         assert_eq!(ran.stdout.text(), "abcdef");
     }
@@ -499,7 +504,7 @@ mod tests {
     #[test]
     fn a_tail_keeps_the_end_of_a_fast_flood() {
         let ran = bounded(Keep::Tail(64), Keep::Nothing, Duration::from_secs(3))
-            .run(sh("head -c 8000000 /dev/zero | tr '\\0' x; echo done"))
+            .run(&mut sh("head -c 8000000 /dev/zero | tr '\\0' x; echo done"))
             .unwrap();
         assert!(ran.stdout.cut());
         assert_eq!(ran.stdout.text().len(), 64);
@@ -522,7 +527,7 @@ mod tests {
             Keep::Nothing,
             Duration::from_secs(20),
         )
-        .run(sh(&format!(
+        .run(&mut sh(&format!(
             "sleep 30 & echo $! > '{}'; echo hi",
             pid.display()
         )))
@@ -542,7 +547,7 @@ mod tests {
     fn a_program_that_never_stops_writing_is_killed_at_its_limit() {
         let started = Instant::now();
         let run = bounded(Keep::Tail(64), Keep::Nothing, Duration::from_millis(300))
-            .run(sh("exec yes x"));
+            .run(&mut sh("exec yes x"));
         assert!(matches!(run, Err(RunError::TimedOut)), "{run:?}");
         assert!(started.elapsed() < Duration::from_secs(10));
     }
@@ -573,7 +578,7 @@ mod tests {
             limit: Duration::from_millis(500),
             retry_busy: false,
         }
-        .run(sh(&format!(
+        .run(&mut sh(&format!(
             "sleep 30 & echo $$ $! $(cut -d' ' -f6 /proc/$$/stat) > '{}'; wait",
             pids.display()
         )));
@@ -596,7 +601,7 @@ mod tests {
     #[test]
     fn an_attached_program_stays_in_crofts_session() {
         let ran = bounded(Keep::All { cap: 64 }, Keep::Nothing, Duration::from_secs(5))
-            .run(sh("cut -d' ' -f6 /proc/$$/stat"))
+            .run(&mut sh("cut -d' ' -f6 /proc/$$/stat"))
             .unwrap();
         // SAFETY: asks for this process's own session id.
         let ours = unsafe { libc::getsid(0) };
