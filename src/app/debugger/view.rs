@@ -142,6 +142,9 @@ impl App {
                 DebugRowKind::Watch { index, .. } => {
                     self.remove_watch_expression(index);
                     self.refresh_debug_panel();
+                    // Its row is gone: the keys stay at its place, on the
+                    // row that took it, as a VS Code list's do.
+                    self.run_debug.row_cursor = Some(idx);
                 }
                 DebugRowKind::Breakpoint { index } => self.breakpoint_list_click(index, true),
                 _ => {}
@@ -232,12 +235,11 @@ impl App {
             .is_some_and(|s| s.phase == crate::dap::session::SessionPhase::Stopped);
         if active {
             self.run_debug.debug_status = status;
-            self.run_debug.debug_rows = rows;
+            self.run_debug.replace_rows(rows);
             let max_scroll = self.run_debug.debug_rows.len().saturating_sub(1);
             if self.run_debug.debug_scroll > max_scroll {
                 self.run_debug.debug_scroll = max_scroll;
             }
-            self.run_debug.settle_row_cursor();
             // Show the console tail (most recent output / REPL lines).
             let n = self.debug_console.len();
             self.run_debug.console_tail = self.debug_console[n.saturating_sub(50)..].to_vec();

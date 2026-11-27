@@ -375,6 +375,42 @@ pub struct DebugRow {
     pub kind: DebugRowKind,
 }
 
+/// Whether `a` and `b` are the same row across a rebuild (#2748): by what
+/// each shows, not where. A variable has no id of its own (every leaf's
+/// reference is 0), so its name, expression and depth stand for it.
+fn same_row(a: &DebugRow, b: &DebugRow) -> bool {
+    use DebugRowKind as K;
+    match (&a.kind, &b.kind) {
+        (K::Header { title: x }, K::Header { title: y }) => x == y,
+        (K::Frame { id: x, .. }, K::Frame { id: y, .. })
+        | (K::Thread { id: x, .. }, K::Thread { id: y, .. }) => x == y,
+        (
+            K::Scope {
+                name: x, index: i, ..
+            },
+            K::Scope {
+                name: y, index: j, ..
+            },
+        ) => x == y && i == j,
+        (
+            K::Variable {
+                name: x,
+                evaluate_name: ex,
+                ..
+            },
+            K::Variable {
+                name: y,
+                evaluate_name: ey,
+                ..
+            },
+        ) => x == y && ex == ey && a.indent == b.indent,
+        (K::Watch { expression: x, .. }, K::Watch { expression: y, .. }) => x == y,
+        (K::WatchAdd, K::WatchAdd) => true,
+        (K::Breakpoint { index: x }, K::Breakpoint { index: y }) => x == y,
+        _ => false,
+    }
+}
+
 pub struct RunDebugPanel {
     pub focused: bool,
     /// Active color theme; chrome colors route through `Theme::ui` so the
@@ -679,6 +715,22 @@ impl RunDebugPanel {
         } else if at >= self.debug_scroll + shown {
             self.debug_scroll = at + 1 - shown;
         }
+    }
+
+    /// Swap in rebuilt rows (#2748), the keyboard staying on the row it was
+    /// on: the same frame, thread, variable, watch or breakpoint, wherever
+    /// the rebuild moved it. Rows come and go above it (another thread's
+    /// frames, a variable opened), so the index alone would land on an
+    /// unrelated row for the next Enter or Delete. When its row is gone,
+    /// the prompt has the keys again.
+    pub fn replace_rows(&mut self, rows: Vec<DebugRow>) {
+        let kept = self
+            .row_cursor
+            .and_then(|at| self.debug_rows.get(at).cloned());
+        self.debug_rows = rows;
+        self.row_cursor =
+            kept.and_then(|row| self.debug_rows.iter().position(|r| same_row(r, &row)));
+        self.settle_row_cursor();
     }
 
     /// After the rows are rebuilt (#2748): a cursor past the end, or on a
@@ -1552,8 +1604,65 @@ impl Widget for &mut RunDebugPanel {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::ansi_text::AnsiLine;
+
+    /// #2748: a rebuild that adds or drops rows above the keyboard's row
+    /// keeps the keyboard on that row, and one that drops the row itself
+    /// hands the keys back to the prompt, so the next Enter or Delete never
+    /// lands on an unrelated row.
+    #[test]
+    fn the_row_cursor_follows_its_row_across_a_rebuild() {
+        let row = |indent, kind| DebugRow { indent, kind };
+        let thread = |id, selected| DebugRowKind::Thread {
+            id,
+            name: format!("t{id}"),
+            selected,
+        };
+        let frame = |id| DebugRowKind::Frame {
+            id,
+            selected: false,
+            name: format!("f{id}"),
+            location: String::from("s.py:1"),
+        };
+        let header = || DebugRowKind::Header {
+            title: String::from("CALL STACK"),
+        };
+        let mut panel = RunDebugPanel::new();
+        panel.debug_active = true;
+        panel.debug_rows = vec![
+            row(0, header()),
+            row(1, thread(1, true)),
+            row(2, frame(11)),
+            row(2, frame(12)),
+            row(2, frame(13)),
+            row(1, thread(2, false)),
+            row(1, DebugRowKind::WatchAdd),
+        ];
+        panel.row_cursor = Some(5);
+        // Thread 2 picked: thread 1's frames go, thread 2's come.
+        panel.replace_rows(vec![
+            row(0, header()),
+            row(1, thread(1, false)),
+            row(1, thread(2, true)),
+            row(2, frame(21)),
+            row(1, DebugRowKind::WatchAdd),
+        ]);
+        assert_eq!(panel.row_cursor, Some(2), "still on thread 2");
+        // A stop with new frames: the cursor's frame is gone.
+        panel.row_cursor = Some(3);
+        panel.replace_rows(vec![
+            row(0, header()),
+            row(1, thread(2, true)),
+            row(2, frame(31)),
+            row(1, DebugRowKind::WatchAdd),
+        ]);
+        assert_eq!(
+            panel.row_cursor, None,
+            "its frame is gone: the prompt has the keys"
+        );
+    }
 
     /// Every row of `line` wrapped to `width`.
     fn wrap_console_line(line: &str, width: usize) -> Vec<String> {
