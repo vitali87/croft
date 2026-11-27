@@ -63,6 +63,11 @@ impl PageLinks {
 pub fn page_links(pdf: &Path, page: u32) -> std::io::Result<PageLinks> {
     let program = which("pdftohtml")
         .ok_or_else(|| std::io::Error::other("install poppler (pdftohtml) to open PDF links"))?;
+    page_links_from(&program, pdf, page)
+}
+
+/// [`page_links`] with `program` as pdftohtml.
+fn page_links_from(program: &Path, pdf: &Path, page: u32) -> std::io::Result<PageLinks> {
     let p = page.to_string();
     // Bounded: this runs on the UI thread from a click, and a wedged
     // pdftohtml (a file pdflatex is still writing) would otherwise freeze
@@ -74,8 +79,8 @@ pub fn page_links(pdf: &Path, page: u32) -> std::io::Result<PageLinks> {
         .map(std::ffi::OsStr::new)
         .chain(std::iter::once(pdf.as_os_str()))
         .collect();
-    let (status, out) =
-        run_bounded_stdout(&program, &args, PDF_LINKS_BUDGET).map_err(|e| match e {
+    let (status, out) = run_bounded_stdout(program, &args, PDF_LINKS_BUDGET, MAX_LINKS_STDOUT)
+        .map_err(|e| match e {
             crate::proc::RunError::TooLong { cap, .. } => std::io::Error::other(format!(
                 "pdftohtml's answer for page {page} passed {} MiB",
                 cap / (1024 * 1024)
@@ -315,7 +320,13 @@ pub fn detect_page_count(pdf: &Path) -> Option<u32> {
 
 fn page_count_via_pdfinfo(pdf: &Path) -> Option<u32> {
     let program = which("pdfinfo")?;
-    let (status, out) = run_bounded_stdout(&program, &[pdf.as_os_str()], PDF_INFO_BUDGET).ok()?;
+    let (status, out) = run_bounded_stdout(
+        &program,
+        &[pdf.as_os_str()],
+        PDF_INFO_BUDGET,
+        MAX_PROBE_STDOUT,
+    )
+    .ok()?;
     // The guard the unbounded version had: stdout from a failed run is not a
     // page count, and every other subprocess in this file checks the same.
     if !status.success() {
@@ -354,6 +365,7 @@ fn page_count_via_mdls(pdf: &Path) -> Option<u32> {
         std::path::Path::new("mdls"),
         &mdls_argv(pdf),
         PDF_INFO_BUDGET,
+        MAX_PROBE_STDOUT,
     )
     .ok()?;
     // mdls exits 0 and prints "(null)" for a file with no page count, and
@@ -373,7 +385,7 @@ fn page_count_via_mdls(pdf: &Path) -> Option<u32> {
 /// a stderr this deliberately drops. Stdout is decoded lossily, so one bad
 /// byte (a title in another encoding echoed into pdfinfo's header block)
 /// cannot lose a `Pages:` line that is itself valid, and kept whole up to
-/// [`MAX_PROBE_STDOUT`]: an answer past it is refused, never parsed in part.
+/// `cap` bytes: an answer past it is refused, never parsed in part.
 ///
 /// Not run apart, unlike `run_pdftoppm`, which kills its process group so a
 /// forked descendant dies with it. Neither probe forks: `pdfinfo` and
@@ -383,11 +395,10 @@ fn run_bounded_stdout(
     program: &Path,
     args: &[&std::ffi::OsStr],
     budget: std::time::Duration,
+    cap: usize,
 ) -> Result<(std::process::ExitStatus, String), crate::proc::RunError> {
     let ran = crate::proc::Bounded {
-        stdout: crate::proc::Keep::All {
-            cap: MAX_PROBE_STDOUT,
-        },
+        stdout: crate::proc::Keep::All { cap },
         // Null, never inherited: the child must not touch croft's TTY.
         stderr: crate::proc::Keep::Nothing,
         detached: false,
@@ -412,11 +423,18 @@ const PDF_INFO_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 /// without rasterising, so this sits between the probe and render budgets.
 const PDF_LINKS_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Cap on a probe's stdout. `pdfinfo` prints a header block of a few hundred
-/// bytes, `mdls -raw` prints one number and `pdftohtml -xml` a line for each
-/// text run on one page; it exists so a program that prints without end
-/// cannot fill memory while the budget runs down.
+/// Cap on a page-count probe's stdout. `pdfinfo` prints a header block of a
+/// few hundred bytes and `mdls -raw` prints one number, so this is orders
+/// above either; it exists so a program that prints without end cannot fill
+/// memory while the budget runs down.
 const MAX_PROBE_STDOUT: usize = 1 << 20;
+
+/// Cap on `pdftohtml -xml`'s answer for one page: a line for each text run,
+/// so a page of the smallest, densest text comes to a few MiB. Far above
+/// that, for the same reason as [`MAX_PROBE_STDOUT`]. The old reader shared
+/// that 1 MiB cap and stopped reading there, so pdftohtml died on its next
+/// write and such a page got no links at all.
+const MAX_LINKS_STDOUT: usize = 32 << 20;
 
 /// How long a failed render's stderr is given to finish arriving after the
 /// exit was observed (#493). The settle poll reads it once it has been
@@ -1307,6 +1325,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A page whose listing passes the page-count probes' 1 MiB still gets
+    /// its links, the last one included (#2767). Before, the reader stopped
+    /// at 1 MiB, pdftohtml died on its next write, and the page got none.
+    #[cfg(unix)]
+    #[test]
+    fn a_page_listing_past_a_mib_still_gives_its_links() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("pdftohtml");
+        let run =
+            r#"<text top="10" left="10" width="50" height="9" font="0">dense table cell</text>"#;
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\n\
+                 echo '<page number=\"1\" position=\"absolute\" top=\"0\" left=\"0\" height=\"1188\" width=\"918\">'\n\
+                 i=0; while [ $i -lt 2048 ]; do printf '%s\\n' {line}; i=$((i+1)); done\n\
+                 echo '<text top=\"192\" left=\"283\" width=\"65\" height=\"13\" font=\"1\"><a href=\"https://a.b/\">last</a></text>'\n\
+                 echo '</page>'\n",
+                line = shell_quote(&run.repeat(8)),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let links = page_links_from(&program, Path::new("a.pdf"), 1).unwrap();
+        assert_eq!(
+            links.links,
+            vec![PdfLink {
+                rect: (283, 192, 348, 205),
+                target: LinkTarget::Url(String::from("https://a.b/")),
+            }]
+        );
+    }
+
+    /// `text` as one single-quoted shell word.
+    #[cfg(unix)]
+    fn shell_quote(text: &str) -> String {
+        format!("'{}'", text.replace('\'', r"'\''"))
+    }
+
     /// Real pdftohtml -xml shape: link runs are `<a href>` inside a `<text>`
     /// element carrying the rect; external hrefs keep their scheme, internal
     /// ones are `docname.html#page`; `&amp;` needs unescaping; the requested
@@ -1589,6 +1647,7 @@ Pages:          12\nEncrypted:      no\nPage size:      612 x 792 pts\n";
             std::path::Path::new("sleep"),
             &[std::ffi::OsStr::new("30")],
             timeout,
+            MAX_PROBE_STDOUT,
         );
         let elapsed = start.elapsed();
         assert!(
@@ -1616,6 +1675,7 @@ Pages:          12\nEncrypted:      no\nPage size:      612 x 792 pts\n";
                 std::ffi::OsStr::new("sleep 0.05; echo 'Pages:          7'"),
             ],
             budget(2000),
+            MAX_PROBE_STDOUT,
         )
         .expect("a child that exits in time yields its stdout");
         assert!(status.success(), "a clean exit is reported as success");
@@ -1635,6 +1695,7 @@ Pages:          12\nEncrypted:      no\nPage size:      612 x 792 pts\n";
                 std::ffi::OsStr::new("echo 'Pages:          9'; exit 1"),
             ],
             budget(2000),
+            MAX_PROBE_STDOUT,
         )
         .expect("output is still returned; the status is what says to ignore it");
         assert!(
@@ -1658,11 +1719,10 @@ Pages:          12\nEncrypted:      no\nPage size:      612 x 792 pts\n";
             std::path::Path::new("sh"),
             &[
                 std::ffi::OsStr::new("-c"),
-                std::ffi::OsStr::new(
-                    "echo 'Pages:          9'; head -c 1100000 /dev/zero | tr '\\0' x",
-                ),
+                std::ffi::OsStr::new("echo 'Pages:          9'; head -c 4096 /dev/zero"),
             ],
             budget(2000),
+            1024,
         );
         assert!(
             matches!(out, Err(crate::proc::RunError::TooLong { .. })),
