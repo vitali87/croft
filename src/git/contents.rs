@@ -6,10 +6,10 @@ use super::*;
 /// The clean/smudge filter `rel_path` goes through (`lfs` for a Git LFS
 /// file), from `git check-attr filter`. `None` when no filter applies.
 pub fn path_filter(root: &Path, rel_path: &str) -> Option<String> {
-    let out = crate::proc::command("git")
-        .arg("-C")
-        .arg(root)
+    let out = Git::new()
+        .at(root)
         .args(["check-attr", "filter", "--", rel_path])
+        .into_command()
         .output()
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
@@ -26,14 +26,14 @@ pub fn path_filter(root: &Path, rel_path: &str) -> Option<String> {
 
 /// Whether git config defines a `filter.<name>` driver.
 pub(super) fn filter_driver_configured(root: &Path, name: &str) -> bool {
-    crate::proc::command("git")
-        .arg("-C")
-        .arg(root)
+    Git::new()
+        .at(root)
         .args(["config", "--get-regexp"])
         .arg(format!(
             r"^filter\.{}\.(clean|smudge|process)$",
             regex::escape(name)
         ))
+        .into_command()
         .output()
         .is_ok_and(|o| o.status.success() && !o.stdout.is_empty())
 }
@@ -83,14 +83,12 @@ pub fn read_bytes_at_head(root: &Path, rel_path: &str) -> Result<Vec<u8>, String
 /// the file and not the pointer (#1238, #1338). Anything else is read with
 /// `git show`, byte for byte as git stores it.
 pub(super) fn show_blob(root: &Path, spec: &str, rel_path: &str) -> Command {
-    let mut cmd = crate::proc::command("git");
-    cmd.arg("-C").arg(root);
-    match path_filter(root, rel_path) {
-        Some(_) => cmd.args(["cat-file", "--filters"]),
-        None => cmd.arg("show"),
+    let git = Git::new().at(root);
+    let git = match path_filter(root, rel_path) {
+        Some(_) => git.args(["cat-file", "--filters"]),
+        None => git.arg("show"),
     };
-    cmd.arg(spec);
-    cmd
+    git.arg(spec).into_command()
 }
 
 /// The contents of `rel_path` (relative to `root`) at revision `rev`, via
@@ -169,11 +167,11 @@ pub fn remerge_diff3(root: &Path, rel_path: &str) -> Result<String, String> {
         for (name, text) in &sides {
             std::fs::write(dir.join(name), text).map_err(|e| e.to_string())?;
         }
-        let output = crate::proc::command("git")
-            .arg("-C")
-            .arg(root)
+        let output = Git::new()
+            .at(root)
             .args(["merge-file", "-p", "-q", "--diff3"])
             .args(sides.iter().map(|(name, _)| dir.join(name)))
+            .into_command()
             .output()
             .map_err(|e| format!("failed to spawn git: {e}"))?;
         // The exit code is the conflict count (at most 127); an error
