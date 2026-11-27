@@ -36,6 +36,10 @@ env:
   # request below this one as part of it, and a split declaring
   # `pure-move: true` failed on a doc fix made in the one under it (#2390).
   PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+  # The commit that branch was at when this run's event fired. For a stacked
+  # pull request whose base has since merged and been deleted, the steps use
+  # it in the branch's place (#2774).
+  PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
 
 jobs:
   release-hygiene:
@@ -79,7 +83,11 @@ jobs:
         # src/release_notes/<version>.md, whether or not it ships.
         run: |
           set -euo pipefail
-          base="$(git merge-base "origin/$PR_BASE_REF" HEAD)"
+          # A stacked base branch is deleted once it merges; a run that
+          # waited past that compares with the commit it was stacked on.
+          from="origin/$PR_BASE_REF"
+          git rev-parse -q --verify "$from^{commit}" >/dev/null || from="$PR_BASE_SHA"
+          base="$(git merge-base "$from" HEAD)"
           python3 scripts/release.py check "$base" HEAD
 
   doc-ownership:
@@ -112,7 +120,11 @@ jobs:
       - name: No function may lose its doc comment
         run: |
           set -euo pipefail
-          base="$(git merge-base "origin/$PR_BASE_REF" HEAD)"
+          # A stacked base branch is deleted once it merges; a run that
+          # waited past that compares with the commit it was stacked on.
+          from="origin/$PR_BASE_REF"
+          git rev-parse -q --verify "$from^{commit}" >/dev/null || from="$PR_BASE_SHA"
+          base="$(git merge-base "$from" HEAD)"
           python3 scripts/check_doc_ownership.py "$base" HEAD
       # The pure-move check asks the pinned rustfmt whether an item that a
       # wider visibility made too long was only laid out anew.
@@ -126,7 +138,11 @@ jobs:
       - name: A declared pure move only moves code
         run: |
           set -euo pipefail
-          base="$(git merge-base "origin/$PR_BASE_REF" HEAD)"
+          # A stacked base branch is deleted once it merges; a run that
+          # waited past that compares with the commit it was stacked on.
+          from="origin/$PR_BASE_REF"
+          git rev-parse -q --verify "$from^{commit}" >/dev/null || from="$PR_BASE_SHA"
+          base="$(git merge-base "$from" HEAD)"
           python3 scripts/check_pure_move.py --if-declared "$base" HEAD
       # ARCHITECTURE.md's tree carries the reasons behind each module, and a
       # rewrite can cut a line's rationale away while the row and its
@@ -136,7 +152,11 @@ jobs:
       - name: No module may lose its reasoning
         run: |
           set -euo pipefail
-          base="$(git merge-base "origin/$PR_BASE_REF" HEAD)"
+          # A stacked base branch is deleted once it merges; a run that
+          # waited past that compares with the commit it was stacked on.
+          from="origin/$PR_BASE_REF"
+          git rev-parse -q --verify "$from^{commit}" >/dev/null || from="$PR_BASE_SHA"
+          base="$(git merge-base "$from" HEAD)"
           python3 scripts/check_arch_content.py "$base"
 
       - name: binstall metadata must match what release.yml builds
