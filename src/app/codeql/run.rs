@@ -303,7 +303,7 @@ impl App {
         if cancel.load(Ordering::SeqCst) {
             return Err(String::from("cancelled"));
         }
-        let mut child = crate::review_ops::spawn_retrying_busy(
+        let mut child = crate::proc::spawn_retrying_busy(
             std::process::Command::new(program)
                 .args(args)
                 .stdin(std::process::Stdio::null())
@@ -359,9 +359,8 @@ impl App {
     /// Run `codeql` with `args` and return what it printed on stdout; a
     /// failure is read as [`Self::codeql_command`] reads it.
     pub(in crate::app) fn codeql_stdout(program: &Path, args: &[String]) -> Result<String, String> {
-        let out =
-            crate::review_ops::output_retrying_busy(std::process::Command::new(program).args(args))
-                .map_err(|e| format!("could not run codeql: {e}"))?;
+        let out = crate::proc::output_retrying_busy(std::process::Command::new(program).args(args))
+            .map_err(|e| format!("could not run codeql: {e}"))?;
         if out.status.success() {
             return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
         }
@@ -373,9 +372,8 @@ impl App {
     /// Run `codeql` with `args` and wait. A failure is the reason and the
     /// fix the CLI printed on stderr ([`crate::codeql_query::failure_reason`]).
     pub(in crate::app) fn codeql_command(program: &Path, args: &[String]) -> Result<(), String> {
-        let out =
-            crate::review_ops::output_retrying_busy(std::process::Command::new(program).args(args))
-                .map_err(|e| format!("could not run codeql: {e}"))?;
+        let out = crate::proc::output_retrying_busy(std::process::Command::new(program).args(args))
+            .map_err(|e| format!("could not run codeql: {e}"))?;
         if out.status.success() {
             return Ok(());
         }

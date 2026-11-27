@@ -72,7 +72,7 @@ impl App {
 
     /// `program`'s bare version number, or why it could not be read.
     pub(in crate::app) fn read_codeql_version(program: &std::path::Path) -> Result<String, String> {
-        let out = crate::review_ops::output_retrying_busy(
+        let out = crate::proc::output_retrying_busy(
             std::process::Command::new(program).args(crate::codeql_query::version_args()),
         );
         match out {

@@ -1676,7 +1676,7 @@ esac
     std::os::unix::fs::symlink("rustup", &proxy).unwrap();
     // Wait out "Text file busy" once: a test forking while the script
     // was open for writing holds it until that child execs.
-    crate::review_ops::output_retrying_busy(std::process::Command::new(&rustup).arg("-V"))
+    crate::proc::output_retrying_busy(std::process::Command::new(&rustup).arg("-V"))
         .expect("the stand-in rustup runs");
     (rustup, proxy)
 }

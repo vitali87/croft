@@ -342,7 +342,7 @@ mod tests {
         let mut perm = std::fs::metadata(path).unwrap().permissions();
         std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
         std::fs::set_permissions(path, perm).unwrap();
-        crate::review_ops::output_retrying_busy(Command::new(path).env("CROFT_STUB_WARMUP", "1"))
+        crate::proc::output_retrying_busy(Command::new(path).env("CROFT_STUB_WARMUP", "1"))
             .expect("the stand-in shell runs");
         path.display().to_string()
     }

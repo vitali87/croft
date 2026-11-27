@@ -139,7 +139,7 @@ impl App {
     /// Refuse suite `suite` when it selects a query whose results are not
     /// alerts (#578): `database analyze` cannot produce those tables.
     pub(in crate::app) fn check_codeql_suite(program: &Path, suite: &Path) -> Result<(), String> {
-        let out = crate::review_ops::output_retrying_busy(
+        let out = crate::proc::output_retrying_busy(
             std::process::Command::new(program)
                 .args(crate::codeql_query::resolve_suite_args(suite)),
         )
