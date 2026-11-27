@@ -679,19 +679,19 @@ ssh -S <master>/ctl -o ControlMaster=no box 'exec tail -F -n 0 '\''<remote>/.cac
 ssh -S <master>/ctl -o ControlMaster=no box 'mkdir -p '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/.claims'\'' && mkdir '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/.claims/pull-1-1'\'''
     in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
 ## write_relay_err
-ssh -S <master>/ctl -o ControlMaster=no box 'mkdir -p '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/pull-1-0'\'' && printf %s '\''it went wrong'\'' > '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/pull-1-0/.err'\'''
-    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -S <master>/ctl -o ControlMaster=no box 'mkdir -p '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/pull-1-0'\'' && cat > '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/pull-1-0/.err'\'''
+    in croft's folder | env unchanged | stdin pipe | stdout nowhere | stderr nowhere | croft's session
 ## handle_pull_request
 ssh -S <master>/ctl -o ControlMaster=no box 'set -e; mkdir -p '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/pull-1-1'\'' && tar -x -f - -C '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/pull-1-1'\'''
     in croft's folder | env unchanged | stdin pipe | stdout pipe | stderr pipe | croft's session
 ssh -S <master>/ctl -o ControlMaster=no box 'touch '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/pull-1-1'\''/.ok'
     in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
 ## handle_pull_request of a hidden file
-ssh -S <master>/ctl -o ControlMaster=no box 'mkdir -p '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/pull-1-2'\'' && printf %s '\''refusing to send a hidden path: <pull>/.secret'\'' > '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/pull-1-2/.err'\'''
-    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -S <master>/ctl -o ControlMaster=no box 'mkdir -p '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/pull-1-2'\'' && cat > '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/pull-1-2/.err'\'''
+    in croft's folder | env unchanged | stdin pipe | stdout nowhere | stderr nowhere | croft's session
 ## handle_pull_request of a missing file
-ssh -S <master>/ctl -o ControlMaster=no box 'mkdir -p '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/pull-1-3'\'' && printf %s '\''local file not found: <pull>/gone.txt'\'' > '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/pull-1-3/.err'\'''
-    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -S <master>/ctl -o ControlMaster=no box 'mkdir -p '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/pull-1-3'\'' && cat > '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/pull-1-3/.err'\'''
+    in croft's folder | env unchanged | stdin pipe | stdout nowhere | stderr nowhere | croft's session
 ## handle_clipboard_request
 ssh -S <master>/ctl -o ControlMaster=no box 'mkdir -p '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/clipboard-1-1'\'''
     in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
