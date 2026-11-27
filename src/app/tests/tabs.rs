@@ -2735,3 +2735,137 @@ fn cmd_k_shift_x_closes_the_other_tabs_and_the_menu_names_it() {
         menu(&app)
     );
 }
+
+/// `a.rs`, `b.rs`, `c.rs` open, split right so both groups show `c.rs`, and
+/// the keys back on the left group with all three tabs (#2745).
+fn twin_groups(root: &std::path::Path) -> App {
+    let names = ["a.rs", "b.rs", "c.rs"];
+    for name in names {
+        std::fs::write(root.join(name), "fn main() {}\n").unwrap();
+    }
+    let mut app = App::new(root.to_path_buf()).unwrap();
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
+    for name in names {
+        app.editor.open_pinned(&root.join(name)).unwrap();
+    }
+    app.focus_pane(Pane::Editor);
+    app.split_editor();
+    app.focus_editor_group(true);
+    app
+}
+
+/// The focused group's tabs, then the other group's.
+fn two_groups(app: &App) -> (Vec<String>, Vec<String>) {
+    let other = app
+        .editor_layout
+        .inactive_groups()
+        .next()
+        .map(|g| g.tab_display_labels())
+        .unwrap_or_default();
+    (app.editor.tab_display_labels(), other)
+}
+
+/// #2745: a tab moved into a group that already shows its file lands on
+/// that group's tab, as in VS Code, rather than opening the file there a
+/// second time. Both the tab menu's Move Right and View: Move Editor into
+/// Next Group.
+#[test]
+fn a_tab_moved_into_a_group_that_shows_its_file_lands_on_that_tab() {
+    use crate::widgets::command_palette::Command;
+    for by_menu in [true, false] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = twin_groups(tmp.path());
+        if by_menu {
+            app.dispatch_menu_action(MenuAction::MoveEditorRight, tmp.path().to_path_buf());
+        } else {
+            app.run_command(Command::MoveEditorToNextGroup);
+        }
+        assert_eq!(
+            two_groups(&app),
+            (
+                vec!["c.rs".to_string()],
+                vec!["a.rs".to_string(), "b.rs".to_string()]
+            ),
+            "by the menu: {by_menu}"
+        );
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(tmp.path().join("c.rs").as_path())
+        );
+    }
+}
+
+/// #2745: the moved copy's unsaved edits are not lost: they take the place
+/// of the group's clean copy.
+#[test]
+fn unsaved_edits_moved_onto_a_clean_copy_take_its_place() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = twin_groups(tmp.path());
+    type_keys(&mut app, "z");
+    app.dispatch_menu_action(MenuAction::MoveEditorRight, tmp.path().to_path_buf());
+    let (here, _) = two_groups(&app);
+    assert_eq!(here, ["● c.rs"], "one tab, its unsaved dot showing");
+    assert!(app.editor.dirty, "the edits came along");
+    assert_eq!(app.editor.lines[0], "zfn main() {}");
+}
+
+/// #2745: a clean copy moved onto a copy with unsaved edits leaves those
+/// edits in place.
+#[test]
+fn a_clean_tab_moved_onto_unsaved_edits_keeps_the_edits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = twin_groups(tmp.path());
+    app.focus_editor_group(false);
+    type_keys(&mut app, "y");
+    app.focus_editor_group(true);
+    app.dispatch_menu_action(MenuAction::MoveEditorRight, tmp.path().to_path_buf());
+    let (here, _) = two_groups(&app);
+    assert_eq!(here, ["● c.rs"], "one tab, its unsaved dot showing");
+    assert!(app.editor.dirty);
+    assert_eq!(app.editor.lines[0], "yfn main() {}");
+}
+
+/// #2745: unsaved work the text does not show still counts. A changed
+/// line ending leaves the lines as they were, but the moved copy holds it,
+/// so it takes the clean copy's place rather than being dropped.
+#[test]
+fn a_moved_copys_unsaved_line_ending_is_not_dropped() {
+    use crate::widgets::editor::LineEnding;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = twin_groups(tmp.path());
+    app.dispatch_menu_action(
+        MenuAction::SetLineEnding(LineEnding::Crlf),
+        tmp.path().to_path_buf(),
+    );
+    assert!(app.editor.dirty, "setup: the change is unsaved");
+    app.dispatch_menu_action(MenuAction::MoveEditorRight, tmp.path().to_path_buf());
+    let (here, _) = two_groups(&app);
+    assert_eq!(here, ["● c.rs"], "one tab, its unsaved dot showing");
+    assert!(
+        app.editor.eol == LineEnding::Crlf,
+        "the new line ending came along"
+    );
+}
+
+/// #2745: when both copies hold unsaved edits, one tab cannot
+/// keep them both: the move is refused, says why, and moves nothing.
+#[test]
+fn different_unsaved_edits_in_both_copies_refuse_the_move() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = twin_groups(tmp.path());
+    type_keys(&mut app, "z");
+    app.focus_editor_group(false);
+    type_keys(&mut app, "y");
+    app.focus_editor_group(true);
+    let before = two_groups(&app);
+    app.dispatch_menu_action(MenuAction::MoveEditorRight, tmp.path().to_path_buf());
+    assert_eq!(two_groups(&app), before, "nothing moved");
+    assert_eq!(app.editor.lines[0], "zfn main() {}");
+    assert!(
+        app.status
+            .contains("c.rs has other unsaved changes in that group"),
+        "{}",
+        app.status
+    );
+}

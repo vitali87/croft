@@ -1477,6 +1477,22 @@ struct AcceptChip {
     fill: Color,
 }
 
+/// Where a tab moved in from another group lands
+/// ([`EditorTabs::landing_for`], #2745).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveLanding {
+    /// The group has no tab of the file: the tab joins it.
+    New,
+    /// The moved copy holds no unsaved work: the move ends on the group's
+    /// tab at this index.
+    Twin(usize),
+    /// The moved copy holds unsaved work and the group's tab at this index
+    /// none: the moved copy takes that tab's place.
+    Replace(usize),
+    /// Both copies hold unsaved work: the move is refused.
+    Clash(usize),
+}
+
 pub struct EditorTabs {
     /// The active editor's rect below the tab strip and breadcrumbs, from
     /// the last frame: where a view standing in for it (the history

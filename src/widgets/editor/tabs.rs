@@ -854,6 +854,55 @@ impl EditorTabs {
         ed
     }
 
+    /// How `moved`, a tab moved in from another group, lands here (#2745).
+    /// A group shows a file once, as in VS Code: when one of this group's
+    /// tabs already holds the file, the move ends on one tab, the copy that
+    /// holds unsaved work, by [`holds_unsaved_work`] alone. Each group keeps
+    /// its own buffer, so both copies can hold work of their own; then
+    /// neither can go. Equal text is no proof two copies are the same: a
+    /// hex or sheet tab keeps its edits outside `lines`, and a changed line
+    /// ending leaves them as they were.
+    pub fn landing_for(&self, moved: &Editor) -> MoveLanding {
+        let plain = |e: &Editor| e.diff.is_none() && e.symbol_view.is_none();
+        let twin = moved
+            .path
+            .as_deref()
+            .filter(|_| plain(moved))
+            .and_then(|path| self.find_tab_matching(path, plain));
+        let Some(idx) = twin else {
+            return MoveLanding::New;
+        };
+        match (
+            holds_unsaved_work(moved),
+            holds_unsaved_work(&self.editors[idx]),
+        ) {
+            (false, _) => MoveLanding::Twin(idx),
+            (true, false) => MoveLanding::Replace(idx),
+            (true, true) => MoveLanding::Clash(idx),
+        }
+    }
+
+    /// Take in `moved` from another group, as [`Self::landing_for`] says,
+    /// and make the tab it lands on active. A clash, which the caller
+    /// refuses before taking the tab out of its group, keeps both copies.
+    pub fn receive_moved(&mut self, mut moved: Editor) {
+        match self.landing_for(&moved) {
+            MoveLanding::New | MoveLanding::Clash(_) => self.push_editor(moved),
+            MoveLanding::Twin(idx) => {
+                self.select(idx);
+            }
+            MoveLanding::Replace(idx) => {
+                // The slot keeps its place, so its pin and preview state go
+                // with it: pinned tabs stay ahead, one preview per group.
+                moved.pinned = self.editors[idx].pinned;
+                moved.preview = self.editors[idx].preview;
+                moved.focused = false;
+                self.editors[idx] = moved;
+                self.select(idx);
+            }
+        }
+    }
+
     /// Add `ed` (moved from another group) and make it active. A blank-initial
     /// group is replaced in place so a Move never leaves a stray blank tab
     /// beside the moved editor. A pinned editor lands at the end of the
