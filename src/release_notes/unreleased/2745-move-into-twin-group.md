@@ -1,0 +1,1 @@
+fix: moving a tab into a group that already shows its file no longer opens the file there twice. The move ends on one tab, as in VS Code, keeping whichever copy holds unsaved edits; when both copies hold different unsaved edits the move is refused and the status line says why (#2745).

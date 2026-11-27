@@ -706,11 +706,29 @@ impl App {
     ) {
         match target {
             Some(target) => {
+                // Both copies of the file hold unsaved edits of their own
+                // (#2745): one tab cannot keep them both, so nothing moves.
+                let clash = self
+                    .editor_layout
+                    .group_ref_at_dfs(target)
+                    .is_some_and(|g| {
+                        matches!(
+                            g.landing_for(&self.editor),
+                            crate::widgets::editor::MoveLanding::Clash(_)
+                        )
+                    });
+                if clash {
+                    let label = self.editor.tab_display_label(self.editor.active_index());
+                    self.status = format!(
+                        "Move: {label} has other unsaved changes in that group; save or close one first"
+                    );
+                    return;
+                }
                 let moved = self.editor.take_active_editor();
                 let source_emptied = self.editor.is_blank_initial();
                 let reduced = std::mem::take(&mut self.editor);
                 self.editor = self.editor_layout.refocus_to_dfs(reduced, target);
-                self.editor.push_editor(moved);
+                self.editor.receive_moved(moved);
                 if source_emptied {
                     self.editor_layout
                         .prune_blank_inactive(|t| t.is_blank_initial());
