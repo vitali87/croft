@@ -1,0 +1,1 @@
+fix: `croft sync-config --diff` now writes the remote's copy to a temp file made fresh and readable by you only, under a name with the time in it; before, another local user could plant a symlink at its guessable name and have croft write the remote config wherever it pointed (#2794).
