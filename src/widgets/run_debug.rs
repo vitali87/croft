@@ -1,3 +1,4 @@
+use crate::widgets::drawn_rows::follow;
 use ratatui::{
     buffer::Buffer,
     layout::{Alignment, Rect},
@@ -373,6 +374,9 @@ pub struct BreakpointItem {
     pub detail: Option<String>,
 }
 
+/// What names a breakpoint for a click: its file and 1-based line.
+type BreakpointKey = (PathBuf, usize);
+
 /// One rendered line of the paused-state debug tree. The app builds these from
 /// the session; the panel renders them and maps clicks back to them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -517,15 +521,19 @@ pub struct RunDebugPanel {
     /// variables) and sets `debug_active`; the panel then renders the tree
     /// instead of the empty-state Run button.
     pub debug_active: bool,
-    /// Remove-`✕` hit cells for Watch rows painted this frame:
-    /// `(y, x, nth watch row)`. Cleared at every tree render.
-    watch_remove_rects: Vec<(u16, u16, usize)>,
+    /// Remove-`✕` hit cells for Watch rows painted this frame: `(y, x,
+    /// index into the app's expressions, expression)`. Cleared at every tree
+    /// render. A click follows the expression (#2753): a remove read before
+    /// the next frame may have moved it up.
+    watch_remove_rects: Vec<(u16, u16, usize, String)>,
     /// Every breakpoint, for the BREAKPOINTS list (#250).
     pub breakpoints: Vec<BreakpointItem>,
-    /// Painted breakpoint rows this frame: `(y, index)`, and their remove
-    /// `✕` cells `(y, x, index)`. Cleared at every render.
-    breakpoint_row_rects: Vec<(u16, usize)>,
-    breakpoint_remove_rects: Vec<(u16, u16, usize)>,
+    /// Painted breakpoint rows this frame: `(y, index, file and line)`, and
+    /// their remove `✕` cells `(y, x, index, file and line)`. Cleared at
+    /// every render. A click follows the breakpoint it was drawn for
+    /// (#2753), as it does the watch.
+    breakpoint_row_rects: Vec<(u16, usize, BreakpointKey)>,
+    breakpoint_remove_rects: Vec<(u16, u16, usize, BreakpointKey)>,
     pub debug_status: String,
     /// Whether the live session is paused (set by the app with the rows),
     /// which decides Continue vs Pause and whether the steps act (#1545).
@@ -619,14 +627,15 @@ impl RunDebugPanel {
         }
     }
 
-    /// Map a click to the watch row whose remove `✕` sits at `(x, y)` —
-    /// returns the index into the ORDER the Watch rows were rendered in,
-    /// which the app maps back to its expression list.
-    pub fn watch_remove_at(&self, x: u16, y: u16) -> Option<usize> {
-        self.watch_remove_rects
+    /// Map a click to the watch whose remove `✕` the last frame drew at
+    /// `(x, y)`: its index in `watches`, the app's expressions as they are
+    /// now, or `None` once it is gone (#2753).
+    pub fn watch_remove_at(&self, x: u16, y: u16, watches: &[String]) -> Option<usize> {
+        let (_, _, at, expression) = self
+            .watch_remove_rects
             .iter()
-            .find(|&&(ry, rx, _)| ry == y && (x == rx || x == rx + 1))
-            .map(|&(_, _, idx)| idx)
+            .find(|&&(ry, rx, ..)| ry == y && (x == rx || x == rx + 1))?;
+        follow(*at, expression, watches.len(), |i, e| watches[i] == *e)
     }
 
     /// The debug toolbar button painted at `(x, y)`, if it acts in the
@@ -646,19 +655,27 @@ impl RunDebugPanel {
     }
 
     /// Map a click to a painted breakpoint (#250): the index into
-    /// `breakpoints`, and whether it landed on the remove `✕`.
+    /// `breakpoints` of the one the last frame drew there, where it is now
+    /// (#2753), and whether it landed on the remove `✕`. `None` once that
+    /// breakpoint is gone.
     pub fn breakpoint_at(&self, x: u16, y: u16) -> Option<(usize, bool)> {
-        if let Some(&(_, _, i)) = self
+        let now = |at: usize, (path, line): &BreakpointKey| {
+            follow(at, &(path, *line), self.breakpoints.len(), |i, &(p, l)| {
+                self.breakpoints[i].path == *p && self.breakpoints[i].line == l
+            })
+        };
+        if let Some((_, _, at, key)) = self
             .breakpoint_remove_rects
             .iter()
-            .find(|&&(ry, rx, _)| ry == y && (x == rx || x == rx + 1))
+            .find(|&&(ry, rx, ..)| ry == y && (x == rx || x == rx + 1))
         {
-            return Some((i, true));
+            return now(*at, key).map(|i| (i, true));
         }
-        self.breakpoint_row_rects
+        let (_, at, key) = self
+            .breakpoint_row_rects
             .iter()
-            .find(|&&(ry, _)| ry == y)
-            .map(|&(_, i)| (i, false))
+            .find(|&&(ry, ..)| ry == y)?;
+        now(*at, key).map(|i| (i, false))
     }
 
     /// Paint one breakpoint on row `y` between `x0` and `right`, recording
@@ -696,7 +713,8 @@ impl RunDebugPanel {
                     .add_modifier(Modifier::ITALIC),
             );
         }
-        self.breakpoint_row_rects.push((y, index));
+        let key = (bp.path.clone(), bp.line);
+        self.breakpoint_row_rects.push((y, index, key.clone()));
         if right > x0 + 2 {
             let rx = right - 2;
             put(
@@ -707,7 +725,7 @@ impl RunDebugPanel {
                 "\u{2715}",
                 Style::default().fg(self.theme.ui(DBG_TYPE)),
             );
-            self.breakpoint_remove_rects.push((y, rx, index));
+            self.breakpoint_remove_rects.push((y, rx, index, key));
         }
     }
 
@@ -1264,7 +1282,8 @@ impl RunDebugPanel {
                             "\u{2715}",
                             Style::default().fg(self.theme.ui(DBG_TYPE)),
                         );
-                        self.watch_remove_rects.push((row_y, rx, *index));
+                        self.watch_remove_rects
+                            .push((row_y, rx, *index, expression.clone()));
                     }
                 }
                 DebugRowKind::Breakpoint { index, .. } => {
@@ -2893,10 +2912,10 @@ mod tests {
         assert!(dump.contains("a.rs:3"), "first row:\n{dump}");
         assert!(dump.contains("b.rs:9 if x > 1"), "detail shown:\n{dump}");
         assert_eq!(panel.breakpoint_row_rects.len(), 2);
-        let (y, idx) = panel.breakpoint_row_rects[1];
+        let (y, idx, _) = panel.breakpoint_row_rects[1].clone();
         assert_eq!(idx, 1);
         assert_eq!(panel.breakpoint_at(3, y), Some((1, false)), "a row click");
-        let (ry, rx, ridx) = panel.breakpoint_remove_rects[0];
+        let (ry, rx, ridx, _) = panel.breakpoint_remove_rects[0].clone();
         assert_eq!(panel.breakpoint_at(rx, ry), Some((ridx, true)), "the ✕");
         assert_eq!(panel.breakpoint_at(3, y + 10), None);
     }
@@ -2974,10 +2993,11 @@ mod tests {
         // Every watch row recorded a remove ✕ at the right edge, mapped by
         // render order.
         assert_eq!(panel.watch_remove_rects.len(), 3);
-        let (y, x, idx) = panel.watch_remove_rects[1];
+        let watches = ["t", "self.missing", "len(cart)"].map(String::from);
+        let (y, x, idx, _) = panel.watch_remove_rects[1].clone();
         assert_eq!(idx, 1, "the second watch row maps to index 1");
-        assert_eq!(panel.watch_remove_at(x, y), Some(1));
-        assert_eq!(panel.watch_remove_at(x, y + 5), None);
+        assert_eq!(panel.watch_remove_at(x, y, &watches), Some(1));
+        assert_eq!(panel.watch_remove_at(x, y + 5, &watches), None);
 
         // Scrolled: the header and the first watch row are skipped. The
         // first VISIBLE watch row must still map to expression index 1 —
@@ -2986,11 +3006,51 @@ mod tests {
         panel.debug_scroll = 2;
         let mut buf = Buffer::empty(area);
         Widget::render(&mut panel, area, &mut buf);
-        let (y, x, idx) = panel.watch_remove_rects[0];
+        let (y, x, idx, _) = panel.watch_remove_rects[0].clone();
         assert_eq!(
             idx, 1,
             "after scrolling past the first watch row, the first visible one keeps its true index"
         );
-        assert_eq!(panel.watch_remove_at(x, y), Some(1));
+        assert_eq!(panel.watch_remove_at(x, y, &watches), Some(1));
+    }
+
+    /// #2753: two remove clicks read in one burst: once the first watch is
+    /// gone, the second `✕` still removes the watch it was drawn for, now
+    /// one place up, and the first `✕` meets nothing.
+    #[test]
+    fn a_remove_click_after_another_meets_the_drawn_watch() {
+        let watch = |index: usize, expression: &str| DebugRow {
+            indent: 1,
+            kind: DebugRowKind::Watch {
+                index,
+                expression: expression.into(),
+                value: "1".into(),
+                available: true,
+                changed: false,
+                pending: false,
+            },
+        };
+        let mut panel = RunDebugPanel::new();
+        panel.debug_active = true;
+        panel.debug_rows = vec![watch(0, "a"), watch(1, "b"), watch(2, "c")];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 44,
+            height: 20,
+        };
+        Widget::render(&mut panel, area, &mut Buffer::empty(area));
+        let cell = |i: usize| {
+            let (y, x, ..) = panel.watch_remove_rects[i];
+            (x, y)
+        };
+        let ((ax, ay), (bx, by)) = (cell(0), cell(1));
+        let after_a = ["b", "c"].map(String::from);
+        assert_eq!(
+            panel.watch_remove_at(bx, by, &after_a),
+            Some(0),
+            "b, now first, not c"
+        );
+        assert_eq!(panel.watch_remove_at(ax, ay, &after_a), None, "a is gone");
     }
 }
