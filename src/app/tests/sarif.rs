@@ -1345,6 +1345,63 @@ fn code_scanning_offers_the_current_branchs_analyses_and_falls_back_to_all() {
     );
 }
 
+/// #2786 review: the alert is looked up off the UI thread, so another
+/// workspace folder may be focused by the time the reason is given; the
+/// dismissal still goes to the repository it began in.
+#[cfg(unix)]
+#[test]
+fn a_dismissal_goes_to_the_repository_it_began_in() {
+    use std::os::unix::fs::PermissionsExt;
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(a.path().join("src")).unwrap();
+    std::fs::write(a.path().join("src/db.rs"), "a\nb\nc\n").unwrap();
+    std::fs::write(b.path().join("other.rs"), "x\n").unwrap();
+    let log = a.path().join("scan.sarif");
+    std::fs::write(
+        &log,
+        r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"CodeQL"}},"results":[
+            {"ruleId":"rust/sql-injection","message":{"text":"Tainted."},
+             "locations":[{"physicalLocation":{"artifactLocation":{"uri":"src/db.rs"},"region":{"startLine":2}}}]}]}]}"#,
+    )
+    .unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let calls = bin.path().join("gh-calls.log");
+    let gh = bin.path().join("gh");
+    std::fs::write(
+        &gh,
+        format!(
+            "#!/bin/sh\necho \"$(pwd) $*\" >> '{}'\ncase \"$*\" in\n  *alerts?per_page*) echo '[{{\"number\":8,\"state\":\"open\",\"rule\":{{\"id\":\"rust/sql-injection\"}},\"most_recent_instance\":{{\"location\":{{\"path\":\"src/db.rs\",\"start_line\":2}}}}}}]' ;;\n  *) echo '{{}}' ;;\nesac\n",
+            calls.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut app = App::new(a.path().to_path_buf()).unwrap();
+    app.add_workspace_folder(b.path().to_path_buf());
+    app.gh_program = gh;
+    app.editor.open(&log).unwrap();
+    app.editor.sarif.as_mut().unwrap().selected = 1;
+    app.handle_sarif_key(key(KeyCode::Char('X'), KeyModifiers::SHIFT));
+    // Focus a file in the other folder while the lookup is out.
+    app.editor.open(&b.path().join("other.rs")).unwrap();
+    assert_eq!(app.active_workspace_root(), b.path());
+    settle_code_scanning(&mut app);
+    assert!(app.list_picker.is_some(), "X asks why");
+    app.list_picker = None;
+    app.dismiss_code_scanning_alert(8, 1, "tracked elsewhere");
+    settle_code_scanning(&mut app);
+    let calls = std::fs::read_to_string(&calls).unwrap();
+    let patch = calls
+        .lines()
+        .find(|l| l.contains("PATCH"))
+        .unwrap_or_else(|| panic!("no dismissal was sent: {calls}"));
+    assert!(
+        patch.starts_with(&format!("{} ", a.path().display())),
+        "the dismissal ran in {patch}"
+    );
+}
+
 /// A stand-in `gh` that never answers in time.
 #[cfg(unix)]
 fn stalled_gh(dir: &std::path::Path) -> std::path::PathBuf {
