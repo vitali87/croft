@@ -489,12 +489,13 @@ mod tests {
     }
 
     /// A tail keeps the end of a stream far longer than itself, and is read as
-    /// fast as the program writes: a pipeful a 50 ms pause, 32 MB would take
-    /// 25 s and be killed at the 10 s limit.
+    /// fast as the program writes: a pipeful a 50 ms pause, 8 MB would take
+    /// 6 s and be killed at the 3 s limit. Small enough not to slow the
+    /// timed tests running beside it.
     #[test]
     fn a_tail_keeps_the_end_of_a_fast_flood() {
-        let ran = bounded(Keep::Tail(64), Keep::Nothing, Duration::from_secs(10))
-            .run(sh("head -c 32000000 /dev/zero | tr '\\0' x; echo done"))
+        let ran = bounded(Keep::Tail(64), Keep::Nothing, Duration::from_secs(3))
+            .run(sh("head -c 8000000 /dev/zero | tr '\\0' x; echo done"))
             .unwrap();
         assert!(ran.stdout.cut());
         assert_eq!(ran.stdout.text().len(), 64);
@@ -536,8 +537,8 @@ mod tests {
     #[test]
     fn a_program_that_never_stops_writing_is_killed_at_its_limit() {
         let started = Instant::now();
-        let run =
-            bounded(Keep::Tail(64), Keep::Nothing, Duration::from_secs(1)).run(sh("exec yes x"));
+        let run = bounded(Keep::Tail(64), Keep::Nothing, Duration::from_millis(300))
+            .run(sh("exec yes x"));
         assert!(matches!(run, Err(RunError::TimedOut)), "{run:?}");
         assert!(started.elapsed() < Duration::from_secs(10));
     }

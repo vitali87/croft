@@ -1025,12 +1025,12 @@ mod tests {
     }
 
     /// #2756: a sink that writes its errors fast is read as fast as it
-    /// writes. Read a pipeful a tick, 32 MB would take 25 s on Linux's 64 KiB
-    /// pipe and be killed at the 10 s bound.
+    /// writes. Read a pipeful a tick, 8 MB would take 6 s on Linux's 64 KiB
+    /// pipe and be killed at the 3 s bound.
     #[test]
     fn a_failing_sink_that_writes_errors_fast_is_read_as_fast_as_it_writes() {
-        let cmd = sh_sink("head -c 32000000 /dev/zero | tr '\\0' x >&2; echo done >&2; exit 3");
-        let err = run_bounded(cmd, "/bin/sh", Duration::from_secs(10)).unwrap_err();
+        let cmd = sh_sink("head -c 8000000 /dev/zero | tr '\\0' x >&2; echo done >&2; exit 3");
+        let err = run_bounded(cmd, "/bin/sh", Duration::from_secs(3)).unwrap_err();
         let head: String = err.message.chars().take(120).collect();
         assert!(err.message.ends_with("done"), "{head}");
     }
@@ -1063,7 +1063,7 @@ mod tests {
     fn a_sink_that_never_stops_writing_errors_is_killed_at_the_bound() {
         let cmd = sh_sink("exec yes x >&2");
         let started = std::time::Instant::now();
-        let err = run_bounded(cmd, "/bin/sh", Duration::from_secs(1)).unwrap_err();
+        let err = run_bounded(cmd, "/bin/sh", Duration::from_millis(300)).unwrap_err();
         let took = started.elapsed();
         assert!(err.message.contains("was killed"), "{}", err.message);
         assert!(took < Duration::from_secs(10), "took {took:?}");
