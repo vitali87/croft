@@ -251,7 +251,7 @@ pub fn resolve_managed(
                 // vtsls is a Node script; its `env node` shebang needs node on
                 // the spawned process's PATH, which (for version managers) means
                 // the discovered node dir, not croft's inherited PATH.
-                let extra: Vec<PathBuf> = node_path_prepend().into_iter().collect();
+                let extra: Vec<PathBuf> = crate::node::dir().into_iter().collect();
                 return Some((resolved, extra));
             }
         }
@@ -352,7 +352,7 @@ pub fn resolve_managed_instead(
 pub fn provisioned_command(name: &str, provision: &Provision) -> Option<(String, Vec<PathBuf>)> {
     match provision {
         Provision::Npm { bin, .. } => {
-            npm_command(name, bin).map(|c| (c, node_path_prepend().into_iter().collect()))
+            npm_command(name, bin).map(|c| (c, crate::node::dir().into_iter().collect()))
         }
         Provision::Uv {
             bin,
@@ -1137,7 +1137,7 @@ fn run_npm_install(name: &'static str, language: Language, package: &str, versio
     let Some(prefix) = npm_prefix(name) else {
         return;
     };
-    if !node_available() {
+    if !crate::node::available() {
         log_file::log(&format!(
             "lsp[{name}] cannot auto-install: no `node`/`npm` found"
         ));
@@ -1153,7 +1153,7 @@ fn run_npm_install(name: &'static str, language: Language, package: &str, versio
         ));
         return;
     }
-    let extra = node_path_prepend();
+    let extra = crate::node::dir();
     let npm: PathBuf = match &extra {
         Some(dir) => dir.join("npm"),
         None => PathBuf::from("npm"),
@@ -1161,13 +1161,15 @@ fn run_npm_install(name: &'static str, language: Language, package: &str, versio
     let spec = npm_spec(package, version);
     log_file::log(&format!("lsp[{name}] installing {spec} into {prefix:?}"));
     set_status(format!("Installing {name}"));
-    let output = Command::new(&npm)
-        .arg("install")
-        .arg("--prefix")
-        .arg(&prefix)
-        .arg(&spec)
-        .env("PATH", augmented_path(extra.as_deref()))
-        .output();
+    let output = crate::node::put(
+        Command::new(&npm)
+            .arg("install")
+            .arg("--prefix")
+            .arg(&prefix)
+            .arg(&spec),
+        extra.as_deref(),
+    )
+    .output();
     finish_install(name, language, output);
 }
 
@@ -1462,235 +1464,6 @@ fn bootstrap_uv() -> Option<PathBuf> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// node discovery (needed by the npm backend and by spawning vtsls).
-// ---------------------------------------------------------------------------
-
-/// A directory to PREPEND to PATH so a non-shell `exec` can find `node`/`npm`,
-/// or `None` when `node` is already on croft's PATH (nothing to add) or none
-/// could be discovered. A directory found is kept for the process; a miss is
-/// looked for again next time, as [`NodeDirMemo`] says (#2806).
-///
-/// Version managers (nvm, fnm, asdf, volta) keep node off croft's inherited
-/// PATH (they add it only when a shell sources its init files). croft is exec'd
-/// without a shell, so it finds node itself: first by reading the well-known
-/// on-disk layouts, then by asking the user's shell in a detached session that
-/// can't touch croft's terminal.
-pub(crate) fn node_path_prepend() -> Option<PathBuf> {
-    if crate::lsp::manager::is_on_path("node") && crate::lsp::manager::is_on_path("npm") {
-        return None;
-    }
-    static FOUND: NodeDirMemo = NodeDirMemo::new();
-    FOUND.get(on_disk_node_dir, detached_shell_node_dir)
-}
-
-/// What [`node_path_prepend`] keeps between calls: the node directory once
-/// found, and the login shell's one answer. Reading the on-disk layouts costs
-/// a few file checks, so after a miss they are read again, and a node
-/// installed while croft runs is found without a restart (#2806). Asking the
-/// shell can take 15 s and runs where the caller is, the UI thread among
-/// them, so it is asked once per process.
-struct NodeDirMemo {
-    found: Mutex<Option<PathBuf>>,
-    shell: OnceLock<Option<PathBuf>>,
-}
-
-impl NodeDirMemo {
-    const fn new() -> Self {
-        Self {
-            found: Mutex::new(None),
-            shell: OnceLock::new(),
-        }
-    }
-
-    /// The node directory: the one kept, else `on_disk`'s, else the shell's.
-    fn get(
-        &self,
-        on_disk: impl FnOnce() -> Option<PathBuf>,
-        shell: impl FnOnce() -> Option<PathBuf>,
-    ) -> Option<PathBuf> {
-        let mut found = self
-            .found
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if found.is_none() {
-            *found = on_disk().or_else(|| self.shell.get_or_init(shell).clone());
-        }
-        found.clone()
-    }
-}
-
-/// True when croft can find a usable `node` + `npm`, either already on PATH or
-/// via the discovered version-manager directory.
-fn node_available() -> bool {
-    (crate::lsp::manager::is_on_path("node") && crate::lsp::manager::is_on_path("npm"))
-        || node_path_prepend().is_some()
-}
-
-/// A directory with real `node` + `npm` binaries in a well-known on-disk
-/// layout (nvm's versions dir, Volta, Homebrew), read with no process spawn.
-/// When none has one, [`node_path_prepend`] asks the user's own
-/// login+interactive shell where `node` resolves, detached from croft's
-/// controlling terminal so it can never do tty job control; that is what makes
-/// fnm / asdf / volta-shim / custom setups work, not just the ones with a
-/// guessable directory.
-fn on_disk_node_dir() -> Option<PathBuf> {
-    if let Some(dir) = nvm_node_dir() {
-        return Some(dir);
-    }
-    well_known_node_dirs().into_iter().find(|dir| {
-        crate::proc::find::runnable(&dir.join("node"))
-            && crate::proc::find::runnable(&dir.join("npm"))
-    })
-}
-
-/// Marker the probe wraps `process.execPath` in, so the real path is
-/// recoverable even if the user's shell init prints noise to stdout first.
-const NODE_PROBE_MARKER: &str = "__CROFT_NODE__";
-
-/// Ask the user's login+interactive shell where `node` lives, detached from
-/// croft's controlling terminal. Runs `node -e` (so it works whether `node` is
-/// a real binary or a version-manager shell function) and reports the absolute
-/// `process.execPath`. Returns its directory.
-///
-/// SAFETY / why detached: an interactive shell does terminal job control
-/// (`tcsetpgrp`) on its controlling tty. Sharing croft's tty would background
-/// croft and corrupt the terminal. `setsid` in `pre_exec` puts the child in a
-/// brand-new session with NO controlling terminal, so it physically cannot
-/// touch croft's tty; stdin is `/dev/null` and stdout is captured. A timeout
-/// guards against a pathological init file that never returns.
-fn detached_shell_node_dir() -> Option<PathBuf> {
-    let dir = node_dir_from_probe(node_probe_command(), std::time::Duration::from_secs(15));
-    if dir.is_none() {
-        log_file::log("lsp[vtsls] node shell-probe found no node within 15s");
-    }
-    dir
-}
-
-/// The directory of the `node` that `probe`, a [`node_probe_command`],
-/// reports. A probe still running after `timeout` is killed with everything
-/// it started (#2755): its shell leads a session of its own, and an init
-/// file that hangs would otherwise keep it, and what it waits on, running
-/// for as long as croft does.
-fn node_dir_from_probe(mut probe: Command, timeout: std::time::Duration) -> Option<PathBuf> {
-    let out = crate::dap::install::run_probe(&mut probe, timeout, crate::proc::Apart::Session)?;
-    let node = Path::new(parse_node_probe(&out)?);
-    if !crate::proc::find::runnable(node) {
-        return None;
-    }
-    node.parent().map(Path::to_path_buf)
-}
-
-/// The shell probe that asks where `node` lives: the user's login+interactive
-/// shell runs `node -e` and prints `process.execPath` after
-/// [`NODE_PROBE_MARKER`], detached from croft's terminal (see
-/// [`detached_shell_node_dir`] for why). Its stdout is read with
-/// [`parse_node_probe`]. Shared by the language-server install and the
-/// JavaScript debugger, so neither can run the shell attached (#2064).
-pub(crate) fn node_probe_command() -> Command {
-    let shell = std::env::var_os("SHELL").unwrap_or_else(|| OsString::from("/bin/sh"));
-    let script =
-        format!("node -e 'process.stdout.write(\"{NODE_PROBE_MARKER}\"+process.execPath)'");
-    detached_shell(&shell, &script)
-}
-
-/// `shell -l -i -c script` with stdin `/dev/null`, stdout piped and stderr
-/// discarded, started by `setsid` in a session of its own with no
-/// controlling terminal, so the interactive shell's job control can never
-/// reach croft's tty.
-fn detached_shell(shell: &std::ffi::OsStr, script: &str) -> Command {
-    use std::os::unix::process::CommandExt;
-    use std::process::Stdio;
-
-    let mut cmd = Command::new(shell);
-    cmd.args(["-l", "-i", "-c", script])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-    cmd
-}
-
-/// Recover the node path from probe stdout: the absolute path written right
-/// after the last marker. Returns `None` if the marker is absent (the probe
-/// didn't run node) or the text after it isn't an absolute path. Tolerates
-/// arbitrary shell-init noise printed before the marker.
-pub(crate) fn parse_node_probe(stdout: &str) -> Option<&str> {
-    let after = &stdout[stdout.rfind(NODE_PROBE_MARKER)? + NODE_PROBE_MARKER.len()..];
-    let path = after.trim();
-    (path.starts_with('/') && !path.is_empty()).then_some(path)
-}
-
-/// Highest installed nvm node's `bin` dir: `$NVM_DIR/versions/node/vX.Y.Z/bin`
-/// (defaulting `NVM_DIR` to `~/.nvm`). Picks the greatest semver so we get a
-/// recent, working node; we only need *a* functional node to install/run vtsls,
-/// not the user's exact `default` alias.
-fn nvm_node_dir() -> Option<PathBuf> {
-    let nvm = std::env::var_os("NVM_DIR")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".nvm")))?;
-    nvm_node_dir_in(&nvm.join("versions").join("node"))
-}
-
-/// Pure core of [`nvm_node_dir`], split out so it's testable against a temp
-/// directory without reading `$NVM_DIR`.
-fn nvm_node_dir_in(versions: &Path) -> Option<PathBuf> {
-    let mut best: Option<((u64, u64, u64), PathBuf)> = None;
-    for entry in std::fs::read_dir(versions).ok()?.flatten() {
-        let bin = entry.path().join("bin");
-        if !crate::proc::find::runnable(&bin.join("node")) {
-            continue;
-        }
-        let version = parse_node_version(&entry.file_name().to_string_lossy());
-        if best.as_ref().is_none_or(|(b, _)| version > *b) {
-            best = Some((version, bin));
-        }
-    }
-    best.map(|(_, bin)| bin)
-}
-
-/// Parse an nvm version dir name like `v23.7.0` into a comparable tuple;
-/// unparseable components become 0.
-fn parse_node_version(name: &str) -> (u64, u64, u64) {
-    let mut parts = name
-        .trim_start_matches('v')
-        .split('.')
-        .map(|p| p.parse::<u64>().unwrap_or(0));
-    (
-        parts.next().unwrap_or(0),
-        parts.next().unwrap_or(0),
-        parts.next().unwrap_or(0),
-    )
-}
-
-/// Static install locations for other managers, checked after nvm.
-fn well_known_node_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        dirs.push(PathBuf::from(&home).join(".volta").join("bin"));
-    }
-    dirs.push(PathBuf::from("/opt/homebrew/bin"));
-    dirs.push(PathBuf::from("/usr/local/bin"));
-    dirs
-}
-
-/// Build a PATH value with `extra` prepended (so it wins over any stale entry),
-/// or the current PATH unchanged when `extra` is `None`.
-fn augmented_path(extra: Option<&Path>) -> OsString {
-    let current = std::env::var_os("PATH").unwrap_or_default();
-    let Some(dir) = extra else {
-        return current;
-    };
-    let mut dirs = vec![dir.to_path_buf()];
-    dirs.extend(std::env::split_paths(&current));
-    std::env::join_paths(dirs).unwrap_or(current)
-}
-
 /// Build a PATH value with `dirs` prepended, for spawning a managed server
 /// (e.g. so vtsls finds `node`). Returns the current PATH when `dirs` is empty.
 pub(crate) fn prepend_paths(dirs: &[PathBuf]) -> OsString {
@@ -1707,27 +1480,6 @@ pub(crate) fn prepend_paths(dirs: &[PathBuf]) -> OsString {
 mod tests {
     use super::*;
 
-    /// #2806: a node found is kept; a miss is no answer for good. The
-    /// on-disk layouts are read again next time, so a node installed since
-    /// (nvm, Volta, Homebrew) is found without a restart, while the login
-    /// shell, which can take 15 s, is asked only once.
-    #[test]
-    fn a_node_installed_after_a_miss_is_found_and_the_shell_is_asked_once() {
-        let memo = NodeDirMemo::new();
-        let asked = std::cell::Cell::new(0);
-        let shell = || {
-            asked.set(asked.get() + 1);
-            None
-        };
-        assert_eq!(memo.get(|| None, shell), None);
-        let nvm = PathBuf::from("/home/u/.nvm/versions/node/v22.1.0/bin");
-        assert_eq!(memo.get(|| Some(nvm.clone()), shell), Some(nvm.clone()));
-        assert_eq!(asked.get(), 1, "the shell was asked once");
-        assert_eq!(
-            memo.get(|| panic!("a found node is kept"), shell),
-            Some(nvm),
-        );
-    }
     use tempfile::TempDir;
 
     #[test]
@@ -2495,134 +2247,6 @@ mod tests {
             None,
             "no fetcher → can't bootstrap uv"
         );
-    }
-
-    #[test]
-    fn parse_node_version_orders_by_semver_not_lexically() {
-        assert_eq!(parse_node_version("v23.7.0"), (23, 7, 0));
-        assert_eq!(parse_node_version("v8.17.1"), (8, 17, 1));
-        // The bug a lexical sort would hit: v8 must NOT outrank v18.
-        assert!(parse_node_version("v18.0.0") > parse_node_version("v8.17.1"));
-        assert_eq!(parse_node_version("garbage"), (0, 0, 0));
-    }
-
-    #[test]
-    fn nvm_node_dir_picks_highest_version_with_a_node_binary() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = TempDir::new().unwrap();
-        let versions = tmp.path();
-        // Two versions with node, one stray dir without — highest wins.
-        for v in ["v18.19.0", "v23.7.0"] {
-            let bin = versions.join(v).join("bin");
-            std::fs::create_dir_all(&bin).unwrap();
-            std::fs::write(bin.join("node"), b"#!/bin/sh\n").unwrap();
-            std::fs::set_permissions(bin.join("node"), std::fs::Permissions::from_mode(0o755))
-                .unwrap();
-        }
-        std::fs::create_dir_all(versions.join("v20.0.0")).unwrap(); // no bin/node
-        let dir = nvm_node_dir_in(versions).unwrap();
-        assert_eq!(dir, versions.join("v23.7.0").join("bin"));
-    }
-
-    #[test]
-    fn nvm_node_dir_is_none_when_no_versions_have_node() {
-        let tmp = TempDir::new().unwrap();
-        assert!(nvm_node_dir_in(tmp.path()).is_none());
-    }
-
-    #[test]
-    fn parse_node_probe_extracts_path_after_marker_ignoring_init_noise() {
-        // Shell init may print noise before the marker; the path is what
-        // follows the last marker.
-        let stdout = "Welcome to your shell!\nnvm loaded\n__CROFT_NODE__/Users/x/.nvm/versions/node/v23.7.0/bin/node";
-        assert_eq!(
-            parse_node_probe(stdout),
-            Some("/Users/x/.nvm/versions/node/v23.7.0/bin/node")
-        );
-    }
-
-    #[test]
-    fn a_probe_that_never_finishes_is_killed_with_what_it_started() {
-        use std::os::unix::process::CommandExt;
-        let tmp = tempfile::tempdir().unwrap();
-        let pids = tmp.path().join("pids");
-        // A shell in a session of its own, as the real probe runs, whose
-        // init hangs on a command it started.
-        let mut probe = Command::new("sh");
-        probe
-            .arg("-c")
-            .arg(format!("sleep 30 & echo $$ $! > {}; wait", pids.display()));
-        unsafe {
-            probe.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-        assert_eq!(
-            node_dir_from_probe(probe, std::time::Duration::from_millis(300)),
-            None
-        );
-        let pids: Vec<i32> = std::fs::read_to_string(&pids)
-            .expect("the probe started")
-            .split_whitespace()
-            .map(|p| p.parse().unwrap())
-            .collect();
-        assert_eq!(pids.len(), 2, "the shell and what it waits on");
-        // Killed and not yet reaped by whoever inherited it is gone too.
-        let gone = |pid: i32| {
-            let signalled = unsafe { libc::kill(pid, 0) };
-            signalled != 0
-                || std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
-                    stat.rsplit(')')
-                        .next()
-                        .is_some_and(|rest| rest.trim_start().starts_with('Z'))
-                })
-        };
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !pids.iter().all(|&p| gone(p)) && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        for pid in pids {
-            assert!(
-                gone(pid),
-                "process {pid} still runs after the probe gave up"
-            );
-        }
-    }
-
-    #[test]
-    fn parse_node_probe_rejects_missing_marker_or_non_absolute() {
-        assert_eq!(parse_node_probe("no marker here"), None);
-        assert_eq!(parse_node_probe("__CROFT_NODE__"), None);
-        assert_eq!(parse_node_probe("__CROFT_NODE__relative/path"), None);
-    }
-
-    /// The node probe's shell leads a session of its own (#2064), so it has
-    /// no controlling terminal and its job control cannot reach croft's.
-    /// Read from the shell's own `/proc/<pid>/stat`: `pid (comm) state ppid
-    /// pgrp session ...`.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn the_node_probe_shell_runs_in_a_session_of_its_own() {
-        let home = tempfile::tempdir().unwrap();
-        let out = detached_shell(
-            std::ffi::OsStr::new("/bin/sh"),
-            "printf __STAT__; cat /proc/$$/stat",
-        )
-        .env("HOME", home.path())
-        .env_remove("ENV")
-        .output()
-        .unwrap();
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stat = &stdout[stdout.rfind("__STAT__").expect("the probe ran") + "__STAT__".len()..];
-        let pid: i32 = stat.split_whitespace().next().unwrap().parse().unwrap();
-        let after_comm: Vec<&str> = stat[stat.rfind(')').unwrap() + 1..]
-            .split_whitespace()
-            .collect();
-        let session: i32 = after_comm[3].parse().unwrap();
-        assert_eq!(session, pid, "the shell leads its own session: {stat}");
-        let ours = unsafe { libc::getsid(0) };
-        assert_ne!(session, ours, "not croft's session");
     }
 
     #[test]

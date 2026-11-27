@@ -738,7 +738,9 @@ fn interpreter_on_path(name: &str) -> bool {
     let probe = || crate::proc::find::on_path(name).is_some();
     match name {
         "python3" => *PYTHON3.get_or_init(probe),
-        "node" => *NODE.get_or_init(probe),
+        // Node as the rest of croft finds it, without asking the login
+        // shell from a frame (#2809).
+        "node" => *NODE.get_or_init(crate::node::known),
         _ => probe(),
     }
 }

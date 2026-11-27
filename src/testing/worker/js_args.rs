@@ -21,7 +21,20 @@ pub(super) fn js_binary(root: &Path, name: &str) -> PathBuf {
 /// `NO_COLOR` strips ANSI from the parsed stream and `CI` keeps vitest out of
 /// watch/interactive mode.
 pub(super) fn js_cmd<S: AsRef<std::ffi::OsStr>>(root: &Path, runner: &str, args: &[S]) -> Command {
+    js_cmd_for(root, runner, args, crate::node::dir().as_deref())
+}
+
+/// [`js_cmd`] under the node in `node`, the folder [`crate::node::dir`]
+/// found off croft's `PATH`: the runner's script starts with
+/// `#!/usr/bin/env node`, so that folder goes first on its `PATH` (#2809).
+pub(super) fn js_cmd_for<S: AsRef<std::ffi::OsStr>>(
+    root: &Path,
+    runner: &str,
+    args: &[S],
+    node: Option<&Path>,
+) -> Command {
     let mut cmd = Command::new(js_binary(root, runner));
+    crate::node::put(&mut cmd, node);
     cmd.args(args)
         .current_dir(root)
         .env("NO_COLOR", "1")

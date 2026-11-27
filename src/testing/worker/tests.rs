@@ -2226,6 +2226,30 @@ fn a_venv_is_probed_only_without_the_script_and_skipped_when_it_lacks_pytest() {
     );
 }
 
+/// #2809: a project's vitest, a `#!/usr/bin/env node` script, runs under the
+/// node croft found off its own `PATH` (nvm's, here), not only under one on
+/// croft's `PATH`.
+#[cfg(unix)]
+#[test]
+fn a_js_runner_runs_under_the_node_croft_found() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let found = tmp.path().join(".nvm/versions/node/v22.1.0/bin");
+    std::fs::create_dir_all(&found).unwrap();
+    let node = found.join("node");
+    std::fs::write(&node, "#!/bin/sh\nprintf 'the found node'\n").unwrap();
+    std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let root = tmp.path().join("proj");
+    let bin = root.join("node_modules/.bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("vitest"), "#!/usr/bin/env node\n").unwrap();
+    std::fs::set_permissions(bin.join("vitest"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = js_cmd_for(&root, "vitest", &["run"], Some(&found))
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "the found node");
+}
+
 /// #845 guard: a project venv with pytest still wins over a `python3`
 /// that has pytest too, and that `python3` is not even asked.
 #[cfg(unix)]

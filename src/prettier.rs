@@ -122,7 +122,8 @@ impl Job {
         let (tx, rx) = std::sync::mpsc::channel();
         let (file, text) = (path.clone(), sent.clone());
         std::thread::spawn(move || {
-            let _ = tx.send(run(&bin, &file, &text, TIMEOUT));
+            let node = crate::node::dir();
+            let _ = tx.send(run(&bin, &file, &text, TIMEOUT, node.as_deref()));
         });
         Self {
             path,
@@ -154,10 +155,20 @@ fn took_too_long(limit: Duration) -> String {
 /// Run `bin --stdin-filepath file` over `text`, stopping it at `limit`.
 /// Prettier resolves the config and `.prettierignore` from that path, so cwd
 /// is the file's folder. It runs apart from croft's terminal, so stopping it
-/// stops whatever its launcher started too.
-fn run(bin: &Path, file: &Path, text: &str, limit: Duration) -> Result<String, String> {
+/// stops whatever its launcher started too. `node` is the folder of the node
+/// croft found off its own `PATH` ([`crate::node::dir`]): the script starts
+/// with `#!/usr/bin/env node`, so that folder goes first on its `PATH`
+/// (#2809).
+fn run(
+    bin: &Path,
+    file: &Path,
+    text: &str,
+    limit: Duration,
+    node: Option<&Path>,
+) -> Result<String, String> {
     use crate::proc::{Bounded, Keep, RunError};
     let mut cmd = std::process::Command::new(bin);
+    crate::node::put(&mut cmd, node);
     cmd.arg("--stdin-filepath").arg(file);
     if let Some(dir) = file.parent() {
         cmd.current_dir(dir);
@@ -338,6 +349,7 @@ mod tests {
             &tmp.path().join("a.ts"),
             &text,
             Duration::from_secs(10),
+            None,
         );
         assert_eq!(formatted, Ok("const a = 1;\n".repeat(64 * 1024)));
     }
@@ -349,7 +361,13 @@ mod tests {
             tmp.path(),
             "cat >/dev/null; echo >&2; echo '[error] a.ts: SyntaxError: x' >&2; echo more >&2; exit 2",
         );
-        let failed = run(&bin, &tmp.path().join("a.ts"), "x", Duration::from_secs(10));
+        let failed = run(
+            &bin,
+            &tmp.path().join("a.ts"),
+            "x",
+            Duration::from_secs(10),
+            None,
+        );
         assert_eq!(failed, Err(String::from("a.ts: SyntaxError: x")));
     }
 
@@ -357,8 +375,42 @@ mod tests {
     fn prettier_answering_bytes_that_are_not_text_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
         let bin = stand_in(tmp.path(), "cat >/dev/null; printf '\\377'");
-        let refused = run(&bin, &tmp.path().join("a.ts"), "x", Duration::from_secs(10));
+        let refused = run(
+            &bin,
+            &tmp.path().join("a.ts"),
+            "x",
+            Duration::from_secs(10),
+            None,
+        );
         assert_eq!(refused, Err(String::from("its output was not UTF-8")));
+    }
+
+    /// #2809: a project Prettier, a `#!/usr/bin/env node` script, runs
+    /// under the node croft found, not only under one on croft's `PATH`.
+    #[test]
+    fn prettier_runs_under_the_node_croft_found() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let found = tmp.path().join(".nvm/versions/node/v22.1.0/bin");
+        std::fs::create_dir_all(&found).unwrap();
+        let node = found.join("node");
+        std::fs::write(
+            &node,
+            "#!/bin/sh\ncat >/dev/null; printf 'the found node'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bin = tmp.path().join("prettier");
+        std::fs::write(&bin, "#!/usr/bin/env node\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let formatted = run(
+            &bin,
+            &tmp.path().join("a.ts"),
+            "x",
+            Duration::from_secs(10),
+            Some(&found),
+        );
+        assert_eq!(formatted, Ok(String::from("the found node")));
     }
 
     /// A Prettier that never answers is stopped at the limit: the save it
@@ -379,6 +431,7 @@ mod tests {
             &tmp.path().join("a.ts"),
             "x",
             Duration::from_millis(300),
+            None,
         );
         assert_eq!(failed, Err(took_too_long(Duration::from_millis(300))));
         assert!(started.elapsed() < Duration::from_secs(5));
