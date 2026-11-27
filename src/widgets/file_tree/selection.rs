@@ -6,9 +6,15 @@ use super::*;
 impl FileTree {
     /// The node a pointer at screen row `y` meets: the one the last frame
     /// drew there (#2751), which the screen shows until the next one, where
-    /// it is now. None once it is gone, as when its folder closed.
+    /// it is now. None once it is gone, as when its folder closed, and on a
+    /// line the sticky band covers: that line shows a pinned folder
+    /// ([`Self::sticky_row_at`]), never the row under it, even once the
+    /// folder is gone.
     pub fn node_at_y(&self, y: u16) -> Option<usize> {
         let line = self.line_at_y(y)?;
+        if line < self.sticky.lines() {
+            return None;
+        }
         self.drawn.now(line, self.nodes.len(), |i, path| {
             self.nodes[i].path == *path
         })

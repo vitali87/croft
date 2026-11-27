@@ -2448,6 +2448,63 @@ fn a_click_after_a_wheel_step_meets_the_drawn_rows() {
     );
 }
 
+/// #2751: a line the sticky band covers shows its pinned folder, never the
+/// row under it. Once a key or click in the same burst closes the folder
+/// away, a click there meets nothing, not the file the band hid.
+#[test]
+fn a_click_on_the_pinned_band_never_meets_the_row_under_it() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    fs::create_dir_all(root.join("outer/inner")).unwrap();
+    for name in [
+        "outer/inner/a.rs",
+        "outer/inner/b.rs",
+        "z1.txt",
+        "z2.txt",
+        "z3.txt",
+        "z4.txt",
+    ] {
+        fs::write(root.join(name), "").unwrap();
+    }
+    let mut tree = FileTree::new(root.to_path_buf());
+    tree.set_compact_folders(false);
+    let index_of = |tree: &FileTree, name: &str| {
+        let path = root.join(name);
+        tree.nodes.iter().position(|n| n.path == path)
+    };
+    for dir in ["outer", "outer/inner"] {
+        tree.selected = index_of(&tree, dir).expect("listed");
+        tree.expand_selected();
+    }
+    tree.scroll = index_of(&tree, "outer/inner/a.rs").expect("listed");
+    tree.selected = index_of(&tree, "z3.txt").expect("listed");
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 34,
+        height: 8,
+    };
+    (&mut tree).render(area, &mut Buffer::empty(area));
+    let band = tree.sticky_rows_for_test();
+    let inner = index_of(&tree, "outer/inner").expect("listed");
+    let &(inner_y, _) = band
+        .iter()
+        .find(|&&(_, i)| i == inner)
+        .expect("inner is pinned");
+    for &(y, idx) in &band {
+        assert_eq!(tree.sticky_row_at(y), Some(idx), "the pinned folder");
+        assert_eq!(tree.node_at_y(y), None, "never the row under the band");
+    }
+    tree.selected = index_of(&tree, "outer").expect("listed");
+    tree.collapse_selected();
+    assert_eq!(tree.sticky_row_at(inner_y), None, "inner left with outer");
+    assert_eq!(
+        tree.node_at_y(inner_y),
+        None,
+        "not z1.txt, which the band hid on that line"
+    );
+}
+
 /// #2751: a key or click that closes a folder, read in the same burst as a
 /// click below it: the click meets the file drawn on its line where it is
 /// now, not the row the closing slid under the pointer, and a click on a
