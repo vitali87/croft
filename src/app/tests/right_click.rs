@@ -228,7 +228,7 @@ fn the_problem_menu() {
 }
 
 #[test]
-pub(super) fn the_debug_row_menus() {
+fn the_debug_row_menus() {
     use crate::widgets::run_debug::{DebugRow, DebugRowKind};
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
@@ -796,4 +796,57 @@ fn shift_f10_opens_nothing_where_nothing_has_a_menu() {
     draw(&mut app, W, H);
     shift_f10(&mut app);
     assert!(app.context_menu.is_none());
+}
+
+/// #2748: with a Run and Debug row holding the keys (Tab, then Down past
+/// the section header), Shift+F10 opens that row's menu just below it:
+/// the menu a right-click on the row opens.
+#[test]
+fn shift_f10_on_a_run_and_debug_row_opens_its_menu() {
+    use crate::widgets::run_debug::{DebugRow, DebugRowKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_view = SidebarView::RunDebug;
+    app.show_tree = true;
+    app.focus_pane(Pane::Tree);
+    let row = |kind| DebugRow { indent: 1, kind };
+    app.run_debug.debug_active = true;
+    app.run_debug.debug_rows = vec![
+        row(DebugRowKind::Header {
+            title: "CALL STACK".into(),
+        }),
+        row(DebugRowKind::Frame {
+            id: 11,
+            selected: true,
+            name: "main".into(),
+            location: "s.py:6".into(),
+        }),
+        row(DebugRowKind::Header {
+            title: "VARIABLES".into(),
+        }),
+        row(DebugRowKind::Variable {
+            reference: 0,
+            expandable: false,
+            expanded: false,
+            name: "count".into(),
+            value: "42".into(),
+            type_name: "int".into(),
+            evaluate_name: Some("self.count".into()),
+        }),
+    ];
+    draw(&mut app, W, H);
+    for code in [KeyCode::Tab, KeyCode::Down] {
+        app.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(app.run_debug.row_cursor, Some(3), "the keys reach `count`");
+    shift_f10(&mut app);
+    let keyed = wherever(&written(&app, "count"));
+    assert!(keyed.contains("AddDebugWatch(\"self.count\")"), "{keyed}");
+    let area = app.run_debug.last_area;
+    let y = row_where(area, |y| app.run_debug.debug_row_at(y) == Some(3));
+    assert_eq!(opened_at(&app).1, y + 1, "just below the row");
+    app.context_menu = None;
+    right_click(&mut app, area.x + 3, y);
+    assert_eq!(keyed, wherever(&written(&app, "count")));
 }

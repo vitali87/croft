@@ -3,28 +3,30 @@
 //! shortcut; this is the test that keeps a new menu row or panel button
 //! from shipping mouse-only.
 //!
-//! Every right-click menu is one of the #2742 ledgers, and [`MENUS`] says
-//! for each how the keyboard reaches its rows. Show Context Menu
-//! (`Shift+F10`, #2744) opens six of them, so their rows are reached with
-//! the menu's own keys. The other five are opened by their scenes in
+//! Every right-click menu is one of the #2742 ledgers, and [`menus::MENUS`]
+//! says for each how the keyboard reaches its rows. Show Context Menu
+//! (`Shift+F10`, #2744) opens seven of them, so their rows are reached with
+//! the menu's own keys. The other four are opened by their scenes in
 //! `right_click.rs`, and every row there must name a key the keyboard
 //! reaches it by: the hint `shortcut_for` draws beside it (the key ledger
-//! presses every advertised hint), or the palette command
-//! `menu_action_command` says it runs.
+//! presses every advertised hint), the palette command
+//! `menu_action_command` says it runs, or one of [`menus::COMMAND_ROUTES`].
 //!
 //! Source Control's controls are the panel's hit areas: every field of
 //! `SourceControlPanel` that records a `Rect` a click lands on. Each is in
 //! [`SCM_CONTROLS`] with its route, or in [`SCM_NOT_CONTROLS`] with why it
 //! takes no click of its own.
 //!
-//! What has no route yet is in [`NO_ROUTE_YET`] with the step or issue that
-//! gives it one. That list can only shrink: an entry no menu holds any more
-//! fails, so a route that lands takes its entry with it.
+//! The Source Control half runs everywhere. The menu half runs on Linux,
+//! where the right-click ledgers' scenes do and where CI runs the tests;
+//! rows only a Mac shows are built there too, by the flag their builders
+//! take.
+//!
+//! A row or control with no keyboard route fails: it ships with one.
 
 use super::*;
 use crate::command_registry::Command;
 use crate::widgets::source_control::KeyStop;
-use std::collections::BTreeSet;
 
 /// How the keyboard reaches a Source Control control.
 #[derive(Clone, Copy, Debug)]
@@ -34,84 +36,6 @@ enum Route {
     /// One of Source Control's Tab stops, where the arrows and `Enter`
     /// reach the item.
     Stop(KeyStop),
-}
-
-/// A right-click menu's ledger, with how the keyboard reaches its rows:
-/// `None` when Show Context Menu opens the menu itself (the `shift_f10_*`
-/// tests in `right_click.rs` prove each), else the scene that opens it,
-/// whose every row must carry a key of its own.
-type MenuRoute = (&'static str, Option<fn()>);
-
-/// Every right-click menu, by its ledger: see [`MenuRoute`].
-const MENUS: [MenuRoute; 11] = [
-    ("right-click-editor", None),
-    ("right-click-explorer", None),
-    ("right-click-commit", None),
-    ("right-click-terminal", None),
-    ("right-click-capture", None),
-    ("right-click-problem", None),
-    ("right-click-minimap", Some(right_click::the_minimap_menu)),
-    (
-        "right-click-debug-row",
-        Some(right_click::the_debug_row_menus),
-    ),
-    ("right-click-outline", Some(right_click::the_outline_menu)),
-    ("right-click-tab", Some(right_click::the_tab_menus)),
-    ("right-click-gutter", Some(right_click::the_gutter_menus)),
-];
-
-/// Right-click actions whose row runs no command, but which a palette
-/// command reaches all the same, by variant: (variant, command id, why).
-const COMMAND_ROUTES: &[(&str, &str, &str)] = &[(
-    "SetMinimapSide",
-    "toggle_minimap_side",
-    "the Side rows pick an edge; the toggle moves the strip to the other one, \
-     and picking the edge it is on changes nothing",
-)];
-
-/// Right-click actions the keyboard cannot reach yet, by variant, with what
-/// gives them a route. Only shrinks.
-const NO_ROUTE_YET: &[(&str, &str)] = &[
-    (
-        "CopyDebugValue",
-        "#871 step 7d: Run and Debug rows from the keyboard",
-    ),
-    (
-        "CopyDebugExpression",
-        "#871 step 7d: Run and Debug rows from the keyboard",
-    ),
-    (
-        "AddDebugWatch",
-        "#871 step 7d: Run and Debug rows from the keyboard",
-    ),
-    (
-        "RemoveDebugWatch",
-        "#871 step 7d: Run and Debug rows from the keyboard",
-    ),
-    (
-        "CopyCallStack",
-        "#871 step 7d: Run and Debug rows from the keyboard",
-    ),
-];
-
-/// An action's variant name, as its `Debug` form starts.
-fn variant(action: &MenuAction) -> String {
-    format!("{action:?}")
-        .split(|c: char| !c.is_alphanumeric())
-        .next()
-        .unwrap_or_default()
-        .to_string()
-}
-
-/// Every item of `items`, submenus' included, as (label, action).
-fn items_of(items: &[MenuEntry], out: &mut Vec<(String, MenuAction)>) {
-    for entry in items {
-        match entry {
-            MenuEntry::Item { label, action } => out.push((label.clone(), action.clone())),
-            MenuEntry::Submenu { items, .. } => items_of(items, out),
-            MenuEntry::Separator | MenuEntry::Header(_) => {}
-        }
-    }
 }
 
 /// Source Control's controls, by the panel field that records where a
@@ -170,63 +94,6 @@ fn check_route(route: Route, item: &str, wrong: &mut Vec<String>) {
     }
 }
 
-#[test]
-fn every_right_click_row_has_a_keyboard_route() {
-    let classified: BTreeSet<&str> = MENUS.iter().map(|(name, _)| *name).collect();
-    let ledgers: BTreeSet<&str> = right_click::RIGHT_CLICK_GOLDENS.into_iter().collect();
-    assert_eq!(
-        classified, ledgers,
-        "every right-click menu says how the keyboard reaches it"
-    );
-    let mut wrong = Vec::new();
-    let mut held = BTreeSet::new();
-    for (name, scene) in MENUS {
-        let Some(scene) = scene else { continue };
-        let menus = right_click::menus_seen_in(scene);
-        assert!(!menus.is_empty(), "{name}'s scene opens a menu");
-        for (spot, entries) in menus {
-            let mut items = Vec::new();
-            items_of(&entries, &mut items);
-            for (label, action) in items {
-                let name = variant(&action);
-                held.insert(name.clone());
-                let routed = shortcut_for(&action).is_some()
-                    || menu_action_command(&action).is_some()
-                    || COMMAND_ROUTES.iter().any(|(v, _, _)| *v == name);
-                let waiting = NO_ROUTE_YET.iter().any(|(a, _)| *a == name);
-                if routed && waiting {
-                    wrong.push(format!(
-                        "`{name}` has a key now: remove it from NO_ROUTE_YET"
-                    ));
-                }
-                if !routed && !waiting {
-                    wrong.push(format!(
-                        "{spot}: \"{label}\" (`{name}`) has no keyboard route; give \
-                         it a key `shortcut_for` shows, or open its menu with Shift+F10"
-                    ));
-                }
-            }
-        }
-    }
-    for (name, id, _) in COMMAND_ROUTES {
-        check_route(Route::Command(id), name, &mut wrong);
-        if !held.contains(*name) {
-            wrong.push(format!(
-                "COMMAND_ROUTES names `{name}`, which no such menu holds"
-            ));
-        }
-    }
-    for (name, why) in NO_ROUTE_YET {
-        if !held.contains(*name) {
-            wrong.push(format!(
-                "`{name}` ({why}) is listed as unreachable but no such menu holds it \
-                 any more: remove it from NO_ROUTE_YET"
-            ));
-        }
-    }
-    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
-}
-
 /// The hit-area fields of `SourceControlPanel`, read from its source: those
 /// whose type records a `Rect` a click lands on.
 fn scm_hit_fields() -> Vec<String> {
@@ -283,144 +150,263 @@ fn every_source_control_control_has_a_keyboard_route() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-/// Three saved tabs in one group, the last active, and, with `split`, the
-/// group split to the right first, with the three tabs' group active, so
-/// the moves have a neighbour. Two apps over one folder draw the same tabs.
-fn three_tabs(root: &Path, split: bool) -> App {
-    let names = ["a.rs", "b.rs", "c.rs"];
-    for name in names {
-        std::fs::write(root.join(name), "fn main() {}\n").unwrap();
-    }
-    let mut app = App::new(root.to_path_buf()).unwrap();
-    for name in names {
-        app.editor.open_pinned(&root.join(name)).unwrap();
-    }
-    if split {
-        // Back to the left group, which keeps all three tabs.
-        app.split_editor();
-        app.focus_editor_group(true);
-    }
-    app
-}
+/// The right-click half, and the tab rows' commands: its menus come from
+/// the right-click ledgers' scenes, which run on Linux, where the CI
+/// tests run.
+#[cfg(target_os = "linux")]
+mod menus {
+    use super::*;
+    use std::collections::BTreeSet;
 
-/// The tab menu's Split and Move rows and the palette commands routed for
-/// them (#871 step 7b) leave the same editor groups, the same focus and the
-/// same status, from one group and from a split: the command is the row,
-/// reached from the keyboard.
-#[test]
-fn a_tab_row_and_its_command_leave_the_same_groups() {
-    let rows = [
-        MenuAction::SplitEditorUp,
-        MenuAction::SplitEditorDown,
-        MenuAction::SplitEditorLeft,
-        MenuAction::SplitInGroup,
-        MenuAction::MoveEditorUp,
-        MenuAction::MoveEditorDown,
-        MenuAction::MoveEditorLeft,
-        MenuAction::MoveEditorRight,
+    /// The menus opened by a scene, built the way a local macOS build builds
+    /// them: the tab menu then carries Reveal in Finder. Its builder takes
+    /// that row as a flag, so the row is checked here, where the tests run,
+    /// though only a Mac shows it. (The Explorer's Finder row is in a menu
+    /// Show Context Menu opens.)
+    fn macos_rows() -> Vec<(String, Vec<MenuEntry>)> {
+        let path = PathBuf::from("/w/a.rs");
+        vec![(
+            String::from("the tab menu on macOS"),
+            build_tab_context_menu_items(0, 2, true, Some(&path), true, false, false),
+        )]
+    }
+
+    /// A right-click menu's ledger, with how the keyboard reaches its rows:
+    /// `None` when Show Context Menu opens the menu itself (the `shift_f10_*`
+    /// tests in `right_click.rs` prove each), else the scene that opens it,
+    /// whose every row must carry a key of its own.
+    type MenuRoute = (&'static str, Option<fn()>);
+
+    /// Every right-click menu, by its ledger: see [`MenuRoute`].
+    const MENUS: [MenuRoute; 11] = [
+        ("right-click-editor", None),
+        ("right-click-explorer", None),
+        ("right-click-commit", None),
+        ("right-click-terminal", None),
+        ("right-click-capture", None),
+        ("right-click-problem", None),
+        ("right-click-minimap", Some(right_click::the_minimap_menu)),
+        ("right-click-debug-row", None),
+        ("right-click-outline", Some(right_click::the_outline_menu)),
+        ("right-click-tab", Some(right_click::the_tab_menus)),
+        ("right-click-gutter", Some(right_click::the_gutter_menus)),
     ];
-    for split in [false, true] {
-        for action in &rows {
-            let cmd = menu_action_command(action).expect("the row runs a command");
-            let tmp = tempfile::tempdir().unwrap();
-            let mut by_row = three_tabs(tmp.path(), split);
-            let mut by_command = three_tabs(tmp.path(), split);
-            let before = key_ledger::groups(&by_row);
-            by_row.dispatch_menu_action(action.clone(), tmp.path().to_path_buf());
-            by_command.run_command(cmd);
-            let after = key_ledger::groups(&by_row);
-            let at = format!("{action:?} as {cmd:?}, split first: {split}");
-            assert_ne!(after, before, "{at}: the row changes the groups");
-            assert_eq!(key_ledger::groups(&by_command), after, "{at}");
-            assert!(by_command.focus == by_row.focus, "{at}: focus");
-            assert_eq!(by_command.status, by_row.status, "{at}: status");
+
+    /// Right-click actions whose row runs no command, but which a palette
+    /// command reaches all the same, by variant: (variant, command id, why).
+    const COMMAND_ROUTES: &[(&str, &str, &str)] = &[(
+        "SetMinimapSide",
+        "toggle_minimap_side",
+        "the Side rows pick an edge; the toggle moves the strip to the other one, \
+     and picking the edge it is on changes nothing",
+    )];
+
+    /// An action's variant name, as its `Debug` form starts.
+    fn variant(action: &MenuAction) -> String {
+        format!("{action:?}")
+            .split(|c: char| !c.is_alphanumeric())
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// Every item of `items`, submenus' included, as (label, action).
+    fn items_of(items: &[MenuEntry], out: &mut Vec<(String, MenuAction)>) {
+        for entry in items {
+            match entry {
+                MenuEntry::Item { label, action } => out.push((label.clone(), action.clone())),
+                MenuEntry::Submenu { items, .. } => items_of(items, out),
+                MenuEntry::Separator | MenuEntry::Header(_) => {}
+            }
         }
     }
-}
 
-/// File: Reveal Active File in Explorer View does what the tab menu's
-/// Reveal in Explorer View row does on the active tab: the Explorer shows,
-/// with the file's row selected and the tree focused.
-#[test]
-fn reveal_active_file_in_explorer_is_the_tab_row() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut by_row = three_tabs(tmp.path(), false);
-    let mut by_command = three_tabs(tmp.path(), false);
-    for app in [&mut by_row, &mut by_command] {
-        app.set_sidebar_view(SidebarView::Search);
-        app.focus_pane(Pane::Editor);
+    #[test]
+    fn every_right_click_row_has_a_keyboard_route() {
+        let classified: BTreeSet<&str> = MENUS.iter().map(|(name, _)| *name).collect();
+        let ledgers: BTreeSet<&str> = right_click::RIGHT_CLICK_GOLDENS.into_iter().collect();
+        assert_eq!(
+            classified, ledgers,
+            "every right-click menu says how the keyboard reaches it"
+        );
+        let mut menus = Vec::new();
+        for (name, scene) in MENUS {
+            let Some(scene) = scene else { continue };
+            let seen = right_click::menus_seen_in(scene);
+            assert!(!seen.is_empty(), "{name}'s scene opens a menu");
+            menus.extend(seen);
+        }
+        menus.extend(macos_rows());
+        let mut wrong = Vec::new();
+        let mut held = BTreeSet::new();
+        for (spot, entries) in menus {
+            let mut items = Vec::new();
+            items_of(&entries, &mut items);
+            for (label, action) in items {
+                let name = variant(&action);
+                held.insert(name.clone());
+                let routed = shortcut_for(&action).is_some()
+                    || menu_action_command(&action).is_some()
+                    || COMMAND_ROUTES.iter().any(|(v, _, _)| *v == name);
+                if !routed {
+                    wrong.push(format!(
+                        "{spot}: \"{label}\" (`{name}`) has no keyboard route; give \
+                     it a key `shortcut_for` shows, or open its menu with Shift+F10"
+                    ));
+                }
+            }
+        }
+        for (name, id, _) in COMMAND_ROUTES {
+            check_route(Route::Command(id), name, &mut wrong);
+            if !held.contains(*name) {
+                wrong.push(format!(
+                    "COMMAND_ROUTES names `{name}`, which no such menu holds"
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
-    let path = by_row.editor.path.clone().expect("c.rs is active");
-    by_row.dispatch_menu_action(MenuAction::RevealInExplorer(path), tmp.path().to_path_buf());
-    by_command.run_command(crate::widgets::command_palette::Command::RevealActiveFileInExplorer);
-    let picked = |app: &App| {
-        app.tree
-            .selected_path()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-    };
-    assert_eq!(
-        picked(&by_row).as_deref(),
-        Some("c.rs"),
-        "the row reveals c.rs"
-    );
-    assert_eq!(picked(&by_command), picked(&by_row));
-    assert!(by_command.sidebar_view == SidebarView::Explorer);
-    assert!(by_command.focus == by_row.focus && by_row.focus == Pane::Tree);
-}
 
-/// With no file to reveal, the command says so rather than doing nothing.
-#[test]
-fn reveal_active_file_in_explorer_without_a_file_says_so() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.run_command(crate::widgets::command_palette::Command::RevealActiveFileInExplorer);
-    assert_eq!(app.status, "Reveal in Explorer View: no active file");
-}
+    /// Three saved tabs in one group, the last active, and, with `split`, the
+    /// group split to the right first, with the three tabs' group active, so
+    /// the moves have a neighbour. Two apps over one folder draw the same tabs.
+    fn three_tabs(root: &Path, split: bool) -> App {
+        let names = ["a.rs", "b.rs", "c.rs"];
+        for name in names {
+            std::fs::write(root.join(name), "fn main() {}\n").unwrap();
+        }
+        let mut app = App::new(root.to_path_buf()).unwrap();
+        for name in names {
+            app.editor.open_pinned(&root.join(name)).unwrap();
+        }
+        if split {
+            // Back to the left group, which keeps all three tabs.
+            app.split_editor();
+            app.focus_editor_group(true);
+        }
+        app
+    }
 
-/// View: Move / Copy Editor into New Window run the tab rows' code on the
-/// active tab: an unsaved buffer gets the rows' own refusal (no window is
-/// opened from a test).
-#[test]
-fn the_new_window_commands_are_the_tab_rows() {
-    use crate::widgets::command_palette::Command as Cmd;
-    for (action, cmd) in [
-        (MenuAction::MoveIntoNewWindow(0), Cmd::MoveEditorToNewWindow),
-        (MenuAction::CopyIntoNewWindow(0), Cmd::CopyEditorToNewWindow),
-    ] {
-        assert_eq!(menu_action_command(&action), Some(cmd));
+    /// The tab menu's Split and Move rows and the palette commands routed for
+    /// them (#871 step 7b) leave the same editor groups, the same focus and the
+    /// same status, from one group and from a split: the command is the row,
+    /// reached from the keyboard.
+    #[test]
+    fn a_tab_row_and_its_command_leave_the_same_groups() {
+        let rows = [
+            MenuAction::SplitEditorUp,
+            MenuAction::SplitEditorDown,
+            MenuAction::SplitEditorLeft,
+            MenuAction::SplitInGroup,
+            MenuAction::MoveEditorUp,
+            MenuAction::MoveEditorDown,
+            MenuAction::MoveEditorLeft,
+            MenuAction::MoveEditorRight,
+        ];
+        for split in [false, true] {
+            for action in &rows {
+                let cmd = menu_action_command(action).expect("the row runs a command");
+                let tmp = tempfile::tempdir().unwrap();
+                let mut by_row = three_tabs(tmp.path(), split);
+                let mut by_command = three_tabs(tmp.path(), split);
+                let before = key_ledger::groups(&by_row);
+                by_row.dispatch_menu_action(action.clone(), tmp.path().to_path_buf());
+                by_command.run_command(cmd);
+                let after = key_ledger::groups(&by_row);
+                let at = format!("{action:?} as {cmd:?}, split first: {split}");
+                assert_ne!(after, before, "{at}: the row changes the groups");
+                assert_eq!(key_ledger::groups(&by_command), after, "{at}");
+                assert!(by_command.focus == by_row.focus, "{at}: focus");
+                assert_eq!(by_command.status, by_row.status, "{at}: status");
+            }
+        }
+    }
+
+    /// File: Reveal Active File in Explorer View does what the tab menu's
+    /// Reveal in Explorer View row does on the active tab: the Explorer shows,
+    /// with the file's row selected and the tree focused.
+    #[test]
+    fn reveal_active_file_in_explorer_is_the_tab_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut by_row = three_tabs(tmp.path(), false);
+        let mut by_command = three_tabs(tmp.path(), false);
+        for app in [&mut by_row, &mut by_command] {
+            app.set_sidebar_view(SidebarView::Search);
+            app.focus_pane(Pane::Editor);
+        }
+        let path = by_row.editor.path.clone().expect("c.rs is active");
+        by_row.dispatch_menu_action(MenuAction::RevealInExplorer(path), tmp.path().to_path_buf());
+        by_command
+            .run_command(crate::widgets::command_palette::Command::RevealActiveFileInExplorer);
+        let picked = |app: &App| {
+            app.tree
+                .selected_path()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+        };
+        assert_eq!(
+            picked(&by_row).as_deref(),
+            Some("c.rs"),
+            "the row reveals c.rs"
+        );
+        assert_eq!(picked(&by_command), picked(&by_row));
+        assert!(by_command.sidebar_view == SidebarView::Explorer);
+        assert!(by_command.focus == by_row.focus && by_row.focus == Pane::Tree);
+    }
+
+    /// With no file to reveal, the command says so rather than doing nothing.
+    #[test]
+    fn reveal_active_file_in_explorer_without_a_file_says_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.run_command(crate::widgets::command_palette::Command::RevealActiveFileInExplorer);
+        assert_eq!(app.status, "Reveal in Explorer View: no active file");
+    }
+
+    /// View: Move / Copy Editor into New Window run the tab rows' code on the
+    /// active tab: an unsaved buffer gets the rows' own refusal (no window is
+    /// opened from a test).
+    #[test]
+    fn the_new_window_commands_are_the_tab_rows() {
+        use crate::widgets::command_palette::Command as Cmd;
+        for (action, cmd) in [
+            (MenuAction::MoveIntoNewWindow(0), Cmd::MoveEditorToNewWindow),
+            (MenuAction::CopyIntoNewWindow(0), Cmd::CopyEditorToNewWindow),
+        ] {
+            assert_eq!(menu_action_command(&action), Some(cmd));
+            let tmp = tempfile::tempdir().unwrap();
+            let mut by_row = App::new(tmp.path().to_path_buf()).unwrap();
+            let mut by_command = App::new(tmp.path().to_path_buf()).unwrap();
+            by_row.dispatch_menu_action(action.clone(), tmp.path().to_path_buf());
+            by_command.run_command(cmd);
+            assert!(
+                by_row.status.contains("save the file first"),
+                "{action:?}: {}",
+                by_row.status
+            );
+            assert_eq!(by_command.status, by_row.status, "{cmd:?}");
+        }
+    }
+
+    /// View: Toggle Minimap Side moves the strip to the edge it is not on, as
+    /// picking that edge in the minimap menu's Side rows does.
+    #[test]
+    fn toggle_minimap_side_picks_the_other_edge() {
         let tmp = tempfile::tempdir().unwrap();
         let mut by_row = App::new(tmp.path().to_path_buf()).unwrap();
         let mut by_command = App::new(tmp.path().to_path_buf()).unwrap();
-        by_row.dispatch_menu_action(action.clone(), tmp.path().to_path_buf());
-        by_command.run_command(cmd);
-        assert!(
-            by_row.status.contains("save the file first"),
-            "{action:?}: {}",
-            by_row.status
-        );
-        assert_eq!(by_command.status, by_row.status, "{cmd:?}");
-    }
-}
-
-/// View: Toggle Minimap Side moves the strip to the edge it is not on, as
-/// picking that edge in the minimap menu's Side rows does.
-#[test]
-fn toggle_minimap_side_picks_the_other_edge() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut by_row = App::new(tmp.path().to_path_buf()).unwrap();
-    let mut by_command = App::new(tmp.path().to_path_buf()).unwrap();
-    for side in [MinimapSide::Left, MinimapSide::Right] {
-        assert!(
-            by_command.minimap_side != side,
-            "setup: {side:?} is the other edge"
-        );
-        by_row.dispatch_menu_action(MenuAction::SetMinimapSide(side), tmp.path().to_path_buf());
-        by_command.run_command(crate::widgets::command_palette::Command::ToggleMinimapSide);
-        assert!(
-            by_command.minimap_side == side,
-            "the toggle lands on {side:?}"
-        );
-        assert!(by_row.minimap_side == side);
+        for side in [MinimapSide::Left, MinimapSide::Right] {
+            assert!(
+                by_command.minimap_side != side,
+                "setup: {side:?} is the other edge"
+            );
+            by_row.dispatch_menu_action(MenuAction::SetMinimapSide(side), tmp.path().to_path_buf());
+            by_command.run_command(crate::widgets::command_palette::Command::ToggleMinimapSide);
+            assert!(
+                by_command.minimap_side == side,
+                "the toggle lands on {side:?}"
+            );
+            assert!(by_row.minimap_side == side);
+        }
     }
 }

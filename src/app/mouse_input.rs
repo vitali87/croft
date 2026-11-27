@@ -2263,7 +2263,12 @@ impl App {
                             self.remove_watch_expression(widx);
                             self.refresh_debug_panel();
                         } else if let Some(idx) = self.run_debug.debug_row_at(m.row) {
+                            self.run_debug.put_row_cursor(idx);
                             self.debug_panel_click(idx);
+                        } else if self.run_debug.prompt_at(m.column, m.row) {
+                            // The prompt takes the keys back (#2748), so
+                            // Backspace and Enter edit and run what is typed.
+                            self.run_debug.row_cursor = None;
                         }
                     } else if self.run_debug.click_button(m.column, m.row) {
                         self.run_debug_button_action();

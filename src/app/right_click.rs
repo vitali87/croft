@@ -204,6 +204,7 @@ impl App {
                 ));
             }
             MenuTarget::DebugRow(idx) => {
+                self.run_debug.put_row_cursor(idx);
                 let items = self.debug_row_menu(idx);
                 if !items.is_empty() {
                     self.context_menu = Some(ContextMenu::flat(at, items, self.tree.root.clone()));
@@ -333,7 +334,8 @@ impl App {
     }
 
     /// The Explorer's selected row (the workspace's menu in an empty
-    /// tree), or the picked commit while COMMITS has the keys.
+    /// tree), the picked commit while COMMITS has the keys, or the Run and
+    /// Debug row the keyboard is on.
     fn sidebar_menu_target(&self) -> Option<(MenuTarget, (u16, u16))> {
         if !self.show_tree {
             return None;
@@ -350,6 +352,17 @@ impl App {
                     MenuTarget::Explorer(Some(idx)),
                     (area.x + 2, y.saturating_add(1)),
                 ))
+            }
+            // The Run and Debug row the keyboard is on (#2748), when it has
+            // a menu: a variable, a watch or a frame.
+            SidebarView::RunDebug => {
+                let idx = self.run_debug.row_cursor?;
+                if self.debug_row_menu(idx).is_empty() {
+                    return None;
+                }
+                let area = self.run_debug.last_area;
+                let y = self.run_debug.row_cursor_y().unwrap_or(area.y);
+                Some((MenuTarget::DebugRow(idx), (area.x + 2, y.saturating_add(1))))
             }
             SidebarView::SourceControl if self.source_control.keys == KeyStop::Commits => {
                 let row = self.commit_graph.selected_row()?;
