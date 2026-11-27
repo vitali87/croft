@@ -472,7 +472,9 @@ fn run(job: &Job) -> Result<Report, String> {
     // A session of its own, so what the script started (a server, `sleep`
     // in a subprocess) is killed with it when it ends, on time or at the
     // deadline: Live Run re-runs on every pause in typing, and each run left
-    // one more behind (#2776). The source goes in on stdin only as fast as
+    // one more behind (#2776). A program the script deliberately detaches
+    // into a session of its own (`start_new_session=True`, a daemon) is out
+    // of reach, as for the node probe (#2755). The source goes in on stdin only as fast as
     // the interpreter reads it, and stderr is drained while it runs, so
     // neither a script that never reads nor one that floods stderr can hold
     // the run past the deadline.
