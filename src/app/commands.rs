@@ -1455,8 +1455,8 @@ impl App {
             Cmd::MoveEditorToBelowGroup => self.move_active_editor(editor_layout::Dir::Down),
             Cmd::MoveEditorToLeftGroup => self.move_active_editor(editor_layout::Dir::Left),
             Cmd::MoveEditorToRightGroup => self.move_active_editor(editor_layout::Dir::Right),
-            Cmd::MoveEditorToNewWindow => self.move_into_new_window(self.editor.active_index()),
-            Cmd::CopyEditorToNewWindow => self.copy_into_new_window(self.editor.active_index()),
+            Cmd::MoveEditorToNewWindow => self.move_into_new_window(tab_target),
+            Cmd::CopyEditorToNewWindow => self.copy_into_new_window(tab_target),
             Cmd::RevealActiveFileInExplorer => self.reveal_active_file_in_explorer(),
             // The chords' own moves (#843): Cmd+Opt+Left / Right have no
             // `Ctrl` form off macOS.
