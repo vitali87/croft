@@ -189,8 +189,16 @@ fn resolve_node_via_login_shell() -> Option<String> {
 /// (a login shell with a chatty/blocking rc must never wedge croft). Stdout is
 /// drained *while* the child runs: an rc that prints more than the OS pipe
 /// buffer would otherwise block in write() and never exit. Returns the
-/// captured stdout, `None` on timeout or spawn failure.
-fn run_bounded(mut cmd: Command, timeout: Duration) -> Option<String> {
+/// captured stdout, decoded lossily so one stray byte from an rc cannot hide
+/// the rest, `None` on timeout or spawn failure.
+///
+/// When it is done the child is killed with its process group: a probe
+/// started by `setsid` ([`crate::lsp::install::node_probe_command`]) leads
+/// one, and whatever its rc started, such as a command that hangs, goes with
+/// it (#2755). A child that leads no group is killed alone. It returns by
+/// `timeout` even when the child cannot die yet: the child is reaped on a
+/// thread of its own.
+pub(crate) fn run_bounded(mut cmd: Command, timeout: Duration) -> Option<String> {
     use std::io::Read;
     // A program written a moment ago (a test's stand-in interpreter) is "Text
     // file busy" while another thread's forked child still holds its write
@@ -204,13 +212,26 @@ fn run_bounded(mut cmd: Command, timeout: Duration) -> Option<String> {
     let mut stdout = child.stdout.take()?;
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = stdout.read_to_string(&mut buf);
-        let _ = tx.send(buf);
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
     });
     let out = rx.recv_timeout(timeout).ok();
+    // Before the wait, so the group's id cannot have been reused: the child
+    // is not reaped yet. No group has the id of a child that leads none.
+    if let Ok(pid) = i32::try_from(child.id()) {
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
     let _ = child.kill();
-    let _ = child.wait();
+    // Reaped on a thread of its own: a child stuck in I/O that cannot be
+    // interrupted, such as an rc reading a dead network mount, dies only
+    // once that I/O returns, and the caller must not wait for it. The
+    // language servers probe from their one command loop.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
     out
 }
 
