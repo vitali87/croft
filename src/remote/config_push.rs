@@ -9,7 +9,7 @@ pub(super) fn read_remote_hashes(
 ) -> Option<std::collections::BTreeMap<String, String>> {
     // Waits out "Text file busy": ssh just installed or updated, or a
     // test's stand-in ssh written a moment ago while another test forked.
-    let out = crate::review_ops::spawn_retrying_busy(&mut command)
+    let out = crate::proc::spawn_retrying_busy(&mut command)
         .and_then(std::process::Child::wait_with_output)
         .ok()?;
     if !out.status.success() {
@@ -223,7 +223,7 @@ pub(super) fn read_remote_config(
         &format!("cat ~/.config/croft/{name} 2>/dev/null"),
     );
     // Waits out "Text file busy", as `read_remote_hashes` does (#2560).
-    let out = crate::review_ops::spawn_retrying_busy(&mut command)
+    let out = crate::proc::spawn_retrying_busy(&mut command)
         .and_then(std::process::Child::wait_with_output)?;
     Ok(out.stdout)
 }
