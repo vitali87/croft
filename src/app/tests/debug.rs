@@ -4320,6 +4320,37 @@ fn removing_from_the_list_drops_the_breakpoint_and_its_condition() {
     assert_eq!(app.run_debug.breakpoints.len(), 2, "the list follows");
 }
 
+/// #2753: two clicks on the BREAKPOINTS list's `✕`, read in one burst: the
+/// second removes the breakpoint its `✕` was drawn for, not the one the
+/// first removal moved up into its place.
+#[test]
+fn two_remove_clicks_in_one_burst_remove_the_two_breakpoints_clicked() {
+    let (_tmp, mut app, a, b) = app_with_breakpoints();
+    app.set_sidebar_view(SidebarView::RunDebug);
+    app.sync_breakpoint_list();
+    let term = draw_terminal(&mut app, 100, 40);
+    let buf = term.backend().buffer();
+    let remove_cell = |label: &str| {
+        let (_, y) = find_painted(&term, label, 0..100).unwrap_or_else(|| panic!("{label} drawn"));
+        let x = (0..100)
+            .find(|&x| buf[(x, y)].symbol() == "\u{2715}")
+            .unwrap_or_else(|| panic!("{label}'s remove button drawn"));
+        (x, y)
+    };
+    let (first, second) = (remove_cell("a.rs:1"), remove_cell("a.rs:3"));
+    left_click(&mut app, first.0, first.1);
+    left_click(&mut app, second.0, second.1);
+    assert!(
+        !app.editor.breakpoints.contains_key(&a),
+        "a.rs:1 and a.rs:3 are gone: {:?}",
+        app.editor.breakpoints
+    );
+    assert!(
+        app.editor.breakpoints[&b].contains(&4),
+        "b.rs:4 was never clicked"
+    );
+}
+
 #[test]
 fn clicking_a_breakpoint_opens_its_file_at_the_line() {
     // Line 1 of a three-line file: a jump one row off lands on a different

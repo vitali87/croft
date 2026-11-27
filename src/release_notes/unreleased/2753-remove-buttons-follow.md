@@ -1,0 +1,1 @@
+fix: in Run and Debug, two quick clicks on the remove buttons of two watches or two breakpoints now remove the two that were clicked. The second used to remove the one after it on screen, which the first removal had moved into its place, and a click on a breakpoint could open the wrong one the same way. This matters most over SSH, where input arrives in bursts (#2753).

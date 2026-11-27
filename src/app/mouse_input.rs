@@ -2259,7 +2259,10 @@ impl App {
                     if self.run_debug.debug_active {
                         if let Some(control) = self.run_debug.debug_control_at(m.column, m.row) {
                             self.run_debug_control(control);
-                        } else if let Some(widx) = self.run_debug.watch_remove_at(m.column, m.row) {
+                        } else if let Some(widx) =
+                            self.run_debug
+                                .watch_remove_at(m.column, m.row, &self.watch_exprs)
+                        {
                             self.remove_watch_expression(widx);
                             self.refresh_debug_panel();
                         } else if let Some(idx) = self.run_debug.debug_row_at(m.row) {
