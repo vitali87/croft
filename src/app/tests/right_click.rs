@@ -71,6 +71,20 @@ fn rows(items: &[MenuEntry], depth: usize, out: &mut String) {
     }
 }
 
+thread_local! {
+    /// The menus [`written`] wrote on this thread, by spot, for the
+    /// keyboard-route guard (`keyboard_routes.rs`) to read the actions of.
+    static SEEN: std::cell::RefCell<Vec<(String, Vec<MenuEntry>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The menus the scene `scene` opens, by spot, as it writes them.
+pub(super) fn menus_seen_in(scene: fn()) -> Vec<(String, Vec<MenuEntry>)> {
+    SEEN.with(|seen| seen.borrow_mut().clear());
+    scene();
+    SEEN.with(|seen| std::mem::take(&mut *seen.borrow_mut()))
+}
+
 /// The open menu (or that none opened) and where the keys went, as the
 /// ledger writes them under the heading `spot`.
 fn written(app: &App, spot: &str) -> String {
@@ -78,6 +92,10 @@ fn written(app: &App, spot: &str) -> String {
     match app.context_menu.as_ref() {
         None => out.push_str("no menu\n"),
         Some(menu) => {
+            SEEN.with(|seen| {
+                seen.borrow_mut()
+                    .push((spot.to_string(), menu.items.clone()))
+            });
             writeln!(
                 out,
                 "opens at {:?}, {:?}{}, row {} lit",
@@ -118,7 +136,7 @@ fn row_where(area: Rect, mut hit: impl FnMut(u16) -> bool) -> u16 {
 }
 
 #[test]
-fn the_minimap_menu() {
+pub(super) fn the_minimap_menu() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("long.rs");
     let body: String = (0..300)
@@ -210,7 +228,7 @@ fn the_problem_menu() {
 }
 
 #[test]
-fn the_debug_row_menus() {
+pub(super) fn the_debug_row_menus() {
     use crate::widgets::run_debug::{DebugRow, DebugRowKind};
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
@@ -282,7 +300,7 @@ fn the_debug_row_menus() {
 }
 
 #[test]
-fn the_outline_menu() {
+pub(super) fn the_outline_menu() {
     let tmp = tempfile::tempdir().unwrap();
     let file = tmp.path().join("lib.rs");
     std::fs::write(&file, "fn a() {\n    1\n}\nfn b() {\n    2\n}").unwrap();
@@ -338,7 +356,7 @@ fn the_capture_menu() {
 }
 
 #[test]
-fn the_tab_menus() {
+pub(super) fn the_tab_menus() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     for name in ["a.rs", "b.rs", "c.rs"] {
@@ -466,7 +484,7 @@ fn the_explorer_menus() {
 }
 
 #[test]
-fn the_gutter_menus() {
+pub(super) fn the_gutter_menus() {
     let tmp = tempfile::tempdir().unwrap();
     let f = tmp.path().join("prog.py");
     std::fs::write(&f, "l1\nl2\nl3\nl4\nl5\n").unwrap();
