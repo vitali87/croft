@@ -1,1 +1,1 @@
-fix: a relay pull (a remote croft fetching a local file) no longer hangs for good, holding up every relay request after it, when the local `tar` prints many warnings (#2795).
+fix: a relay pull (a remote croft fetching a local file) no longer hangs for good, holding up every relay request after it, when the local `tar` prints many warnings, and a pull that fails after many warnings now reports tar's reason instead of timing out after 120 seconds (#2795).
