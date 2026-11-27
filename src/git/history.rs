@@ -53,10 +53,9 @@ pub fn file_history(root: &Path, rel_path: &str, limit: usize) -> Vec<FileHistor
     let Some(path_str) = dir.to_str() else {
         return Vec::new();
     };
-    let output = crate::proc::command("git")
+    let output = Git::new()
+        .at(path_str)
         .args([
-            "-C",
-            path_str,
             "log",
             "--follow",
             &format!("-n{limit}"),
@@ -64,6 +63,7 @@ pub fn file_history(root: &Path, rel_path: &str, limit: usize) -> Vec<FileHistor
             "--",
             &name,
         ])
+        .into_command()
         .output();
     let Ok(output) = output else {
         return Vec::new();
@@ -247,10 +247,9 @@ pub fn commit_graph(root: &Path, limit: usize) -> Vec<GraphCommit> {
     let Some(path_str) = root.to_str() else {
         return Vec::new();
     };
-    let output = crate::proc::command("git")
+    let output = Git::new()
+        .at(path_str)
         .args([
-            "-C",
-            path_str,
             "log",
             "--branches",
             "--tags",
@@ -259,6 +258,7 @@ pub fn commit_graph(root: &Path, limit: usize) -> Vec<GraphCommit> {
             &format!("-n{limit}"),
             "--format=%H\x1f%h\x1f%P\x1f%D\x1f%s\x1f%an\x1f%ct",
         ])
+        .into_command()
         .output();
     let Ok(output) = output else {
         return Vec::new();
@@ -307,16 +307,16 @@ pub fn branch_history_range(root: &Path, revspec: &str, limit: usize) -> Vec<Gra
     let Some(path_str) = root.to_str() else {
         return Vec::new();
     };
-    let output = crate::proc::command("git")
+    let output = Git::new()
+        .at(path_str)
         .args([
-            "-C",
-            path_str,
             "log",
             "--first-parent",
             revspec,
             &format!("-n{limit}"),
             "--format=%H\x1f%h\x1f%P\x1f%D\x1f%s\x1f%an\x1f%ct",
         ])
+        .into_command()
         .output();
     let Ok(output) = output else {
         return Vec::new();
@@ -364,11 +364,11 @@ impl CommitTree {
 /// `None` on any failure (no repo, unknown revision), so a caller dims
 /// nothing rather than everything.
 pub fn tree_paths(root: &Path, rev: &str) -> Option<CommitTree> {
-    let output = crate::proc::command("git")
-        .arg("-C")
-        .arg(root)
-        .env("GIT_OPTIONAL_LOCKS", "0")
+    let output = Git::new()
+        .at(root)
+        .without_optional_locks()
         .args(["ls-tree", "-r", "-t", "-z", rev])
+        .into_command()
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .output()
