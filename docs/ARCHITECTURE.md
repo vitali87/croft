@@ -51,6 +51,7 @@ src/
 │   ├── blame.rs          which commit last changed each line of a file
 │   ├── branches.rs       the default branch; list, switch, track, create, rename, delete, merge and rebase branches
 │   ├── changes.rs        changed files from `git status --porcelain`: kind, section and badge; Explorer decorations; line counts
+│   ├── command.rs        how croft starts git: one builder that names what each call asks of git (no optional locks, never prompt)
 │   ├── commits.rs        commit and amend with their refusals, undo the last commit, the commit graph's cherry-pick, revert, checkout, tag and reset
 │   ├── contents.rs       a file at HEAD, a commit or an index stage; a conflict re-merged in diff3 style; a path's clean/smudge filter
 │   ├── diffs.rs          staged diffs; against a branch, its merge base or the previous commit; submodule diffs
@@ -685,7 +686,7 @@ Remote (SSH) target metadata and launch dispatch, plus the ssh-pane re-root offe
 
 ### git.rs
 
-Branch, dirty and ahead-behind status, plus the full set of working-tree operations the Source Control panel drives. `git.rs` keeps the git runner every part shares: `run_git`, `git_raw`, `repo_toplevel` and the mutation wrappers. Each feature's code is in a file in `git/`, named at the end of its paragraph below.
+Branch, dirty and ahead-behind status, plus the full set of working-tree operations the Source Control panel drives. `git.rs` keeps the git runner every part shares: `run_git`, `git_raw`, `repo_toplevel` and the mutation wrappers, all built through `Git` in `git/command.rs`, which names what each call asks of git: no optional locks for a read-only query, never a prompt for a call that may reach a remote. Each feature's code is in a file in `git/`, named at the end of its paragraph below.
 
 **Multi-root.** There is one `GitWorker` per workspace root (`App::git` primary plus `git_extra`), each discovering its own toplevel. The SCM surfaces — status-line branch, panel, COMMITS graph, and `scm_root` for panel ops — follow the ACTIVE repo, meaning the root owning the focused file, with the primary as fallback. Non-active workers drain status-only and have their change lists re-requested on switch. HEAD-oid invalidation for gutter baselines is per repo, gutter/blame/timeline pair each file with its owning root, and the Explorer's ignored set is unioned across every root's cwd-scoped query. Code: the app's `GitWorker` handle in `app/git_worker.rs`; the loop it talks to is in `git/worker.rs`.
 
