@@ -375,9 +375,29 @@ pub struct DebugRow {
     pub kind: DebugRowKind,
 }
 
+/// Row `idx` and the rows it sits under, nearest first, up to its section
+/// header (#2748): each is the closest row above with less indent. Two
+/// fields named `value` under different objects differ here, so the
+/// keyboard's row is matched by this whole path, not by its own row alone.
+fn row_path(rows: &[DebugRow], idx: usize) -> Vec<usize> {
+    let mut path = vec![idx];
+    let mut indent = rows[idx].indent;
+    for i in (0..idx).rev() {
+        if indent == 0 {
+            break;
+        }
+        if rows[i].indent < indent {
+            path.push(i);
+            indent = rows[i].indent;
+        }
+    }
+    path
+}
+
 /// Whether `a` and `b` are the same row across a rebuild (#2748): by what
 /// each shows, not where. A variable has no id of its own (every leaf's
-/// reference is 0), so its name, expression and depth stand for it.
+/// reference is 0), so its name, expression and depth stand for it, and
+/// [`row_path`] tells apart same-named fields under different parents.
 fn same_row(a: &DebugRow, b: &DebugRow) -> bool {
     use DebugRowKind as K;
     match (&a.kind, &b.kind) {
@@ -733,12 +753,23 @@ impl RunDebugPanel {
     /// unrelated row for the next Enter or Delete. When its row is gone,
     /// the prompt has the keys again.
     pub fn replace_rows(&mut self, rows: Vec<DebugRow>) {
-        let kept = self
-            .row_cursor
-            .and_then(|at| self.debug_rows.get(at).cloned());
+        let kept: Option<Vec<DebugRow>> = self.row_cursor.map(|at| {
+            row_path(&self.debug_rows, at)
+                .into_iter()
+                .map(|i| self.debug_rows[i].clone())
+                .collect()
+        });
         self.debug_rows = rows;
-        self.row_cursor =
-            kept.and_then(|row| self.debug_rows.iter().position(|r| same_row(r, &row)));
+        self.row_cursor = kept.and_then(|path| {
+            (0..self.debug_rows.len()).find(|&i| {
+                let here = row_path(&self.debug_rows, i);
+                here.len() == path.len()
+                    && here
+                        .iter()
+                        .zip(&path)
+                        .all(|(&j, row)| same_row(&self.debug_rows[j], row))
+            })
+        });
         self.settle_row_cursor();
     }
 
@@ -1677,6 +1708,45 @@ mod tests {
             panel.row_cursor, None,
             "its frame is gone: the prompt has the keys"
         );
+    }
+
+    /// #2748: two fields named alike under different objects are different
+    /// rows. A rebuild (the panel rebuilds on every poll) keeps the
+    /// keyboard on the second, not the first that shares its name.
+    #[test]
+    fn same_named_fields_under_different_parents_stay_apart() {
+        let variable = |indent, name: &str, reference| DebugRow {
+            indent,
+            kind: DebugRowKind::Variable {
+                reference,
+                expandable: reference != 0,
+                expanded: reference != 0,
+                name: name.into(),
+                value: String::from("1"),
+                type_name: String::from("int"),
+                evaluate_name: None,
+            },
+        };
+        let rows = || {
+            vec![
+                DebugRow {
+                    indent: 0,
+                    kind: DebugRowKind::Header {
+                        title: String::from("VARIABLES"),
+                    },
+                },
+                variable(2, "first", 7),
+                variable(3, "value", 0),
+                variable(2, "second", 8),
+                variable(3, "value", 0),
+            ]
+        };
+        let mut panel = RunDebugPanel::new();
+        panel.debug_active = true;
+        panel.debug_rows = rows();
+        panel.row_cursor = Some(4);
+        panel.replace_rows(rows());
+        assert_eq!(panel.row_cursor, Some(4), "still second's `value`");
     }
 
     /// Every row of `line` wrapped to `width`.
