@@ -133,7 +133,7 @@ pub fn install_state() -> InstallState {
 /// fallback for non-standard layouts.
 fn binary_present() -> bool {
     if let Some(prefix) = std::env::var_os("PREFIX")
-        && PathBuf::from(prefix).join("bin").join(BINARY).exists()
+        && crate::proc::find::runnable(&PathBuf::from(prefix).join("bin").join(BINARY))
     {
         return true;
     }

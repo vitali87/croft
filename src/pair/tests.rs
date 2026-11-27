@@ -2395,6 +2395,7 @@ fn dropping_the_host_does_not_block_the_ui_thread() {
 /// the navigator can still seat on Croft.app launches.
 #[test]
 fn claude_resolves_to_an_absolute_path_off_a_stripped_path() {
+    use std::os::unix::fs::PermissionsExt;
     // On PATH: spawn by bare name (PATH resolves it).
     assert_eq!(
         resolve_claude_in(true, &[]).as_deref(),
@@ -2412,6 +2413,7 @@ fn claude_resolves_to_an_absolute_path_off_a_stripped_path() {
     let dir = tempfile::tempdir().unwrap();
     let claude = dir.path().join("claude");
     std::fs::write(&claude, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
     let got = resolve_claude_in(false, &[dir.path().to_path_buf()]).unwrap();
     assert_eq!(got, claude.to_string_lossy());
     assert!(

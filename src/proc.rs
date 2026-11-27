@@ -8,12 +8,14 @@
 //!
 //! A program croft waits for runs through [`Bounded`], which states what
 //! is kept of each output, whether it runs apart from croft's terminal and
-//! how long it may take.
+//! how long it may take. A program croft looks for, on `PATH` or in a list
+//! of folders, is found through [`find`], by one rule for what can run.
 
 use std::ffi::OsString;
 use std::process::{Command, Stdio};
 
 mod bounded;
+pub(crate) mod find;
 #[cfg(test)]
 pub(crate) mod record;
 

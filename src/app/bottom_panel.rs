@@ -491,11 +491,12 @@ impl App {
             return Some(ProjectCheck::Empty);
         }
         let local = root.join("node_modules").join(".bin").join("tsc");
-        let (program, prefix): (std::ffi::OsString, &[&str]) = if local.is_file() {
-            (local.into_os_string(), &[])
-        } else {
-            (std::ffi::OsString::from("npx"), &["--no-install", "tsc"])
-        };
+        let (program, prefix): (std::ffi::OsString, &[&str]) =
+            if crate::proc::find::runnable(&local) {
+                (local.into_os_string(), &[])
+            } else {
+                (std::ffi::OsString::from("npx"), &["--no-install", "tsc"])
+            };
         Some(ProjectCheck::Run(
             runs.into_iter()
                 .map(|args| {

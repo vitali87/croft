@@ -53,10 +53,7 @@ pub(super) fn resolve_claude_in(on_path: bool, dirs: &[PathBuf]) -> Option<Strin
     if on_path {
         return Some(String::from("claude"));
     }
-    dirs.iter()
-        .map(|d| d.join("claude"))
-        .find(|p| p.is_file())
-        .map(|p| p.to_string_lossy().into_owned())
+    crate::proc::find::first_in("claude", dirs).map(|p| p.to_string_lossy().into_owned())
 }
 
 /// The claude program to spawn, resolved to an absolute path on a stripped

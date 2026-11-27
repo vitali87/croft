@@ -8,25 +8,13 @@ use super::*;
 /// config resolvable), then `PATH`, then the usual global dirs — absolute for
 /// the same GUI-stripped-PATH reason as [`cargo_cmd`].
 pub(super) fn js_binary(root: &Path, name: &str) -> PathBuf {
-    let local = root.join("node_modules").join(".bin").join(name);
-    if local.is_file() {
-        return local;
-    }
-    if let Some(path_var) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                return candidate;
-            }
-        }
-    }
-    for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
-        let candidate = PathBuf::from(dir).join(name);
-        if candidate.is_file() {
-            return candidate;
-        }
-    }
-    PathBuf::from(name)
+    let path_dirs = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let dirs = std::iter::once(root.join("node_modules").join(".bin"))
+        .chain(path_dirs)
+        .chain(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from));
+    crate::proc::find::first_in(name, dirs).unwrap_or_else(|| PathBuf::from(name))
 }
 
 /// `<vitest|jest> <args>` rooted at the workspace, with piped stdio.

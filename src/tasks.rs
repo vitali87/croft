@@ -417,7 +417,7 @@ fn tsconfig_tasks(root: &Path) -> Vec<Task> {
         .filter(|n| !n.contains(char::is_whitespace))
         .collect();
     names.sort();
-    let tsc = if root.join("node_modules/.bin/tsc").is_file() {
+    let tsc = if crate::proc::find::runnable(&root.join("node_modules/.bin/tsc")) {
         "node_modules/.bin/tsc"
     } else {
         "tsc"
@@ -1323,10 +1323,7 @@ fn cmake_condition_holds(c: &serde_json::Value, preset_name: &str) -> bool {
 }
 
 fn pyproject_tasks(root: &Path) -> Vec<Task> {
-    let on_path = |tool: &str| {
-        std::env::var_os("PATH")
-            .is_some_and(|paths| std::env::split_paths(&paths).any(|p| p.join(tool).is_file()))
-    };
+    let on_path = |tool: &str| crate::proc::find::on_path(tool).is_some();
     pyproject_tasks_on(root, &on_path)
 }
 
@@ -1348,7 +1345,7 @@ fn pyproject_tasks_on(root: &Path, on_path: &dyn Fn(&str) -> bool) -> Vec<Task> 
     let tool = |name: &str| table.get("tool").and_then(|t| t.get(name));
     let venv = [".venv", "venv"]
         .into_iter()
-        .find(|v| root.join(v).join("bin/python").is_file());
+        .find(|v| crate::proc::find::runnable(&root.join(v).join("bin/python")));
     // (prefix for a script, the pytest command)
     let uv_on_path = on_path("uv");
     let uv_runs = root.join("uv.lock").exists() && uv_on_path;
@@ -1457,6 +1454,15 @@ fn dedup(tasks: Vec<Task>) -> Vec<Task> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// A project venv's `bin/python`, runnable as a real one is.
+    fn venv_python(root: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let python = root.join(".venv/bin/python");
+        std::fs::create_dir_all(python.parent().unwrap()).unwrap();
+        std::fs::write(&python, "").unwrap();
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 
     fn commands(root: &Path) -> Vec<String> {
         discover_tasks(root)
@@ -2327,8 +2333,7 @@ mod tests {
             py_commands_with(tmp.path(), &["uv"]),
             ["uv run serve", "uv run pytest"]
         );
-        std::fs::create_dir_all(tmp.path().join(".venv/bin")).unwrap();
-        std::fs::write(tmp.path().join(".venv/bin/python"), "").unwrap();
+        venv_python(tmp.path());
         assert_eq!(
             py_commands_with(tmp.path(), &[]),
             [".venv/bin/serve", ".venv/bin/python -m pytest"]
@@ -2340,13 +2345,9 @@ mod tests {
     /// that fail with exit 127.
     #[test]
     fn a_project_whose_tool_is_not_installed_runs_through_its_venv() {
-        let venv = |root: &Path| {
-            std::fs::create_dir_all(root.join(".venv/bin")).unwrap();
-            std::fs::write(root.join(".venv/bin/python"), "").unwrap();
-        };
         let poetry = tempfile::tempdir().unwrap();
         std::fs::write(poetry.path().join("pyproject.toml"), POETRY_PYPROJECT).unwrap();
-        venv(poetry.path());
+        venv_python(poetry.path());
         assert_eq!(
             py_commands_with(poetry.path(), &["uv"]),
             [".venv/bin/calc", ".venv/bin/python -m pytest"]
@@ -2358,7 +2359,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(pdm.path().join("pdm.lock"), "").unwrap();
-        venv(pdm.path());
+        venv_python(pdm.path());
         assert_eq!(
             py_commands_with(pdm.path(), &["poetry"]),
             [".venv/bin/python -m pytest"]
@@ -2370,7 +2371,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(uv.path().join("uv.lock"), "").unwrap();
-        venv(uv.path());
+        venv_python(uv.path());
         assert_eq!(
             py_commands(uv.path(), false),
             [".venv/bin/python -m pytest"]
@@ -2383,8 +2384,7 @@ mod tests {
     fn a_project_whose_tool_is_installed_still_uses_it() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("pyproject.toml"), POETRY_PYPROJECT).unwrap();
-        std::fs::create_dir_all(tmp.path().join(".venv/bin")).unwrap();
-        std::fs::write(tmp.path().join(".venv/bin/python"), "").unwrap();
+        venv_python(tmp.path());
         assert_eq!(
             py_commands_with(tmp.path(), &["poetry"]),
             ["poetry run calc", "poetry run pytest"]
@@ -2403,8 +2403,7 @@ mod tests {
                 .replace("tool.poetry.", "project."),
         )
         .unwrap();
-        std::fs::create_dir_all(tmp.path().join(".venv/bin")).unwrap();
-        std::fs::write(tmp.path().join(".venv/bin/python"), "").unwrap();
+        venv_python(tmp.path());
         assert_eq!(
             py_commands(tmp.path(), true),
             [".venv/bin/calc", ".venv/bin/python -m pytest"]
@@ -2822,6 +2821,7 @@ mod tests {
     /// task running `tsc -p <file>` (the project's own tsc when installed).
     #[test]
     fn vs_code_task_labels_find_package_scripts_and_tsc_builds() {
+        use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path();
         std::fs::write(
@@ -2853,6 +2853,11 @@ mod tests {
         );
         std::fs::create_dir_all(p.join("node_modules/.bin")).unwrap();
         std::fs::write(p.join("node_modules/.bin/tsc"), "").unwrap();
+        std::fs::set_permissions(
+            p.join("node_modules/.bin/tsc"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
         assert_eq!(
             find_task(discover_tasks(p), "tsc: build - tsconfig.json")
                 .unwrap()

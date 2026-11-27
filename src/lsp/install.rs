@@ -587,9 +587,7 @@ fn versioned_on_path(bin: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
             let Ok(full) = std::path::absolute(entry.path()) else {
                 continue;
             };
-            if crate::lsp::manager::is_executable_file(&full)
-                && best.as_ref().is_none_or(|(k, _)| key > *k)
-            {
+            if crate::proc::find::runnable(&full) && best.as_ref().is_none_or(|(k, _)| key > *k) {
                 best = Some((key, full));
             }
         }
@@ -1361,8 +1359,7 @@ pub(crate) fn uv_program_on(
     path_var: Option<&std::ffi::OsStr>,
 ) -> Option<PathBuf> {
     let on_path = path_var.is_some_and(|dirs| {
-        std::env::split_paths(dirs)
-            .any(|dir| crate::lsp::manager::is_executable_file(&dir.join("uv")))
+        std::env::split_paths(dirs).any(|dir| crate::proc::find::runnable(&dir.join("uv")))
     });
     if on_path {
         return Some(PathBuf::from("uv"));
@@ -1375,7 +1372,9 @@ pub(crate) fn uv_program_on(
     }
     candidates.push(PathBuf::from("/opt/homebrew/bin/uv"));
     candidates.push(PathBuf::from("/usr/local/bin/uv"));
-    candidates.into_iter().find(|p| p.is_file())
+    candidates
+        .into_iter()
+        .find(|p| crate::proc::find::runnable(p))
 }
 
 /// Return a usable `uv`, bootstrapping it via the official installer if the box
@@ -1537,9 +1536,10 @@ fn on_disk_node_dir() -> Option<PathBuf> {
     if let Some(dir) = nvm_node_dir() {
         return Some(dir);
     }
-    well_known_node_dirs()
-        .into_iter()
-        .find(|dir| dir.join("node").is_file() && dir.join("npm").exists())
+    well_known_node_dirs().into_iter().find(|dir| {
+        crate::proc::find::runnable(&dir.join("node"))
+            && crate::proc::find::runnable(&dir.join("npm"))
+    })
 }
 
 /// Marker the probe wraps `process.execPath` in, so the real path is
@@ -1573,7 +1573,7 @@ fn detached_shell_node_dir() -> Option<PathBuf> {
 fn node_dir_from_probe(mut probe: Command, timeout: std::time::Duration) -> Option<PathBuf> {
     let out = crate::dap::install::run_probe(&mut probe, timeout, crate::proc::Apart::Session)?;
     let node = Path::new(parse_node_probe(&out)?);
-    if !node.is_file() {
+    if !crate::proc::find::runnable(node) {
         return None;
     }
     node.parent().map(Path::to_path_buf)
@@ -1641,7 +1641,7 @@ fn nvm_node_dir_in(versions: &Path) -> Option<PathBuf> {
     let mut best: Option<((u64, u64, u64), PathBuf)> = None;
     for entry in std::fs::read_dir(versions).ok()?.flatten() {
         let bin = entry.path().join("bin");
-        if !bin.join("node").is_file() {
+        if !crate::proc::find::runnable(&bin.join("node")) {
             continue;
         }
         let version = parse_node_version(&entry.file_name().to_string_lossy());
@@ -2506,6 +2506,7 @@ mod tests {
 
     #[test]
     fn nvm_node_dir_picks_highest_version_with_a_node_binary() {
+        use std::os::unix::fs::PermissionsExt;
         let tmp = TempDir::new().unwrap();
         let versions = tmp.path();
         // Two versions with node, one stray dir without — highest wins.
@@ -2513,6 +2514,8 @@ mod tests {
             let bin = versions.join(v).join("bin");
             std::fs::create_dir_all(&bin).unwrap();
             std::fs::write(bin.join("node"), b"#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(bin.join("node"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
         }
         std::fs::create_dir_all(versions.join("v20.0.0")).unwrap(); // no bin/node
         let dir = nvm_node_dir_in(versions).unwrap();

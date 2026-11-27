@@ -33,7 +33,7 @@ pub(in crate::app) fn lldb_dap_rank(name: &str) -> Option<i64> {
 /// none is installed.
 pub(in crate::app) fn lldb_dap_path() -> Option<String> {
     let xcode = "/Library/Developer/CommandLineTools/usr/bin/lldb-dap";
-    if std::path::Path::new(xcode).is_file() {
+    if crate::proc::find::runnable(Path::new(xcode)) {
         return Some(xcode.to_string());
     }
     let path_var = std::env::var_os("PATH")?;
@@ -50,7 +50,7 @@ pub(in crate::app) fn lldb_dap_path() -> Option<String> {
                 continue;
             };
             let full = entry.path();
-            if is_executable_file(&full) && best.as_ref().is_none_or(|(r, _)| rank > *r) {
+            if crate::proc::find::runnable(&full) && best.as_ref().is_none_or(|(r, _)| rank > *r) {
                 best = Some((rank, full.to_string_lossy().into_owned()));
             }
         }
@@ -67,17 +67,6 @@ pub(in crate::app) fn lldb_dap_missing_message() -> String {
         "install LLVM, e.g. apt install lldb"
     };
     format!("lldb-dap not found ({hint})")
-}
-
-/// Whether `path` is a regular file with the executable bit set — i.e. a
-/// compiled binary or script croft can run directly (`./file`) and debug via
-/// lldb-dap without a build step. The honest signal for "directly executable",
-/// since such files usually have no extension.
-pub(in crate::app) fn is_executable_file(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
 }
 
 impl App {

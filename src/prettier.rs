@@ -83,7 +83,9 @@ pub fn for_file(file: &Path) -> Option<PathBuf> {
     }
     let dirs = || file.ancestors().skip(1);
     dirs().find(|d| has_config(d))?;
-    dirs().map(|d| d.join(BIN)).find(|b| b.is_file())
+    dirs()
+        .map(|d| d.join(BIN))
+        .find(|b| crate::proc::find::runnable(b))
 }
 
 fn has_config(dir: &Path) -> bool {
@@ -225,14 +227,18 @@ pub fn edits_for(old: &[String], new: &str) -> Vec<crate::text_edit::TextSpanEdi
 mod tests {
     use super::*;
 
-    /// A project with `node_modules/.bin/prettier` (an empty stand-in) and
-    /// `files` written under it.
+    /// A project with `files` written under it; one in `node_modules/.bin`
+    /// can run, as npm leaves it.
     fn project(files: &[(&str, &str)]) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
         let tmp = tempfile::tempdir().unwrap();
         for (rel, body) in files {
             let p = tmp.path().join(rel);
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            std::fs::write(p, body).unwrap();
+            std::fs::write(&p, body).unwrap();
+            if rel.starts_with("node_modules/.bin/") {
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
         }
         tmp
     }

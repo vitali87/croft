@@ -185,28 +185,16 @@ struct MetaPackage {
 /// — which lives in `/usr/bin` — is found. Resolving by absolute path, like
 /// croft already does for language servers, makes it launch-agnostic.
 pub(crate) fn cargo_binary() -> PathBuf {
-    if let Some(path_var) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join("cargo");
-            if candidate.is_file() {
-                return candidate;
-            }
-        }
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        let candidate = PathBuf::from(home).join(".cargo").join("bin").join("cargo");
-        if candidate.is_file() {
-            return candidate;
-        }
-    }
-    for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
-        let candidate = PathBuf::from(dir).join("cargo");
-        if candidate.is_file() {
-            return candidate;
-        }
-    }
+    let path_dirs = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let cargo_home = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo").join("bin"));
+    let dirs = path_dirs
+        .into_iter()
+        .chain(cargo_home)
+        .chain(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from));
     // Last resort: let the OS resolve it and fail honestly into the empty state.
-    PathBuf::from("cargo")
+    crate::proc::find::first_in("cargo", dirs).unwrap_or_else(|| PathBuf::from("cargo"))
 }
 
 fn fetch_rust(root: &Path) -> Vec<Dependency> {

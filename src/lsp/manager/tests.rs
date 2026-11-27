@@ -2396,10 +2396,7 @@ fn drain_completion_blocking(manager: &LspManager, timeout: Duration) -> Option<
 
 /// The `python3` the stub server runs under, if there is one.
 fn python_for_stub_server() -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|entry| entry.join("python3"))
-        .find(|candidate| is_executable_file(candidate))
+    crate::proc::find::on_path("python3")
 }
 
 fn any_python_completion_server_on_path() -> bool {

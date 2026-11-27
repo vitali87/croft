@@ -325,7 +325,7 @@ fn known_node() -> Option<String> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
-        .filter(|path| Path::new(path).is_file())
+        .filter(|path| crate::proc::find::runnable(Path::new(path)))
 }
 
 /// The directory containing the resolved node binary, when it is an absolute
@@ -350,7 +350,7 @@ fn resolve_node_via_login_shell() -> Option<String> {
         crate::proc::Apart::Session,
     )?;
     let path = crate::lsp::install::parse_node_probe(&out)?;
-    Path::new(path).is_file().then(|| path.to_string())
+    crate::proc::find::runnable(Path::new(path)).then(|| path.to_string())
 }
 
 /// Run a probe, `cmd`, to its exit or `timeout`: a program asked one
@@ -394,9 +394,7 @@ pub(crate) const PROBE_TAIL: usize = 64 * 1024;
 /// Whether `bin` resolves on PATH (a `command -v` check via the shell-less
 /// `which`-style scan of PATH entries).
 fn which(bin: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|p| p.join(bin).is_file()))
-        .unwrap_or(false)
+    crate::proc::find::on_path(bin).is_some()
 }
 
 /// Ensure the vscode-js-debug server is installed, downloading + extracting the
@@ -491,9 +489,7 @@ pub fn find_dlv(
         None => dirs.extend(home.map(|h| h.join("go").join("bin"))),
     }
     dirs.extend(home.map(|h| h.join(".croft").join("servers").join("go")));
-    dirs.into_iter()
-        .map(|d| d.join("dlv"))
-        .find(|p| p.is_file())
+    crate::proc::find::first_in("dlv", dirs)
 }
 
 /// The command "Debug: Install Go Debugger (delve)" runs, visibly, in a
@@ -668,6 +664,13 @@ mod tests {
         assert!(DLV_INSTALL.contains("GOBIN=\"$HOME/.croft/servers/go\" go install "));
     }
 
+    /// An empty program at `path` that can run.
+    fn runnable_stand_in(path: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(path, "").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     /// #264: delve's own resolution order, PATH first; `~/go/bin` stands in
     /// for an unset GOPATH, and croft's servers dir comes last.
     #[test]
@@ -676,7 +679,7 @@ mod tests {
         let mk = |rel: &str| {
             let dir = tmp.path().join(rel);
             std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("dlv"), "").unwrap();
+            runnable_stand_in(&dir.join("dlv"));
             dir
         };
         let on_path = mk("path");
@@ -794,7 +797,7 @@ mod tests {
         for dir in [&first, &second] {
             std::fs::create_dir_all(dir.join("bin")).unwrap();
         }
-        std::fs::write(second.join("bin").join("dlv"), "").unwrap();
+        runnable_stand_in(&second.join("bin").join("dlv"));
         let gopath = std::env::join_paths([
             "",
             "relative",
@@ -806,7 +809,7 @@ mod tests {
             find_dlv(None, None, Some(&gopath), None),
             Some(second.join("bin").join("dlv"))
         );
-        std::fs::write(first.join("bin").join("dlv"), "").unwrap();
+        runnable_stand_in(&first.join("bin").join("dlv"));
         assert_eq!(
             find_dlv(None, None, Some(&gopath), None),
             Some(first.join("bin").join("dlv")),

@@ -1061,7 +1061,7 @@ fn cross_tool_lookup_finds_home_cargo_bin_outside_inherited_path() {
         cross_tool_search_dirs_from(Some(launchd_path.as_os_str()), Some(tmp.path().as_os_str()));
 
     assert_eq!(
-        find_executable_in_dirs("cargo-zigbuild", &dirs),
+        crate::proc::find::first_in("cargo-zigbuild", &dirs),
         Some(tool),
         "the remote fast path must work when Croft.app starts with launchd's stripped PATH"
     );

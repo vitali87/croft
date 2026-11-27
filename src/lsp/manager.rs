@@ -77,7 +77,6 @@ pub use diagnostics::diagnostics_source;
 pub use diagnostics::diagnostics_store_key;
 pub use diagnostics::one_line;
 use diagnostics::*;
-pub(crate) use discovery::is_executable_file;
 pub(crate) use discovery::is_on_path;
 pub(crate) use discovery::path_to_language;
 use discovery::*;

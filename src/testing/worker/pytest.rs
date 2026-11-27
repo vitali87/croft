@@ -30,7 +30,10 @@ pub(super) fn pytest_launch_on(
         // `-m pytest` needs the module: the console script says it is
         // installed without a process, and without the script the venv's
         // python is asked.
-        if python.is_file() && (bin.join("pytest").is_file() || python_has_pytest(root, &python)) {
+        if crate::proc::find::runnable(&python)
+            && (crate::proc::find::runnable(&bin.join("pytest"))
+                || python_has_pytest(root, &python))
+        {
             return (python, MODULE);
         }
     }
@@ -50,10 +53,7 @@ pub(super) fn pytest_launch_on(
 pub(super) fn python3_program(path_var: Option<&std::ffi::OsStr>) -> PathBuf {
     let path_dirs = path_var.map(std::env::split_paths).into_iter().flatten();
     let fallback = ["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from);
-    path_dirs
-        .chain(fallback)
-        .map(|dir| dir.join("python3"))
-        .find(|candidate| candidate.is_file())
+    crate::proc::find::first_in("python3", path_dirs.chain(fallback))
         .unwrap_or_else(|| PathBuf::from("python3"))
 }
 
@@ -90,30 +90,12 @@ pub(super) fn python_has_pytest(root: &Path, python: &Path) -> bool {
 /// [`cargo_cmd`] because a GUI-launched croft inherits the stripped
 /// launchd PATH.
 pub(super) fn pytest_script(path_var: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
-    if let Some(path_var) = path_var {
-        for dir in std::env::split_paths(path_var) {
-            let candidate = dir.join("pytest");
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        let candidate = PathBuf::from(home)
-            .join(".local")
-            .join("bin")
-            .join("pytest");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
-        let candidate = PathBuf::from(dir).join("pytest");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    let path_dirs = path_var.map(std::env::split_paths).into_iter().flatten();
+    let user_bin = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("bin"));
+    let dirs = path_dirs
+        .chain(user_bin)
+        .chain(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from));
+    crate::proc::find::first_in("pytest", dirs)
 }
 
 /// pytest's verbosity for a run: `<id> PASSED` lines are printed from 1

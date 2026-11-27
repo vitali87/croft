@@ -2194,11 +2194,13 @@ fn a_venv_whose_python_imports_pytest_runs_it_without_the_script() {
 #[cfg(unix)]
 #[test]
 fn a_venv_is_probed_only_without_the_script_and_skipped_when_it_lacks_pytest() {
+    use std::os::unix::fs::PermissionsExt;
     let tmp = tempfile::tempdir().unwrap();
     let with_script = tmp.path().join("a");
     let python = scriptless_venv(&with_script, 0);
     let script = python.with_file_name("pytest");
     std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(pytest_launch_on(&with_script, None).0, python);
     assert!(
         !python.with_file_name("python.log").exists(),
@@ -2560,4 +2562,26 @@ fn a_js_title_with_a_double_colon_still_runs_exactly() {
     for other in ["server connects to ::12", "server connects to"] {
         assert!(!filter.is_match(other), "{other} must not run");
     }
+}
+
+/// #2808: a `python3` or `pytest` on PATH that cannot run is passed over
+/// for the next folder's, as a shell passes it over; taken, it failed to
+/// start with "permission denied".
+#[cfg(unix)]
+#[test]
+fn a_python3_or_pytest_that_cannot_run_is_passed_over() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let (first, second) = (tmp.path().join("a"), tmp.path().join("b"));
+    for name in ["python3", "pytest"] {
+        for (dir, mode) in [(&first, 0o644), (&second, 0o755)] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join(name), "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(dir.join(name), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+        }
+    }
+    let path = std::env::join_paths([&first, &second]).unwrap();
+    assert_eq!(python3_program(Some(&path)), second.join("python3"));
+    assert_eq!(pytest_script(Some(&path)), Some(second.join("pytest")));
 }

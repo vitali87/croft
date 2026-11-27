@@ -189,30 +189,10 @@ pub(super) fn report_missing_servers_once(lang: Language, note: &str) {
     crate::lsp::install::set_status(note);
 }
 
+/// Whether `cmd` is a program on croft's PATH, by [`crate::proc::find`]'s
+/// rule.
 pub(crate) fn is_on_path(cmd: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|entry| is_executable_file(&entry.join(cmd)))
-}
-
-/// True when `path` is a regular file with at least one execute bit set. On
-/// non-unix any existing file counts (no mode bits to inspect).
-pub(crate) fn is_executable_file(path: &Path) -> bool {
-    if !path.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path)
-            .map(|m| m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
+    crate::proc::find::on_path(cmd).is_some()
 }
 
 /// Toolchain `bin` dirs that a macOS GUI launch (Finder / Dock / the Croft.app
@@ -235,14 +215,6 @@ pub(super) fn toolchain_fallback_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-/// Absolute path to `cmd` in the first `dirs` entry that holds an executable
-/// file of that name, or `None`.
-pub(super) fn find_executable_in(cmd: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
-    dirs.iter()
-        .map(|dir| dir.join(cmd))
-        .find(|candidate| is_executable_file(candidate))
-}
-
 /// Resolve a PATH-only server (no managed provision) to a spawnable
 /// `(config, extra_path)` pair, or `None` to skip it. When `on_path` the
 /// bare command spawns as-is; otherwise the toolchain `fallback_dirs` are
@@ -256,7 +228,7 @@ pub(super) fn resolve_path_only(
     if on_path {
         return Some((config.clone(), Vec::new()));
     }
-    let abs = find_executable_in(&config.command, fallback_dirs)?;
+    let abs = crate::proc::find::first_in(&config.command, fallback_dirs)?;
     let extra = abs.parent().map(Path::to_path_buf).into_iter().collect();
     let mut resolved = config.clone();
     resolved.command = abs.to_string_lossy().into_owned();
@@ -347,7 +319,7 @@ pub(super) fn command_path(command: &str) -> Option<PathBuf> {
         return Some(path.to_path_buf());
     }
     let dirs: Vec<PathBuf> = std::env::split_paths(&std::env::var_os("PATH")?).collect();
-    find_executable_in(command, &dirs)
+    crate::proc::find::first_in(command, &dirs)
 }
 
 /// The `rustup` that `candidate` is a proxy for, or `None` when it is a

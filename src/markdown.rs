@@ -735,10 +735,7 @@ fn interpreter_on_path(name: &str) -> bool {
     // a PATH walk per python fence per keystroke is a syscall burst.
     static PYTHON3: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     static NODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let probe = || {
-        std::env::var_os("PATH")
-            .is_some_and(|path| std::env::split_paths(&path).any(|d| d.join(name).is_file()))
-    };
+    let probe = || crate::proc::find::on_path(name).is_some();
     match name {
         "python3" => *PYTHON3.get_or_init(probe),
         "node" => *NODE.get_or_init(probe),

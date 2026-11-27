@@ -20,12 +20,10 @@ pub(in crate::app) fn project_python_on(
     path_var: Option<&std::ffi::OsStr>,
 ) -> Option<PathBuf> {
     let venv = root.join(".venv").join("bin").join("python");
-    if venv.is_file() {
+    if crate::proc::find::runnable(&venv) {
         return Some(venv);
     }
-    std::env::split_paths(path_var?)
-        .map(|dir| dir.join("python3"))
-        .find(|candidate| candidate.is_file())
+    crate::proc::find::on_path_in("python3", path_var)
 }
 
 /// Walk from `start` up to and including `workspace_root` looking for a
@@ -44,7 +42,7 @@ pub(in crate::app) fn find_python_venv(
     loop {
         for venv_name in [".venv", "venv", ".env"] {
             let py = probe.join(venv_name).join("bin").join("python");
-            if py.is_file() {
+            if crate::proc::find::runnable(&py) {
                 return Some((py, probe));
             }
         }

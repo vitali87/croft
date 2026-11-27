@@ -285,14 +285,7 @@ pub fn detect_backend() -> Option<PdfBackend> {
 }
 
 fn which(cmd: &str) -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(cmd);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    crate::proc::find::on_path(cmd)
 }
 
 /// Total pages in `pdf`. Returns None when no detector is available so the

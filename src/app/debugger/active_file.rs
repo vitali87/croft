@@ -52,7 +52,7 @@ impl App {
             _ => {
                 // No known script runner. If the file is itself an executable
                 // (a compiled binary, usually extensionless), run it directly.
-                if is_executable_file(file) {
+                if crate::proc::find::runnable(file) {
                     return Some(RunSpec {
                         program: file_str,
                         args: vec![],
@@ -100,7 +100,7 @@ impl App {
             None => {
                 // An executable binary (e.g. a compiled `target/debug/app`) can
                 // be debugged directly by lldb-dap with no build step.
-                if is_executable_file(&path) {
+                if crate::proc::find::runnable(&path) {
                     self.launch_lldb(&path, &path);
                 } else if let Some(ext_id) = crate::dap::registry::disabled_extension_for(&ext) {
                     // A debugger exists for this file type but its extension is

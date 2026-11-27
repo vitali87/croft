@@ -10,12 +10,10 @@ pub(super) fn go_binary() -> PathBuf {
     let path_dirs = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
         .unwrap_or_default();
-    path_dirs
+    let dirs = path_dirs
         .into_iter()
-        .chain(["/usr/local/go/bin", "/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from))
-        .map(|d| d.join("go"))
-        .find(|p| p.is_file())
-        .unwrap_or_else(|| PathBuf::from("go"))
+        .chain(["/usr/local/go/bin", "/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from));
+    crate::proc::find::first_in("go", dirs).unwrap_or_else(|| PathBuf::from("go"))
 }
 
 /// `go test -json <args>` in `root` (#264).

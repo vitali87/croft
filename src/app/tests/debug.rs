@@ -1096,6 +1096,7 @@ fn f5_refuses_a_project_venv_too_old_for_debugpy() {
 /// `python3` on PATH is still preferred, as for Run.
 #[test]
 fn a_debuggee_with_no_venv_and_no_python3_is_left_to_the_debug_venv() {
+    use std::os::unix::fs::PermissionsExt;
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("proj");
     let pkg = root.join("pkg");
@@ -1109,6 +1110,7 @@ fn a_debuggee_with_no_venv_and_no_python3_is_left_to_the_debug_venv() {
     let bin = tmp.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     std::fs::write(bin.join("python3"), b"#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(bin.join("python3"), std::fs::Permissions::from_mode(0o755)).unwrap();
     let with_python = std::env::join_paths([&empty, &bin]).unwrap();
     assert_eq!(
         super::debuggee_python(&pkg, &root, Some(&with_python)),
@@ -6898,5 +6900,26 @@ fn a_member_ending_while_the_rest_wait_for_their_debugger_keeps_the_set() {
     assert_eq!(
         app.status,
         "A ended — the rest start when their debugger is set up · Shift+F5 stops all"
+    );
+}
+
+/// #2808: the interpreter F5 runs a program under passes over a `python3`
+/// on PATH that cannot run, for the next folder's.
+#[cfg(unix)]
+#[test]
+fn the_debuggee_python_passes_over_a_python3_that_cannot_run() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let (first, second) = (tmp.path().join("a"), tmp.path().join("b"));
+    for (dir, mode) in [(&first, 0o644), (&second, 0o755)] {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("python3"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(dir.join("python3"), std::fs::Permissions::from_mode(mode))
+            .unwrap();
+    }
+    let path = std::env::join_paths([&first, &second]).unwrap();
+    assert_eq!(
+        super::debuggee_python(tmp.path(), tmp.path(), Some(&path)),
+        Some(second.join("python3"))
     );
 }
