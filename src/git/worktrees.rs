@@ -105,8 +105,10 @@ pub fn lane_removal_block(lane: &Path) -> Option<String> {
     let Some(path_str) = lane.to_str() else {
         return Some(format!("{} is not a readable path", lane.display()));
     };
-    let output = crate::proc::command("git")
-        .args(["-C", path_str, "status", "--porcelain", "--ignored"])
+    let output = Git::new()
+        .at(path_str)
+        .args(["status", "--porcelain", "--ignored"])
+        .into_command()
         .output();
     let Ok(output) = output else {
         return Some(String::from(
@@ -252,12 +254,14 @@ pub fn checkout_pr_worktree(
     // No prompt: this runs off the UI thread, where a credential prompt,
     // or ssh's own passphrase or host-key question on /dev/tty, would wait
     // forever on a terminal nobody sees, or draw over the UI.
-    let mut fetch = crate::proc::command("git");
-    fetch
-        .args(["-C", repo_s, "fetch", "--quiet", remote])
-        .arg(format!("refs/pull/{number}/head"));
-    never_prompt(&mut fetch);
-    let fetch = fetch.output().map_err(|e| e.to_string())?;
+    let fetch = Git::new()
+        .at(repo_s)
+        .args(["fetch", "--quiet", remote])
+        .arg(format!("refs/pull/{number}/head"))
+        .never_prompting()
+        .into_command()
+        .output()
+        .map_err(|e| e.to_string())?;
     if !fetch.status.success() {
         let err = String::from_utf8_lossy(&fetch.stderr);
         return Err(err
