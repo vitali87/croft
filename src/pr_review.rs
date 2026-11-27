@@ -201,7 +201,7 @@ pub fn run_gh(
     let ran = crate::proc::Bounded {
         stdout: crate::proc::Keep::All { cap: GH_OUTPUT_CAP },
         stderr: crate::proc::Keep::Tail(GH_ERROR_TAIL),
-        detached: false,
+        apart: crate::proc::Apart::No,
         limit: timeout,
         retry_busy: true,
     }

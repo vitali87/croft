@@ -1827,7 +1827,7 @@ pub(super) fn bounded_output(
             cap: BOUNDED_OUTPUT_CAP,
         },
         stderr: crate::proc::Keep::Nothing,
-        detached: false,
+        apart: crate::proc::Apart::No,
         limit: budget,
         retry_busy: true,
     }

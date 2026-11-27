@@ -144,9 +144,7 @@ pub fn send_osc52(text: &str) {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::io::Write;
-    use std::os::unix::process::CommandExt;
-    use std::process::{Command, Stdio};
+    use std::process::Command;
 
     /// Write `text` to the system clipboard on Linux.
     ///
@@ -161,78 +159,35 @@ mod linux {
             || write_via(&["xsel", "--clipboard", "--input"], text, deadline)
     }
 
+    /// How the copy and paste helpers run: in a group of their own, so at
+    /// the deadline croft kills a child the helper forked along with it
+    /// (one left holding the pipe kept croft waiting, and its late write
+    /// raised SIGPIPE), while what a helper leaves after a clean exit is
+    /// kept: `xclip` and `wl-copy` leave a process serving the selection.
+    fn bounded(stdout: crate::proc::Keep, deadline: std::time::Instant) -> crate::proc::Bounded {
+        crate::proc::Bounded {
+            stdout,
+            stderr: crate::proc::Keep::Nothing,
+            apart: crate::proc::Apart::Group,
+            limit: deadline.saturating_duration_since(std::time::Instant::now()),
+            retry_busy: false,
+        }
+    }
+
     fn write_via(argv: &[&str], text: &str, deadline: std::time::Instant) -> bool {
         // Bounded by `deadline`, through the program's exit (#1154): a copy
         // runs on the UI thread, and a helper that never exits (xclip on an
-        // X display that never answers) froze croft for good. The text goes
-        // in on a thread, so a helper that never reads its stdin can't block
-        // a write past the pipe buffer either.
+        // X display that never answers) froze croft for good. The text is
+        // written only as fast as the helper reads it, so one that never
+        // reads it cannot block croft either.
         if std::time::Instant::now() >= deadline {
             return false;
         }
-        let Ok(mut child) = Command::new(argv[0])
-            .args(&argv[1..])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0)
-            .spawn()
-        else {
-            return false;
-        };
-        let Some(mut stdin) = child.stdin.take() else {
-            give_up(&mut child);
-            return false;
-        };
-        let bytes = text.as_bytes().to_vec();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let written = stdin.write_all(&bytes).is_ok();
-            drop(stdin);
-            let _ = tx.send(written);
-        });
-        let left = deadline.saturating_duration_since(std::time::Instant::now());
-        if rx.recv_timeout(left) != Ok(true) {
-            give_up(&mut child);
-            return false;
-        }
-        wait_by(&mut child, deadline).is_some_and(|s| s.success())
-    }
-
-    /// Kill a helper croft has stopped waiting on, with everything it
-    /// started, and reap it. Its own group (`process_group(0)` at spawn),
-    /// because a child it forked keeps the pipe open: croft's writer thread
-    /// stayed blocked until that child exited, then wrote into a closed pipe.
-    fn give_up(child: &mut std::process::Child) {
-        if let Ok(pid) = libc::pid_t::try_from(child.id()) {
-            // SAFETY: a negative pid addresses the helper's own process
-            // group; the call only sends a signal.
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
-            }
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-
-    /// The helper's exit status, or None (and the helper killed) once
-    /// `deadline` passes first.
-    fn wait_by(
-        child: &mut std::process::Child,
-        deadline: std::time::Instant,
-    ) -> Option<std::process::ExitStatus> {
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => return Some(status),
-                Ok(None) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-                _ => {
-                    give_up(child);
-                    return None;
-                }
-            }
-        }
+        bounded(crate::proc::Keep::Nothing, deadline)
+            .run_fed(Command::new(argv[0]).args(&argv[1..]), text.as_bytes())
+            // A helper that exits before taking all of the text did not copy
+            // it, whatever its status says.
+            .is_ok_and(|ran| ran.took_input && ran.status.success())
     }
 
     /// Read text from the system clipboard on Linux.
@@ -251,7 +206,6 @@ mod linux {
     }
 
     fn read_via(argv: &[&str], deadline: std::time::Instant) -> Option<String> {
-        use std::io::Read;
         // Bounded by `deadline`, through the program's exit: a paste runs on
         // the UI thread, and a clipboard owner that never answers (a hung X
         // client holding the selection) would freeze croft for as long as
@@ -259,34 +213,16 @@ mod linux {
         if std::time::Instant::now() >= deadline {
             return None;
         }
-        let mut child = Command::new(argv[0])
-            .args(&argv[1..])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .process_group(0)
-            .spawn()
+        let ran = bounded(crate::proc::Keep::All { cap: PASTE_CAP }, deadline)
+            .run(Command::new(argv[0]).args(&argv[1..]))
             .ok()?;
-        let mut stdout = child.stdout.take()?;
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = stdout.read_to_end(&mut buf);
-            let _ = tx.send(buf);
-        });
-        let left = deadline.saturating_duration_since(std::time::Instant::now());
-        let Ok(bytes) = rx.recv_timeout(left) else {
-            give_up(&mut child);
-            return None;
-        };
-        // Stdout closing is not exiting: a program can close it and keep
-        // running, so the wait is bounded too.
-        let status = wait_by(&mut child, deadline)?;
-        if !status.success() {
-            return None;
-        }
-        Some(String::from_utf8_lossy(&bytes).to_string())
+        ran.status.success().then(|| ran.stdout.text())
     }
+
+    /// The most of a paste croft keeps: far past any clipboard, there only
+    /// so a reader that never stops writing cannot fill croft's memory
+    /// before the deadline.
+    const PASTE_CAP: usize = 1 << 30;
 
     #[cfg(test)]
     mod tests {
@@ -384,6 +320,14 @@ mod linux {
             let pid = pid.trim();
             assert!(!gone_soon(pid), "the selection server {pid} was killed");
             let _ = std::process::Command::new("kill").arg(pid).status();
+        }
+
+        /// A helper that exits cleanly without taking all of the text did not
+        /// copy it.
+        #[test]
+        fn a_clipboard_writer_that_skips_the_text_did_not_copy_it() {
+            let big = "x".repeat(4 << 20);
+            assert!(!super::write_via(&["sh", "-c", "exit 0"], &big, soon()));
         }
 
         /// A helper that takes the text and exits still copies, a failing

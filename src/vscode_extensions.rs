@@ -675,7 +675,7 @@ pub fn installed_via(mut cmd: std::process::Command, timeout: std::time::Duratio
     let ran = crate::proc::Bounded {
         stdout: crate::proc::Keep::All { cap: LIST_CAP },
         stderr: crate::proc::Keep::Nothing,
-        detached: false,
+        apart: crate::proc::Apart::No,
         limit: timeout,
         retry_busy: false,
     }

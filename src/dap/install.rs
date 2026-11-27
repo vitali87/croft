@@ -85,7 +85,7 @@ pub fn python_version(python: &Path) -> Option<PyVersion> {
     let out = run_probe(
         Command::new(python).args(["-c", "import sys; print('%d.%d' % sys.version_info[:2])"]),
         Duration::from_secs(5),
-        false,
+        crate::proc::Apart::No,
     )?;
     PyVersion::parse(&out)
 }
@@ -182,7 +182,7 @@ fn resolve_node_via_login_shell() -> Option<String> {
     let out = run_probe(
         &mut crate::lsp::install::node_probe_command(),
         Duration::from_secs(8),
-        true,
+        crate::proc::Apart::Session,
     )?;
     let path = crate::lsp::install::parse_node_probe(&out)?;
     Path::new(path).is_file().then(|| path.to_string())
@@ -197,18 +197,23 @@ fn resolve_node_via_login_shell() -> Option<String> {
 ///
 /// Its stdout is read as it runs, so an rc that prints more than a pipe
 /// holds cannot block the probe, and only the last [`PROBE_TAIL`] bytes are
-/// kept, where the answer is. One that runs `detached`, as the node probe
-/// does ([`crate::lsp::install::node_probe_command`]), is killed with
+/// kept, where the answer is. One that runs in a session of its own
+/// ([`crate::proc::Apart::Session`]), as the node probe does
+/// ([`crate::lsp::install::node_probe_command`]), is killed with
 /// everything it started once croft is done with it, at its exit or at
 /// `timeout`, so whatever its rc left running goes with it (#2755).
-pub(crate) fn run_probe(cmd: &mut Command, timeout: Duration, detached: bool) -> Option<String> {
+pub(crate) fn run_probe(
+    cmd: &mut Command,
+    timeout: Duration,
+    apart: crate::proc::Apart,
+) -> Option<String> {
     // A program written a moment ago (a test's stand-in interpreter) is "Text
     // file busy" while another thread's forked child still holds its write
     // descriptor; that read as "no version" instead of waiting it out.
     let ran = crate::proc::Bounded {
         stdout: crate::proc::Keep::Tail(PROBE_TAIL),
         stderr: crate::proc::Keep::Nothing,
-        detached,
+        apart,
         limit: timeout,
         retry_busy: true,
     }
@@ -454,7 +459,7 @@ mod tests {
         let out = run_probe(
             Command::new("/bin/sh").args(["-c", "yes croft | head -c 200000; echo answer"]),
             Duration::from_secs(3),
-            false,
+            crate::proc::Apart::No,
         )
         .expect("the probe answers");
         assert_eq!(out.len(), PROBE_TAIL, "only the end is kept");

@@ -143,7 +143,7 @@ pub(super) fn handle_copy_request(host: &str, socket: &Path, inbox_dir: &str, re
     let ran = crate::proc::Bounded {
         stdout: crate::proc::Keep::All { cap: limit },
         stderr: crate::proc::Keep::Nothing,
-        detached: false,
+        apart: crate::proc::Apart::No,
         limit: COPY_READ_TIMEOUT,
         retry_busy: false,
     }
