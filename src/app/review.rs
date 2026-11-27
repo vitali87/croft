@@ -833,8 +833,17 @@ impl App {
         }
         let out = crate::gh::Client::new(&self.review_gh, root, std::time::Duration::from_secs(5))
             .run(&["pr", "view", "--json", "number", "--jq", ".number"]);
-        let number = match out {
-            Ok(stdout) => String::from_utf8_lossy(&stdout).trim().to_string(),
+        // Only a number is a PR to comment on: any other answer, however
+        // gh came to give it, is none.
+        let answer = out.and_then(|stdout| {
+            std::str::from_utf8(&stdout)
+                .ok()
+                .and_then(|text| text.trim().parse::<u64>().ok())
+                .map(|n| n.to_string())
+                .ok_or_else(|| crate::gh::Error::NoAnswer(String::from("not a PR number")))
+        });
+        let number = match answer {
+            Ok(number) => number,
             // A gh that is missing or signed out says how to fix it, as the
             // review tab does (#917), not that the branch has no PR.
             Err(e) => {
