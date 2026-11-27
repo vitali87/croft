@@ -522,103 +522,60 @@ fn run_one_untimed(host: &str, command: &str, timeout: Duration) -> HostResult {
     run_killable(cmd, &program, host, timeout)
 }
 
+/// The most of each of a command's outputs a tile keeps: far past anything
+/// a tile shows, there only so a command that never stops printing cannot
+/// fill croft's memory before its deadline.
+const OUTPUT_CAP: usize = 1 << 30;
+
 /// Run `cmd` (`program`, for messages) for `host`, collecting stdout and
 /// stderr, and kill it if it outlives `timeout`.
+///
+/// Both outputs are read while the command runs, so one printing more than a
+/// pipe holds (any `journalctl`) still finishes, and the answer comes at its
+/// exit, so a background process it leaves holding a pipe (`nohup srv &`)
+/// cannot hold the tile.
 fn run_killable(
     mut cmd: std::process::Command,
     program: &str,
     host: &str,
     timeout: Duration,
 ) -> HostResult {
-    use std::io::Read;
     let result = |output: String, exit: Option<i32>| HostResult {
         host: host.to_string(),
         output,
         exit,
         elapsed: Duration::ZERO,
     };
-    let spawned = cmd
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn();
-    let mut child = match spawned {
-        Ok(c) => c,
-        Err(e) => return result(format!("could not run {program}: {e}"), None),
-    };
-    // Both pipes drain on their own threads WHILE the child runs. Read only
-    // after exit, a command printing more than a pipe buffer (~64 KiB, any
-    // `journalctl`) blocked on the write, never exited, and was killed at
-    // the deadline with all its output lost.
-    // Into a shared buffer, chunk by chunk: a command that leaves a
-    // background process holding the pipe (`nohup srv &`) never reaches EOF,
-    // and waiting for the whole read lost everything it had printed.
-    let drain = |pipe: Option<Box<dyn Read + Send>>| {
-        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-        let sink = buf.clone();
-        std::thread::spawn(move || {
-            if let Some(mut p) = pipe {
-                let mut chunk = [0u8; 8192];
-                while let Ok(n) = p.read(&mut chunk) {
-                    if n == 0 {
-                        break;
-                    }
-                    if let Ok(mut b) = sink.lock() {
-                        b.extend_from_slice(&chunk[..n]);
-                    }
-                }
-            }
-            let _ = done_tx.send(());
-        });
-        (buf, done_rx)
-    };
-    let stdout = drain(
-        child
-            .stdout
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-    );
-    let stderr = drain(
-        child
-            .stderr
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-    );
-    // Poll rather than block, so the child can be killed when its time is
-    // up. `wait_with_output` would consume the child and leave no handle to
-    // kill, which is how the abandoned processes accumulated.
-    let deadline = std::time::Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                // Reaped, so the process does not linger as a zombie.
-                let _ = child.wait();
-                return result(String::from("timed out"), None);
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
-            Err(e) => return result(format!("could not wait on {program}: {e}"), None),
+    let kept = crate::proc::Keep::All { cap: OUTPUT_CAP };
+    let ran = crate::proc::Bounded {
+        stdout: kept,
+        stderr: kept,
+        apart: crate::proc::Apart::No,
+        limit: timeout,
+        retry_busy: false,
+    }
+    .run(&mut cmd);
+    let ran = match ran {
+        Ok(ran) => ran,
+        Err(crate::proc::RunError::Spawn(e)) => {
+            return result(format!("could not run {program}: {e}"), None);
+        }
+        Err(crate::proc::RunError::TimedOut) => return result(String::from("timed out"), None),
+        Err(crate::proc::RunError::TooLong { cap, .. }) => {
+            return result(
+                format!("{program} printed more than {} MiB", cap >> 20),
+                None,
+            );
+        }
+        Err(crate::proc::RunError::Wait(e) | crate::proc::RunError::Pipe(e)) => {
+            return result(format!("could not wait on {program}: {e}"), None);
         }
     };
-    // A descendant the command left running can hold a pipe open past the
-    // exit, so the readers get a short grace rather than a join.
-    let grace = Duration::from_millis(500);
-    let take = |(buf, done): (
-        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
-        std::sync::mpsc::Receiver<()>,
-    )| {
-        let _ = done.recv_timeout(grace);
-        buf.lock().map(|b| b.clone()).unwrap_or_default()
-    };
-    let out = take(stdout);
-    let err = take(stderr);
     // stdout AND stderr: a command that failed usually said why on
     // stderr, and a tile showing an empty box for a failure tells
     // the user nothing they can act on.
-    let mut text = String::from_utf8_lossy(&out).trim_end().to_string();
-    let err = String::from_utf8_lossy(&err);
+    let mut text = ran.stdout.text().trim_end().to_string();
+    let err = ran.stderr.text();
     let err = err.trim_end();
     if !err.is_empty() {
         if !text.is_empty() {
@@ -626,7 +583,7 @@ fn run_killable(
         }
         text.push_str(err);
     }
-    result(text, status.code())
+    result(text, ran.status.code())
 }
 
 #[cfg(test)]
@@ -761,6 +718,25 @@ mod tests {
         let r = run_killable(cmd, "sh", "h", Duration::from_secs(20));
         assert_eq!(r.exit, Some(0));
         assert_eq!(r.output, "started");
+    }
+
+    #[test]
+    fn a_command_that_outlives_its_deadline_is_timed_out() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "echo partial; exec sleep 30"]);
+        let started = std::time::Instant::now();
+        let r = run_killable(cmd, "sh", "h", Duration::from_millis(300));
+        assert_eq!(r.output, "timed out");
+        assert_eq!(r.exit, None);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_command_that_cannot_start_says_so() {
+        let cmd = std::process::Command::new("/nonexistent/croft-fleet-stand-in");
+        let r = run_killable(cmd, "ssh", "h", Duration::from_secs(5));
+        assert!(r.output.starts_with("could not run ssh: "), "{}", r.output);
+        assert_eq!(r.exit, None);
     }
 
     #[test]
