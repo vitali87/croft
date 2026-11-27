@@ -1,0 +1,809 @@
+# Every ssh, rsync and scp call croft makes: src/remote/recorded_calls.rs. Rewrite with CROFT_BLESS=1 after a change meant to move one.
+## SshControl::start
+ssh -M -S <master>/ctl -f -N -T -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box
+    in croft's folder | env unchanged | stdin croft's | stdout croft's | stderr croft's | croft's session
+## SshControl::command
+ssh -S <master>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'echo command'
+    in croft's folder | env unchanged | stdin croft's | stdout croft's | stderr croft's | croft's session
+## SshControl::background_command
+ssh -S <master>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -n box 'echo background'
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+## SshControl::background_shell
+ssh -S <master>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -n box 'echo shell'
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+## ssh_socket_read
+ssh -S <master>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -n box 'echo read'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr nowhere | croft's session
+## ssh_socket_command, not in the background
+ssh -S <master>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'echo socket'
+    in croft's folder | env unchanged | stdin croft's | stdout croft's | stderr croft's | croft's session
+## ssh_exec
+ssh -S <master>/ctl -o ControlMaster=no box true
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+## remote_croft_present, no croft there
+ssh -S <master>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
+export PATH="$HOME/.cargo/bin:$PATH"
+command -v croft >/dev/null 2>&1 && echo yes'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## remote_install_needed
+ssh -S <master>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'if [ -f "$HOME/.cargo/env" ]; then
+  . "$HOME/.cargo/env"
+fi
+export PATH="$HOME/.cargo/bin:$PATH"
+command -v croft >/dev/null 2>&1 && cat "$HOME/.cache/croft/install-stamp" 2>/dev/null'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## remote_target_triple
+ssh -S <master>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'uname -m'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## remote_has_session_supervisor, no croft there
+ssh -S <master>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'export PATH="$HOME/.cargo/bin:$PATH"; croft session-host --probe >/dev/null 2>&1 || command -v dtach >/dev/null 2>&1'
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+## mark_remote_updating
+ssh -S <master>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -n box 'mkdir -p "$HOME/.cache/croft" && : > "$HOME/.cache/croft/updating"'
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+## clear_remote_updating
+ssh -S <master>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -n box 'rm -f "$HOME/.cache/croft/updating"'
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+## run_remote_croft, no croft there
+ssh -S <master>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -tt box 'export CROFT_REMOTE_AUTOUPDATE=1; export CROFT_UNDERLINE_COLORS='\''0'\''; export CROFT_RELAY_KEY='\''c2f8f60eca464df5'\''; export CROFT_CLIENT_NONCE='\''<nonce>'\''; export PATH="$HOME/.cargo/bin:$PATH"; command -v croft >/dev/null 2>&1 || { echo '\''croft not found on remote PATH'\'' >&2; exit 127; }; if croft session-host --probe >/dev/null 2>&1; then mkdir -p "$(dirname "$HOME/.cache/croft/sessions/c2f8f60eca464df5.mux.sock")"; export CROFT_SESSION_PERSISTENT=1; exec croft session-host --socket "$HOME/.cache/croft/sessions/c2f8f60eca464df5.mux.sock" --workspace '\''proj'\'' -- croft '\''proj'\''; elif command -v dtach >/dev/null 2>&1; then mkdir -p "$(dirname "$HOME/.cache/croft/sessions/c2f8f60eca464df5.sock")"; export CROFT_SESSION_PERSISTENT=1 CROFT_UNDERLINE_COLORS=0; exec dtach -A "$HOME/.cache/croft/sessions/c2f8f60eca464df5.sock" -E -z -r winch croft '\''proj'\''; else exec croft '\''proj'\''; fi'
+    in croft's folder | env unchanged | stdin croft's | stdout croft's | stderr croft's | croft's session
+## run_remote_croft solo, no croft there
+ssh -S <master>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -tt box 'export CROFT_REMOTE_AUTOUPDATE=1; export CROFT_UNDERLINE_COLORS='\''0'\''; export CROFT_RELAY_KEY='\''c2f8f60eca464df5'\''; export CROFT_CLIENT_NONCE='\''<nonce>'\''; export PATH="$HOME/.cargo/bin:$PATH"; command -v croft >/dev/null 2>&1 || { echo '\''croft not found on remote PATH'\'' >&2; exit 127; }; if croft collab-relay --probe >/dev/null 2>&1; then mkdir -p "$(dirname "$HOME/.cache/croft/sessions/d1fba762150c532c.collab.sock")"; croft collab-relay --ensure --socket "$HOME/.cache/croft/sessions/d1fba762150c532c.collab.sock"; export CROFT_COLLAB_SOCKET="$HOME/.cache/croft/sessions/d1fba762150c532c.collab.sock"; export CROFT_COLLAB_ROLE=guest; exec croft; else exec croft; fi'
+    in croft's folder | env unchanged | stdin croft's | stdout croft's | stderr croft's | croft's session
+## remote_bulk::establish, a connection of its own
+ssh -o BatchMode=yes -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=5 box true
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -M -S <scratch>/ctl -f -N -T -o BatchMode=yes -o IPQoS=throughput -o ConnectTimeout=10 -o ServerAliveInterval=15 box
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -S <scratch>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'cat >/dev/null'
+    in croft's folder | env unchanged | stdin pipe | stdout nowhere | stderr nowhere | croft's session
+## remote_bulk::establish's connection closed
+ssh -S <scratch>/ctl -O exit box
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+## remote_bulk::establish, sharing the session's connection
+ssh -o BatchMode=yes -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=5 box true
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -S <master>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'cat >/dev/null'
+    in croft's folder | env unchanged | stdin pipe | stdout nowhere | stderr nowhere | croft's session
+## remote_bulk::establish's shared lane dropped
+## place_prebuilt on the terminal, as `croft remote` runs it (its copy is the test's)
+ssh -S <master>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'mkdir -p "$HOME/.cargo/bin" "$HOME/.cache/croft"'
+    in croft's folder | env unchanged | stdin croft's | stdout croft's | stderr croft's | croft's session
+ssh -S <master>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'chmod 755 "$HOME/.cargo/bin/croft.new" && mv "$HOME/.cargo/bin/croft.new" "$HOME/.cargo/bin/croft" && printf %s '\''prebuilt-stamp'\'' > "$HOME/.cache/croft/install-stamp" && rm -f "$HOME/.cache/croft/updating"'
+    in croft's folder | env unchanged | stdin croft's | stdout croft's | stderr croft's | croft's session
+## place_prebuilt into the install log, as an install inside croft runs it
+ssh -S <master>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'mkdir -p "$HOME/.cargo/bin" "$HOME/.cache/croft"'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+rsync -az --checksum --bwlimit=0 -e 'ssh -S <master>/ctl -o ControlMaster=no' <prebuilt>/croft box:.cargo/bin/croft.new
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+ssh -S <master>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'chmod 755 "$HOME/.cargo/bin/croft.new" && mv "$HOME/.cargo/bin/croft.new" "$HOME/.cargo/bin/croft" && printf %s '\''prebuilt-stamp'\'' > "$HOME/.cache/croft/install-stamp" && rm -f "$HOME/.cache/croft/updating"'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## install_only_streaming: the cross-build ships
+ssh -S <adopted>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
+export PATH="$HOME/.cargo/bin:$PATH"
+command -v croft >/dev/null 2>&1 && echo yes'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+ssh -S <adopted>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'if [ -f "$HOME/.cargo/env" ]; then
+  . "$HOME/.cargo/env"
+fi
+export PATH="$HOME/.cargo/bin:$PATH"
+command -v croft >/dev/null 2>&1 && cat "$HOME/.cache/croft/install-stamp" 2>/dev/null'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+ssh -S <adopted>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -n box 'mkdir -p "$HOME/.cache/croft" && : > "$HOME/.cache/croft/updating"'
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -o BatchMode=yes -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=5 box true
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -M -S <scratch>/ctl -f -N -T -o BatchMode=yes -o IPQoS=throughput -o ConnectTimeout=10 -o ServerAliveInterval=15 box
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -S <scratch>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'cat >/dev/null'
+    in croft's folder | env unchanged | stdin pipe | stdout nowhere | stderr nowhere | croft's session
+ssh -S <adopted>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'uname -m'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+ssh -S <adopted>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -n box 'mkdir -p "$HOME/.cargo/bin" "$HOME/.cache/croft"'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+rsync -az --checksum --bwlimit=<measured> -e 'ssh -S <scratch>/ctl -o ControlMaster=no' <source>/target/x86_64-unknown-linux-musl/remote-fast/croft box:.cargo/bin/croft.new
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+ssh -S <adopted>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -n box 'chmod 755 "$HOME/.cargo/bin/croft.new" && mv "$HOME/.cargo/bin/croft.new" "$HOME/.cargo/bin/croft" && printf %s '\''<stamp>'\'' > "$HOME/.cache/croft/install-stamp" && rm -f "$HOME/.cache/croft/updating"'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+ssh -S <scratch>/ctl -O exit box
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+## install_only_streaming: already up to date
+ssh -S <adopted>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
+export PATH="$HOME/.cargo/bin:$PATH"
+command -v croft >/dev/null 2>&1 && echo yes'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+ssh -S <adopted>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'if [ -f "$HOME/.cargo/env" ]; then
+  . "$HOME/.cargo/env"
+fi
+export PATH="$HOME/.cargo/bin:$PATH"
+command -v croft >/dev/null 2>&1 && cat "$HOME/.cache/croft/install-stamp" 2>/dev/null'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## install_only_streaming beside a running croft: no cross-build, so no update
+ssh -S <adopted>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
+export PATH="$HOME/.cargo/bin:$PATH"
+command -v croft >/dev/null 2>&1 && echo yes'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+ssh -S <adopted>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'if [ -f "$HOME/.cargo/env" ]; then
+  . "$HOME/.cargo/env"
+fi
+export PATH="$HOME/.cargo/bin:$PATH"
+command -v croft >/dev/null 2>&1 && cat "$HOME/.cache/croft/install-stamp" 2>/dev/null'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+ssh -S <adopted>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -n box 'mkdir -p "$HOME/.cache/croft" && : > "$HOME/.cache/croft/updating"'
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -o BatchMode=yes -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=5 box true
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -M -S <scratch>/ctl -f -N -T -o BatchMode=yes -o IPQoS=throughput -o ConnectTimeout=10 -o ServerAliveInterval=15 box
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -S <scratch>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'cat >/dev/null'
+    in croft's folder | env unchanged | stdin pipe | stdout nowhere | stderr nowhere | croft's session
+ssh -S <adopted>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -n box 'rm -f "$HOME/.cache/croft/updating"'
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -S <scratch>/ctl -O exit box
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+## install_only_streaming: no cross-build, so the remote compiles
+ssh -S <adopted>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
+export PATH="$HOME/.cargo/bin:$PATH"
+command -v croft >/dev/null 2>&1 && echo yes'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+ssh -S <adopted>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'if [ -f "$HOME/.cargo/env" ]; then
+  . "$HOME/.cargo/env"
+fi
+export PATH="$HOME/.cargo/bin:$PATH"
+command -v croft >/dev/null 2>&1 && cat "$HOME/.cache/croft/install-stamp" 2>/dev/null'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+ssh -S <adopted>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -n box 'mkdir -p "$HOME/.cache/croft" && : > "$HOME/.cache/croft/updating"'
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -o BatchMode=yes -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=5 box true
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -M -S <scratch>/ctl -f -N -T -o BatchMode=yes -o IPQoS=throughput -o ConnectTimeout=10 -o ServerAliveInterval=15 box
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -S <scratch>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'cat >/dev/null'
+    in croft's folder | env unchanged | stdin pipe | stdout nowhere | stderr nowhere | croft's session
+ssh -S <adopted>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -n box 'mkdir -p "$HOME/.cache/croft/source" && find "$HOME/.cache/croft/source/." -mindepth 1 -maxdepth 1 ! -name '\''target'\'' ! -name '\''Cargo.toml'\'' ! -name '\''Cargo.lock'\'' ! -name '\''build.rs'\'' ! -name '\''rust-toolchain.toml'\'' ! -name '\''src'\'' ! -name '\''assets'\'' ! -name '\''vendor'\'' -exec rm -rf {} +'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+rsync -a -z --delete --exclude=.git --exclude=target --exclude=.DS_Store --include=/Cargo.toml '--include=/Cargo.toml/***' --include=/Cargo.lock '--include=/Cargo.lock/***' --include=/build.rs '--include=/build.rs/***' --include=/rust-toolchain.toml '--include=/rust-toolchain.toml/***' --include=/src '--include=/src/***' --include=/assets '--include=/assets/***' --include=/vendor '--include=/vendor/***' '--exclude=*' --bwlimit=<measured> -e 'ssh -S <scratch>/ctl -o ControlMaster=no' <source>/ box:.cache/croft/source/
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+ssh -S <scratch>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -n box 'set -e
+if [ -f "$HOME/.cargo/env" ]; then
+  . "$HOME/.cargo/env"
+fi
+export PATH="$HOME/.cargo/bin:$PATH"
+
+# Package installs need root. Run them directly when already root or when
+# there is no sudo, otherwise through sudo. `sudo -n` never prompts: an
+# account that needs a password fails at once with a clear message instead
+# of sudo'\''s TTY errors on a session with no terminal (#950). A function, not
+# a variable holding "sudo -n": zsh, a common login shell, does not split an
+# unquoted variable into words, so it would look for a command "sudo -n".
+croft_sudo() {
+  if [ "$(id -u)" != "0" ] && command -v sudo >/dev/null 2>&1; then
+    sudo -n "$@"
+  else
+    "$@"
+  fi
+}
+
+# Install system packages with whatever package manager the box ships.
+croft_pkg_install() {
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    croft_sudo apt-get update
+    croft_sudo apt-get install -y "$@"
+  elif command -v dnf >/dev/null 2>&1; then
+    croft_sudo dnf install -y "$@"
+  elif command -v yum >/dev/null 2>&1; then
+    croft_sudo yum install -y "$@"
+  elif command -v apk >/dev/null 2>&1; then
+    croft_sudo apk add "$@"
+  elif command -v pacman >/dev/null 2>&1; then
+    croft_sudo pacman -Sy --noconfirm "$@"
+  elif command -v zypper >/dev/null 2>&1; then
+    croft_sudo zypper install -y "$@"
+  else
+    return 1
+  fi
+}
+
+# croft compiles native crates from source, so the final link step needs a C
+# compiler/linker (`cc`) and pkg-config. Stock cloud images (Ubuntu Server,
+# minimal Fedora, Alpine, ...) ship without them, which is why a bare
+# `cargo install` dies with `linker `cc` not found`. The user opted into a
+# from-source install, so install the toolchain rather than fail. This runs
+# unconditionally, even when cargo already exists, because cargo can be
+# present on a box that still lacks cc. The per-manager package names differ:
+# Debian bundles the compiler in build-essential; others name it separately.
+croft_ensure_build_toolchain() {
+  if command -v cc >/dev/null 2>&1 && command -v pkg-config >/dev/null 2>&1; then
+    return 0
+  fi
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    croft_sudo apt-get update
+    croft_sudo apt-get install -y build-essential pkg-config
+  elif command -v dnf >/dev/null 2>&1; then
+    croft_sudo dnf install -y gcc make pkgconf-pkg-config
+  elif command -v yum >/dev/null 2>&1; then
+    croft_sudo yum install -y gcc make pkgconfig
+  elif command -v apk >/dev/null 2>&1; then
+    croft_sudo apk add build-base pkgconf
+  elif command -v pacman >/dev/null 2>&1; then
+    croft_sudo pacman -Sy --noconfirm base-devel pkgconf
+  elif command -v zypper >/dev/null 2>&1; then
+    croft_sudo zypper install -y gcc make pkg-config
+  else
+    echo '\''croft: no supported package manager found to install a C toolchain (need cc + pkg-config)'\'' >&2
+    return 1
+  fi
+}
+
+if ! command -v cargo >/dev/null 2>&1; then
+  if ! command -v curl >/dev/null 2>&1; then
+    if ! croft_pkg_install curl ca-certificates; then
+      echo '\''cargo and curl are missing and no supported package manager was found to bootstrap them'\'' >&2
+      exit 127
+    fi
+  fi
+  # --no-modify-path: rustup would otherwise append `. "$HOME/.cargo/env"`
+  # to the remote user'\''s ~/.bashrc and ~/.profile (#950). This script puts
+  # ~/.cargo/bin on PATH itself, just below.
+  curl --proto '\''=https'\'' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path
+fi
+export PATH="$HOME/.cargo/bin:$PATH"
+# Ensure the C toolchain before compiling, regardless of whether cargo was
+# already installed: a box can have rustup/cargo but no cc.
+croft_ensure_build_toolchain
+# dtach lets a remote croft session survive an SSH transport drop (laptop
+# sleep, network change): croft launches itself under it for reconnect. Best
+# effort and never fatal; a box without dtach just runs without persistence.
+command -v dtach >/dev/null 2>&1 || croft_pkg_install dtach || true
+# Cap the host build to ~half its cores and run it niced: this fallback
+# compiles on the shared remote (often while other workloads run and,
+# with launch-now, while a live croft session is using the box), so the
+# default `cargo install -j <all cores>` would pin the machine. (nproc+1)/2
+# stays >=1 even on a single core; nice is best-effort if present.
+CROFT_JOBS=$(( ( $(nproc 2>/dev/null || echo 2) + 1 ) / 2 ))
+# A live croft session on this box outranks the build entirely: the user
+# is typing into a shell that shares these cores, RAM, and disk. Half the
+# cores still wrecks a small VPS, so drop to one compile job and put all
+# codegen IO in the idle class; the update simply takes longer.
+CROFT_LIVE=""
+if pgrep -x croft >/dev/null 2>&1; then
+  CROFT_JOBS=1
+  CROFT_LIVE=1
+fi
+# nice and ionice ration CPU and IO, not memory (#694). Each rustc job on
+# croft costs well over a GB, so on a host under 16 GB two of them next to
+# rust-analyzer were enough to wake the OOM killer, which then took croft or
+# a terminal pane. Below that, compile one crate at a time.
+CROFT_MEM_KB=$(awk '\''/^MemTotal:/ { print $2 }'\'' /proc/meminfo 2>/dev/null || true)
+CROFT_AVAIL_KB=$(awk '\''/^MemAvailable:/ { print $2 }'\'' /proc/meminfo 2>/dev/null || true)
+if [ -n "$CROFT_MEM_KB" ] && [ "$CROFT_MEM_KB" -lt 16777216 ]; then
+  CROFT_JOBS=1
+fi
+# Little memory free right now counts too, whatever the total: a big host
+# can still be mostly spoken for by the time the update runs.
+if [ -n "$CROFT_AVAIL_KB" ] && [ "$CROFT_AVAIL_KB" -lt 2097152 ]; then
+  CROFT_JOBS=1
+  echo "croft: only $(( CROFT_AVAIL_KB / 1024 )) MB of memory available; building with one job" >&2
+fi
+# And cap the build'\''s memory outright where systemd can: the compile runs
+# in its own scope limited to 60% of RAM with no swap, so if it outgrows
+# that it is the BUILD the kernel kills, inside its scope, and never croft
+# or a shell. Probed first, because a user manager or a delegated memory
+# controller is not a given on a server; without one the build runs uncapped
+# but still single-job on a small host.
+CROFT_MEMCAP=""
+# The probe reads the limit back from inside a test scope: systemd accepts
+# MemoryMax without complaint where the memory controller is not delegated
+# to the user manager (cgroup v1 and hybrid hosts), and enforces nothing.
+if [ -n "$CROFT_MEM_KB" ] && command -v systemd-run >/dev/null 2>&1 \
+  && [ "$(systemd-run --user --scope --quiet -p MemoryMax=64M -p MemorySwapMax=0 \
+    sh -c '\''cat "/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)/memory.max"'\'' 2>/dev/null)" = 67108864 ]; then
+  CROFT_MEMCAP="systemd-run --user --scope --quiet -p MemoryMax=$(( CROFT_MEM_KB * 6 / 10 ))K -p MemorySwapMax=0"
+fi
+CROFT_NICE=""
+if command -v nice >/dev/null 2>&1; then CROFT_NICE="nice -n 19"; fi
+CROFT_IONICE=""
+if command -v ionice >/dev/null 2>&1; then CROFT_IONICE="ionice -c3"; fi
+# Tell a croft running on this box that a compile is under way, so it stops
+# its own language servers (rust-analyzer alone held 2.4 GB in the OOM that
+# prompted #694) and restarts them once no marker names a live build.
+#
+# One marker per build (`building.<this shell'\''s pid>`), so a second install
+# finishing first cannot clear the first'\''s. It holds the pid of the COMPILE
+# once it starts (systemd-run --scope, nice and ionice all exec, so `$!` is
+# cargo itself): a shell killed mid-build leaves cargo running as an orphan,
+# and the marker must keep naming it. Markers whose pid is gone are stale;
+# they are swept here, and croft ignores them and any from before a reboot.
+#
+# Which boot a marker belongs to is `building.<pid>.boot`, the kernel'\''s
+# boot_id (#736): unlike boot time it does not move when the wall clock is
+# stepped. A sidecar rather than a second field, so a croft from before it,
+# which reads the marker as one pid, still pauses for this build.
+mkdir -p "$HOME/.cache/croft"
+# The script runs under the login shell, and zsh aborts on a glob that
+# matches nothing (NOMATCH), which an empty cache always is (#734).
+# null_glob makes it expand to nothing, as the `[ -f ]` below expects of
+# every other shell. Not `emulate sh`: that also clears ERR_EXIT, and a
+# failed compile would then write the install stamp.
+[ -z "${ZSH_VERSION:-}" ] || setopt null_glob
+CROFT_BOOT=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)
+for CROFT_OLD in "$HOME/.cache/croft"/building.*; do
+  [ -f "$CROFT_OLD" ] || continue
+  case "$CROFT_OLD" in
+    # Its marker sorts first, so a sidecar whose marker is gone is orphaned.
+    *.boot) [ -e "${CROFT_OLD%.boot}" ] || rm -f "$CROFT_OLD"; continue ;;
+  esac
+  CROFT_OLD_PID=$(cat "$CROFT_OLD" 2>/dev/null || true)
+  CROFT_OLD_BOOT=$(cat "$CROFT_OLD.boot" 2>/dev/null || true)
+  if [ -z "$CROFT_OLD_PID" ] || ! kill -0 "$CROFT_OLD_PID" 2>/dev/null \
+    || { [ -n "$CROFT_OLD_BOOT" ] && [ -n "$CROFT_BOOT" ] && [ "$CROFT_OLD_BOOT" != "$CROFT_BOOT" ]; }; then
+    rm -f "$CROFT_OLD" "$CROFT_OLD.boot"
+  fi
+done
+CROFT_MARK="$HOME/.cache/croft/building.$$"
+CROFT_BUILD_PID=""
+if [ -n "$CROFT_BOOT" ]; then printf %s "$CROFT_BOOT" > "$CROFT_MARK.boot"; fi
+printf %s "$$" > "$CROFT_MARK"
+# Keep the marker while the compile outlives this shell; croft sees it go
+# stale the moment the compile ends.
+trap '\''if [ -z "$CROFT_BUILD_PID" ] || ! kill -0 "$CROFT_BUILD_PID" 2>/dev/null; then rm -f "$CROFT_MARK" "$CROFT_MARK.boot"; fi'\'' EXIT
+if [ -n "$CROFT_LIVE" ]; then
+  # croft polls the marker once a second, and a server gets up to three
+  # seconds to shut down cleanly: let both finish before the first rustc.
+  sleep 5
+fi
+# eval, because this script runs under the remote user'\''s login shell and
+# zsh does not word-split unquoted parameters: bare `$CROFT_NICE ...` would
+# try to run a command literally named "nice -n 19". eval re-parses the
+# assembled line, which splits correctly under both sh/bash and zsh.
+# The subshell marks the build (and every rustc under it) as the kernel'\''s
+# first choice when memory runs out, without touching this shell (#694),
+# then `exec`s it, so `$!` below is still the compile'\''s own pid.
+(
+  echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true
+  eval "exec $CROFT_MEMCAP $CROFT_NICE $CROFT_IONICE"'\'' cargo install --path "$HOME/.cache/croft/source" --jobs "$CROFT_JOBS" --force --locked'\''
+) &
+CROFT_BUILD_PID=$!
+printf %s "$CROFT_BUILD_PID" > "$CROFT_MARK"
+wait "$CROFT_BUILD_PID"
+rm -f "$CROFT_MARK" "$CROFT_MARK.boot"
+printf %s '\''<stamp>'\'' > "$HOME/.cache/croft/install-stamp"
+rm -f "$HOME/.cache/croft/updating"
+'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+ssh -S <scratch>/ctl -O exit box
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+## install_remote_croft: the cross-build ships
+ssh -S <master>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'uname -m'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+ssh -S <master>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'mkdir -p "$HOME/.cargo/bin" "$HOME/.cache/croft"'
+    in croft's folder | env unchanged | stdin croft's | stdout croft's | stderr croft's | croft's session
+rsync -az --checksum -e 'ssh -S <master>/ctl -o ControlMaster=no' <source>/target/x86_64-unknown-linux-musl/remote-fast/croft box:.cargo/bin/croft.new
+    in croft's folder | env unchanged | stdin croft's | stdout croft's | stderr croft's | croft's session
+ssh -S <master>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'chmod 755 "$HOME/.cargo/bin/croft.new" && mv "$HOME/.cargo/bin/croft.new" "$HOME/.cargo/bin/croft" && printf %s '\''<stamp>'\'' > "$HOME/.cache/croft/install-stamp" && rm -f "$HOME/.cache/croft/updating"'
+    in croft's folder | env unchanged | stdin croft's | stdout croft's | stderr croft's | croft's session
+## install_remote_croft on a terminal: no cross-build, so the remote compiles, as answered
+ssh -S <master>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'mkdir -p "$HOME/.cache/croft/source" && find "$HOME/.cache/croft/source/." -mindepth 1 -maxdepth 1 ! -name '\''target'\'' ! -name '\''Cargo.toml'\'' ! -name '\''Cargo.lock'\'' ! -name '\''build.rs'\'' ! -name '\''rust-toolchain.toml'\'' ! -name '\''src'\'' ! -name '\''assets'\'' ! -name '\''vendor'\'' -exec rm -rf {} +'
+    in croft's folder | env unchanged | stdin terminal | stdout croft's | stderr croft's | croft's session
+rsync -a -z --delete --exclude=.git --exclude=target --exclude=.DS_Store --include=/Cargo.toml '--include=/Cargo.toml/***' --include=/Cargo.lock '--include=/Cargo.lock/***' --include=/build.rs '--include=/build.rs/***' --include=/rust-toolchain.toml '--include=/rust-toolchain.toml/***' --include=/src '--include=/src/***' --include=/assets '--include=/assets/***' --include=/vendor '--include=/vendor/***' '--exclude=*' -e 'ssh -S <master>/ctl -o ControlMaster=no' <source>/ box:.cache/croft/source/
+    in croft's folder | env unchanged | stdin terminal | stdout croft's | stderr croft's | croft's session
+ssh -S <master>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'set -e
+if [ -f "$HOME/.cargo/env" ]; then
+  . "$HOME/.cargo/env"
+fi
+export PATH="$HOME/.cargo/bin:$PATH"
+
+# Package installs need root. Run them directly when already root or when
+# there is no sudo, otherwise through sudo. `sudo -n` never prompts: an
+# account that needs a password fails at once with a clear message instead
+# of sudo'\''s TTY errors on a session with no terminal (#950). A function, not
+# a variable holding "sudo -n": zsh, a common login shell, does not split an
+# unquoted variable into words, so it would look for a command "sudo -n".
+croft_sudo() {
+  if [ "$(id -u)" != "0" ] && command -v sudo >/dev/null 2>&1; then
+    sudo -n "$@"
+  else
+    "$@"
+  fi
+}
+
+# Install system packages with whatever package manager the box ships.
+croft_pkg_install() {
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    croft_sudo apt-get update
+    croft_sudo apt-get install -y "$@"
+  elif command -v dnf >/dev/null 2>&1; then
+    croft_sudo dnf install -y "$@"
+  elif command -v yum >/dev/null 2>&1; then
+    croft_sudo yum install -y "$@"
+  elif command -v apk >/dev/null 2>&1; then
+    croft_sudo apk add "$@"
+  elif command -v pacman >/dev/null 2>&1; then
+    croft_sudo pacman -Sy --noconfirm "$@"
+  elif command -v zypper >/dev/null 2>&1; then
+    croft_sudo zypper install -y "$@"
+  else
+    return 1
+  fi
+}
+
+# croft compiles native crates from source, so the final link step needs a C
+# compiler/linker (`cc`) and pkg-config. Stock cloud images (Ubuntu Server,
+# minimal Fedora, Alpine, ...) ship without them, which is why a bare
+# `cargo install` dies with `linker `cc` not found`. The user opted into a
+# from-source install, so install the toolchain rather than fail. This runs
+# unconditionally, even when cargo already exists, because cargo can be
+# present on a box that still lacks cc. The per-manager package names differ:
+# Debian bundles the compiler in build-essential; others name it separately.
+croft_ensure_build_toolchain() {
+  if command -v cc >/dev/null 2>&1 && command -v pkg-config >/dev/null 2>&1; then
+    return 0
+  fi
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    croft_sudo apt-get update
+    croft_sudo apt-get install -y build-essential pkg-config
+  elif command -v dnf >/dev/null 2>&1; then
+    croft_sudo dnf install -y gcc make pkgconf-pkg-config
+  elif command -v yum >/dev/null 2>&1; then
+    croft_sudo yum install -y gcc make pkgconfig
+  elif command -v apk >/dev/null 2>&1; then
+    croft_sudo apk add build-base pkgconf
+  elif command -v pacman >/dev/null 2>&1; then
+    croft_sudo pacman -Sy --noconfirm base-devel pkgconf
+  elif command -v zypper >/dev/null 2>&1; then
+    croft_sudo zypper install -y gcc make pkg-config
+  else
+    echo '\''croft: no supported package manager found to install a C toolchain (need cc + pkg-config)'\'' >&2
+    return 1
+  fi
+}
+
+if ! command -v cargo >/dev/null 2>&1; then
+  if ! command -v curl >/dev/null 2>&1; then
+    if ! croft_pkg_install curl ca-certificates; then
+      echo '\''cargo and curl are missing and no supported package manager was found to bootstrap them'\'' >&2
+      exit 127
+    fi
+  fi
+  # --no-modify-path: rustup would otherwise append `. "$HOME/.cargo/env"`
+  # to the remote user'\''s ~/.bashrc and ~/.profile (#950). This script puts
+  # ~/.cargo/bin on PATH itself, just below.
+  curl --proto '\''=https'\'' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path
+fi
+export PATH="$HOME/.cargo/bin:$PATH"
+# Ensure the C toolchain before compiling, regardless of whether cargo was
+# already installed: a box can have rustup/cargo but no cc.
+croft_ensure_build_toolchain
+# dtach lets a remote croft session survive an SSH transport drop (laptop
+# sleep, network change): croft launches itself under it for reconnect. Best
+# effort and never fatal; a box without dtach just runs without persistence.
+command -v dtach >/dev/null 2>&1 || croft_pkg_install dtach || true
+# Cap the host build to ~half its cores and run it niced: this fallback
+# compiles on the shared remote (often while other workloads run and,
+# with launch-now, while a live croft session is using the box), so the
+# default `cargo install -j <all cores>` would pin the machine. (nproc+1)/2
+# stays >=1 even on a single core; nice is best-effort if present.
+CROFT_JOBS=$(( ( $(nproc 2>/dev/null || echo 2) + 1 ) / 2 ))
+# A live croft session on this box outranks the build entirely: the user
+# is typing into a shell that shares these cores, RAM, and disk. Half the
+# cores still wrecks a small VPS, so drop to one compile job and put all
+# codegen IO in the idle class; the update simply takes longer.
+CROFT_LIVE=""
+if pgrep -x croft >/dev/null 2>&1; then
+  CROFT_JOBS=1
+  CROFT_LIVE=1
+fi
+# nice and ionice ration CPU and IO, not memory (#694). Each rustc job on
+# croft costs well over a GB, so on a host under 16 GB two of them next to
+# rust-analyzer were enough to wake the OOM killer, which then took croft or
+# a terminal pane. Below that, compile one crate at a time.
+CROFT_MEM_KB=$(awk '\''/^MemTotal:/ { print $2 }'\'' /proc/meminfo 2>/dev/null || true)
+CROFT_AVAIL_KB=$(awk '\''/^MemAvailable:/ { print $2 }'\'' /proc/meminfo 2>/dev/null || true)
+if [ -n "$CROFT_MEM_KB" ] && [ "$CROFT_MEM_KB" -lt 16777216 ]; then
+  CROFT_JOBS=1
+fi
+# Little memory free right now counts too, whatever the total: a big host
+# can still be mostly spoken for by the time the update runs.
+if [ -n "$CROFT_AVAIL_KB" ] && [ "$CROFT_AVAIL_KB" -lt 2097152 ]; then
+  CROFT_JOBS=1
+  echo "croft: only $(( CROFT_AVAIL_KB / 1024 )) MB of memory available; building with one job" >&2
+fi
+# And cap the build'\''s memory outright where systemd can: the compile runs
+# in its own scope limited to 60% of RAM with no swap, so if it outgrows
+# that it is the BUILD the kernel kills, inside its scope, and never croft
+# or a shell. Probed first, because a user manager or a delegated memory
+# controller is not a given on a server; without one the build runs uncapped
+# but still single-job on a small host.
+CROFT_MEMCAP=""
+# The probe reads the limit back from inside a test scope: systemd accepts
+# MemoryMax without complaint where the memory controller is not delegated
+# to the user manager (cgroup v1 and hybrid hosts), and enforces nothing.
+if [ -n "$CROFT_MEM_KB" ] && command -v systemd-run >/dev/null 2>&1 \
+  && [ "$(systemd-run --user --scope --quiet -p MemoryMax=64M -p MemorySwapMax=0 \
+    sh -c '\''cat "/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)/memory.max"'\'' 2>/dev/null)" = 67108864 ]; then
+  CROFT_MEMCAP="systemd-run --user --scope --quiet -p MemoryMax=$(( CROFT_MEM_KB * 6 / 10 ))K -p MemorySwapMax=0"
+fi
+CROFT_NICE=""
+if command -v nice >/dev/null 2>&1; then CROFT_NICE="nice -n 19"; fi
+CROFT_IONICE=""
+if command -v ionice >/dev/null 2>&1; then CROFT_IONICE="ionice -c3"; fi
+# Tell a croft running on this box that a compile is under way, so it stops
+# its own language servers (rust-analyzer alone held 2.4 GB in the OOM that
+# prompted #694) and restarts them once no marker names a live build.
+#
+# One marker per build (`building.<this shell'\''s pid>`), so a second install
+# finishing first cannot clear the first'\''s. It holds the pid of the COMPILE
+# once it starts (systemd-run --scope, nice and ionice all exec, so `$!` is
+# cargo itself): a shell killed mid-build leaves cargo running as an orphan,
+# and the marker must keep naming it. Markers whose pid is gone are stale;
+# they are swept here, and croft ignores them and any from before a reboot.
+#
+# Which boot a marker belongs to is `building.<pid>.boot`, the kernel'\''s
+# boot_id (#736): unlike boot time it does not move when the wall clock is
+# stepped. A sidecar rather than a second field, so a croft from before it,
+# which reads the marker as one pid, still pauses for this build.
+mkdir -p "$HOME/.cache/croft"
+# The script runs under the login shell, and zsh aborts on a glob that
+# matches nothing (NOMATCH), which an empty cache always is (#734).
+# null_glob makes it expand to nothing, as the `[ -f ]` below expects of
+# every other shell. Not `emulate sh`: that also clears ERR_EXIT, and a
+# failed compile would then write the install stamp.
+[ -z "${ZSH_VERSION:-}" ] || setopt null_glob
+CROFT_BOOT=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)
+for CROFT_OLD in "$HOME/.cache/croft"/building.*; do
+  [ -f "$CROFT_OLD" ] || continue
+  case "$CROFT_OLD" in
+    # Its marker sorts first, so a sidecar whose marker is gone is orphaned.
+    *.boot) [ -e "${CROFT_OLD%.boot}" ] || rm -f "$CROFT_OLD"; continue ;;
+  esac
+  CROFT_OLD_PID=$(cat "$CROFT_OLD" 2>/dev/null || true)
+  CROFT_OLD_BOOT=$(cat "$CROFT_OLD.boot" 2>/dev/null || true)
+  if [ -z "$CROFT_OLD_PID" ] || ! kill -0 "$CROFT_OLD_PID" 2>/dev/null \
+    || { [ -n "$CROFT_OLD_BOOT" ] && [ -n "$CROFT_BOOT" ] && [ "$CROFT_OLD_BOOT" != "$CROFT_BOOT" ]; }; then
+    rm -f "$CROFT_OLD" "$CROFT_OLD.boot"
+  fi
+done
+CROFT_MARK="$HOME/.cache/croft/building.$$"
+CROFT_BUILD_PID=""
+if [ -n "$CROFT_BOOT" ]; then printf %s "$CROFT_BOOT" > "$CROFT_MARK.boot"; fi
+printf %s "$$" > "$CROFT_MARK"
+# Keep the marker while the compile outlives this shell; croft sees it go
+# stale the moment the compile ends.
+trap '\''if [ -z "$CROFT_BUILD_PID" ] || ! kill -0 "$CROFT_BUILD_PID" 2>/dev/null; then rm -f "$CROFT_MARK" "$CROFT_MARK.boot"; fi'\'' EXIT
+if [ -n "$CROFT_LIVE" ]; then
+  # croft polls the marker once a second, and a server gets up to three
+  # seconds to shut down cleanly: let both finish before the first rustc.
+  sleep 5
+fi
+# eval, because this script runs under the remote user'\''s login shell and
+# zsh does not word-split unquoted parameters: bare `$CROFT_NICE ...` would
+# try to run a command literally named "nice -n 19". eval re-parses the
+# assembled line, which splits correctly under both sh/bash and zsh.
+# The subshell marks the build (and every rustc under it) as the kernel'\''s
+# first choice when memory runs out, without touching this shell (#694),
+# then `exec`s it, so `$!` below is still the compile'\''s own pid.
+(
+  echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true
+  eval "exec $CROFT_MEMCAP $CROFT_NICE $CROFT_IONICE"'\'' cargo install --path "$HOME/.cache/croft/source" --jobs "$CROFT_JOBS" --force --locked'\''
+) &
+CROFT_BUILD_PID=$!
+printf %s "$CROFT_BUILD_PID" > "$CROFT_MARK"
+wait "$CROFT_BUILD_PID"
+rm -f "$CROFT_MARK" "$CROFT_MARK.boot"
+printf %s '\''<stamp>'\'' > "$HOME/.cache/croft/install-stamp"
+rm -f "$HOME/.cache/croft/updating"
+'
+    in croft's folder | env unchanged | stdin terminal | stdout croft's | stderr croft's | croft's session
+## sync_local_source_to_remote: rsync fails, so the tar pipe
+ssh -S <master>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'mkdir -p "$HOME/.cache/croft/source" && find "$HOME/.cache/croft/source/." -mindepth 1 -maxdepth 1 ! -name '\''target'\'' ! -name '\''Cargo.toml'\'' ! -name '\''Cargo.lock'\'' ! -name '\''build.rs'\'' ! -name '\''rust-toolchain.toml'\'' ! -name '\''src'\'' ! -name '\''assets'\'' ! -name '\''vendor'\'' -exec rm -rf {} +'
+    in croft's folder | env unchanged | stdin croft's | stdout croft's | stderr croft's | croft's session
+rsync -a -z --delete --exclude=.git --exclude=target --exclude=.DS_Store --include=/Cargo.toml '--include=/Cargo.toml/***' --include=/Cargo.lock '--include=/Cargo.lock/***' --include=/build.rs '--include=/build.rs/***' --include=/rust-toolchain.toml '--include=/rust-toolchain.toml/***' --include=/src '--include=/src/***' --include=/assets '--include=/assets/***' --include=/vendor '--include=/vendor/***' '--exclude=*' -e 'ssh -S <master>/ctl -o ControlMaster=no' <source>/ box:.cache/croft/source/
+    in croft's folder | env unchanged | stdin croft's | stdout croft's | stderr croft's | croft's session
+ssh -S <master>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'mkdir -p "$HOME/.cache/croft/source" && find "$HOME/.cache/croft/source/." -mindepth 1 -maxdepth 1 ! -name '\''target'\'' ! -name '\''Cargo.toml'\'' ! -name '\''Cargo.lock'\'' ! -name '\''build.rs'\'' ! -name '\''rust-toolchain.toml'\'' ! -name '\''src'\'' ! -name '\''assets'\'' ! -name '\''vendor'\'' -exec rm -rf {} + && tar -xzf - -C "$HOME/.cache/croft/source"'
+    in croft's folder | env unchanged | stdin pipe | stdout croft's | stderr croft's | croft's session
+## push_config_files
+ssh -S <master>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -n box 'mkdir -p ~/.config/croft'
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -S <master>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -n box 'echo croft-config-hashes; cd ~/.config/croft 2>/dev/null || exit 0; for f in config.synced.json keybindings.json snippets.json triggers.json matchers.json macros.json; do [ -f "$f" ] || continue; if command -v sha256sum >/dev/null 2>&1; then sha256sum "$f"; else shasum -a 256 "$f"; fi; done'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr nowhere | croft's session
+ssh -o BatchMode=yes -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=5 box true
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -M -S <scratch>/ctl -f -N -T -o BatchMode=yes -o IPQoS=throughput -o ConnectTimeout=10 -o ServerAliveInterval=15 box
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -S <scratch>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'cat >/dev/null'
+    in croft's folder | env unchanged | stdin pipe | stdout nowhere | stderr nowhere | croft's session
+rsync -az --checksum --bwlimit=<measured> -e 'ssh -S <scratch>/ctl -o ControlMaster=no' <config>/keybindings.json box:.config/croft/keybindings.json
+    in croft's folder | env unchanged | stdin croft's | stdout croft's | stderr croft's | croft's session
+ssh -S <scratch>/ctl -O exit box
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+## read_remote_hashes
+ssh -S <master>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -n box 'echo croft-config-hashes; cd ~/.config/croft 2>/dev/null || exit 0; for f in config.synced.json keybindings.json snippets.json triggers.json matchers.json macros.json; do [ -f "$f" ] || continue; if command -v sha256sum >/dev/null 2>&1; then sha256sum "$f"; else shasum -a 256 "$f"; fi; done'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr nowhere | croft's session
+## read_remote_config
+ssh -S <master>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -n box 'cat ~/.config/croft/keybindings.json 2>/dev/null'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr nowhere | croft's session
+## print_config_diff
+ssh -S <master>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -n box 'cat ~/.config/croft/keybindings.json 2>/dev/null'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr nowhere | croft's session
+## push_over_bulk_lane
+ssh -S <master>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -n box 'mkdir -p ~/.config/croft'
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -S <master>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -n box 'echo croft-config-hashes; cd ~/.config/croft 2>/dev/null || exit 0; for f in config.synced.json keybindings.json snippets.json triggers.json matchers.json macros.json; do [ -f "$f" ] || continue; if command -v sha256sum >/dev/null 2>&1; then sha256sum "$f"; else shasum -a 256 "$f"; fi; done'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr nowhere | croft's session
+ssh -o BatchMode=yes -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=5 box true
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -M -S <scratch>/ctl -f -N -T -o BatchMode=yes -o IPQoS=throughput -o ConnectTimeout=10 -o ServerAliveInterval=15 box
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -S <scratch>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'cat >/dev/null'
+    in croft's folder | env unchanged | stdin pipe | stdout nowhere | stderr nowhere | croft's session
+rsync -az --checksum --bwlimit=<measured> -e 'ssh -S <scratch>/ctl -o ControlMaster=no' <config>/keybindings.json box:.config/croft/keybindings.json
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -S <scratch>/ctl -O exit box
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+## sync_config_now --diff
+ssh -M -S <scratch>/ctl -f -N -T -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box
+    in croft's folder | env unchanged | stdin croft's | stdout croft's | stderr croft's | croft's session
+ssh -S <scratch>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -n box 'cat ~/.config/croft/keybindings.json 2>/dev/null'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr nowhere | croft's session
+ssh -S <scratch>/ctl -O exit box
+    in croft's folder | env unchanged | stdin croft's | stdout croft's | stderr croft's | croft's session
+## sync_config_now
+ssh -M -S <scratch>/ctl -f -N -T -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box
+    in croft's folder | env unchanged | stdin croft's | stdout croft's | stderr croft's | croft's session
+ssh -S <scratch>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -n box 'mkdir -p ~/.config/croft'
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -S <scratch>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -n box 'echo croft-config-hashes; cd ~/.config/croft 2>/dev/null || exit 0; for f in config.synced.json keybindings.json snippets.json triggers.json matchers.json macros.json; do [ -f "$f" ] || continue; if command -v sha256sum >/dev/null 2>&1; then sha256sum "$f"; else shasum -a 256 "$f"; fi; done'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr nowhere | croft's session
+ssh -o BatchMode=yes -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=5 box true
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -M -S <scratch>/ctl -f -N -T -o BatchMode=yes -o IPQoS=throughput -o ConnectTimeout=10 -o ServerAliveInterval=15 box
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -S <scratch>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'cat >/dev/null'
+    in croft's folder | env unchanged | stdin pipe | stdout nowhere | stderr nowhere | croft's session
+rsync -az --checksum --bwlimit=<measured> -e 'ssh -S <scratch>/ctl -o ControlMaster=no' <config>/keybindings.json box:.config/croft/keybindings.json
+    in croft's folder | env unchanged | stdin croft's | stdout croft's | stderr croft's | croft's session
+ssh -S <scratch>/ctl -O exit box
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -S <scratch>/ctl -O exit box
+    in croft's folder | env unchanged | stdin croft's | stdout croft's | stderr croft's | croft's session
+## DropPump::start, then stopped
+ssh -S <master>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'set -e; RELAY="$HOME/.cache/croft/relay-d1fba762150c532c"; INBOX="$RELAY/inbox"; LOG="$RELAY/requests.log"; mkdir -p "$INBOX"; : > "$LOG"; printf '\''%s\n%s\n'\'' "$INBOX" "$LOG"'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+ssh -S <master>/ctl -o ControlMaster=no box 'exec tail -F -n 0 '\''<remote>/.cache/croft/relay-d1fba762150c532c/requests.log'\'' 2>/dev/null'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr nowhere | croft's session
+## a relay request claimed
+ssh -S <master>/ctl -o ControlMaster=no box 'mkdir -p '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/.claims'\'' && mkdir '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/.claims/pull-1-1'\'''
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+## write_relay_err
+ssh -S <master>/ctl -o ControlMaster=no box 'mkdir -p '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/pull-1-0'\'' && printf %s '\''it went wrong'\'' > '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/pull-1-0/.err'\'''
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+## handle_pull_request
+ssh -S <master>/ctl -o ControlMaster=no box 'set -e; mkdir -p '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/pull-1-1'\'' && tar -x -f - -C '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/pull-1-1'\'''
+    in croft's folder | env unchanged | stdin pipe | stdout pipe | stderr pipe | croft's session
+ssh -S <master>/ctl -o ControlMaster=no box 'touch '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/pull-1-1'\''/.ok'
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+## handle_pull_request of a hidden file
+ssh -S <master>/ctl -o ControlMaster=no box 'mkdir -p '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/pull-1-2'\'' && printf %s '\''refusing to send a hidden path: <pull>/.secret'\'' > '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/pull-1-2/.err'\'''
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+## handle_pull_request of a missing file
+ssh -S <master>/ctl -o ControlMaster=no box 'mkdir -p '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/pull-1-3'\'' && printf %s '\''local file not found: <pull>/gone.txt'\'' > '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/pull-1-3/.err'\'''
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+## handle_clipboard_request
+ssh -S <master>/ctl -o ControlMaster=no box 'mkdir -p '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/clipboard-1-1'\'''
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -S <master>/ctl -o ControlMaster=no box 'cat > '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/clipboard-1-1/clipboard.txt'\'''
+    in croft's folder | env unchanged | stdin pipe | stdout nowhere | stderr nowhere | croft's session
+ssh -S <master>/ctl -o ControlMaster=no box 'touch '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/clipboard-1-1'\''/.ok'
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+## handle_copy_request
+ssh -S <master>/ctl -o ControlMaster=no box 'head -c 4194305 '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/copy-1-1.txt'\''; rm -f '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/copy-1-1.txt'\'''
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr nowhere | croft's session
+## handle_open_request
+ssh -S <master>/ctl -o ControlMaster=no box 'mkdir -p '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/open-1-1'\'''
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -S <master>/ctl -o ControlMaster=no box 'touch '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/open-1-1'\''/.ok'
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+## handle_forward_request
+ssh -S <master>/ctl -o ControlMaster=no box 'mkdir -p '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/forward-1-1'\'''
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -S <master>/ctl -O forward -L 127.0.0.1:<port>:127.0.0.1:<port> box
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -S <master>/ctl -o ControlMaster=no box 'printf %s <port> > '\''<remote>/.cache/croft/relay-d1fba762150c532c/inbox/forward-1-1'\''/.ok'
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+## handle_unforward_request
+ssh -S <master>/ctl -O cancel -L 127.0.0.1:<port>:127.0.0.1:<port> box
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+## SshAuth::start, then cancel
+ssh -M -S <scratch>/ctl -N -T -o BatchMode=no -o ConnectTimeout=10 -o ServerAliveInterval=15 box
+    in <home> | env TERM=dumb -DISPLAY -SSH_ASKPASS -SSH_ASKPASS_REQUIRE | stdin terminal | stdout terminal | stderr terminal | own session
+ssh -S <scratch>/ctl -O exit box
+    in croft's folder | env unchanged | stdin croft's | stdout nowhere | stderr nowhere | croft's session
+## SshAuth::start, then dropped
+ssh -M -S <scratch>/ctl -N -T -o BatchMode=no -o ConnectTimeout=10 -o ServerAliveInterval=15 box
+    in <home> | env TERM=dumb -DISPLAY -SSH_ASKPASS -SSH_ASKPASS_REQUIRE | stdin terminal | stdout terminal | stderr terminal | own session
+ssh -S <scratch>/ctl -O exit box
+    in croft's folder | env unchanged | stdin croft's | stdout nowhere | stderr nowhere | croft's session
+## SshAuth::start, handed off, then close_master
+ssh -M -S <scratch>/ctl -N -T -o BatchMode=no -o ConnectTimeout=10 -o ServerAliveInterval=15 box
+    in <home> | env TERM=dumb -DISPLAY -SSH_ASKPASS -SSH_ASKPASS_REQUIRE | stdin terminal | stdout terminal | stderr terminal | own session
+ssh -S <scratch>/ctl -O exit box
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+## fleet::run_on_hosts
+ssh -o ConnectTimeout=30 -n -o BatchMode=yes -o StrictHostKeyChecking=yes box -- 'echo fleet'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+## croft open-link, a decision for a croft on another machine
+ssh -- box 'export PATH="$HOME/.cargo/bin:$PATH"; croft '\''decide'\'' '\''0123456789abcdef0123456789abcdef'\'' '\''allow'\'' '\''--path'\'' '\''./proj'\'''
+    in croft's folder | env unchanged | stdin croft's | stdout croft's | stderr croft's | croft's session
+## launch_only
+ssh -M -S <scratch>/ctl -f -N -T -o BatchMode=yes -o IPQoS=throughput -o ConnectTimeout=10 -o ServerAliveInterval=15 box
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -S <adopted>/ctl -O exit box
+    in croft's folder | env unchanged | stdin croft's | stdout croft's | stderr croft's | croft's session
+ssh -S <adopted>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -n box 'echo croft-config-hashes; cd ~/.config/croft 2>/dev/null || exit 0; for f in config.synced.json keybindings.json snippets.json triggers.json matchers.json macros.json; do [ -f "$f" ] || continue; if command -v sha256sum >/dev/null 2>&1; then sha256sum "$f"; else shasum -a 256 "$f"; fi; done'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr nowhere | croft's session
+ssh -S <adopted>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -n box 'mkdir -p ~/.config/croft'
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -S <adopted>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -tt box 'export CROFT_REMOTE_AUTOUPDATE=1; export CROFT_UNDERLINE_COLORS='\''0'\''; export CROFT_RELAY_KEY='\''c2f8f60eca464df5'\''; export CROFT_CLIENT_NONCE='\''<nonce>'\''; export PATH="$HOME/.cargo/bin:$PATH"; command -v croft >/dev/null 2>&1 || { echo '\''croft not found on remote PATH'\'' >&2; exit 127; }; if croft session-host --probe >/dev/null 2>&1; then mkdir -p "$(dirname "$HOME/.cache/croft/sessions/c2f8f60eca464df5.mux.sock")"; export CROFT_SESSION_PERSISTENT=1; exec croft session-host --socket "$HOME/.cache/croft/sessions/c2f8f60eca464df5.mux.sock" --workspace '\''proj'\'' -- croft '\''proj'\''; elif command -v dtach >/dev/null 2>&1; then mkdir -p "$(dirname "$HOME/.cache/croft/sessions/c2f8f60eca464df5.sock")"; export CROFT_SESSION_PERSISTENT=1 CROFT_UNDERLINE_COLORS=0; exec dtach -A "$HOME/.cache/croft/sessions/c2f8f60eca464df5.sock" -E -z -r winch croft '\''proj'\''; else exec croft '\''proj'\''; fi'
+    in croft's folder | env unchanged | stdin croft's | stdout croft's | stderr croft's | croft's session
+ssh -S <adopted>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'export PATH="$HOME/.cargo/bin:$PATH"; croft session-host --probe >/dev/null 2>&1 || command -v dtach >/dev/null 2>&1'
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -S <adopted>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'set -e; RELAY="$HOME/.cache/croft/relay-c2f8f60eca464df5"; INBOX="$RELAY/inbox"; LOG="$RELAY/requests.log"; mkdir -p "$INBOX"; : > "$LOG"; printf '\''%s\n%s\n'\'' "$INBOX" "$LOG"'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+ssh -S <adopted>/ctl -o ControlMaster=no box 'exec tail -F -n 0 '\''<remote>/.cache/croft/relay-c2f8f60eca464df5/requests.log'\'' 2>/dev/null'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr nowhere | croft's session
+ssh -S <scratch>/ctl -O exit box
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -S <scratch>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'cat >/dev/null'
+    in croft's folder | env unchanged | stdin pipe | stdout nowhere | stderr nowhere | croft's session
+ssh -o BatchMode=yes -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=5 box true
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+## launch_croft_with, no croft there, so it is installed first
+rsync -az --checksum -e 'ssh -S <scratch>/ctl -o ControlMaster=no' <source>/target/x86_64-unknown-linux-musl/remote-fast/croft box:.cargo/bin/croft.new
+    in croft's folder | env unchanged | stdin croft's | stdout croft's | stderr croft's | croft's session
+ssh -M -S <scratch>/ctl -f -N -T -o BatchMode=yes -o IPQoS=throughput -o ConnectTimeout=10 -o ServerAliveInterval=15 box
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -M -S <scratch>/ctl -f -N -T -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box
+    in croft's folder | env unchanged | stdin croft's | stdout croft's | stderr croft's | croft's session
+ssh -S <scratch>/ctl -O exit box
+    in croft's folder | env unchanged | stdin croft's | stdout croft's | stderr croft's | croft's session
+ssh -S <scratch>/ctl -O exit box
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -S <scratch>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -n box 'echo croft-config-hashes; cd ~/.config/croft 2>/dev/null || exit 0; for f in config.synced.json keybindings.json snippets.json triggers.json matchers.json macros.json; do [ -f "$f" ] || continue; if command -v sha256sum >/dev/null 2>&1; then sha256sum "$f"; else shasum -a 256 "$f"; fi; done'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr nowhere | croft's session
+ssh -S <scratch>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -n box 'mkdir -p ~/.config/croft'
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -S <scratch>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -tt box 'export CROFT_REMOTE_AUTOUPDATE=1; export CROFT_UNDERLINE_COLORS='\''0'\''; export CROFT_RELAY_KEY='\''c2f8f60eca464df5'\''; export CROFT_CLIENT_NONCE='\''<nonce>'\''; export PATH="$HOME/.cargo/bin:$PATH"; command -v croft >/dev/null 2>&1 || { echo '\''croft not found on remote PATH'\'' >&2; exit 127; }; if croft session-host --probe >/dev/null 2>&1; then mkdir -p "$(dirname "$HOME/.cache/croft/sessions/c2f8f60eca464df5.mux.sock")"; export CROFT_SESSION_PERSISTENT=1; exec croft session-host --socket "$HOME/.cache/croft/sessions/c2f8f60eca464df5.mux.sock" --workspace '\''proj'\'' -- croft '\''proj'\''; elif command -v dtach >/dev/null 2>&1; then mkdir -p "$(dirname "$HOME/.cache/croft/sessions/c2f8f60eca464df5.sock")"; export CROFT_SESSION_PERSISTENT=1 CROFT_UNDERLINE_COLORS=0; exec dtach -A "$HOME/.cache/croft/sessions/c2f8f60eca464df5.sock" -E -z -r winch croft '\''proj'\''; else exec croft '\''proj'\''; fi'
+    in croft's folder | env unchanged | stdin croft's | stdout croft's | stderr croft's | croft's session
+ssh -S <scratch>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'cat >/dev/null'
+    in croft's folder | env unchanged | stdin pipe | stdout nowhere | stderr nowhere | croft's session
+ssh -S <scratch>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'chmod 755 "$HOME/.cargo/bin/croft.new" && mv "$HOME/.cargo/bin/croft.new" "$HOME/.cargo/bin/croft" && printf %s '\''<stamp>'\'' > "$HOME/.cache/croft/install-stamp" && rm -f "$HOME/.cache/croft/updating"'
+    in croft's folder | env unchanged | stdin croft's | stdout croft's | stderr croft's | croft's session
+ssh -S <scratch>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'export PATH="$HOME/.cargo/bin:$PATH"; croft session-host --probe >/dev/null 2>&1 || command -v dtach >/dev/null 2>&1'
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+ssh -S <scratch>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
+export PATH="$HOME/.cargo/bin:$PATH"
+command -v croft >/dev/null 2>&1 && echo yes'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+ssh -S <scratch>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'mkdir -p "$HOME/.cargo/bin" "$HOME/.cache/croft"'
+    in croft's folder | env unchanged | stdin croft's | stdout croft's | stderr croft's | croft's session
+ssh -S <scratch>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'set -e; RELAY="$HOME/.cache/croft/relay-c2f8f60eca464df5"; INBOX="$RELAY/inbox"; LOG="$RELAY/requests.log"; mkdir -p "$INBOX"; : > "$LOG"; printf '\''%s\n%s\n'\'' "$INBOX" "$LOG"'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+ssh -S <scratch>/ctl -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 box 'uname -m'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr pipe | croft's session
+ssh -S <scratch>/ctl -o ControlMaster=no box 'exec tail -F -n 0 '\''<remote>/.cache/croft/relay-c2f8f60eca464df5/requests.log'\'' 2>/dev/null'
+    in croft's folder | env unchanged | stdin nowhere | stdout pipe | stderr nowhere | croft's session
+ssh -o BatchMode=yes -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=5 box true
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+## the scp uploads of a drop on the Remote Explorer
+scp -r <upload>/dropped.txt box:
+    in croft's folder | env unchanged | stdin croft's | stdout croft's | stderr croft's | croft's session
+## close_master
+ssh -S <adopted>/ctl -O exit box
+    in croft's folder | env unchanged | stdin nowhere | stdout nowhere | stderr nowhere | croft's session
+## SshControl dropped
+ssh -S <master>/ctl -O exit box
+    in croft's folder | env unchanged | stdin croft's | stdout croft's | stderr croft's | croft's session

@@ -6026,6 +6026,36 @@ const END_SYNCHRONIZED_UPDATE: &[u8] = b"\x1b[?2026l";
 
 type CroftTerminal = Terminal<CrosstermBackend<CountingWriter>>;
 
+/// Queue `sources` for an scp upload to `alias` as a drop on the Remote
+/// Explorer does, then run them as the main loop does, on a screen of a
+/// fixed size that asks the terminal nothing. For the saved record of every
+/// ssh, rsync and scp call (`src/remote/recorded_calls.rs`, #2062): the
+/// upload needs an app and croft's own screen, and neither leaves this
+/// module.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn run_scp_uploads_for_record(
+    workspace: PathBuf,
+    alias: &str,
+    sources: &[PathBuf],
+) -> Result<()> {
+    let mut app = App::new(workspace)?;
+    app.remote.targets = vec![crate::remote::RemoteTarget {
+        alias: alias.to_string(),
+        host_name: None,
+        user: None,
+    }];
+    app.remote.selected = 0;
+    app.import_paths_into_remote(sources);
+    let backend = CrosstermBackend::new(CountingWriter::new(stdout(), Default::default()));
+    let mut terminal: CroftTerminal = Terminal::with_options(
+        backend,
+        ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+        },
+    )?;
+    remote_sessions::run_pending_scp_uploads(&mut app, &mut terminal)
+}
+
 pub fn run(
     root: PathBuf,
     restore_session: Option<PathBuf>,

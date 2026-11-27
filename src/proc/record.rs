@@ -30,6 +30,18 @@ pub(crate) struct Recording {
 pub(crate) fn record(dir: &Path, name: &str, then: &str) -> Recording {
     let runs = dir.join(format!("{name}.recorded"));
     std::fs::create_dir_all(&runs).unwrap();
+    recording_stand_in(dir, name, &runs, "", then);
+    Recording {
+        runs,
+        name: name.to_string(),
+        env_before: std::env::vars_os().collect(),
+        taken: 0,
+    }
+}
+
+/// The stand-in script for `name` that writes each run down in `runs`, and
+/// `mark` beside it, then runs `then`.
+fn recording_stand_in(dir: &Path, name: &str, runs: &Path, mark: &str, then: &str) {
     let r = runs.display();
     super::stand_in_script(
         dir,
@@ -43,19 +55,23 @@ pub(crate) fn record(dir: &Path, name: &str, then: &str) -> Recording {
              cp /proc/$$/stat \"$f.stat\"\n\
              readlink /proc/$$/cwd > \"$f.cwd\"\n\
              printf '%s\\n%s\\n%s\\n' \"$i\" \"$o\" \"$e\" > \"$f.fds\"\n\
+             {mark}\
              echo \"$f\" >> '{r}/order'\n\
              {then}\n"
         ),
     );
-    Recording {
-        runs,
-        name: name.to_string(),
-        env_before: std::env::vars_os().collect(),
-        taken: 0,
-    }
 }
 
 impl Recording {
+    /// Put a stand-in for `name` on this thread too, its runs written down
+    /// with this recording's and in the one order they all started in, each
+    /// under its own name: for programs that work together, as ssh, rsync
+    /// and scp do.
+    pub(crate) fn also(&mut self, dir: &Path, name: &str, then: &str) {
+        let mark = format!("printf %s '{name}' > \"$f.name\"\n");
+        recording_stand_in(dir, name, &self.runs, &mark, then);
+    }
+
     /// The runs since the last call, two lines each: the command, then where
     /// it ran, what croft changed in its environment, its three streams, and
     /// whether it runs apart from croft's session. Each path in `names` is
@@ -95,7 +111,9 @@ impl Recording {
             .collect();
         // `printf '%s\0'` ends every argument with a NUL, so the last piece is empty.
         let args = &args[..args.len().saturating_sub(1)];
-        let mut line = self.name.clone();
+        // A program put in place with `also` names itself.
+        let mut line = std::fs::read_to_string(format!("{}.name", run.display()))
+            .unwrap_or_else(|_| self.name.clone());
         for arg in args {
             line.push(' ');
             line.push_str(&quoted(&named(arg)));
