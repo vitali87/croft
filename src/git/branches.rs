@@ -22,14 +22,10 @@ pub fn default_branch(root: &Path) -> Result<String, String> {
     let path_str = root
         .to_str()
         .ok_or_else(|| "non-utf8 workspace path".to_string())?;
-    if let Ok(out) = crate::proc::command("git")
-        .args([
-            "-C",
-            path_str,
-            "symbolic-ref",
-            "--short",
-            "refs/remotes/origin/HEAD",
-        ])
+    if let Ok(out) = Git::new()
+        .at(path_str)
+        .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+        .into_command()
         .output()
         && out.status.success()
     {
@@ -43,15 +39,10 @@ pub fn default_branch(root: &Path) -> Result<String, String> {
         }
     }
     for candidate in ["main", "master", "develop", "trunk"] {
-        let out = crate::proc::command("git")
-            .args([
-                "-C",
-                path_str,
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                candidate,
-            ])
+        let out = Git::new()
+            .at(path_str)
+            .args(["rev-parse", "--verify", "--quiet", candidate])
+            .into_command()
             .output();
         if let Ok(o) = out
             && o.status.success()

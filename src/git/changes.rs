@@ -365,10 +365,12 @@ pub fn query_changes(root: &Path) -> Vec<ChangeEntry> {
         Some(s) => s,
         None => return Vec::new(),
     };
-    let output = match crate::proc::command("git")
-        // Poll without taking index.lock; see run_git.
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .args(["-C", path_str, "status", "--porcelain", "--untracked-files=all"])
+    let output = match Git::new()
+        .at(path_str)
+        // A poll: it must not take index.lock.
+        .without_optional_locks()
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .into_command()
         .output()
     {
         Ok(o) if o.status.success() => o,
@@ -435,15 +437,17 @@ pub(super) fn numstat_map(
     workdir: &str,
     args: &[&str],
 ) -> std::collections::HashMap<String, (usize, usize)> {
-    let output = match crate::proc::command("git")
-        // Poll without taking index.lock; see run_git. `git diff` does not
-        // honour GIT_OPTIONAL_LOCKS: a file whose timestamp changed but
-        // whose bytes did not has it write the refreshed index back, so its
-        // refresh is turned off too (#2593). The counts are the same: a
-        // file with the same bytes has none either way.
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .args(["-c", "diff.autoRefreshIndex=false", "-C", workdir])
+    let output = match Git::new()
+        // A poll: it must not take index.lock. `git diff` does not honour
+        // GIT_OPTIONAL_LOCKS: a file whose timestamp changed but whose bytes
+        // did not has it write the refreshed index back, so its refresh is
+        // turned off too (#2593). The counts are the same: a file with the
+        // same bytes has none either way.
+        .config("diff.autoRefreshIndex", "false")
+        .at(workdir)
+        .without_optional_locks()
         .args(args)
+        .into_command()
         .output()
     {
         Ok(o) if o.status.success() => o,
