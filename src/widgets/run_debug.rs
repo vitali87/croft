@@ -547,6 +547,11 @@ pub struct RunDebugPanel {
     /// against it: the screen shows it until the next frame, while a key or
     /// wheel step read in the same burst has already moved `debug_scroll`.
     pub last_debug_scroll: usize,
+    /// The rows those were, when a rebuild has replaced them since (#2751):
+    /// a click read before the next frame follows the row it was drawn on to
+    /// where the rebuild put it, as the keyboard does, since a click on a
+    /// scope or a watch's remove button in the same burst may have moved it.
+    replaced_debug_rows: Option<Vec<DebugRow>>,
     /// Tail of the debug console (program output + REPL echoes/results), set by
     /// the app each refresh; rendered below the variables tree.
     pub console_tail: Vec<crate::ansi_text::AnsiLine>,
@@ -602,6 +607,7 @@ impl RunDebugPanel {
             last_debug_row_y0: 0,
             last_debug_rows_shown: 0,
             last_debug_scroll: 0,
+            replaced_debug_rows: None,
             console_tail: Vec::new(),
             repl_input: String::new(),
             last_prompt_area: Rect::default(),
@@ -712,11 +718,18 @@ impl RunDebugPanel {
             return None;
         }
         let offset = (y - self.last_debug_row_y0) as usize;
-        if offset < self.last_debug_rows_shown {
-            Some(self.last_debug_scroll + offset)
-        } else {
-            None
+        if offset >= self.last_debug_rows_shown {
+            return None;
         }
+        let at = self.last_debug_scroll + offset;
+        let Some(drawn) = &self.replaced_debug_rows else {
+            return (at < self.debug_rows.len()).then_some(at);
+        };
+        if at >= drawn.len() {
+            return None;
+        }
+        let chain = row_chain(drawn, &row_parents(drawn), at);
+        find_chain(&self.debug_rows, &row_parents(&self.debug_rows), &chain)
     }
 
     /// Whether the keyboard cursor can rest on row `idx`: any row but a
@@ -810,7 +823,9 @@ impl RunDebugPanel {
     /// the rebuild moved it ([`row_chain`]). Rows come and go above it
     /// (another thread's frames, a variable opened), so the index alone
     /// would land on an unrelated row for the next Enter or Delete. When
-    /// its row is gone, the prompt has the keys again.
+    /// its row is gone, the prompt has the keys again. A click read before
+    /// the next frame follows the row it was drawn on the same way
+    /// ([`Self::debug_row_at`]).
     pub fn replace_rows(&mut self, rows: Vec<DebugRow>) {
         let old = std::mem::replace(&mut self.debug_rows, rows);
         self.row_cursor = self.row_cursor.filter(|&at| at < old.len()).and_then(|at| {
@@ -818,6 +833,8 @@ impl RunDebugPanel {
             find_chain(&self.debug_rows, &row_parents(&self.debug_rows), &chain)
         });
         self.settle_row_cursor();
+        // The first rows replaced since the frame are the ones on screen.
+        self.replaced_debug_rows.get_or_insert(old);
     }
 
     /// After the rows are rebuilt (#2748): a cursor past the end, or on a
@@ -1004,6 +1021,7 @@ impl RunDebugPanel {
         let rows_area_h = rows_bottom.saturating_sub(y) as usize;
         self.last_debug_row_y0 = y;
         self.last_debug_scroll = self.debug_scroll;
+        self.replaced_debug_rows = None;
 
         let mut shown = 0usize;
         // Breakpoint rows paint after the loop: `put_breakpoint` needs
@@ -2520,6 +2538,71 @@ mod tests {
             panel.debug_row_at(y0),
             Some(top),
             "the row drawn at the top, not the one scrolled there"
+        );
+    }
+
+    /// #2751: a click that rebuilds the rows (a scope opened, a watch
+    /// removed) and a second click read in the same burst: the second meets
+    /// the row drawn on its line where the rebuild put it, and nothing once
+    /// it is gone, however many rebuilds came between.
+    #[test]
+    fn a_click_after_a_rebuild_meets_the_drawn_row() {
+        let header = DebugRow {
+            indent: 0,
+            kind: DebugRowKind::Header {
+                title: String::from("VARIABLES"),
+            },
+        };
+        let var = |name: &str| DebugRow {
+            indent: 1,
+            kind: DebugRowKind::Variable {
+                reference: 0,
+                expandable: false,
+                expanded: false,
+                name: name.to_string(),
+                value: String::from("1"),
+                type_name: String::from("int"),
+                evaluate_name: Some(name.to_string()),
+            },
+        };
+        let rows = |names: &[&str]| -> Vec<DebugRow> {
+            std::iter::once(header.clone())
+                .chain(names.iter().map(|n| var(n)))
+                .collect()
+        };
+        let name_at = |panel: &RunDebugPanel, y| {
+            panel
+                .debug_row_at(y)
+                .map(|i| match &panel.debug_rows[i].kind {
+                    DebugRowKind::Variable { name, .. } => name.clone(),
+                    _ => String::from("not a variable"),
+                })
+        };
+        let mut panel = RunDebugPanel::new();
+        panel.debug_active = true;
+        panel.replace_rows(rows(&["v0", "v1", "v2", "v3"]));
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 16,
+        };
+        Widget::render(&mut panel, area, &mut Buffer::empty(area));
+        let y = (panel.last_debug_row_y0..area.height)
+            .find(|&y| name_at(&panel, y).as_deref() == Some("v2"))
+            .expect("v2 is drawn");
+
+        panel.replace_rows(rows(&["w", "v0", "v1", "v2", "v3"]));
+        assert_eq!(
+            name_at(&panel, y).as_deref(),
+            Some("v2"),
+            "the row drawn there, a row down now, not v1"
+        );
+        panel.replace_rows(rows(&["w", "v0", "v1", "v3"]));
+        assert_eq!(
+            name_at(&panel, y),
+            None,
+            "v2 is gone, so the click meets none"
         );
     }
 

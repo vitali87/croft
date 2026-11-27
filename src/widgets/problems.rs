@@ -258,6 +258,11 @@ pub struct ProblemsPanel {
     /// against it: the screen shows it until the next frame, while a key or
     /// wheel step read in the same burst has already moved `scroll`.
     last_scroll: usize,
+    /// The groups `rows` was laid out from, when [`Self::set_groups`] has
+    /// replaced them since (#2751). The rows point into their groups by
+    /// index, so a click read before the next frame, after a scope switch
+    /// in the same burst, resolves against the groups the screen shows.
+    drawn_groups: Option<Vec<ProblemGroup>>,
     viewport_rows: u16,
 }
 
@@ -285,6 +290,7 @@ impl ProblemsPanel {
             first_row_y: 0,
             visible_rows: 0,
             last_scroll: 0,
+            drawn_groups: None,
             viewport_rows: 0,
         }
     }
@@ -303,7 +309,9 @@ impl ProblemsPanel {
         }
         self.collapsed
             .retain(|p| groups.iter().any(|g| &g.path == p));
-        self.groups = groups;
+        let old = std::mem::replace(&mut self.groups, groups);
+        // The first groups replaced since the frame are the ones on screen.
+        self.drawn_groups.get_or_insert(old);
         self.scroll = self.scroll.min(self.max_scroll());
         true
     }
@@ -462,20 +470,15 @@ impl ProblemsPanel {
 
     /// Resolve a click at row `y` to a header (collapse) or diagnostic (jump).
     pub fn hit_at(&self, y: u16) -> Option<ProblemHit> {
-        if self.visible_rows == 0 || y < self.first_row_y {
-            return None;
-        }
-        let offset = (y - self.first_row_y) as usize;
-        if offset >= self.visible_rows as usize {
-            return None;
-        }
-        match self.rows.get(self.last_scroll + offset)? {
+        let line = self.line_at_y(y)?;
+        let groups = self.drawn_groups();
+        match self.rows.get(self.last_scroll + line)? {
             RenderRow::Header(g) => {
-                let group = self.groups.get(*g)?;
+                let group = groups.get(*g)?;
                 Some(ProblemHit::Header(group.path.clone()))
             }
             RenderRow::Diag(g, i) => {
-                let group = self.groups.get(*g)?;
+                let group = groups.get(*g)?;
                 let item = group.items.get(*i)?;
                 Some(ProblemHit::Diagnostic {
                     path: group.path.clone(),
@@ -485,7 +488,7 @@ impl ProblemsPanel {
                 })
             }
             RenderRow::Related(g, i, r) => {
-                let related = self.groups.get(*g)?.items.get(*i)?.related.get(*r)?;
+                let related = groups.get(*g)?.items.get(*i)?.related.get(*r)?;
                 Some(ProblemHit::Diagnostic {
                     path: related.path.clone(),
                     line: related.line,
@@ -499,32 +502,30 @@ impl ProblemsPanel {
     /// The diagnostic on the row painted at `y`, with its file, for actions
     /// that need the whole item rather than a jump target (#374).
     pub fn diagnostic_at(&self, y: u16) -> Option<(PathBuf, ProblemItem)> {
-        self.diagnostic_at_from(y, self.last_scroll)
+        let line = self.line_at_y(y)?;
+        diagnostic_of(self.drawn_groups(), self.rows.get(self.last_scroll + line)?)
     }
 
-    /// The diagnostic the next frame draws at row `y`, for what that frame
-    /// shows beside it, as a menu opened from the keyboard.
-    pub fn diagnostic_at_next_frame(&self, y: u16) -> Option<(PathBuf, ProblemItem)> {
-        self.diagnostic_at_from(y, self.scroll)
+    /// The first diagnostic the next frame draws, with the screen row it is
+    /// on, for a menu opened from the keyboard beside it. That frame lays
+    /// the rows out afresh from the live groups, filter and scroll.
+    pub fn first_diagnostic_next_frame(&self) -> Option<(u16, (PathBuf, ProblemItem))> {
+        let shown = self.visible_rows as usize;
+        let rows = self.layout();
+        (self.first_row_y..)
+            .zip(rows.iter().skip(self.scroll).take(shown))
+            .find_map(|(y, row)| Some((y, diagnostic_of(&self.groups, row)?)))
     }
 
-    fn diagnostic_at_from(&self, y: u16, scroll: usize) -> Option<(PathBuf, ProblemItem)> {
-        if self.visible_rows == 0 || y < self.first_row_y {
-            return None;
-        }
-        let offset = (y - self.first_row_y) as usize;
-        if offset >= self.visible_rows as usize {
-            return None;
-        }
-        match self.rows.get(scroll + offset)? {
-            RenderRow::Header(_) => None,
-            // A related row stands for the diagnostic it explains.
-            RenderRow::Diag(g, i) | RenderRow::Related(g, i, _) => {
-                let group = self.groups.get(*g)?;
-                let item = group.items.get(*i)?;
-                Some((group.path.clone(), item.clone()))
-            }
-        }
+    /// The list line, from the top, that screen row `y` is on.
+    fn line_at_y(&self, y: u16) -> Option<usize> {
+        let offset = (y.checked_sub(self.first_row_y)?) as usize;
+        (offset < self.visible_rows as usize).then_some(offset)
+    }
+
+    /// The groups the drawn rows point into.
+    fn drawn_groups(&self) -> &[ProblemGroup] {
+        self.drawn_groups.as_deref().unwrap_or(&self.groups)
     }
 
     /// The rows for the current filter, collapse state, and grouping.
@@ -553,6 +554,7 @@ impl ProblemsPanel {
     /// matches what was painted.
     fn build_rows(&mut self) {
         self.rows = self.layout();
+        self.drawn_groups = None;
     }
 
     /// Cycle the severity filter (toolbar funnel). Resets scroll so the
@@ -586,6 +588,19 @@ impl ProblemsPanel {
 
 fn rect_has(r: Rect, x: u16, y: u16) -> bool {
     x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+}
+
+/// The diagnostic `row` stands for in `groups`, with its file: a related
+/// row stands for the diagnostic it explains, and a header for none.
+fn diagnostic_of(groups: &[ProblemGroup], row: &RenderRow) -> Option<(PathBuf, ProblemItem)> {
+    match row {
+        RenderRow::Header(_) => None,
+        RenderRow::Diag(g, i) | RenderRow::Related(g, i, _) => {
+            let group = groups.get(*g)?;
+            let item = group.items.get(*i)?;
+            Some((group.path.clone(), item.clone()))
+        }
+    }
 }
 
 impl Default for ProblemsPanel {
@@ -1264,6 +1279,45 @@ mod tests {
         p.scroll_down(3);
         assert!(p.scroll > before, "the wheel scrolled the rows");
         assert_eq!(p.hit_at(2), drawn, "the row drawn there");
+    }
+
+    /// #2751: a key that switches the scope, and so replaces the groups, and
+    /// a click read in the same burst: the click meets the diagnostic drawn
+    /// on its line, not the one the new groups hold at the drawn row's
+    /// place. A menu opened from the keyboard sits by the first diagnostic
+    /// the next frame draws, from the new groups.
+    #[test]
+    fn a_click_after_the_groups_change_meets_the_drawn_diagnostic() {
+        let mut p = ProblemsPanel::new();
+        p.set_groups(vec![
+            group("a.rs", vec![diag(1, DiagnosticSeverity::Error, "boom")]),
+            group("b.rs", vec![diag(2, DiagnosticSeverity::Error, "kaboom")]),
+        ]);
+        render(&mut p, 60, 8);
+        let b = PathBuf::from("/repo/src/b.rs");
+        let y = (0..8)
+            .find(|&y| matches!(p.hit_at(y), Some(ProblemHit::Diagnostic { ref path, .. }) if *path == b))
+            .expect("b.rs's diagnostic is drawn");
+        p.set_groups(vec![
+            group("0.rs", vec![diag(7, DiagnosticSeverity::Error, "first")]),
+            group("a.rs", vec![diag(1, DiagnosticSeverity::Error, "boom")]),
+            group("b.rs", vec![diag(2, DiagnosticSeverity::Error, "kaboom")]),
+        ]);
+        assert!(
+            matches!(p.hit_at(y), Some(ProblemHit::Diagnostic { ref path, line: 2, .. }) if *path == b),
+            "the diagnostic drawn there: {:?}",
+            p.hit_at(y)
+        );
+        let (path, item) = p.diagnostic_at(y).expect("a diagnostic is drawn there");
+        assert_eq!((path, item.message.as_str()), (b, "kaboom"));
+        let (_, (path, item)) = p
+            .first_diagnostic_next_frame()
+            .expect("the next frame has one");
+        assert_eq!(
+            (path, item.message.as_str()),
+            (PathBuf::from("/repo/src/0.rs"), "first"),
+            "the next frame draws the new groups"
+        );
     }
 
     #[test]

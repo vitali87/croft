@@ -4,26 +4,40 @@
 use super::*;
 
 impl FileTree {
-    /// The node a pointer at screen row `y` meets: the rows as the last
-    /// frame drew them (#2751), which the screen shows until the next one.
+    /// The node a pointer at screen row `y` meets: the one the last frame
+    /// drew there (#2751), which the screen shows until the next one, where
+    /// it is now. None once it is gone, as when its folder closed.
     pub fn node_at_y(&self, y: u16) -> Option<usize> {
-        self.node_at_y_from(y, self.last_scroll)
+        let line = self.line_at_y(y)?;
+        self.drawn.now(line, self.nodes.len(), |i, path| {
+            self.nodes[i].path == *path
+        })
     }
 
     /// The node the next frame draws at screen row `y`, for what that frame
-    /// shows beside it, as a menu opened from the keyboard.
+    /// shows beside it, as a menu opened from the keyboard. Screen rows map
+    /// straight onto consecutive node indices from the scroll offset.
     pub fn node_at_y_next_frame(&self, y: u16) -> Option<usize> {
-        self.node_at_y_from(y, self.scroll)
+        let idx = self.scroll + self.line_at_y(y)?;
+        (idx < self.nodes.len()).then_some(idx)
     }
 
-    /// Screen rows map straight onto consecutive node indices from `scroll`.
-    fn node_at_y_from(&self, y: u16, scroll: usize) -> Option<usize> {
-        if y < self.last_inner.y || y >= self.last_inner.y + self.last_inner.height {
-            return None;
-        }
-        let row = (y - self.last_inner.y) as usize;
-        let idx = scroll + row;
-        (idx < self.nodes.len()).then_some(idx)
+    /// Test-only stand-in for a frame: the tree as `render` would note it
+    /// drawn into `inner` from its scroll, for tests that click rows
+    /// without painting.
+    #[cfg(test)]
+    pub fn pretend_drawn(&mut self, inner: Rect) {
+        self.last_inner = inner;
+        let end = (self.scroll + inner.height as usize).min(self.nodes.len());
+        self.drawn
+            .record((self.scroll..end).map(|i| (i, self.nodes[i].path.clone())));
+        self.sticky.clear();
+    }
+
+    /// The list line, from the top, that screen row `y` is on.
+    pub(super) fn line_at_y(&self, y: u16) -> Option<usize> {
+        let inner = self.last_inner;
+        (y >= inner.y && y < inner.y + inner.height).then(|| (y - inner.y) as usize)
     }
 
     pub fn select(&mut self, idx: usize) {

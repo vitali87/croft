@@ -408,11 +408,7 @@ impl App {
             }
             BottomPanelTab::Problems => {
                 let area = self.problems.last_area;
-                let (y, (path, item)) = (area.y..area.y + area.height).find_map(|y| {
-                    self.problems
-                        .diagnostic_at_next_frame(y)
-                        .map(|hit| (y, hit))
-                })?;
+                let (y, (path, item)) = self.problems.first_diagnostic_next_frame()?;
                 Some((
                     MenuTarget::Problem { path, item },
                     (area.x + 2, y.saturating_add(1)),

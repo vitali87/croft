@@ -2338,10 +2338,10 @@ fn sticky_band_pins_ancestors_and_maps_clicks_but_never_covers_the_selection() {
     let mut buf = Buffer::empty(area);
     (&mut tree).render(area, &mut buf);
     assert!(
-        !tree.sticky_rows.is_empty(),
+        !tree.sticky_rows_for_test().is_empty(),
         "scrolled deep inside inner/, the band must pin ancestors"
     );
-    let (y, idx) = tree.sticky_rows[0];
+    let (y, idx) = tree.sticky_rows_for_test()[0];
     assert!(tree.nodes[idx].is_dir, "only directories pin");
     assert_eq!(tree.sticky_row_at(y), Some(idx));
     let row: String = (area.x..area.x + area.width)
@@ -2363,7 +2363,7 @@ fn sticky_band_pins_ancestors_and_maps_clicks_but_never_covers_the_selection() {
     let mut buf = Buffer::empty(area);
     (&mut tree).render(area, &mut buf);
     assert!(
-        tree.sticky_rows.is_empty(),
+        tree.sticky_rows_for_test().is_empty(),
         "the band never covers the selected row"
     );
 }
@@ -2446,4 +2446,49 @@ fn a_click_after_a_wheel_step_meets_the_drawn_rows() {
         Some(drawn),
         "the row drawn there, not the one scrolled there"
     );
+}
+
+/// #2751: a key or click that closes a folder, read in the same burst as a
+/// click below it: the click meets the file drawn on its line where it is
+/// now, not the row the closing slid under the pointer, and a click on a
+/// file the folder took with it meets nothing.
+#[test]
+fn a_click_after_a_folder_closes_above_meets_the_drawn_row() {
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir(tmp.path().join("a")).unwrap();
+    for name in [
+        "a/a1.txt", "a/a2.txt", "a/a3.txt", "b1.txt", "b2.txt", "b3.txt", "b4.txt",
+    ] {
+        fs::write(tmp.path().join(name), "").unwrap();
+    }
+    let mut tree = FileTree::new(tmp.path().to_path_buf());
+    let index_of = |tree: &FileTree, name: &str| {
+        let path = tmp.path().join(name);
+        tree.nodes.iter().position(|n| n.path == path)
+    };
+    let folder = index_of(&tree, "a").expect("folder a is listed");
+    tree.select(folder);
+    tree.expand_selected();
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 30,
+        height: 12,
+    };
+    (&mut tree).render(area, &mut Buffer::empty(area));
+    let line_of = |tree: &FileTree, name: &str| {
+        let at = index_of(tree, name).expect("drawn");
+        (tree.last_inner.y..tree.last_inner.y + tree.last_inner.height)
+            .find(|&y| tree.node_at_y(y) == Some(at))
+            .expect("on screen")
+    };
+    let (b1_y, a2_y) = (line_of(&tree, "b1.txt"), line_of(&tree, "a/a2.txt"));
+    tree.select(folder);
+    tree.collapse_selected();
+    assert_eq!(
+        tree.node_at_y(b1_y),
+        index_of(&tree, "b1.txt"),
+        "the file drawn there, where it is now, not b4.txt"
+    );
+    assert_eq!(tree.node_at_y(a2_y), None, "a2.txt left with its folder");
 }

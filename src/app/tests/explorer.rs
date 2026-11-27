@@ -1318,12 +1318,12 @@ fn click_on_tree_row_aligned_with_terminal_splitter_y_selects_the_row_not_the_sp
         width: 32,
         height: 12,
     };
-    app.tree.last_inner = Rect {
+    app.tree.pretend_drawn(Rect {
         x: 5,
         y: 1,
         width: 30,
         height: 10,
-    };
+    });
     app.sidebar_splitter_x = Some(36);
     // Splitter sits inside the tree's rendered row band.
     app.terminal_splitter_y = Some(6);
@@ -1365,12 +1365,12 @@ fn double_clicking_directory_toggles_only_once() {
         width: 40,
         height: 8,
     };
-    app.tree.last_inner = Rect {
+    app.tree.pretend_drawn(Rect {
         x: 1,
         y: 1,
         width: 38,
         height: 6,
-    };
+    });
     let sub_idx = app
         .tree
         .nodes
@@ -1551,12 +1551,12 @@ fn drag_drop_moves_marked_paths_to_target_dir() {
         width: 40,
         height: 8,
     };
-    app.tree.last_inner = Rect {
+    app.tree.pretend_drawn(Rect {
         x: 1,
         y: 1,
         width: 38,
         height: 6,
-    };
+    });
     let src_idx = app
         .tree
         .nodes
@@ -1605,12 +1605,12 @@ fn alt_drag_copies_instead_of_moves() {
         width: 40,
         height: 8,
     };
-    app.tree.last_inner = Rect {
+    app.tree.pretend_drawn(Rect {
         x: 1,
         y: 1,
         width: 38,
         height: 6,
-    };
+    });
     let src_idx = app
         .tree
         .nodes
@@ -1663,12 +1663,12 @@ fn shift_click_extends_marks_from_anchor() {
         width: 40,
         height: 8,
     };
-    app.tree.last_inner = Rect {
+    app.tree.pretend_drawn(Rect {
         x: 1,
         y: 1,
         width: 38,
         height: 6,
-    };
+    });
     let first_idx = 1usize;
     let last_idx = app.tree.nodes.len() - 1;
     let first_row = app.tree.last_inner.y + first_idx as u16;
@@ -1707,12 +1707,12 @@ fn alt_click_toggles_individual_mark_on_release() {
         width: 40,
         height: 8,
     };
-    app.tree.last_inner = Rect {
+    app.tree.pretend_drawn(Rect {
         x: 1,
         y: 1,
         width: 38,
         height: 6,
-    };
+    });
     let a_idx = app
         .tree
         .nodes
@@ -1757,12 +1757,12 @@ fn ctrl_click_also_toggles_individual_mark() {
         width: 40,
         height: 8,
     };
-    app.tree.last_inner = Rect {
+    app.tree.pretend_drawn(Rect {
         x: 1,
         y: 1,
         width: 38,
         height: 6,
-    };
+    });
     let a_idx = app
         .tree
         .nodes
@@ -1799,12 +1799,12 @@ fn alt_click_does_not_open_the_file() {
         width: 40,
         height: 8,
     };
-    app.tree.last_inner = Rect {
+    app.tree.pretend_drawn(Rect {
         x: 1,
         y: 1,
         width: 38,
         height: 6,
-    };
+    });
     let idx = app.tree.nodes.iter().position(|n| n.path == f).unwrap();
     let row = app.tree.last_inner.y + idx as u16;
     app.handle_mouse(crossterm::event::MouseEvent {

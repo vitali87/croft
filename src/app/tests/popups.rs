@@ -884,7 +884,7 @@ fn a_drag_a_popup_cuts_short_drops_nothing_later() {
         std::fs::create_dir(tmp.path().join("dest")).unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
         app.tree.last_area = Rect::new(0, 0, 40, 8);
-        app.tree.last_inner = Rect::new(1, 1, 38, 6);
+        app.tree.pretend_drawn(Rect::new(1, 1, 38, 6));
         let row_of = |app: &App, name: &str| {
             let i = app.tree.nodes.iter().position(|n| n.path.ends_with(name));
             app.tree.last_inner.y + i.expect("the tree lists it") as u16

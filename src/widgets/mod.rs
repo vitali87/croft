@@ -11,6 +11,7 @@ pub mod connect_dialog;
 pub mod dependencies;
 pub mod diff;
 pub mod diff_syntax;
+pub mod drawn_rows;
 pub mod editor;
 pub mod editor_find;
 pub mod extensions;
