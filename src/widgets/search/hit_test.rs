@@ -88,7 +88,8 @@ impl SearchPanel {
         if col < inner.x || col >= right {
             return None;
         }
-        self.hit_at_y(row).map(|i| self.hits[i].path.as_path())
+        self.hit_at_y_from(row, self.scroll)
+            .map(|i| self.hits[i].path.as_path())
     }
 
     /// Map a click to the input field whose editable row it lands on, for
@@ -145,13 +146,20 @@ impl SearchPanel {
     /// cluster; the exact first row depends on which optional rows (Replace,
     /// include/exclude) are expanded, captured in `results_start_offset`.
     pub fn hit_at_y(&self, y: u16) -> Option<usize> {
+        self.hit_at_y_from(y, self.last_scroll)
+    }
+
+    /// The row a pointer at `y` meets, from `scroll`: the drawn scroll for a
+    /// click (#2751), which acts on what the screen shows, and the live one
+    /// for the hover hint, which the next frame draws beside those rows.
+    fn hit_at_y_from(&self, y: u16, scroll: usize) -> Option<usize> {
         let inner = self.last_inner;
         let results_start = inner.y + self.results_start_offset;
         if y < results_start || y >= inner.y + inner.height {
             return None;
         }
         let row_in_results = (y - results_start) as usize;
-        let idx = self.scroll + row_in_results;
+        let idx = scroll + row_in_results;
         if idx < self.hits.len() {
             Some(idx)
         } else {

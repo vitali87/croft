@@ -1,4 +1,5 @@
 use crate::icons;
+use crate::widgets::drawn_rows::DrawnRows;
 use crate::widgets::scrollbar;
 use ratatui::{
     buffer::Buffer,
@@ -159,12 +160,17 @@ pub struct FileTree {
     /// the name.
     pub note_counts: Arc<HashMap<PathBuf, usize>>,
     pub last_inner: Rect,
+    /// The rows the last frame drew, by path (#2751). A click is matched
+    /// against them: the screen shows them until the next frame, while a
+    /// wheel step, or a key or click that opened or closed a folder, read in
+    /// the same burst has already moved the rows under it.
+    drawn: DrawnRows<PathBuf>,
     pub last_area: Rect,
     pub last_scrollbar: Rect,
-    /// The sticky band painted this frame: `(screen y, node index)` per
-    /// pinned ancestor row. Cleared at render start so the hit test always
-    /// describes the painted frame (#103's invariant).
-    sticky_rows: Vec<(u16, usize)>,
+    /// The sticky band painted this frame, one pinned ancestor per line from
+    /// the top, by path like the rows below it. Cleared at render start so
+    /// the hit test always describes the painted frame (#103's invariant).
+    sticky: DrawnRows<PathBuf>,
     pub anchor: usize,
     pub marked: BTreeSet<PathBuf>,
     /// While the user is mid-drag, the index of the directory row currently
@@ -218,9 +224,10 @@ impl FileTree {
             note_counts: Arc::default(),
             root_badges: Arc::default(),
             last_inner: Rect::default(),
+            drawn: DrawnRows::default(),
             last_area: Rect::default(),
             last_scrollbar: Rect::default(),
-            sticky_rows: Vec::new(),
+            sticky: DrawnRows::default(),
             anchor: 0,
             marked: BTreeSet::new(),
             drag_target: None,

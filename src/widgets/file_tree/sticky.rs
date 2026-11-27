@@ -14,16 +14,17 @@ impl FileTree {
 
     /// Test-only view of the band painted this frame.
     #[cfg(test)]
-    pub fn sticky_rows_for_test(&self) -> &[(u16, usize)] {
-        &self.sticky_rows
+    pub fn sticky_rows_for_test(&self) -> Vec<(u16, usize)> {
+        (self.last_inner.y..).zip(self.sticky.drawn_at()).collect()
     }
 
-    /// Map a click on the sticky band to the pinned directory's node index.
+    /// Map a click on the sticky band to the pinned directory's node index:
+    /// the one the last frame pinned on that line, where it is now (#2751).
     pub fn sticky_row_at(&self, y: u16) -> Option<usize> {
-        self.sticky_rows
-            .iter()
-            .find(|&&(ry, _)| ry == y)
-            .map(|&(_, idx)| idx)
+        let line = self.line_at_y(y)?;
+        self.sticky.now(line, self.nodes.len(), |i, path| {
+            self.nodes[i].path == *path
+        })
     }
 }
 

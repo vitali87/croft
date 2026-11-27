@@ -1,4 +1,5 @@
 use crate::remote::{RemoteTarget, SshConfigState, discover_ssh_targets, ssh_config_state};
+use crate::widgets::drawn_rows::DrawnRows;
 use crate::widgets::scrollbar;
 use ratatui::{
     buffer::Buffer,
@@ -25,6 +26,11 @@ pub struct RemotePanel {
     pub last_area: Rect,
     pub last_inner: Rect,
     pub last_list_area: Rect,
+    /// The hosts the last frame drew, by alias, at their place in `visible`
+    /// (#2751). A click is matched against them: the screen shows them until
+    /// the next frame, while a wheel step, a filter key or a refresh read in
+    /// the same burst has already moved the rows under it.
+    drawn: DrawnRows<String>,
     pub last_scrollbar: Rect,
     pub header_chevron_btn: Rect,
     pub header_add_btn: Rect,
@@ -59,6 +65,7 @@ impl RemotePanel {
             last_area: Rect::default(),
             last_inner: Rect::default(),
             last_list_area: Rect::default(),
+            drawn: DrawnRows::default(),
             last_scrollbar: Rect::default(),
             header_chevron_btn: Rect::default(),
             header_add_btn: Rect::default(),
@@ -157,9 +164,11 @@ impl RemotePanel {
         if y < self.last_list_area.y || y >= self.last_list_area.y + self.last_list_area.height {
             return None;
         }
-        let row = (y - self.last_list_area.y) as usize;
-        let idx = self.scroll + row;
-        self.visible.get(idx).copied()
+        let line = (y - self.last_list_area.y) as usize;
+        let at = self.drawn.now(line, self.visible.len(), |at, alias| {
+            self.targets[self.visible[at]].alias == *alias
+        })?;
+        Some(self.visible[at])
     }
 
     pub fn select(&mut self, idx: usize) {
@@ -634,6 +643,7 @@ impl Widget for &mut RemotePanel {
         self.last_area = area;
         self.last_inner = inner;
         self.last_scrollbar = Rect::default();
+        self.drawn.clear();
         self.header_chevron_btn = Rect::default();
         self.header_add_btn = Rect::default();
         self.header_refresh_btn = Rect::default();
@@ -739,6 +749,9 @@ impl Widget for &mut RemotePanel {
         };
         let pointer = self.hover_pointer;
         let end = (self.scroll + viewport).min(self.visible.len());
+        self.drawn.record(
+            (self.scroll..end).map(|at| (at, self.targets[self.visible[at]].alias.clone())),
+        );
         for (row, vis_idx) in (self.scroll..end).enumerate() {
             let idx = self.visible[vis_idx];
             let target = &self.targets[idx];
@@ -1076,6 +1089,82 @@ mod tests {
         assert_eq!(
             p.targets[idx].alias, "bravo",
             "clicking the first visible row under a filter must select the matching host, not raw targets[0]"
+        );
+    }
+
+    /// #2751: a wheel step and a click read in the same burst: the click
+    /// meets the rows the last frame drew, not the ones the wheel has moved
+    /// there before the next frame.
+    #[test]
+    fn a_click_after_a_wheel_step_meets_the_drawn_rows() {
+        let names: Vec<String> = (0..30).map(|i| format!("host{i:02}")).collect();
+        let aliases: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut p = populated_panel(&aliases);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        let y = p.last_list_area.y + 1;
+        let drawn = p.target_at_y(y);
+        assert!(drawn.is_some(), "a row is drawn there");
+        let before = p.scroll;
+        p.scroll_down(3);
+        assert!(p.scroll > before, "the wheel scrolled the rows");
+        assert_eq!(p.target_at_y(y), drawn, "the row drawn there");
+    }
+
+    /// #2751: a filter key and a click read in the same burst: the click
+    /// meets the host drawn on its line wherever the filter moved it, and
+    /// nothing once the filter dropped it, never a host the filter slid
+    /// under the pointer, which a double-click would connect to.
+    #[test]
+    fn a_click_after_a_filter_key_meets_the_drawn_host() {
+        let names: Vec<String> = (0..10)
+            .map(|i| format!("a{i:02}"))
+            .chain((0..20).map(|i| format!("z{i:02}")))
+            .collect();
+        let aliases: Vec<&str> = names.iter().map(String::as_str).collect();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
+        let alias_at = |p: &RemotePanel, y| p.target_at_y(y).map(|t| p.targets[t].alias.clone());
+
+        let mut p = populated_panel(&aliases);
+        p.selected = 10;
+        p.scroll = 10;
+        (&mut p).render(area, &mut Buffer::empty(area));
+        let top = p.last_list_area.y;
+        assert_eq!(
+            alias_at(&p, top).as_deref(),
+            Some("z00"),
+            "z00 drawn on top"
+        );
+        p.push_filter_char('z');
+        assert_eq!(
+            alias_at(&p, top).as_deref(),
+            Some("z00"),
+            "the host drawn there, now first under the filter, not z10"
+        );
+
+        let mut p = populated_panel(&aliases);
+        (&mut p).render(area, &mut Buffer::empty(area));
+        assert_eq!(
+            alias_at(&p, top).as_deref(),
+            Some("a00"),
+            "a00 drawn on top"
+        );
+        p.push_filter_char('z');
+        assert_eq!(
+            alias_at(&p, top),
+            None,
+            "the filter dropped the host drawn there, so the click meets none"
         );
     }
 

@@ -347,7 +347,7 @@ impl App {
                     return Some((MenuTarget::Explorer(None), (area.x + 2, area.y + 1)));
                 };
                 let idx = self.tree.selected.min(last);
-                let y = row_drawn(area, |y| self.tree.node_at_y(y) == Some(idx));
+                let y = row_drawn(area, |y| self.tree.node_at_y_next_frame(y) == Some(idx));
                 Some((
                     MenuTarget::Explorer(Some(idx)),
                     (area.x + 2, y.saturating_add(1)),
@@ -408,8 +408,7 @@ impl App {
             }
             BottomPanelTab::Problems => {
                 let area = self.problems.last_area;
-                let (y, (path, item)) = (area.y..area.y + area.height)
-                    .find_map(|y| self.problems.diagnostic_at(y).map(|hit| (y, hit)))?;
+                let (y, (path, item)) = self.problems.first_diagnostic_next_frame()?;
                 Some((
                     MenuTarget::Problem { path, item },
                     (area.x + 2, y.saturating_add(1)),

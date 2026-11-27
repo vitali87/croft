@@ -4,15 +4,46 @@
 use super::*;
 
 impl FileTree {
-    /// Map a screen y coordinate to a node index, if any. Screen rows map
-    /// straight onto consecutive node indices from the scroll offset.
+    /// The node a pointer at screen row `y` meets: the one the last frame
+    /// drew there (#2751), which the screen shows until the next one, where
+    /// it is now. None once it is gone, as when its folder closed, and on a
+    /// line the sticky band covers: that line shows a pinned folder
+    /// ([`Self::sticky_row_at`]), never the row under it, even once the
+    /// folder is gone.
     pub fn node_at_y(&self, y: u16) -> Option<usize> {
-        if y < self.last_inner.y || y >= self.last_inner.y + self.last_inner.height {
+        let line = self.line_at_y(y)?;
+        if line < self.sticky.lines() {
             return None;
         }
-        let row = (y - self.last_inner.y) as usize;
-        let idx = self.scroll + row;
+        self.drawn.now(line, self.nodes.len(), |i, path| {
+            self.nodes[i].path == *path
+        })
+    }
+
+    /// The node the next frame draws at screen row `y`, for what that frame
+    /// shows beside it, as a menu opened from the keyboard. Screen rows map
+    /// straight onto consecutive node indices from the scroll offset.
+    pub fn node_at_y_next_frame(&self, y: u16) -> Option<usize> {
+        let idx = self.scroll + self.line_at_y(y)?;
         (idx < self.nodes.len()).then_some(idx)
+    }
+
+    /// Test-only stand-in for a frame: the tree as `render` would note it
+    /// drawn into `inner` from its scroll, for tests that click rows
+    /// without painting.
+    #[cfg(test)]
+    pub fn pretend_drawn(&mut self, inner: Rect) {
+        self.last_inner = inner;
+        let end = (self.scroll + inner.height as usize).min(self.nodes.len());
+        self.drawn
+            .record((self.scroll..end).map(|i| (i, self.nodes[i].path.clone())));
+        self.sticky.clear();
+    }
+
+    /// The list line, from the top, that screen row `y` is on.
+    pub(super) fn line_at_y(&self, y: u16) -> Option<usize> {
+        let inner = self.last_inner;
+        (y >= inner.y && y < inner.y + inner.height).then(|| (y - inner.y) as usize)
     }
 
     pub fn select(&mut self, idx: usize) {

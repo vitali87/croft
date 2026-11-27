@@ -209,6 +209,10 @@ pub struct SearchPanel {
     /// down. `results_viewport_height` and `hit_at_y` read this so scrolling
     /// and click mapping stay aligned with the rendered layout.
     pub results_start_offset: u16,
+    /// The scroll the rows were drawn with (#2751). A click is matched
+    /// against it: the screen shows it until the next frame, while a key or
+    /// wheel step read in the same burst has already moved `scroll`.
+    pub last_scroll: usize,
     /// Screen cell of the focused field's text caret, captured each render so
     /// the app can drive the host's blinking hardware caret there (matching
     /// the Source Control commit box). `None` when no field is focused or the
@@ -295,6 +299,7 @@ impl SearchPanel {
             project_exclude: Vec::new(),
             use_exclude_settings: true,
             results_start_offset: 5,
+            last_scroll: 0,
             caret_cell: None,
         }
     }

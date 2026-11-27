@@ -774,6 +774,7 @@ impl Widget for &mut SearchPanel {
         if self.scroll > max_scroll {
             self.scroll = max_scroll;
         }
+        self.last_scroll = self.scroll;
         // Reserve the rightmost column for the scrollbar when the result
         // list overflows the viewport. `vertical_metrics` returns None when
         // there's no overflow, so the rightmost column is freed for content.

@@ -1817,12 +1817,12 @@ fn click_open_in_explorer(app: &mut App, name: &str) {
         width: 32,
         height: 20,
     };
-    app.tree.last_inner = Rect {
+    app.tree.pretend_drawn(Rect {
         x: 5,
         y: 1,
         width: 30,
         height: 18,
-    };
+    });
     app.focus_pane(Pane::Tree);
     let idx = app
         .tree

@@ -59,6 +59,10 @@ pub struct OpenEditorsPanel {
     last_header_w: u16,
     first_row_y: u16,
     visible_rows: u16,
+    /// The scroll those rows were drawn with (#2751). A click is matched
+    /// against it: the screen shows it until the next frame, while a key or
+    /// wheel step read in the same burst has already moved `scroll`.
+    last_scroll: usize,
     viewport_rows: u16,
 }
 
@@ -82,6 +86,7 @@ impl OpenEditorsPanel {
             last_header_w: 0,
             first_row_y: 0,
             visible_rows: 0,
+            last_scroll: 0,
             viewport_rows: 0,
         }
     }
@@ -175,7 +180,7 @@ impl OpenEditorsPanel {
         if offset >= self.visible_rows as usize {
             return None;
         }
-        let idx = self.scroll + offset;
+        let idx = self.last_scroll + offset;
         (idx < self.items.len()).then_some(idx)
     }
 
@@ -314,6 +319,7 @@ impl Widget for &mut OpenEditorsPanel {
 
         let visible = (body_h as usize).min(self.items.len().saturating_sub(self.scroll));
         self.visible_rows = visible as u16;
+        self.last_scroll = self.scroll;
         let brand = self.focus_gradient;
         let sel_bg = if brand {
             crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG)
@@ -403,6 +409,34 @@ mod tests {
             3,
             "header + 'No open editors' + separator"
         );
+    }
+
+    /// #2751: a wheel step and a click read in the same burst: the click
+    /// meets the rows the last frame drew, not the ones the wheel has moved
+    /// there before the next frame.
+    #[test]
+    fn a_click_after_a_wheel_step_meets_the_drawn_rows() {
+        let mut p = OpenEditorsPanel::new();
+        p.collapsed = false;
+        p.set_items(
+            (0..20)
+                .map(|i| item(&format!("f{i:02}.rs"), false, i == 0))
+                .collect(),
+        );
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 6,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        let drawn = p.row_at(2);
+        assert!(drawn.is_some(), "a row is drawn there");
+        let before = p.scroll;
+        p.scroll_down(3);
+        assert!(p.scroll > before, "the wheel scrolled the rows");
+        assert_eq!(p.row_at(2), drawn, "the row drawn there");
     }
 
     #[test]

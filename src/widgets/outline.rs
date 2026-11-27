@@ -72,6 +72,10 @@ pub struct OutlinePanel {
     /// be mapped back to a symbol index.
     first_row_y: u16,
     visible_rows: u16,
+    /// The scroll those rows were drawn with (#2751). A click is matched
+    /// against it: the screen shows it until the next frame, while a key or
+    /// wheel step read in the same burst has already moved `scroll`.
+    last_scroll: usize,
     /// The symbol-row capacity of the body at the last render (independent of
     /// the current scroll), so wheel-scroll can clamp to the last row without
     /// knowing the layout at input time.
@@ -104,6 +108,7 @@ pub struct OutlineView {
     last_header_w: u16,
     first_row_y: u16,
     visible_rows: u16,
+    last_scroll: usize,
     viewport_rows: u16,
 }
 
@@ -144,6 +149,7 @@ impl OutlinePanel {
             last_header_w: 0,
             first_row_y: 0,
             visible_rows: 0,
+            last_scroll: 0,
             viewport_rows: 0,
             followed: None,
             file_generation: 0,
@@ -167,6 +173,7 @@ impl OutlinePanel {
             last_header_w: self.last_header_w,
             first_row_y: self.first_row_y,
             visible_rows: self.visible_rows,
+            last_scroll: self.last_scroll,
             viewport_rows: self.viewport_rows,
         };
         let theirs = std::mem::replace(view, mine);
@@ -180,6 +187,7 @@ impl OutlinePanel {
         self.last_header_w = theirs.last_header_w;
         self.first_row_y = theirs.first_row_y;
         self.visible_rows = theirs.visible_rows;
+        self.last_scroll = theirs.last_scroll;
         self.viewport_rows = theirs.viewport_rows;
         if self.view_generation != self.file_generation {
             self.view_generation = self.file_generation;
@@ -400,7 +408,7 @@ impl OutlinePanel {
         if offset >= self.visible_rows as usize {
             return None;
         }
-        let idx = self.scroll + offset;
+        let idx = self.last_scroll + offset;
         (idx < self.symbols.len()).then_some(idx)
     }
 
@@ -519,6 +527,7 @@ impl Widget for &mut OutlinePanel {
 
         let visible = (body_h as usize).min(self.symbols.len().saturating_sub(self.scroll));
         self.visible_rows = visible as u16;
+        self.last_scroll = self.scroll;
         let brand = self.focus_gradient;
         let sel_bg = if brand {
             crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG)
@@ -695,6 +704,24 @@ mod tests {
         let area = Rect::new(0, 0, 30, height);
         let mut buf = Buffer::empty(area);
         p.render(area, &mut buf);
+    }
+
+    /// #2751: a wheel step and a click read in the same burst: the click
+    /// meets the rows the last frame drew, not the ones the wheel has moved
+    /// there before the next frame.
+    #[test]
+    fn a_click_after_a_wheel_step_meets_the_drawn_rows() {
+        let mut p = OutlinePanel::new();
+        p.toggle_collapse();
+        p.set_symbols("a.rs".into(), many(50));
+        render_rows(&mut p, 10);
+        let y = p.first_row_y + 1;
+        let drawn = p.row_at(y);
+        assert!(drawn.is_some(), "a row is drawn there");
+        let before = p.scroll;
+        p.scroll_down(3);
+        assert!(p.scroll > before, "the wheel scrolled the rows");
+        assert_eq!(p.row_at(y), drawn, "the row drawn there");
     }
 
     #[test]

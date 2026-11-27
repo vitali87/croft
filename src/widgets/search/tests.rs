@@ -3542,3 +3542,27 @@ fn croft_black_result_rows_keep_the_teal_chip_and_gold_matches() {
         crate::widgets::surface::ROW_BAR
     );
 }
+
+/// #2751: a wheel step and a click read in the same burst: the click meets
+/// the rows the last frame drew, not the ones the wheel has moved there
+/// before the next frame.
+#[test]
+fn a_click_after_a_wheel_step_meets_the_drawn_rows() {
+    let tmp = TempDir::new().unwrap();
+    let mut panel = make_panel_with_hits(&tmp, 100);
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 60,
+        height: 30,
+    };
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+    let y = panel.last_inner.y + panel.results_start_offset + 1;
+    let drawn = panel.hit_at_y(y);
+    assert!(drawn.is_some(), "a row is drawn there");
+    let before = panel.scroll;
+    panel.scroll_down(3);
+    assert!(panel.scroll > before, "the wheel scrolled the rows");
+    assert_eq!(panel.hit_at_y(y), drawn, "the row drawn there");
+}

@@ -93,7 +93,8 @@ impl Widget for &mut FileTree {
         self.header_views_btn = Rect::default();
         self.last_area = area;
         self.last_scrollbar = Rect::default();
-        self.sticky_rows.clear();
+        self.drawn.clear();
+        self.sticky.clear();
 
         // Paint the ⋯ button at the right end of the title border row. It is
         // always available (not focus-gated) so the view-toggle menu is one
@@ -161,6 +162,11 @@ impl Widget for &mut FileTree {
         // No Explorer filter any more, so no characters are ever highlighted.
         let query = String::new();
         let end = (scroll_pos + visible_height).min(visible.len());
+        self.drawn.record(
+            visible[scroll_pos..end]
+                .iter()
+                .map(|&i| (i, self.nodes[i].path.clone())),
+        );
         // Croft Loch's indent guides: the guide of the selected row's parent
         // folder is drawn a step brighter down that folder's children (VS
         // Code's active indent guide), as `(level, first, end)` node indices.
@@ -494,7 +500,7 @@ impl Widget for &mut FileTree {
                     Span::styled(name, name_style),
                 ];
                 buf.set_line(inner.x, y, &Line::from(spans), row_width);
-                self.sticky_rows.push((y, aidx));
+                self.sticky.push(aidx, self.nodes[aidx].path.clone());
             }
         }
         if let Some(metrics) = scrollbar_metrics {
