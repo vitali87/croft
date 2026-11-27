@@ -26,6 +26,119 @@ pub(super) fn fetch_sarif_source(url: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+/// How long one code scanning `gh` call may take before it is killed and
+/// reported, as the review tab's calls are: a stalled network must neither
+/// freeze croft nor leave a lookup waiting for good (#2786).
+pub(super) const CODE_SCAN_GH_LIMIT: std::time::Duration = crate::pr_review::GH_TIMEOUT;
+
+/// The most of either output a code scanning call keeps: far past any
+/// analysis, so only a runaway answer is refused.
+const GH_OUTPUT_CAP: usize = 1 << 30;
+
+/// How a code scanning `gh` call exited and what it printed.
+struct GhAnswer {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: String,
+}
+
+/// Run `gh` with `args` in `root` for at most `limit`, both outputs read
+/// while it runs. An error says it could not start, has no account signed
+/// in, ran past the limit or answered too much; anything else is gh's own
+/// answer, whatever its exit.
+fn ask_gh(
+    gh: &Path,
+    root: &Path,
+    args: &[String],
+    limit: std::time::Duration,
+) -> Result<GhAnswer, String> {
+    use crate::proc::{Apart, Bounded, Keep, RunError};
+    let ran = Bounded {
+        stdout: Keep::All { cap: GH_OUTPUT_CAP },
+        stderr: Keep::All { cap: GH_OUTPUT_CAP },
+        apart: Apart::No,
+        limit,
+        retry_busy: true,
+    }
+    .run(std::process::Command::new(gh).args(args).current_dir(root));
+    match ran {
+        Ok(ran) if crate::gh::signed_out(ran.status) => Err(String::from(crate::gh::SIGNED_OUT)),
+        Ok(ran) => Ok(GhAnswer {
+            status: ran.status,
+            stderr: ran.stderr.text(),
+            stdout: ran.stdout.into_bytes(),
+        }),
+        Err(RunError::Spawn(e)) => Err(crate::gh::spawn_error(&e, Some(root))),
+        Err(RunError::TimedOut) => Err(format!(
+            "{} took longer than {}s",
+            gh.display(),
+            limit.as_secs()
+        )),
+        Err(RunError::TooLong { .. }) => Err(format!(
+            "{} answered more than {} MiB",
+            gh.display(),
+            GH_OUTPUT_CAP >> 20
+        )),
+        Err(RunError::Wait(e) | RunError::Pipe(e)) => {
+            Err(format!("could not wait on {}: {e}", gh.display()))
+        }
+    }
+}
+
+/// Run `gh` with `args` in `root` for at most `limit`. Its stdout, or the
+/// first line of what it said went wrong: GitHub's own message when the API
+/// sent one, else gh's; or that gh is missing, signed out or too slow.
+fn code_scanning_gh(
+    gh: &Path,
+    root: &Path,
+    args: &[String],
+    limit: std::time::Duration,
+) -> Result<String, String> {
+    let out = ask_gh(gh, root, args, limit)?;
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    if out.status.success() {
+        return Ok(stdout);
+    }
+    let api_message = serde_json::from_str::<serde_json::Value>(&stdout)
+        .ok()
+        .and_then(|v| v.get("message")?.as_str().map(str::to_string));
+    let first = |s: &str| s.trim().lines().next().map(str::to_string);
+    Err(api_message
+        .or_else(|| {
+            let s = out.stderr.trim();
+            serde_json::from_str::<serde_json::Value>(s)
+                .ok()
+                .and_then(|v| v.get("message")?.as_str().map(str::to_string))
+                .or_else(|| first(s))
+        })
+        .unwrap_or_else(|| String::from("gh failed")))
+}
+
+/// What one of code scanning's asks of GitHub came back with (#2786). Each
+/// runs on a job, so the UI keeps drawing while gh waits on the network.
+pub(super) enum CodeScanAnswer {
+    /// The analyses to offer, with the picker's title.
+    Analyses(Result<(Vec<crate::sarif::github::Analysis>, String), String>),
+    /// The open alert a result without a stamped number matched, if any;
+    /// `target` is the result, as the dismiss target holds it.
+    Alert {
+        target: (PathBuf, usize, usize),
+        found: Result<Option<u64>, String>,
+    },
+    /// GitHub's answer to dismissing alert `number` for `target`.
+    Dismissed {
+        number: u64,
+        reason: crate::sarif::github::DismissReason,
+        target: Option<(PathBuf, usize, usize)>,
+        result: Result<(), String>,
+    },
+    /// Analysis `id` saved as SARIF in croft's cache, to open.
+    Analysis {
+        id: u64,
+        saved: Result<PathBuf, String>,
+    },
+}
+
 impl App {
     /// Publish every open SARIF log's results as diagnostics (#577), and
     /// withdraw what a closed log published. Recomputed only when the set of
@@ -748,48 +861,131 @@ impl App {
     }
 
     /// List recent code scanning analyses to open one (#577): the current
-    /// branch's when it has any, else the repository's.
+    /// branch's when it has any, else the repository's. Asked off the UI
+    /// thread; the picker opens when the answer comes (#2786).
     pub(super) fn open_code_scanning_picker(&mut self) {
         use crate::sarif::github;
-        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
-        let fetch = |app: &Self, git_ref: Option<&str>| {
-            app.run_gh(&github::analyses_args(git_ref))
-                .and_then(|json| github::parse_analyses(&json))
-        };
+        let gh = self.gh_program.clone();
+        let root = self.active_workspace_root().to_path_buf();
+        let limit = self.gh_limit;
         let branch = self.source_control.status.branch.clone();
-        let on_branch = match &branch {
-            Some(b) => match fetch(self, Some(&format!("refs/heads/{b}"))) {
-                Ok(a) => a,
-                Err(e) => {
-                    self.status = format!("Code scanning: {e}");
-                    return;
-                }
-            },
-            None => Vec::new(),
-        };
-        let (analyses, title) = if on_branch.is_empty() {
-            match fetch(self, None) {
-                Ok(a) => (a, String::from("Open Code Scanning Analysis")),
-                Err(e) => {
-                    self.status = format!("Code scanning: {e}");
-                    return;
-                }
+        self.ask_code_scanning("Fetching code scanning analyses…", move || {
+            let fetch = |git_ref: Option<&str>| {
+                code_scanning_gh(&gh, &root, &github::analyses_args(git_ref), limit)
+                    .and_then(|json| github::parse_analyses(&json))
+            };
+            CodeScanAnswer::Analyses((|| {
+                let on_branch = match &branch {
+                    Some(b) => fetch(Some(&format!("refs/heads/{b}")))?,
+                    None => Vec::new(),
+                };
+                Ok(if on_branch.is_empty() {
+                    (fetch(None)?, String::from("Open Code Scanning Analysis"))
+                } else {
+                    let b = branch.unwrap_or_default();
+                    (on_branch, format!("Open Code Scanning Analysis \u{b7} {b}"))
+                })
+            })())
+        });
+    }
+
+    /// Start `work`, one of code scanning's asks of GitHub, on a job, and
+    /// say `status` while it runs; [`Self::poll_code_scanning`] takes its
+    /// answer.
+    fn ask_code_scanning(
+        &mut self,
+        status: &str,
+        work: impl FnOnce() -> CodeScanAnswer + Send + 'static,
+    ) {
+        match crate::jobs::Job::spawn("code-scanning", crate::jobs::Start::Now, work) {
+            Ok(job) => {
+                self.code_scan_asks.push(job);
+                self.status = String::from(status);
             }
-        } else {
-            let b = branch.unwrap_or_default();
-            (on_branch, format!("Open Code Scanning Analysis \u{b7} {b}"))
-        };
-        let rows = analyses
-            .iter()
-            .map(|a| ListRow {
-                id: a.id.to_string(),
-                label: github::label(a),
-            })
-            .collect();
-        self.open_list_picker(
-            ListPicker::new(ListPurpose::CodeScanningAnalysis, title, rows),
-            "This repository has no code scanning analyses",
-        );
+            Err(e) => self.status = format!("Code scanning: {e}"),
+        }
+    }
+
+    /// Act on what one of code scanning's asks came back with.
+    fn code_scan_answered(&mut self, answer: CodeScanAnswer) {
+        use crate::sarif::github;
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        match answer {
+            CodeScanAnswer::Analyses(Err(e)) => self.status = format!("Code scanning: {e}"),
+            CodeScanAnswer::Analyses(Ok((analyses, title))) => {
+                self.status.clear();
+                let rows = analyses
+                    .iter()
+                    .map(|a| ListRow {
+                        id: a.id.to_string(),
+                        label: github::label(a),
+                    })
+                    .collect();
+                self.open_list_picker(
+                    ListPicker::new(ListPurpose::CodeScanningAnalysis, title, rows),
+                    "This repository has no code scanning analyses",
+                );
+            }
+            CodeScanAnswer::Alert {
+                found: Err(err), ..
+            } => {
+                self.status = format!("Code scanning alerts: {err}");
+            }
+            CodeScanAnswer::Alert {
+                found: Ok(None), ..
+            } => {
+                self.status = String::from("No code scanning alert matches this result");
+            }
+            CodeScanAnswer::Alert {
+                target,
+                found: Ok(Some(number)),
+            } => {
+                self.status.clear();
+                self.ask_dismiss_reason(target, number);
+            }
+            CodeScanAnswer::Dismissed {
+                number,
+                target,
+                result: Err(e),
+                ..
+            } => {
+                // Kept for another try, unless a newer result took its place.
+                if self.dismiss_target.is_none() {
+                    self.dismiss_target = target;
+                }
+                self.status = format!("Alert #{number} was not dismissed: {e}");
+            }
+            CodeScanAnswer::Dismissed {
+                number,
+                reason,
+                target,
+                result: Ok(()),
+            } => {
+                if let (Some((log_path, run, result)), Some(view)) =
+                    (target, self.editor.sarif.as_mut())
+                {
+                    let log = view.logs.iter().position(|l| l.path == log_path);
+                    for e in &mut view.entries {
+                        if Some(e.log) == log && e.run == run && e.result == result {
+                            e.suppression = crate::sarif::semantics::SuppressionState::Suppressed;
+                        }
+                    }
+                }
+                self.status = format!("Dismissed alert #{number} as {}", reason.api());
+            }
+            CodeScanAnswer::Analysis { saved: Err(e), .. } => self.status = e,
+            CodeScanAnswer::Analysis {
+                id,
+                saved: Ok(path),
+            } => match self.editor.open(&path) {
+                Ok(()) => {
+                    self.sync_open_file_poll_mtime();
+                    self.focus_pane(Pane::Editor);
+                    self.status = format!("Opened code scanning analysis #{id}");
+                }
+                Err(e) => self.status = format!("Code scanning analysis #{id}: {e}"),
+            },
+        }
     }
 
     /// The branch code scanning follows (#577): its name, or `HEAD <oid>`
@@ -813,18 +1009,11 @@ impl App {
         let gh = self.gh_program.clone();
         let root = self.active_workspace_root().to_path_buf();
         let git_ref = (!branch.starts_with("HEAD ")).then(|| format!("refs/heads/{branch}"));
+        let limit = self.gh_limit;
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let gh_json = |git_ref: Option<&str>| -> Result<String, String> {
-                let mut cmd = std::process::Command::new(&gh);
-                cmd.args(github::analyses_args(git_ref))
-                    .current_dir(&root)
-                    .stdin(std::process::Stdio::null());
-                let out = crate::proc::output_retrying_busy(&mut cmd)
-                    .map_err(|e| crate::gh::spawn_error(&e, Some(root.as_path())))?;
-                if crate::gh::signed_out(out.status) {
-                    return Err(String::from(crate::gh::SIGNED_OUT));
-                }
+                let out = ask_gh(&gh, &root, &github::analyses_args(git_ref), limit)?;
                 Ok(String::from_utf8_lossy(&out.stdout).into_owned())
             };
             let result = (|| {
@@ -852,6 +1041,22 @@ impl App {
     pub(super) fn poll_code_scanning(&mut self) -> bool {
         use crate::sarif::github::CodeScanningMode;
         let mut changed = false;
+        let mut i = 0;
+        while i < self.code_scan_asks.len() {
+            match self.code_scan_asks[i].poll() {
+                crate::jobs::Poll::Pending => i += 1,
+                crate::jobs::Poll::Done(answer) => {
+                    self.code_scan_asks.remove(i);
+                    self.code_scan_answered(answer);
+                    changed = true;
+                }
+                // Its thread crashed, and the crash notice said so.
+                crate::jobs::Poll::Died => {
+                    self.code_scan_asks.remove(i);
+                    changed = true;
+                }
+            }
+        }
         if self.code_scanning != CodeScanningMode::Off
             && self.code_scan_list.is_none()
             && let Some(branch) = self.code_scan_branch()
@@ -928,20 +1133,13 @@ impl App {
         let gh = self.gh_program.clone();
         let root = self.active_workspace_root().to_path_buf();
         let dir = croft_cache_dir().join("code-scanning");
+        let limit = self.gh_limit;
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let files = chosen
                 .iter()
                 .map(|a| {
-                    let mut cmd = std::process::Command::new(&gh);
-                    cmd.args(crate::sarif::github::sarif_args(a.id))
-                        .current_dir(&root)
-                        .stdin(std::process::Stdio::null());
-                    let out = crate::proc::output_retrying_busy(&mut cmd)
-                        .map_err(|e| crate::gh::spawn_error(&e, Some(root.as_path())))?;
-                    if crate::gh::signed_out(out.status) {
-                        return Err(String::from(crate::gh::SIGNED_OUT));
-                    }
+                    let out = ask_gh(&gh, &root, &crate::sarif::github::sarif_args(a.id), limit)?;
                     if !out.status.success() {
                         return Err(format!("analysis #{} could not be downloaded", a.id));
                     }
@@ -962,8 +1160,7 @@ impl App {
     /// number GitHub stamped on the result, or else the open alert with the
     /// same rule, path and line; then ask why.
     pub(super) fn start_dismiss_code_scanning_alert(&mut self) {
-        use crate::sarif::github::{self, DismissReason};
-        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        use crate::sarif::github;
         let Some(view) = self.editor.sarif.as_ref() else {
             return;
         };
@@ -992,29 +1189,30 @@ impl App {
             .and_then(|a| crate::sarif::resolve::location_parts(run, a))
             .map(|(uri, _)| uri)
             .unwrap_or_default();
-        let number = match stamped {
-            Some(n) => n,
-            None => {
-                let alerts = match self
-                    .run_gh(&github::alerts_args(None))
-                    .and_then(|json| github::parse_alerts(&json))
-                {
-                    Ok(a) => a,
-                    Err(err) => {
-                        self.status = format!("Code scanning alerts: {err}");
-                        return;
-                    }
-                };
-                match github::match_alert(&alerts, &e.rule_id, &path, e.line) {
-                    Some(n) => n,
-                    None => {
-                        self.status = String::from("No code scanning alert matches this result");
-                        return;
-                    }
-                }
-            }
-        };
-        self.dismiss_target = Some((log_path, e.run, e.result));
+        let target = (log_path, e.run, e.result);
+        if let Some(number) = stamped {
+            self.ask_dismiss_reason(target, number);
+            return;
+        }
+        // Matched against the open alerts, asked off the UI thread (#2786).
+        let gh = self.gh_program.clone();
+        let root = self.active_workspace_root().to_path_buf();
+        let limit = self.gh_limit;
+        let (rule, line) = (e.rule_id.clone(), e.line);
+        self.ask_code_scanning("Finding the code scanning alert…", move || {
+            let found = code_scanning_gh(&gh, &root, &github::alerts_args(None), limit)
+                .and_then(|json| github::parse_alerts(&json))
+                .map(|alerts| github::match_alert(&alerts, &rule, &path, line));
+            CodeScanAnswer::Alert { target, found }
+        });
+    }
+
+    /// Ask why alert `number`, found for the SARIF result `target`, is
+    /// dismissed (#577).
+    fn ask_dismiss_reason(&mut self, target: (PathBuf, usize, usize), number: u64) {
+        use crate::sarif::github::DismissReason;
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        self.dismiss_target = Some(target);
         let rows = DismissReason::ALL
             .iter()
             .enumerate()
@@ -1038,8 +1236,9 @@ impl App {
         );
     }
 
-    /// Send the dismissal of alert `number` (#577); on success the result
-    /// it came from is marked suppressed, which the default filter hides.
+    /// Send the dismissal of alert `number` (#577), off the UI thread
+    /// (#2786); on success the result it came from is marked suppressed,
+    /// which the default filter hides.
     pub(super) fn dismiss_code_scanning_alert(
         &mut self,
         number: u64,
@@ -1051,46 +1250,45 @@ impl App {
             .get(reason)
             .copied()
             .unwrap_or(DismissReason::FalsePositive);
-        if let Err(e) = self.run_gh(&github::dismiss_args(number, reason, comment)) {
-            self.status = format!("Alert #{number} was not dismissed: {e}");
-            return;
-        }
-        if let (Some((log_path, run, result)), Some(view)) =
-            (self.dismiss_target.take(), self.editor.sarif.as_mut())
-        {
-            let log = view.logs.iter().position(|l| l.path == log_path);
-            for e in &mut view.entries {
-                if Some(e.log) == log && e.run == run && e.result == result {
-                    e.suppression = crate::sarif::semantics::SuppressionState::Suppressed;
-                }
+        let gh = self.gh_program.clone();
+        let root = self.active_workspace_root().to_path_buf();
+        let limit = self.gh_limit;
+        let args = github::dismiss_args(number, reason, comment);
+        let target = self.dismiss_target.take();
+        self.ask_code_scanning(&format!("Dismissing alert #{number}…"), move || {
+            let result = code_scanning_gh(&gh, &root, &args, limit).map(drop);
+            CodeScanAnswer::Dismissed {
+                number,
+                reason,
+                target,
+                result,
             }
-        }
-        self.status = format!("Dismissed alert #{number} as {}", reason.api());
+        });
     }
 
-    /// Download code scanning analysis `id` as SARIF and open it (#577).
+    /// Download code scanning analysis `id` as SARIF and open it (#577),
+    /// off the UI thread (#2786).
     pub(super) fn open_code_scanning_analysis(&mut self, id: u64) {
-        let text = match self.run_gh(&crate::sarif::github::sarif_args(id)) {
-            Ok(t) => t,
-            Err(e) => {
-                self.status = format!("Code scanning analysis #{id}: {e}");
-                return;
-            }
-        };
+        let gh = self.gh_program.clone();
+        let root = self.active_workspace_root().to_path_buf();
+        let limit = self.gh_limit;
         let dir = croft_cache_dir().join("code-scanning");
-        let path = dir.join(format!("analysis-{id}.sarif"));
-        if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, text)) {
-            self.status = format!("{}: {e}", path.display());
-            return;
-        }
-        match self.editor.open(&path) {
-            Ok(()) => {
-                self.sync_open_file_poll_mtime();
-                self.focus_pane(Pane::Editor);
-                self.status = format!("Opened code scanning analysis #{id}");
-            }
-            Err(e) => self.status = format!("Code scanning analysis #{id}: {e}"),
-        }
+        self.ask_code_scanning(
+            &format!("Downloading code scanning analysis #{id}…"),
+            move || {
+                let saved =
+                    code_scanning_gh(&gh, &root, &crate::sarif::github::sarif_args(id), limit)
+                        .map_err(|e| format!("Code scanning analysis #{id}: {e}"))
+                        .and_then(|text| {
+                            let path = dir.join(format!("analysis-{id}.sarif"));
+                            std::fs::create_dir_all(&dir)
+                                .and_then(|()| std::fs::write(&path, text))
+                                .map(|()| path.clone())
+                                .map_err(|e| format!("{}: {e}", path.display()))
+                        });
+                CodeScanAnswer::Analysis { id, saved }
+            },
+        );
     }
 
     /// Write the SARIF viewer's visible results to a CSV file (#577),

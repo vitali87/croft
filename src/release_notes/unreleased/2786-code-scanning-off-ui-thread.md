@@ -1,0 +1,1 @@
+fix: code scanning no longer freezes croft while it waits on GitHub: listing analyses, opening one, finding a result's alert and dismissing it now run in the background, and every code scanning call stops after 60 seconds on a stalled network and says so. A stalled branch lookup no longer stops code scanning from following later branch switches (#2786).

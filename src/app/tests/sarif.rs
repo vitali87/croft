@@ -1123,6 +1123,19 @@ fn fake_gh(dir: &std::path::Path, rules: &[(&str, &str)]) -> std::path::PathBuf 
     gh
 }
 
+/// Wait for code scanning's asks of GitHub to come back and be acted on
+/// (#2786): they run off the UI thread.
+fn settle_code_scanning(app: &mut App) {
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(10),
+        "code scanning's gh calls",
+        || {
+            app.poll_code_scanning();
+            app.code_scan_asks.is_empty()
+        },
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn a_code_scanning_analysis_opens_from_github_in_the_sarif_viewer() {
@@ -1151,6 +1164,7 @@ fn a_code_scanning_analysis_opens_from_github_in_the_sarif_viewer() {
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
         app.gh_program = gh;
         app.run_command(crate::widgets::command_palette::Command::SarifOpenCodeScanning);
+        settle_code_scanning(&mut app);
         let picker = app.list_picker.as_ref().expect("the analyses are offered");
         assert_eq!(
             picker.purpose,
@@ -1164,6 +1178,7 @@ fn a_code_scanning_analysis_opens_from_github_in_the_sarif_viewer() {
             picker.rows[0].label
         );
         app.confirm_list_picker();
+        settle_code_scanning(&mut app);
         let view = app
             .editor
             .sarif
@@ -1184,6 +1199,7 @@ fn code_scanning_reports_githubs_own_error() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.gh_program = gh;
     app.run_command(crate::widgets::command_palette::Command::SarifOpenCodeScanning);
+    settle_code_scanning(&mut app);
     assert!(app.list_picker.is_none());
     assert!(app.status.contains("unexpected call"), "{}", app.status);
 }
@@ -1222,6 +1238,7 @@ fn x_dismisses_the_selected_results_code_scanning_alert_with_a_reason() {
     app.editor.open(&log).unwrap();
     app.editor.sarif.as_mut().unwrap().selected = 1;
     app.handle_sarif_key(key(KeyCode::Char('X'), KeyModifiers::SHIFT));
+    settle_code_scanning(&mut app);
     let picker = app.list_picker.as_ref().expect("X asks why");
     assert_eq!(
         picker.purpose,
@@ -1242,6 +1259,7 @@ fn x_dismisses_the_selected_results_code_scanning_alert_with_a_reason() {
         )
     ));
     app.dismiss_code_scanning_alert(8, 1, "tracked elsewhere");
+    settle_code_scanning(&mut app);
     let calls = std::fs::read_to_string(bin.path().join("gh-calls.log")).unwrap();
     assert!(
         calls.contains("PATCH repos/{owner}/{repo}/code-scanning/alerts/8 -f state=dismissed -f dismissed_reason=won't fix -f dismissed_comment=tracked elsewhere"),
@@ -1302,6 +1320,7 @@ fn code_scanning_offers_the_current_branchs_analyses_and_falls_back_to_all() {
     app.gh_program = gh;
     app.source_control.status.branch = Some(String::from("feat/x"));
     app.run_command(crate::widgets::command_palette::Command::SarifOpenCodeScanning);
+    settle_code_scanning(&mut app);
     let picker = app.list_picker.take().expect("offered");
     assert_eq!(
         picker
@@ -1314,6 +1333,7 @@ fn code_scanning_offers_the_current_branchs_analyses_and_falls_back_to_all() {
     assert!(picker.title.contains("feat/x"), "{}", picker.title);
     app.source_control.status.branch = Some(String::from("empty"));
     app.run_command(crate::widgets::command_palette::Command::SarifOpenCodeScanning);
+    settle_code_scanning(&mut app);
     let picker = app.list_picker.take().expect("offered");
     assert_eq!(
         picker
@@ -1322,6 +1342,74 @@ fn code_scanning_offers_the_current_branchs_analyses_and_falls_back_to_all() {
             .map(|r| r.id.as_str())
             .collect::<Vec<_>>(),
         ["300"]
+    );
+}
+
+/// A stand-in `gh` that never answers in time.
+#[cfg(unix)]
+fn stalled_gh(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let gh = dir.join("gh");
+    std::fs::write(&gh, "#!/bin/sh\nexec sleep 30\n").unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    gh
+}
+
+/// #2786: listing the analyses asks GitHub off the UI thread, so croft
+/// keeps drawing while gh waits; a gh that never answers is stopped at the
+/// limit and says so.
+#[cfg(unix)]
+#[test]
+fn opening_a_code_scanning_analysis_never_waits_on_gh() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.gh_program = stalled_gh(bin.path());
+    app.gh_limit = std::time::Duration::from_secs(4);
+    let started = std::time::Instant::now();
+    app.run_command(crate::widgets::command_palette::Command::SarifOpenCodeScanning);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "the command waited {:?} on gh",
+        started.elapsed()
+    );
+    assert_eq!(app.status, "Fetching code scanning analyses…");
+    settle_code_scanning(&mut app);
+    assert!(app.list_picker.is_none());
+    assert!(
+        app.status.ends_with("took longer than 4s"),
+        "{}",
+        app.status
+    );
+}
+
+/// #2786: a branch lookup whose gh never answers ends at the limit, so the
+/// next branch switch is looked up again.
+#[cfg(unix)]
+#[test]
+fn a_stalled_code_scanning_lookup_ends_at_the_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.gh_program = stalled_gh(bin.path());
+    app.gh_limit = std::time::Duration::from_secs(1);
+    app.source_control.status.in_repo = true;
+    app.source_control.status.branch = Some(String::from("main"));
+    app.code_scanning = crate::sarif::github::CodeScanningMode::On;
+    app.poll_code_scanning();
+    assert!(app.code_scan_list.is_some(), "the branch is looked up");
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(10),
+        "the stalled lookup to end",
+        || {
+            app.poll_code_scanning();
+            app.code_scan_list.is_none()
+        },
+    );
+    assert!(
+        app.status.starts_with("Code scanning: ") && app.status.ends_with("took longer than 1s"),
+        "{}",
+        app.status
     );
 }
 
