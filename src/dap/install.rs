@@ -298,20 +298,28 @@ fn verify_js_debug(bytes: &[u8]) -> Result<()> {
 }
 
 /// Where `dlv` is, for Go debugging (#264), in delve's own resolution order:
-/// `PATH`, then `$GOBIN`, then `$GOPATH/bin` (default `~/go/bin`), then
-/// croft's servers directory. Pure over its inputs so the order is testable.
+/// `PATH`, then `$GOBIN`, then each `bin` of the folders `$GOPATH` lists
+/// (default `~/go/bin`), then croft's servers directory. Pure over its
+/// inputs so the order is testable.
 pub fn find_dlv(
     path_env: Option<&std::ffi::OsStr>,
     gobin: Option<&Path>,
-    gopath: Option<&Path>,
+    gopath: Option<&std::ffi::OsStr>,
     home: Option<&Path>,
 ) -> Option<PathBuf> {
     let mut dirs: Vec<PathBuf> = path_env
         .map(|p| std::env::split_paths(p).collect())
         .unwrap_or_default();
     dirs.extend(gobin.map(Path::to_path_buf));
+    // `go` reads GOPATH as a list and refuses an entry that is not
+    // absolute (#2805); such an entry, read here, would be a folder of
+    // croft's own.
     match gopath {
-        Some(gp) => dirs.push(gp.join("bin")),
+        Some(gp) => dirs.extend(
+            std::env::split_paths(gp)
+                .filter(|dir| dir.is_absolute())
+                .map(|dir| dir.join("bin")),
+        ),
         None => dirs.extend(home.map(|h| h.join("go").join("bin"))),
     }
     dirs.extend(home.map(|h| h.join(".croft").join("servers").join("go")));
@@ -354,7 +362,7 @@ pub fn dlv_missing_message(go_available: bool) -> String {
 /// `dlv` for this machine, or an error that says how to install it.
 pub fn dlv_program() -> Result<PathBuf> {
     let gobin = std::env::var_os("GOBIN").map(PathBuf::from);
-    let gopath = std::env::var_os("GOPATH").map(PathBuf::from);
+    let gopath = std::env::var_os("GOPATH");
     let home = std::env::var_os("HOME").map(PathBuf::from);
     find_dlv(
         std::env::var_os("PATH").as_deref(),
@@ -527,6 +535,38 @@ mod tests {
             Some(croft.join("dlv"))
         );
         assert_eq!(find_dlv(None, None, None, None), None, "nowhere to look");
+    }
+
+    /// #2805: GOPATH may list several folders, as `go` reads it; delve is
+    /// looked for in each one's `bin`, in order, not in a folder named after
+    /// the whole list. An empty or relative entry, which `go` refuses, is
+    /// passed over rather than read against croft's own folder.
+    #[test]
+    fn find_dlv_reads_each_folder_a_gopath_lists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        for dir in [&first, &second] {
+            std::fs::create_dir_all(dir.join("bin")).unwrap();
+        }
+        std::fs::write(second.join("bin").join("dlv"), "").unwrap();
+        let gopath = std::env::join_paths([
+            "",
+            "relative",
+            first.to_str().unwrap(),
+            second.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(
+            find_dlv(None, None, Some(&gopath), None),
+            Some(second.join("bin").join("dlv"))
+        );
+        std::fs::write(first.join("bin").join("dlv"), "").unwrap();
+        assert_eq!(
+            find_dlv(None, None, Some(&gopath), None),
+            Some(first.join("bin").join("dlv")),
+            "the first folder listed wins"
+        );
     }
 
     /// A stand-in interpreter at `<dir>/<venv>/bin/python`: a shell script
