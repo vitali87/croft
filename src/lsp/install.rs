@@ -2512,10 +2512,9 @@ mod tests {
         // A shell in a session of its own, as the real probe runs, whose
         // init hangs on a command it started.
         let mut probe = Command::new("sh");
-        probe.arg("-c").arg(format!(
-            "sleep 30 & echo $$ $! > {}; wait",
-            pids.display()
-        ));
+        probe
+            .arg("-c")
+            .arg(format!("sleep 30 & echo $$ $! > {}; wait", pids.display()));
         unsafe {
             probe.pre_exec(|| {
                 libc::setsid();
@@ -2534,9 +2533,12 @@ mod tests {
         assert_eq!(pids.len(), 2, "the shell and what it waits on");
         // Killed and not yet reaped by whoever inherited it is gone too.
         let gone = |pid: i32| {
-            unsafe { libc::kill(pid, 0) } != 0
+            let signalled = unsafe { libc::kill(pid, 0) };
+            signalled != 0
                 || std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
-                    stat.rsplit(')').next().is_some_and(|rest| rest.trim_start().starts_with('Z'))
+                    stat.rsplit(')')
+                        .next()
+                        .is_some_and(|rest| rest.trim_start().starts_with('Z'))
                 })
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -2544,7 +2546,10 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         for pid in pids {
-            assert!(gone(pid), "process {pid} still runs after the probe gave up");
+            assert!(
+                gone(pid),
+                "process {pid} still runs after the probe gave up"
+            );
         }
     }
 
