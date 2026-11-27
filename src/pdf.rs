@@ -358,16 +358,13 @@ fn page_count_via_mdls(pdf: &Path) -> Option<u32> {
 /// Run `program` with a deadline, returning its exit status and stdout, or
 /// `None` on timeout or spawn failure (#493).
 ///
-/// `dap/install.rs` has a `run_bounded` of the same shape. They are NOT
-/// merged, and the reason is the exit status: that one discards it, which is
-/// right for its caller (a version probe where any output at all is the
-/// answer) and wrong here, because both page-count probes must reject stdout
-/// from a failed run - `mdls` exits non-zero on a missing file and prints to
-/// a stderr this deliberately drops. This one also caps the read and recovers
-/// lossily from bad bytes. Folding them together would mean pushing this
-/// caller's requirements onto a function that does not want them; if a third
-/// caller wants THIS contract, that is the point to lift it into a shared
-/// module.
+/// Not yet on [`crate::proc::Bounded`], which `dap/install.rs`'s probes run
+/// through (#2062): this one cuts its read at [`MAX_PROBE_STDOUT`] and parses
+/// what it has, where `Bounded` refuses an answer past its cap rather than
+/// act on part of it. Both page-count probes must reject stdout from a
+/// failed run - `mdls` exits non-zero on a missing file and prints to a
+/// stderr this deliberately drops - and this one recovers lossily from bad
+/// bytes.
 ///
 /// The reader runs on its own thread and is never joined: a descendant the
 /// child left behind keeps the pipe's write end open, and a join would then

@@ -65,8 +65,11 @@ pub(crate) struct Bounded {
     pub stdout: Keep,
     pub stderr: Keep,
     /// Run in a session of its own, apart from croft's terminal: it can
-    /// neither read from nor write to it, and at the limit everything it
-    /// started is killed with it.
+    /// neither read from nor write to it. When croft is done with it, at its
+    /// exit or at the limit, everything it started is killed with it: a
+    /// helper it left running, such as a job a login shell's init file put
+    /// in the background, would otherwise outlive it for as long as croft
+    /// runs (#2755).
     pub detached: bool,
     /// How long it may run, counted from before the first start attempt.
     pub limit: Duration,
@@ -177,8 +180,9 @@ impl Bounded {
         if self.detached {
             // SAFETY: `setsid` is async-signal-safe, the only kind of call
             // allowed between fork and exec, and touches no memory of
-            // croft's. It fails only for a process group leader, which a
-            // freshly forked child is not.
+            // croft's. It fails only for a process group leader: a child
+            // whose command already called it, which is then in a session of
+            // its own anyway.
             unsafe {
                 cmd.pre_exec(|| {
                     libc::setsid();
@@ -224,7 +228,7 @@ impl Bounded {
                     }
                 }
             }
-            match child.try_wait() {
+            match exited(&mut child, self.detached) {
                 Ok(Some(status)) => {
                     // All the program itself wrote is in its pipes now it has
                     // exited, so what is there is the whole of it.
@@ -358,6 +362,59 @@ fn wait_for_output(pipes: &[Pipe], wait: Duration) {
     // ends this wait early; the caller checks the program and the clock either
     // way.
     unsafe { libc::poll(ready.as_mut_ptr(), ready.len() as libc::nfds_t, ms) };
+}
+
+/// Whether the program has exited, and how. One that runs apart is seen to
+/// have exited before it is reaped: everything it left in its session is
+/// killed first, while it is still a zombie and its id, which names that
+/// session, cannot pass to another.
+fn exited(child: &mut Child, detached: bool) -> std::io::Result<Option<ExitStatus>> {
+    if !detached {
+        return child.try_wait();
+    }
+    let Ok(pid) = i32::try_from(child.id()) else {
+        return child.try_wait();
+    };
+    if !exited_unreaped(pid)? {
+        return Ok(None);
+    }
+    // SAFETY: a plain signal to the process group the program led. It has
+    // exited but is not reaped, so the id still names that group.
+    unsafe { libc::kill(-pid, libc::SIGKILL) };
+    child.wait().map(Some)
+}
+
+/// Whether `pid`, a child of croft's, has exited, asked without reaping it.
+fn exited_unreaped(pid: i32) -> std::io::Result<bool> {
+    // SAFETY: an all-zero `siginfo_t` is a valid value for `waitid` to fill.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a live `siginfo_t` for `waitid` to fill. WNOWAIT
+    // leaves the child waitable, WNOHANG returns at once if it has not
+    // exited.
+    let asked = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if asked != 0 {
+        let err = std::io::Error::last_os_error();
+        // A signal arriving mid-call answers nothing; ask again next turn.
+        return if err.kind() == std::io::ErrorKind::Interrupted {
+            Ok(false)
+        } else {
+            Err(err)
+        };
+    }
+    // The id of the child that exited, or 0 when none has yet.
+    #[cfg(target_vendor = "apple")]
+    let who = info.si_pid;
+    // SAFETY: filled by `waitid` above for a child's state change.
+    #[cfg(not(target_vendor = "apple"))]
+    let who = unsafe { info.si_pid() };
+    Ok(who != 0)
 }
 
 /// Kill a program croft no longer waits for, with everything it started when
@@ -594,6 +651,41 @@ mod tests {
         assert_eq!(session, shell, "it leads a session of its own");
         assert!(wait_gone(shell), "the program is killed");
         assert!(wait_gone(helper), "and what it started with it");
+    }
+
+    /// Run apart, what a program leaves running when it exits, such as a
+    /// job a login shell's init file put in the background, is killed with
+    /// it, not left for as long as croft runs (#2755).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn what_a_detached_program_leaves_running_is_killed_at_its_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid = dir.path().join("helper.pid");
+        let started = Instant::now();
+        let ran = Bounded {
+            stdout: Keep::All { cap: 64 },
+            stderr: Keep::Nothing,
+            detached: true,
+            limit: Duration::from_secs(20),
+            retry_busy: false,
+        }
+        .run(&mut sh(&format!(
+            "sleep 30 & echo $! > '{}'; echo answer",
+            pid.display()
+        )))
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "answered at its exit"
+        );
+        assert_eq!(ran.stdout.text(), "answer\n");
+        assert!(ran.status.success());
+        let helper: i32 = std::fs::read_to_string(&pid)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(wait_gone(helper), "the job it left running is killed");
     }
 
     /// Not run apart, a program stays in croft's session.
