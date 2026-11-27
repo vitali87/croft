@@ -39,6 +39,11 @@ impl<K> DrawnRows<K> {
         self.rows.extend(rows);
     }
 
+    /// How many lines the frame drew.
+    pub fn lines(&self) -> usize {
+        self.rows.len()
+    }
+
     /// The indices the rows were drawn at, top line first.
     #[cfg(test)]
     pub fn drawn_at(&self) -> impl Iterator<Item = usize> + '_ {
