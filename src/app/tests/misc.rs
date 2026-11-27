@@ -218,31 +218,25 @@ fn build_title_uses_basename_and_app_name() {
     assert_eq!(build_title(p), "croft  /");
 }
 
+/// The gh client gives up on a call that hangs, even one that closed its
+/// stdout, at its limit (#2062, card 12 step 7).
 #[test]
-fn bounded_output_gives_up_on_a_command_that_hangs() {
+fn the_gh_client_gives_up_on_a_command_that_hangs() {
     let started = std::time::Instant::now();
-    let budget = std::time::Duration::from_millis(500);
-    assert!(
-        bounded_output(
-            std::process::Command::new("sh").args(["-c", "sleep 30"]),
-            budget
-        )
-        .is_none()
-    );
-    assert!(
-        bounded_output(
-            std::process::Command::new("sh").args(["-c", "exec 1>&-; sleep 30"]),
-            budget
-        )
-        .is_none()
-    );
+    let dir = std::env::temp_dir();
+    let quick = crate::gh::Client::new("sh", &dir, std::time::Duration::from_millis(500));
+    assert!(matches!(
+        quick.run(&["-c", "sleep 30"]),
+        Err(crate::gh::Error::NoAnswer(_))
+    ));
+    assert!(matches!(
+        quick.run(&["-c", "exec 1>&-; sleep 30"]),
+        Err(crate::gh::Error::NoAnswer(_))
+    ));
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
-    let (status, out) = bounded_output(
-        std::process::Command::new("sh").args(["-c", "printf 42"]),
-        std::time::Duration::from_secs(10),
-    )
-    .unwrap();
-    assert!(status.success());
+    let out = crate::gh::Client::new("sh", &dir, std::time::Duration::from_secs(10))
+        .run(&["-c", "printf 42"])
+        .unwrap();
     assert_eq!(out, b"42");
 }
 
@@ -270,19 +264,18 @@ fn busy_script(path: &std::path::Path, hold: std::time::Duration) -> std::thread
 /// the retries run out, and one that comes free late gets only what is left
 /// of the budget to answer, not the whole budget again.
 #[test]
-fn bounded_output_counts_a_busy_program_against_its_budget() {
+fn the_gh_client_counts_a_busy_program_against_its_limit() {
     use std::time::{Duration, Instant};
     let tmp = tempfile::tempdir().unwrap();
 
     let always_busy = tmp.path().join("always-busy");
     let release = busy_script(&always_busy, Duration::from_secs(2));
     let started = Instant::now();
+    let none: [&str; 0] = [];
     assert!(
-        bounded_output(
-            &mut std::process::Command::new(&always_busy),
-            Duration::from_millis(50)
-        )
-        .is_none()
+        crate::gh::Client::new(&always_busy, tmp.path(), Duration::from_millis(50))
+            .run(&none)
+            .is_err()
     );
     let waited = started.elapsed();
     assert!(
@@ -295,11 +288,9 @@ fn bounded_output_counts_a_busy_program_against_its_budget() {
     let release = busy_script(&late, Duration::from_millis(400));
     let started = Instant::now();
     assert!(
-        bounded_output(
-            &mut std::process::Command::new(&late),
-            Duration::from_millis(450)
-        )
-        .is_none()
+        crate::gh::Client::new(&late, tmp.path(), Duration::from_millis(450))
+            .run(&none)
+            .is_err()
     );
     let waited = started.elapsed();
     assert!(

@@ -31,87 +31,20 @@ pub(super) fn fetch_sarif_source(url: &str) -> Result<Vec<u8>, String> {
 /// freeze croft nor leave a lookup waiting for good (#2786).
 pub(super) const CODE_SCAN_GH_LIMIT: std::time::Duration = crate::pr_review::GH_TIMEOUT;
 
-/// The most of either output a code scanning call keeps: far past any
-/// analysis, so only a runaway answer is refused.
-const GH_OUTPUT_CAP: usize = 1 << 30;
-
-/// How a code scanning `gh` call exited and what it printed.
-struct GhAnswer {
-    status: std::process::ExitStatus,
-    stdout: Vec<u8>,
-    stderr: String,
-}
-
-/// Run `gh` with `args` in `root` for at most `limit`, both outputs read
-/// while it runs. An error says it could not start, has no account signed
-/// in, ran past the limit or answered too much; anything else is gh's own
-/// answer, whatever its exit.
-fn ask_gh(
-    gh: &Path,
-    root: &Path,
-    args: &[String],
-    limit: std::time::Duration,
-) -> Result<GhAnswer, String> {
-    use crate::proc::{Apart, Bounded, Keep, RunError};
-    let ran = Bounded {
-        stdout: Keep::All { cap: GH_OUTPUT_CAP },
-        stderr: Keep::All { cap: GH_OUTPUT_CAP },
-        apart: Apart::No,
-        limit,
-        retry_busy: true,
-    }
-    .run(std::process::Command::new(gh).args(args).current_dir(root));
-    match ran {
-        Ok(ran) if crate::gh::signed_out(ran.status) => Err(String::from(crate::gh::SIGNED_OUT)),
-        Ok(ran) => Ok(GhAnswer {
-            status: ran.status,
-            stderr: ran.stderr.text(),
-            stdout: ran.stdout.into_bytes(),
-        }),
-        Err(RunError::Spawn(e)) => Err(crate::gh::spawn_error(&e, Some(root))),
-        Err(RunError::TimedOut) => Err(format!(
-            "{} took longer than {}s",
-            gh.display(),
-            limit.as_secs()
-        )),
-        Err(RunError::TooLong { .. }) => Err(format!(
-            "{} answered more than {} MiB",
-            gh.display(),
-            GH_OUTPUT_CAP >> 20
-        )),
-        Err(RunError::Wait(e) | RunError::Pipe(e)) => {
-            Err(format!("could not wait on {}: {e}", gh.display()))
-        }
-    }
-}
-
-/// Run `gh` with `args` in `root` for at most `limit`. Its stdout, or the
-/// first line of what it said went wrong: GitHub's own message when the API
-/// sent one, else gh's; or that gh is missing, signed out or too slow.
+/// Run `gh` with `args` in `root` for at most `limit` ([`crate::gh::Client`]).
+/// Its stdout, or the first line of what it said went wrong: GitHub's own
+/// message when the API sent one, else gh's; or that gh is missing, signed
+/// out or too slow.
 fn code_scanning_gh(
     gh: &Path,
     root: &Path,
     args: &[String],
     limit: std::time::Duration,
 ) -> Result<String, String> {
-    let out = ask_gh(gh, root, args, limit)?;
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    if out.status.success() {
-        return Ok(stdout);
-    }
-    let api_message = serde_json::from_str::<serde_json::Value>(&stdout)
-        .ok()
-        .and_then(|v| v.get("message")?.as_str().map(str::to_string));
-    let first = |s: &str| s.trim().lines().next().map(str::to_string);
-    Err(api_message
-        .or_else(|| {
-            let s = out.stderr.trim();
-            serde_json::from_str::<serde_json::Value>(s)
-                .ok()
-                .and_then(|v| v.get("message")?.as_str().map(str::to_string))
-                .or_else(|| first(s))
-        })
-        .unwrap_or_else(|| String::from("gh failed")))
+    crate::gh::Client::new(gh, root, limit)
+        .run(args)
+        .map(|out| String::from_utf8_lossy(&out).into_owned())
+        .map_err(|e| e.api_message())
 }
 
 /// What one of code scanning's asks of GitHub came back with (#2786). Each
@@ -1012,9 +945,16 @@ impl App {
         let limit = self.gh_limit;
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
+            // gh's answer whatever its exit: a refusal is GitHub's error
+            // JSON, which the parser reports.
+            let client = crate::gh::Client::new(&gh, &root, limit);
             let gh_json = |git_ref: Option<&str>| -> Result<String, String> {
-                let out = ask_gh(&gh, &root, &github::analyses_args(git_ref), limit)?;
-                Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+                match client.run(&github::analyses_args(git_ref)) {
+                    Ok(out) | Err(crate::gh::Error::Refused { stdout: out, .. }) => {
+                        Ok(String::from_utf8_lossy(&out).into_owned())
+                    }
+                    Err(e) => Err(e.first_line()),
+                }
             };
             let result = (|| {
                 let mut analyses = match git_ref.as_deref() {
@@ -1139,13 +1079,18 @@ impl App {
             let files = chosen
                 .iter()
                 .map(|a| {
-                    let out = ask_gh(&gh, &root, &crate::sarif::github::sarif_args(a.id), limit)?;
-                    if !out.status.success() {
-                        return Err(format!("analysis #{} could not be downloaded", a.id));
-                    }
+                    let out = match crate::gh::Client::new(&gh, &root, limit)
+                        .run(&crate::sarif::github::sarif_args(a.id))
+                    {
+                        Ok(out) => out,
+                        Err(crate::gh::Error::Refused { .. }) => {
+                            return Err(format!("analysis #{} could not be downloaded", a.id));
+                        }
+                        Err(e) => return Err(e.first_line()),
+                    };
                     let path = dir.join(format!("analysis-{}.sarif", a.id));
                     std::fs::create_dir_all(&dir)
-                        .and_then(|()| std::fs::write(&path, &out.stdout))
+                        .and_then(|()| std::fs::write(&path, &out))
                         .map_err(|e| format!("{}: {e}", path.display()))?;
                     Ok(path)
                 })

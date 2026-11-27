@@ -831,38 +831,17 @@ impl App {
         {
             return Some(number.clone());
         }
-        let out = bounded_output(
-            std::process::Command::new(&self.review_gh)
-                .args(["pr", "view", "--json", "number", "--jq", ".number"])
-                .current_dir(root),
-            std::time::Duration::from_secs(5),
-        );
+        let out = crate::gh::Client::new(&self.review_gh, root, std::time::Duration::from_secs(5))
+            .run(&["pr", "view", "--json", "number", "--jq", ".number"]);
         let number = match out {
-            Some((status, stdout)) if status.success() => {
-                String::from_utf8_lossy(&stdout).trim().to_string()
-            }
+            Ok(stdout) => String::from_utf8_lossy(&stdout).trim().to_string(),
             // A gh that is missing or signed out says how to fix it, as the
             // review tab does (#917), not that the branch has no PR.
-            failed => {
-                let why = match failed {
-                    Some((status, _)) => {
-                        crate::gh::signed_out(status).then(|| String::from(crate::gh::SIGNED_OUT))
-                    }
-                    // No output: gh did not start, or ran past the budget.
-                    None => {
-                        let mut probe = std::process::Command::new(&self.review_gh);
-                        probe
-                            .arg("--version")
-                            .stdin(std::process::Stdio::null())
-                            .stdout(std::process::Stdio::null())
-                            .stderr(std::process::Stdio::null());
-                        crate::proc::retry_while_busy(
-                            || probe.status(),
-                            |r| r.as_ref().is_err_and(crate::proc::text_file_busy),
-                        )
-                        .err()
-                        .map(|e| crate::gh::spawn_error(&e, Some(root)))
-                    }
+            Err(e) => {
+                let why = match e {
+                    crate::gh::Error::Start(why) => Some(why),
+                    crate::gh::Error::SignedOut => Some(String::from(crate::gh::SIGNED_OUT)),
+                    crate::gh::Error::NoAnswer(_) | crate::gh::Error::Refused { .. } => None,
                 };
                 self.status = match why {
                     Some(why) => format!("Could not find this branch's PR: {why}"),
@@ -1779,31 +1758,3 @@ impl App {
         );
     }
 }
-
-/// Run `cmd` for at most `budget`, collecting stdout; None when it could not
-/// start, ran out of time (it is then killed and reaped), or answered more
-/// than [`BOUNDED_OUTPUT_CAP`]. For the few short commands that still run on
-/// the UI thread. A program just written, such as a freshly installed `gh`,
-/// is waited out while it is "Text file busy" (#2422), as croft's other `gh`
-/// calls do, and that wait comes out of the same budget.
-pub(super) fn bounded_output(
-    cmd: &mut std::process::Command,
-    budget: std::time::Duration,
-) -> Option<(std::process::ExitStatus, Vec<u8>)> {
-    let ran = crate::proc::Bounded {
-        stdout: crate::proc::Keep::All {
-            cap: BOUNDED_OUTPUT_CAP,
-        },
-        stderr: crate::proc::Keep::Nothing,
-        apart: crate::proc::Apart::No,
-        limit: budget,
-        retry_busy: true,
-    }
-    .run(cmd)
-    .ok()?;
-    Some((ran.status, ran.stdout.into_bytes()))
-}
-
-/// The most of a short command's answer [`bounded_output`] takes: far past
-/// a pull request's number, so a longer answer is no answer at all.
-const BOUNDED_OUTPUT_CAP: usize = 1024 * 1024;

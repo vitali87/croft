@@ -185,68 +185,21 @@ pub fn parse_pr_list(json: &str) -> Result<Vec<PrListItem>, String> {
 /// slow network or a large log must not hang the review for good.
 pub const GH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Run `gh` (`program`) with `args` in `cwd` and return its stdout, or its
-/// stderr (or why it could not run, that it is not signed in, or that it
-/// timed out) as the error. Blocking: the app calls it on a worker thread.
-///
-/// Both outputs are read while it runs, so a log larger than a pipe cannot
-/// block gh on its write until the deadline, and a helper gh leaves holding
-/// them cannot keep the call waiting past gh's own exit.
+/// Run `gh` (`program`) with `args` in `cwd` and return its stdout, or the
+/// end of its stderr (or why it could not run, that it is not signed in, or
+/// that it timed out) as the error. Blocking: the app calls it on a worker
+/// thread. Through [`crate::gh::Client`].
 pub fn run_gh(
     program: &str,
     args: &[String],
     cwd: &std::path::Path,
     timeout: std::time::Duration,
 ) -> Result<String, String> {
-    let ran = crate::proc::Bounded {
-        stdout: crate::proc::Keep::All { cap: GH_OUTPUT_CAP },
-        stderr: crate::proc::Keep::Tail(GH_ERROR_TAIL),
-        apart: crate::proc::Apart::No,
-        limit: timeout,
-        retry_busy: true,
-    }
-    .run(
-        std::process::Command::new(program)
-            .args(args)
-            .current_dir(cwd),
-    );
-    let ran = match ran {
-        Ok(ran) => ran,
-        Err(crate::proc::RunError::Spawn(e)) => return Err(crate::gh::spawn_error(&e, Some(cwd))),
-        Err(crate::proc::RunError::TimedOut) => {
-            return Err(format!("{program} took longer than {}s", timeout.as_secs()));
-        }
-        Err(crate::proc::RunError::TooLong { .. }) => {
-            return Err(format!(
-                "{program} answered more than {} MiB",
-                GH_OUTPUT_CAP / (1024 * 1024)
-            ));
-        }
-        Err(crate::proc::RunError::Wait(e) | crate::proc::RunError::Pipe(e)) => {
-            return Err(format!("could not wait on {program}: {e}"));
-        }
-    };
-    if ran.status.success() {
-        Ok(ran.stdout.text())
-    } else if crate::gh::signed_out(ran.status) {
-        Err(String::from(crate::gh::SIGNED_OUT))
-    } else {
-        let text = ran.stderr.text();
-        Err(if ran.stderr.cut() {
-            format!("…{}", text.trim())
-        } else {
-            text.trim().to_string()
-        })
-    }
+    crate::gh::Client::new(program, cwd, timeout)
+        .run(args)
+        .map(|out| String::from_utf8_lossy(&out).into_owned())
+        .map_err(|e| e.tail())
 }
-
-/// The most of one `gh` answer croft takes: far past any log, list or SARIF
-/// file gh returns, so a longer one is refused, never cut short.
-const GH_OUTPUT_CAP: usize = 1024 * 1024 * 1024;
-
-/// How much of a failed `gh` call's error output its message keeps: the end,
-/// where gh says why.
-const GH_ERROR_TAIL: usize = 16 * 1024;
 
 static STARTUP_PR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 

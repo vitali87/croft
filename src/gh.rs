@@ -1,4 +1,5 @@
-//! What croft says when the GitHub CLI cannot do the job (#917): one
+//! The GitHub CLI: [`Client`], how the review tab and code scanning start `gh` (#2062),
+//! and what croft says when it cannot do the job (#917): one
 //! message for a `gh` that is not installed and one for a `gh` with no
 //! account signed in, shared by everything that shells out to it (`croft
 //! pr`, the PR review tab, review comments, code scanning, and CodeQL's
@@ -102,6 +103,181 @@ fn any_host_signed_in(program: &str) -> Result<bool, String> {
     Ok(out.status.success() || says(&out.stdout) || says(&out.stderr))
 }
 
+/// One way to run `gh` from the editor (#2062, card 12 step 7): which
+/// program, in which folder, and for how long at most. The review tab, its
+/// write side and code scanning all start gh through it, named through
+/// [`crate::proc::command`] so a test can put a stand-in in its place.
+///
+/// Both outputs are read while gh runs, so a log larger than a pipe cannot
+/// block it on its write until the limit, and a helper gh leaves holding
+/// them cannot keep the call waiting past gh's own exit.
+#[derive(Debug, Clone)]
+pub struct Client {
+    program: std::path::PathBuf,
+    dir: std::path::PathBuf,
+    limit: std::time::Duration,
+}
+
+/// Why a `gh` call did not answer as asked.
+#[derive(Debug)]
+pub enum Error {
+    /// It could not be started, in [`spawn_error`]'s words: not installed,
+    /// or its folder is gone.
+    Start(String),
+    /// It has no account signed in.
+    SignedOut,
+    /// It ran, but gave no answer: past its time limit, more output than
+    /// croft keeps, or it could not be waited on. The words say which.
+    NoAnswer(String),
+    /// It answered with a failing exit; what it printed.
+    Refused { stdout: Vec<u8>, stderr: String },
+}
+
+/// The most of either output a `gh` call keeps: far past any log, list or
+/// SARIF file gh returns, so a longer one is refused, never cut short.
+const OUTPUT_CAP: usize = 1 << 30;
+
+/// How much of a refusal's stderr [`Error::tail`] shows: the end, where gh
+/// says why.
+const ERROR_TAIL: usize = 16 * 1024;
+
+impl Client {
+    /// `program` run in `dir`, killed after `limit`.
+    pub fn new(
+        program: impl Into<std::path::PathBuf>,
+        dir: impl Into<std::path::PathBuf>,
+        limit: std::time::Duration,
+    ) -> Self {
+        Self {
+            program: program.into(),
+            dir: dir.into(),
+            limit,
+        }
+    }
+
+    /// Run gh with `args` and an empty stdin; its stdout when it succeeds.
+    pub fn run<S: AsRef<std::ffi::OsStr>>(&self, args: &[S]) -> Result<Vec<u8>, Error> {
+        self.call(args, None)
+    }
+
+    /// [`Self::run`], handing gh `input` on its stdin.
+    pub fn run_fed<S: AsRef<std::ffi::OsStr>>(
+        &self,
+        args: &[S],
+        input: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        self.call(args, Some(input))
+    }
+
+    fn call<S: AsRef<std::ffi::OsStr>>(
+        &self,
+        args: &[S],
+        input: Option<&[u8]>,
+    ) -> Result<Vec<u8>, Error> {
+        use crate::proc::{Apart, Bounded, Keep, RunError};
+        let bounded = Bounded {
+            stdout: Keep::All { cap: OUTPUT_CAP },
+            stderr: Keep::All { cap: OUTPUT_CAP },
+            apart: Apart::No,
+            limit: self.limit,
+            retry_busy: true,
+        };
+        let mut cmd = match self.program.to_str() {
+            Some(name) => crate::proc::command(name),
+            None => std::process::Command::new(&self.program),
+        };
+        cmd.args(args).current_dir(&self.dir);
+        let ran = match input {
+            Some(input) => bounded.run_fed(&mut cmd, input),
+            None => bounded.run(&mut cmd),
+        };
+        let program = self.program.display();
+        match ran {
+            Ok(ran) if ran.status.success() => Ok(ran.stdout.into_bytes()),
+            Ok(ran) if signed_out(ran.status) => Err(Error::SignedOut),
+            Ok(ran) => Err(Error::Refused {
+                stderr: ran.stderr.text(),
+                stdout: ran.stdout.into_bytes(),
+            }),
+            Err(RunError::Spawn(e)) => Err(Error::Start(spawn_error(&e, Some(&self.dir)))),
+            Err(RunError::TimedOut) => Err(Error::NoAnswer(format!(
+                "{program} took longer than {}s",
+                self.limit.as_secs()
+            ))),
+            Err(RunError::TooLong { .. }) => Err(Error::NoAnswer(format!(
+                "{program} answered more than {} MiB",
+                OUTPUT_CAP >> 20
+            ))),
+            Err(RunError::Wait(e) | RunError::Pipe(e)) => {
+                Err(Error::NoAnswer(format!("could not wait on {program}: {e}")))
+            }
+        }
+    }
+}
+
+impl Error {
+    /// Why, for a call that did not get as far as gh's own words.
+    fn unanswered(&self) -> Option<String> {
+        match self {
+            Self::Start(why) | Self::NoAnswer(why) => Some(why.clone()),
+            Self::SignedOut => Some(String::from(SIGNED_OUT)),
+            Self::Refused { .. } => None,
+        }
+    }
+
+    /// Why, with a refusal read as the first line of gh's stderr: gh names
+    /// the problem there (a scope, a rate limit, a line outside the diff).
+    pub fn first_line(&self) -> String {
+        self.unanswered().unwrap_or_else(|| match self {
+            Self::Refused { stderr, .. } => stderr
+                .trim()
+                .lines()
+                .next()
+                .unwrap_or("gh failed")
+                .to_string(),
+            _ => unreachable!(),
+        })
+    }
+
+    /// Why, with a refusal read as the end of gh's stderr, marked "…" when
+    /// its front was left out: a failed log or check says why at the end.
+    pub fn tail(&self) -> String {
+        self.unanswered().unwrap_or_else(|| match self {
+            Self::Refused { stderr, .. } => match stderr.len().checked_sub(ERROR_TAIL) {
+                Some(drop) if drop > 0 => {
+                    let start = (drop..stderr.len())
+                        .find(|&i| stderr.is_char_boundary(i))
+                        .unwrap_or(stderr.len());
+                    format!("…{}", stderr[start..].trim())
+                }
+                _ => stderr.trim().to_string(),
+            },
+            _ => unreachable!(),
+        })
+    }
+
+    /// Why, with a refusal read as GitHub's own message when the API sent
+    /// one (on stdout, else on stderr), else gh's first stderr line.
+    pub fn api_message(&self) -> String {
+        self.unanswered().unwrap_or_else(|| match self {
+            Self::Refused { stdout, stderr } => {
+                let message = |text: &str| {
+                    serde_json::from_str::<serde_json::Value>(text)
+                        .ok()
+                        .and_then(|v| v.get("message")?.as_str().map(str::to_string))
+                };
+                message(&String::from_utf8_lossy(stdout))
+                    .or_else(|| {
+                        let s = stderr.trim();
+                        message(s).or_else(|| s.lines().next().map(str::to_string))
+                    })
+                    .unwrap_or_else(|| String::from("gh failed"))
+            }
+            _ => unreachable!(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,5 +357,34 @@ mod tests {
         };
         assert!(signed_out(status("4")));
         assert!(!signed_out(status("1")));
+    }
+
+    /// Each caller's wording of a refusal, kept as it was before the client
+    /// (#2062, card 12 step 7).
+    #[test]
+    fn a_refusal_reads_as_each_caller_put_it() {
+        let refused = |stdout: &str, stderr: &str| Error::Refused {
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.to_string(),
+        };
+        let e = refused("", "HTTP 422: Unprocessable\nsee the docs\n");
+        assert_eq!(e.first_line(), "HTTP 422: Unprocessable");
+        assert_eq!(e.tail(), "HTTP 422: Unprocessable\nsee the docs");
+        assert_eq!(e.api_message(), "HTTP 422: Unprocessable");
+        let api = refused(
+            r#"{"message":"Alert is already dismissed"}"#,
+            "gh: exit 1\n",
+        );
+        assert_eq!(api.api_message(), "Alert is already dismissed");
+        assert_eq!(api.first_line(), "gh: exit 1");
+        assert_eq!(refused("", "").first_line(), "gh failed");
+        assert_eq!(refused("", "").api_message(), "gh failed");
+        let long = format!("{}\nthe end", "x".repeat(ERROR_TAIL * 2));
+        let tail = refused("", &long).tail();
+        assert!(tail.starts_with('…') && tail.ends_with("the end"), "{tail}");
+        assert!(tail.len() <= ERROR_TAIL + '…'.len_utf8());
+        for e in [Error::SignedOut, Error::Start(String::from(MISSING))] {
+            assert!(unusable(&e.first_line()) && unusable(&e.tail()) && unusable(&e.api_message()));
+        }
     }
 }
