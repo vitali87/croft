@@ -1345,6 +1345,37 @@ fn code_scanning_offers_the_current_branchs_analyses_and_falls_back_to_all() {
     );
 }
 
+/// #2791: a SARIF location's source past 64 MiB is refused, not opened cut
+/// short as if whole; one at the cap still opens.
+#[test]
+fn a_sarif_source_past_its_cap_is_refused_not_cut_short() {
+    use std::io::{Read as _, Write as _};
+    const CAP: usize = 64 << 20;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for (stream, len) in listener.incoming().zip([CAP + 1, CAP]) {
+            let Ok(mut s) = stream else { break };
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            let head =
+                format!("HTTP/1.1 200 OK\r\ncontent-length: {len}\r\nconnection: close\r\n\r\n");
+            let _ = s.write_all(head.as_bytes());
+            let _ = s.write_all(&vec![b'a'; len]);
+        }
+    });
+    let url = format!("http://127.0.0.1:{port}/big.rs");
+    let refused = match fetch_sarif_source(&url) {
+        Ok(bytes) => panic!("a file past the cap came back as {} bytes", bytes.len()),
+        Err(e) => e,
+    };
+    assert!(
+        refused.contains("larger than its 64 MiB limit"),
+        "{refused}"
+    );
+    assert_eq!(fetch_sarif_source(&url).map(|b| b.len()), Ok(CAP));
+}
+
 /// A stand-in `gh` that never answers in time.
 #[cfg(unix)]
 fn stalled_gh(dir: &std::path::Path) -> std::path::PathBuf {
