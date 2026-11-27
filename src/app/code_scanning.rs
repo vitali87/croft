@@ -46,22 +46,37 @@ fn code_scanning_gh(
         .map_err(|e| e.api_message())
 }
 
+/// The SARIF result a code scanning dismissal is for: its log's path, its
+/// run and result indices, and the workspace folder the dismissal began in.
+/// gh dismisses the alert in that folder's repository, though another folder
+/// may be focused by the time the reason is given, now that the alert is
+/// looked up off the UI thread (#2786).
+#[derive(Debug, Clone)]
+pub(super) struct DismissTarget {
+    log: PathBuf,
+    run: usize,
+    result: usize,
+    root: PathBuf,
+}
+
 /// What one of code scanning's asks of GitHub came back with (#2786). Each
 /// runs on a job, so the UI keeps drawing while gh waits on the network.
 pub(super) enum CodeScanAnswer {
-    /// The analyses to offer, with the picker's title.
-    Analyses(Result<(Vec<crate::sarif::github::Analysis>, String), String>),
-    /// The open alert a result without a stamped number matched, if any;
-    /// `target` is the result, as the dismiss target holds it.
+    /// The analyses `root`'s repository has, with the picker's title.
+    Analyses {
+        root: PathBuf,
+        listed: Result<(Vec<crate::sarif::github::Analysis>, String), String>,
+    },
+    /// The open alert a result without a stamped number matched, if any.
     Alert {
-        target: (PathBuf, usize, usize),
+        target: DismissTarget,
         found: Result<Option<u64>, String>,
     },
     /// GitHub's answer to dismissing alert `number` for `target`.
     Dismissed {
         number: u64,
         reason: crate::sarif::github::DismissReason,
-        target: Option<(PathBuf, usize, usize)>,
+        target: Option<DismissTarget>,
         result: Result<(), String>,
     },
     /// Analysis `id` saved as SARIF in croft's cache, to open.
@@ -806,7 +821,7 @@ impl App {
                 code_scanning_gh(&gh, &root, &github::analyses_args(git_ref), limit)
                     .and_then(|json| github::parse_analyses(&json))
             };
-            CodeScanAnswer::Analyses((|| {
+            let listed = (|| {
                 let on_branch = match &branch {
                     Some(b) => fetch(Some(&format!("refs/heads/{b}")))?,
                     None => Vec::new(),
@@ -817,7 +832,8 @@ impl App {
                     let b = branch.unwrap_or_default();
                     (on_branch, format!("Open Code Scanning Analysis \u{b7} {b}"))
                 })
-            })())
+            })();
+            CodeScanAnswer::Analyses { root, listed }
         });
     }
 
@@ -843,9 +859,17 @@ impl App {
         use crate::sarif::github;
         use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
         match answer {
-            CodeScanAnswer::Analyses(Err(e)) => self.status = format!("Code scanning: {e}"),
-            CodeScanAnswer::Analyses(Ok((analyses, title))) => {
+            CodeScanAnswer::Analyses { listed: Err(e), .. } => {
+                self.status = format!("Code scanning: {e}");
+            }
+            CodeScanAnswer::Analyses {
+                root,
+                listed: Ok((analyses, title)),
+            } => {
                 self.status.clear();
+                // The analysis picked is fetched from this repository, not
+                // whichever folder is focused when it is picked.
+                self.code_scan_picker_root = Some(root);
                 let rows = analyses
                     .iter()
                     .map(|a| ListRow {
@@ -893,12 +917,10 @@ impl App {
                 target,
                 result: Ok(()),
             } => {
-                if let (Some((log_path, run, result)), Some(view)) =
-                    (target, self.editor.sarif.as_mut())
-                {
-                    let log = view.logs.iter().position(|l| l.path == log_path);
+                if let (Some(target), Some(view)) = (target, self.editor.sarif.as_mut()) {
+                    let log = view.logs.iter().position(|l| l.path == target.log);
                     for e in &mut view.entries {
-                        if Some(e.log) == log && e.run == run && e.result == result {
+                        if Some(e.log) == log && e.run == target.run && e.result == target.result {
                             e.suppression = crate::sarif::semantics::SuppressionState::Suppressed;
                         }
                     }
@@ -1133,14 +1155,19 @@ impl App {
             .and_then(|a| crate::sarif::resolve::location_parts(run, a))
             .map(|(uri, _)| uri)
             .unwrap_or_default();
-        let target = (log_path, e.run, e.result);
+        let root = self.active_workspace_root().to_path_buf();
+        let target = DismissTarget {
+            log: log_path,
+            run: e.run,
+            result: e.result,
+            root: root.clone(),
+        };
         if let Some(number) = stamped {
             self.ask_dismiss_reason(target, number);
             return;
         }
         // Matched against the open alerts, asked off the UI thread (#2786).
         let gh = self.gh_program.clone();
-        let root = self.active_workspace_root().to_path_buf();
         let limit = self.gh_limit;
         let (rule, line) = (e.rule_id.clone(), e.line);
         self.ask_code_scanning("Finding the code scanning alert…", move || {
@@ -1153,7 +1180,7 @@ impl App {
 
     /// Ask why alert `number`, found for the SARIF result `target`, is
     /// dismissed (#577).
-    fn ask_dismiss_reason(&mut self, target: (PathBuf, usize, usize), number: u64) {
+    fn ask_dismiss_reason(&mut self, target: DismissTarget, number: u64) {
         use crate::sarif::github::DismissReason;
         use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
         self.dismiss_target = Some(target);
@@ -1195,10 +1222,13 @@ impl App {
             .copied()
             .unwrap_or(DismissReason::FalsePositive);
         let gh = self.gh_program.clone();
-        let root = self.active_workspace_root().to_path_buf();
+        let target = self.dismiss_target.take();
+        // The repository the dismissal began in, whatever is focused now.
+        let root = target
+            .as_ref()
+            .map_or_else(|| self.active_workspace_root(), |t| t.root.clone());
         let limit = self.gh_limit;
         let args = github::dismiss_args(number, reason, comment);
-        let target = self.dismiss_target.take();
         self.ask_code_scanning(&format!("Dismissing alert #{number}…"), move || {
             let result = code_scanning_gh(&gh, &root, &args, limit).map(drop);
             CodeScanAnswer::Dismissed {
@@ -1214,7 +1244,10 @@ impl App {
     /// off the UI thread (#2786).
     pub(super) fn open_code_scanning_analysis(&mut self, id: u64) {
         let gh = self.gh_program.clone();
-        let root = self.active_workspace_root().to_path_buf();
+        let root = self
+            .code_scan_picker_root
+            .take()
+            .unwrap_or_else(|| self.active_workspace_root());
         let limit = self.gh_limit;
         let dir = croft_cache_dir().join("code-scanning");
         self.ask_code_scanning(
