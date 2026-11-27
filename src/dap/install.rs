@@ -35,20 +35,6 @@ const JS_DEBUG_SHA256: &str = "ad8d04ede9d4b75cc290fd5438a65047a06f786d04f604b61
 /// generous ceiling that still refuses a runaway/redirected body).
 const MAX_JS_DEBUG_BYTES: u64 = 64 * 1024 * 1024;
 
-/// `~/.croft/debug-venv`, or `None` when `$HOME` is unset (the guard the rest of
-/// croft uses for `~/.croft`).
-pub fn debug_venv_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".croft").join("debug-venv"))
-}
-
-/// The venv's interpreter, which runs `-m debugpy.adapter` only. The program
-/// being debugged runs under the project's own interpreter (#864): debugpy
-/// injects itself there, so neither debugpy nor 3.14 is required of it.
-pub fn debug_venv_python() -> Option<PathBuf> {
-    Some(debug_venv_dir()?.join("bin").join("python"))
-}
-
 /// Oldest CPython a launched program may run under: debugpy 1.8 declares
 /// `Requires-Python >=3.10`, and the code it injects into the program's
 /// interpreter does not load on an older one (#864). Attach's own floor is
@@ -95,20 +81,35 @@ pub fn python_version(python: &Path) -> Option<PyVersion> {
 /// `uv venv` + `uv pip install debugpy` (a few seconds); subsequent calls are a
 /// cheap existence check.
 pub fn ensure_debug_venv() -> Result<PathBuf> {
-    let py = debug_venv_python().context("$HOME unset; cannot locate ~/.croft/debug-venv")?;
+    let home =
+        std::env::var_os("HOME").context("$HOME unset; cannot locate ~/.croft/debug-venv")?;
+    ensure_debug_venv_in(Path::new(&home), std::env::var_os("PATH").as_deref())
+}
+
+/// [`ensure_debug_venv`] under the home folder `home`, with `path_var` as
+/// `PATH`: the venv is `~/.croft/debug-venv`, and its interpreter runs
+/// `-m debugpy.adapter` only. The program being debugged runs under the
+/// project's own interpreter (#864): debugpy injects itself there, so
+/// neither debugpy nor 3.14 is required of it. The venv is built with the
+/// uv the language servers use (#2804): on PATH, else croft's own copy or
+/// one where uv's installer puts it.
+fn ensure_debug_venv_in(home: &Path, path_var: Option<&std::ffi::OsStr>) -> Result<PathBuf> {
+    let dir = home.join(".croft").join("debug-venv");
+    let py = dir.join("bin").join("python");
     if py.exists() {
         return Ok(py);
     }
-    let dir = debug_venv_dir().context("$HOME unset")?;
+    let uv = crate::lsp::install::uv_program_on(Some(home), path_var)
+        .context("uv is not installed; install it (https://docs.astral.sh/uv) to debug Python")?;
 
     // .output(), never .status(): uv paints progress bars on stderr, and an
     // inherited TTY would spray them over the running TUI (same class as the
     // pdftoppm trailer-dictionary spray).
-    let venv = Command::new("uv")
+    let venv = Command::new(&uv)
         .args(["venv", "-p", PYTHON_VERSION])
         .arg(&dir)
         .output()
-        .context("running `uv venv` (is uv installed and on PATH?)")?;
+        .context("running `uv venv`")?;
     if !venv.status.success() {
         bail!(
             "`uv venv -p {PYTHON_VERSION}` failed (is CPython {PYTHON_VERSION} available?): {}",
@@ -116,7 +117,7 @@ pub fn ensure_debug_venv() -> Result<PathBuf> {
         );
     }
 
-    let pip = Command::new("uv")
+    let pip = Command::new(&uv)
         .args(["pip", "install", "--python"])
         .arg(&py)
         .arg("debugpy")
@@ -535,6 +536,39 @@ mod tests {
             Some(croft.join("dlv"))
         );
         assert_eq!(find_dlv(None, None, None, None), None, "nowhere to look");
+    }
+
+    /// #2804: the debug venv is built with the uv croft finds for the
+    /// language servers, its own copy among them, not only a uv on PATH:
+    /// with croft's copy in its servers folder and none on PATH, the venv
+    /// is made and debugpy installed with that copy.
+    #[cfg(unix)]
+    #[test]
+    fn the_debug_venv_is_built_with_crofts_own_uv() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = tempfile::tempdir().unwrap();
+        let dist = home.path().join(".croft/servers/uv-dist");
+        std::fs::create_dir_all(&dist).unwrap();
+        let calls = home.path().join("uv-calls");
+        let uv = dist.join("uv");
+        std::fs::write(
+            &uv,
+            format!(
+                "#!/bin/sh\necho \"$1 $2\" >> '{}'\n\
+                 if [ \"$1\" = venv ]; then mkdir -p \"$4/bin\" && : > \"$4/bin/python\"; fi\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&uv, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        let path_var = std::env::join_paths([empty.path()]).unwrap();
+        let py = ensure_debug_venv_in(home.path(), Some(&path_var)).unwrap();
+        assert_eq!(py, home.path().join(".croft/debug-venv/bin/python"));
+        assert_eq!(
+            std::fs::read_to_string(&calls).unwrap(),
+            "venv -p\npip install\n"
+        );
     }
 
     /// #2805: GOPATH may list several folders, as `go` reads it; delve is

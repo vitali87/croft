@@ -434,7 +434,12 @@ fn go_command(name: &str, bin: &str, version: Option<&str>) -> Option<String> {
 /// unset (the same guard the rest of croft uses for `~/.croft`).
 fn servers_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".croft").join("servers"))
+    Some(servers_dir_in(Path::new(&home)))
+}
+
+/// [`servers_dir`] under the home folder `home`.
+fn servers_dir_in(home: &Path) -> PathBuf {
+    home.join(".croft").join("servers")
 }
 
 /// Directory `npm install --prefix` targets for a given server.
@@ -1344,15 +1349,27 @@ fn uv_dist_dir() -> Option<PathBuf> {
 /// `~/.cargo/bin`) plus the common Homebrew/local prefixes — a non-login `exec`
 /// won't have those on PATH. `None` when uv isn't installed anywhere croft
 /// looks.
-fn uv_program() -> Option<PathBuf> {
-    if crate::lsp::manager::is_on_path("uv") {
+pub(crate) fn uv_program() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    uv_program_on(home.as_deref(), std::env::var_os("PATH").as_deref())
+}
+
+/// [`uv_program`] for the home folder `home` and the `PATH` value
+/// `path_var`. The Python debugger builds its venv with it too (#2804).
+pub(crate) fn uv_program_on(
+    home: Option<&Path>,
+    path_var: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    let on_path = path_var.is_some_and(|dirs| {
+        std::env::split_paths(dirs)
+            .any(|dir| crate::lsp::manager::is_executable_file(&dir.join("uv")))
+    });
+    if on_path {
         return Some(PathBuf::from("uv"));
     }
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(dist) = uv_dist_dir() {
-        candidates.push(dist.join("uv"));
-    }
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = home {
+        candidates.push(servers_dir_in(home).join("uv-dist").join("uv"));
         candidates.push(home.join(".local").join("bin").join("uv"));
         candidates.push(home.join(".cargo").join("bin").join("uv"));
     }
