@@ -31,11 +31,15 @@ pub fn read_string() -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn read_pbpaste() -> Option<String> {
-    let out = std::process::Command::new("pbpaste").output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&out.stdout).to_string())
+    // Bounded like the Linux helpers (#2771): this runs on the UI thread,
+    // and a pasteboard service that never answers would freeze croft.
+    helper::read_via(&["pbpaste"], fallback_deadline())
+}
+
+/// The time a macOS fallback helper may take, as the Linux helpers have.
+#[cfg(target_os = "macos")]
+fn fallback_deadline() -> std::time::Instant {
+    std::time::Instant::now() + std::time::Duration::from_secs(2)
 }
 
 /// Put `text` on the host system clipboard as UTF-8 plain text. Returns
@@ -144,8 +148,6 @@ pub fn send_osc52(text: &str) {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::process::Command;
-
     /// Write `text` to the system clipboard on Linux.
     ///
     /// Tries `wl-copy`, then `xclip`, then `xsel`. Returns `true`
@@ -154,10 +156,35 @@ mod linux {
     pub fn write_string(text: &str) -> bool {
         // One deadline for the whole copy, fallbacks included, as for paste.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        write_via(&["wl-copy"], text, deadline)
-            || write_via(&["xclip", "-selection", "clipboard"], text, deadline)
-            || write_via(&["xsel", "--clipboard", "--input"], text, deadline)
+        super::helper::write_via(&["wl-copy"], text, deadline)
+            || super::helper::write_via(&["xclip", "-selection", "clipboard"], text, deadline)
+            || super::helper::write_via(&["xsel", "--clipboard", "--input"], text, deadline)
     }
+
+    /// Read text from the system clipboard on Linux.
+    ///
+    /// Tries `wl-paste`, then `xclip`, then `xsel`.
+    pub fn read_string() -> Option<String> {
+        // `--no-newline`: wl-paste appends `\n` to text otherwise. `--type
+        // text`: any text type, never an image's bytes when an image is on
+        // the clipboard.
+        // One deadline for the whole paste, fallbacks included: a fresh
+        // budget per program let three hung readers freeze croft for 6s.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        super::helper::read_via(&["wl-paste", "--no-newline", "--type", "text"], deadline)
+            .or_else(|| {
+                super::helper::read_via(&["xclip", "-selection", "clipboard", "-o"], deadline)
+            })
+            .or_else(|| super::helper::read_via(&["xsel", "--clipboard", "--output"], deadline))
+    }
+}
+
+/// Copy and paste through a helper program, to a deadline: the Linux
+/// clipboard tools, and `pbcopy` and `pbpaste` on macOS when the pasteboard
+/// cannot be reached directly.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod helper {
+    use std::process::Command;
 
     /// How the copy and paste helpers run: in a group of their own, so at
     /// the deadline croft kills a child the helper forked along with it
@@ -174,7 +201,7 @@ mod linux {
         }
     }
 
-    fn write_via(argv: &[&str], text: &str, deadline: std::time::Instant) -> bool {
+    pub(super) fn write_via(argv: &[&str], text: &str, deadline: std::time::Instant) -> bool {
         // Bounded by `deadline`, through the program's exit (#1154): a copy
         // runs on the UI thread, and a helper that never exits (xclip on an
         // X display that never answers) froze croft for good. The text is
@@ -190,22 +217,7 @@ mod linux {
             .is_ok_and(|ran| ran.took_input && ran.status.success())
     }
 
-    /// Read text from the system clipboard on Linux.
-    ///
-    /// Tries `wl-paste`, then `xclip`, then `xsel`.
-    pub fn read_string() -> Option<String> {
-        // `--no-newline`: wl-paste appends `\n` to text otherwise. `--type
-        // text`: any text type, never an image's bytes when an image is on
-        // the clipboard.
-        // One deadline for the whole paste, fallbacks included: a fresh
-        // budget per program let three hung readers freeze croft for 6s.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        read_via(&["wl-paste", "--no-newline", "--type", "text"], deadline)
-            .or_else(|| read_via(&["xclip", "-selection", "clipboard", "-o"], deadline))
-            .or_else(|| read_via(&["xsel", "--clipboard", "--output"], deadline))
-    }
-
-    fn read_via(argv: &[&str], deadline: std::time::Instant) -> Option<String> {
+    pub(super) fn read_via(argv: &[&str], deadline: std::time::Instant) -> Option<String> {
         // Bounded by `deadline`, through the program's exit: a paste runs on
         // the UI thread, and a clipboard owner that never answers (a hung X
         // client holding the selection) would freeze croft for as long as
@@ -224,7 +236,8 @@ mod linux {
     /// before the deadline.
     const PASTE_CAP: usize = 1 << 30;
 
-    #[cfg(test)]
+    // Linux only: they read `/proc` to see what was killed.
+    #[cfg(all(test, target_os = "linux"))]
     mod tests {
         fn soon() -> std::time::Instant {
             std::time::Instant::now() + std::time::Duration::from_secs(1)
@@ -377,26 +390,8 @@ mod linux {
 
 #[cfg(target_os = "macos")]
 fn write_pbcopy(text: &str) -> bool {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-    let Ok(mut child) = Command::new("pbcopy")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return false;
-    };
-    let Some(mut stdin) = child.stdin.take() else {
-        let _ = child.wait();
-        return false;
-    };
-    if stdin.write_all(text.as_bytes()).is_err() {
-        let _ = child.wait();
-        return false;
-    }
-    drop(stdin);
-    child.wait().map(|st| st.success()).unwrap_or(false)
+    // Bounded like the Linux helpers (#2771).
+    helper::write_via(&["pbcopy"], text, fallback_deadline())
 }
 
 #[cfg(target_os = "macos")]
