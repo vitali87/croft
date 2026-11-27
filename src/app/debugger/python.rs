@@ -4,10 +4,11 @@
 
 use super::*;
 
-/// The interpreter that runs a Python project's own code: its `.venv` python
-/// (where the project's deps, pytest included, are importable) or the system
-/// python3. The debug venv's python is only the debugpy ADAPTER host — the
-/// debuggee must be this one, or a pytest module launch can't import pytest.
+/// The interpreter that runs a Python project's own code: its venv's python
+/// ([`crate::python_env::VENV_NAMES`]; where the project's deps, pytest
+/// included, are importable) or the system python3. The debug venv's python
+/// is only the debugpy ADAPTER host — the debuggee must be this one, or a
+/// pytest module launch can't import pytest.
 pub(in crate::app) fn project_python(root: &Path) -> PathBuf {
     project_python_on(root, std::env::var_os("PATH").as_deref())
         .unwrap_or_else(|| PathBuf::from("python3"))
@@ -19,46 +20,19 @@ pub(in crate::app) fn project_python_on(
     root: &Path,
     path_var: Option<&std::ffi::OsStr>,
 ) -> Option<PathBuf> {
-    let venv = root.join(".venv").join("bin").join("python");
-    if crate::proc::find::runnable(&venv) {
-        return Some(venv);
-    }
-    crate::proc::find::on_path_in("python3", path_var)
+    crate::python_env::venv_python_in(root)
+        .or_else(|| crate::proc::find::on_path_in("python3", path_var))
 }
 
-/// Walk from `start` up to and including `workspace_root` looking for a
-/// venv-style Python interpreter. Returns `(interpreter_path, owning_dir)`
-/// where `owning_dir` is the directory that contains the venv folder — the
-/// natural cwd for the run.
-///
-/// The walk stops at `workspace_root`: a venv that lives ABOVE the workspace
-/// would belong to a different project the user has not opened, and using it
-/// silently would surprise them.
+/// The venv nearest `start`, up to and including `workspace_root`
+/// ([`crate::python_env::nearest_venv`], which Run Test asks too, #2810):
+/// `(interpreter_path, owning_dir)`, where `owning_dir` is the directory
+/// that contains the venv folder, the natural cwd for the run.
 pub(in crate::app) fn find_python_venv(
     start: &Path,
     workspace_root: &Path,
 ) -> Option<(PathBuf, PathBuf)> {
-    let mut probe = start.to_path_buf();
-    loop {
-        for venv_name in [".venv", "venv", ".env"] {
-            let py = probe.join(venv_name).join("bin").join("python");
-            if crate::proc::find::runnable(&py) {
-                return Some((py, probe));
-            }
-        }
-        if probe == workspace_root {
-            return None;
-        }
-        match probe.parent() {
-            Some(parent) if parent != probe => {
-                if !parent.starts_with(workspace_root) && parent != workspace_root {
-                    return None;
-                }
-                probe = parent.to_path_buf();
-            }
-            _ => return None,
-        }
-    }
+    crate::python_env::nearest_venv(start, workspace_root)
 }
 
 /// The interpreter that runs Python code in `dir`: the nearest venv up to

@@ -2032,7 +2032,7 @@ fn pytest_runs_as_a_module_of_the_project_venvs_python() {
         fake_venv(root, venv, "exit 0");
         let python = root.join(venv).join("bin").join("python");
         assert_eq!(
-            pytest_launch(root),
+            pytest_launch_on(root, std::env::var_os("PATH").as_deref()),
             (python.clone(), &["-m", "pytest"][..]),
             "{venv}"
         );
@@ -2057,7 +2057,10 @@ fn pytest_runs_as_a_module_of_the_project_venvs_python() {
     let bin = tmp.path().join(".venv").join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     std::fs::write(bin.join("python"), "").unwrap();
-    assert_ne!(pytest_launch(tmp.path()).0, bin.join("python"));
+    assert_ne!(
+        pytest_launch_on(tmp.path(), std::env::var_os("PATH").as_deref()).0,
+        bin.join("python")
+    );
 }
 
 /// #845 guard: only exit 0 and pytest's 5 ("no tests were collected")
@@ -2584,4 +2587,53 @@ fn a_python3_or_pytest_that_cannot_run_is_passed_over() {
     let path = std::env::join_paths([&first, &second]).unwrap();
     assert_eq!(python3_program(Some(&path)), second.join("python3"));
     assert_eq!(pytest_script(Some(&path)), Some(second.join("pytest")));
+}
+
+/// A venv at `dir/<name>` whose `python` and `pytest` can run.
+#[cfg(unix)]
+fn venv_with_pytest(dir: &Path, name: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let bin = dir.join(name).join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for exe in ["python", "pytest"] {
+        std::fs::write(bin.join(exe), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(bin.join(exe), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    bin.join("python")
+}
+
+/// #2810: a workspace venv named `.env`, which F5 and Debug Test run
+/// under, runs the tests too.
+#[cfg(unix)]
+#[test]
+fn a_workspace_venv_named_env_runs_the_tests() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    let python = venv_with_pytest(&root, ".env");
+    let empty = std::ffi::OsString::new();
+    assert_eq!(
+        pytest_launch_on(&root, Some(&empty)),
+        (python, &["-m", "pytest"][..])
+    );
+}
+
+/// #2810: a run of the tests in one file goes under the venv nearest that
+/// file, the interpreter Debug Test runs the same test under (#864); the
+/// workspace-wide run keeps the workspace's.
+#[cfg(unix)]
+#[test]
+fn a_run_of_one_file_uses_the_venv_nearest_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    let svc = root.join("svc");
+    let python = venv_with_pytest(&svc, "venv");
+    let file = pytest_node_file(&root, "svc/test_app.py::test_ok").unwrap();
+    assert_eq!(file, svc.join("test_app.py"));
+    let empty = std::ffi::OsString::new();
+    assert_eq!(
+        pytest_launch_for(&root, Some(&file), Some(&empty)).0,
+        python
+    );
+    assert_ne!(pytest_launch_for(&root, None, Some(&empty)).0, python);
+    assert_eq!(pytest_node_file(&root, "test_ok"), None);
 }

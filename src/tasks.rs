@@ -1343,7 +1343,7 @@ fn pyproject_tasks_on(root: &Path, on_path: &dyn Fn(&str) -> bool) -> Vec<Task> 
     };
     let table = text.parse::<toml::Table>().unwrap_or_default();
     let tool = |name: &str| table.get("tool").and_then(|t| t.get(name));
-    let venv = [".venv", "venv"]
+    let venv = crate::python_env::VENV_NAMES
         .into_iter()
         .find(|v| crate::proc::find::runnable(&root.join(v).join("bin/python")));
     // (prefix for a script, the pytest command)

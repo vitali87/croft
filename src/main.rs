@@ -101,6 +101,7 @@ mod proc;
 mod profiles;
 mod program_status;
 mod provenance;
+mod python_env;
 mod quick_select;
 mod quickfix;
 mod rebase_todo;
