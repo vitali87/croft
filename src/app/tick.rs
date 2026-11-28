@@ -171,8 +171,10 @@ fn tick_panes_and_saves(app: &mut App, symbol_views_settled: bool) -> bool {
 fn tick_highlights_and_pictures(app: &mut App) -> bool {
     let highlights_changed = app.poll_highlights();
     // Pictures baked off the UI thread (#1973) go up as they land.
-    let images_changed =
-        app.poll_chrome_bake() | app.poll_welcome_bake() | app.poll_saved_session();
+    let images_changed = app.poll_chrome_bake()
+        | app.poll_welcome_bake()
+        | app.poll_saved_session()
+        | app.poll_pdf_previews();
     // A closed tab's bookmarks are kept, and come back with its file.
     let bookmarks_changed = app.settle_bookmarks();
     crate::startup_trace::mark("highlights and pictures polled");

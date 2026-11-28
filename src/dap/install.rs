@@ -286,46 +286,36 @@ fn js_debug_server_path(dir: &Path) -> PathBuf {
 }
 
 /// Resolve the `node` runtime croft launches the js-debug server (and the
-/// debuggee) with, returning an absolute path or the bare `node` command.
+/// debuggee) with, returning an absolute path or the bare `node` command:
+/// `node` on croft's `PATH`, else the one [`crate::node::dir`] finds, the
+/// node the language servers run under (nvm, Volta, Homebrew, then the
+/// login shell, #2809). Errors with an actionable hint when node genuinely
+/// cannot be found.
 ///
-/// Version managers (nvm, fnm, asdf, volta) expose node only inside an
-/// interactive login shell, and nvm *lazy-loads* it, so node's directory is not
-/// on the inherited PATH and is not even on a captured login-shell PATH until
-/// node first runs. So when the plain PATH scan misses, croft asks the user's
-/// login+interactive shell to run node and print its own path — which triggers
-/// the lazy loader. This mirrors how Zed resolves the shell environment for
-/// GUI/launcher-started processes. Errors with an actionable hint when node
-/// genuinely cannot be found.
-///
-/// A node the login shell named is kept for the rest of the process, so
-/// only the first launch waits for the shell (#2803).
+/// Can ask the login shell once per process; a launch calls it on a job,
+/// never on the UI thread (#2803).
 pub fn node_program() -> Result<String> {
-    if let Some(node) = known_node() {
-        return Ok(node);
+    if which("node") {
+        return Ok(String::from("node"));
     }
-    if let Some(path) = resolve_node_via_login_shell() {
-        *SHELL_NODE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path.clone());
-        return Ok(path);
-    }
-    bail!("`node` not found on PATH; install Node.js to debug JavaScript/TypeScript")
+    crate::node::dir()
+        .and_then(|dir| node_in(&dir))
+        .context("`node` not found on PATH; install Node.js to debug JavaScript/TypeScript")
 }
 
-/// The node the login shell named, once it has (#2803).
-static SHELL_NODE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-
-/// A node known without asking a shell: one on PATH, or the one the login
-/// shell named earlier, while it is still there.
+/// A node known without asking a shell: one on PATH, or the one
+/// [`crate::node::known_dir`] holds.
 fn known_node() -> Option<String> {
     if which("node") {
         return Some(String::from("node"));
     }
-    SHELL_NODE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
-        .filter(|path| Path::new(path).is_file())
+    node_in(&crate::node::known_dir()?)
+}
+
+/// The node in `dir`, while it can run.
+fn node_in(dir: &Path) -> Option<String> {
+    let node = dir.join("node");
+    crate::proc::find::runnable(&node).then(|| node.to_string_lossy().into_owned())
 }
 
 /// The directory containing the resolved node binary, when it is an absolute
@@ -334,23 +324,6 @@ fn known_node() -> Option<String> {
 pub fn node_bin_dir(node: &str) -> Option<PathBuf> {
     let p = Path::new(node);
     p.is_absolute().then(|| p.parent().map(Path::to_path_buf))?
-}
-
-/// Ask the user's login+interactive shell to print node's absolute path by
-/// running it (`process.execPath`). `-i` is required because nvm defines its
-/// lazy `node` function in the interactive rc; the call is bounded so a
-/// misbehaving rc cannot hang croft. The shell runs detached from croft's
-/// terminal and marks the path, through the same probe the language-server
-/// install uses (#2064): an attached interactive shell can take croft's
-/// terminal, and a line printed by the rc would read as the path.
-fn resolve_node_via_login_shell() -> Option<String> {
-    let out = run_probe(
-        &mut crate::lsp::install::node_probe_command(),
-        Duration::from_secs(8),
-        crate::proc::Apart::Session,
-    )?;
-    let path = crate::lsp::install::parse_node_probe(&out)?;
-    Path::new(path).is_file().then(|| path.to_string())
 }
 
 /// Run a probe, `cmd`, to its exit or `timeout`: a program asked one
@@ -363,10 +336,10 @@ fn resolve_node_via_login_shell() -> Option<String> {
 /// Its stdout is read as it runs, so an rc that prints more than a pipe
 /// holds cannot block the probe, and only the last [`PROBE_TAIL`] bytes are
 /// kept, where the answer is. One that runs in a session of its own
-/// ([`crate::proc::Apart::Session`]), as the node probe does
-/// ([`crate::lsp::install::node_probe_command`]), is killed with
-/// everything it started once croft is done with it, at its exit or at
-/// `timeout`, so whatever its rc left running goes with it (#2755).
+/// ([`crate::proc::Apart::Session`]), as [`crate::node`]'s probe does, is
+/// killed with everything it started once croft is done with it, at its
+/// exit or at `timeout`, so whatever its rc left running goes with it
+/// (#2755).
 pub(crate) fn run_probe(
     cmd: &mut Command,
     timeout: Duration,
@@ -394,9 +367,7 @@ pub(crate) const PROBE_TAIL: usize = 64 * 1024;
 /// Whether `bin` resolves on PATH (a `command -v` check via the shell-less
 /// `which`-style scan of PATH entries).
 fn which(bin: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|p| p.join(bin).is_file()))
-        .unwrap_or(false)
+    crate::proc::find::on_path(bin).is_some()
 }
 
 /// Ensure the vscode-js-debug server is installed, downloading + extracting the
@@ -491,9 +462,7 @@ pub fn find_dlv(
         None => dirs.extend(home.map(|h| h.join("go").join("bin"))),
     }
     dirs.extend(home.map(|h| h.join(".croft").join("servers").join("go")));
-    dirs.into_iter()
-        .map(|d| d.join("dlv"))
-        .find(|p| p.is_file())
+    crate::proc::find::first_in("dlv", dirs)
 }
 
 /// The command "Debug: Install Go Debugger (delve)" runs, visibly, in a
@@ -505,12 +474,35 @@ pub fn find_dlv(
 /// delve refuses a Go older than it supports (1.27 wants Go 1.25 or later),
 /// so Go 1.24 and older get delve 1.25.2, the last release that takes them,
 /// and anything newer gets `@latest`. Wrapped in `sh -c`, since it is typed
-/// into whatever shell the pane runs, fish included.
-pub const DLV_INSTALL: &str = "sh -c 'case \"$(go env GOVERSION)\" in go1.[0-9]|go1.[0-9].*|go1.1[0-9]*|go1.2[0-4]*) v=v1.25.2 ;; *) v=latest ;; esac; GOBIN=\"$HOME/.croft/servers/go\" go install github.com/go-delve/delve/cmd/dlv@$v'";
+/// into whatever shell the pane runs, fish included. It runs `go`, the Go
+/// croft found ([`crate::proc::find::go`], #2807), by its path: the pane's
+/// shell may not have the official installer's folder on its `PATH`.
+pub fn dlv_install_command(go: &Path) -> String {
+    let go = sh_double_quoted(&go.to_string_lossy());
+    let script = format!(
+        "case \"$({go} env GOVERSION)\" in go1.[0-9]|go1.[0-9].*|go1.1[0-9]*|go1.2[0-4]*) v=v1.25.2 ;; *) v=latest ;; esac; GOBIN=\"$HOME/.croft/servers/go\" {go} install github.com/go-delve/delve/cmd/dlv@$v"
+    );
+    format!("sh -c '{}'", script.replace('\'', "'\\''"))
+}
 
-/// Whether the `go` toolchain is on PATH: installing delve needs it.
+/// `text` in double quotes for `sh`, with what is special inside them
+/// escaped.
+fn sh_double_quoted(text: &str) -> String {
+    let mut quoted = String::from("\"");
+    for c in text.chars() {
+        if matches!(c, '"' | '\\' | '$' | '`') {
+            quoted.push('\\');
+        }
+        quoted.push(c);
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// Whether there is a Go to install delve with: the one every feature
+/// uses ([`crate::proc::find::go`], #2807).
 pub fn go_on_path() -> bool {
-    which("go")
+    crate::proc::find::go().is_some()
 }
 
 /// Why Go debugging cannot start, and the next step. Without Go there is
@@ -604,10 +596,11 @@ mod tests {
             )
             .unwrap();
             std::fs::set_permissions(&go, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // Not on PATH: the command names the Go croft found (#2807).
             let ok = std::process::Command::new("sh")
                 .arg("-c")
-                .arg(DLV_INSTALL)
-                .env("PATH", format!("{}:/usr/bin:/bin", tmp.path().display()))
+                .arg(dlv_install_command(&go))
+                .env("PATH", "/usr/bin:/bin")
                 .env("HOME", tmp.path())
                 .status()
                 .unwrap()
@@ -664,8 +657,19 @@ mod tests {
         let without = dlv_missing_message(false);
         assert!(without.contains("installing delve needs Go"));
         assert!(without.contains("https://go.dev/dl"));
-        // The install lands where find_dlv looks last.
-        assert!(DLV_INSTALL.contains("GOBIN=\"$HOME/.croft/servers/go\" go install "));
+        // The install lands where find_dlv looks last, built by the Go
+        // croft found.
+        assert!(
+            dlv_install_command(Path::new("/usr/local/go/bin/go"))
+                .contains("GOBIN=\"$HOME/.croft/servers/go\" \"/usr/local/go/bin/go\" install ")
+        );
+    }
+
+    /// An empty program at `path` that can run.
+    fn runnable_stand_in(path: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(path, "").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     /// #264: delve's own resolution order, PATH first; `~/go/bin` stands in
@@ -676,7 +680,7 @@ mod tests {
         let mk = |rel: &str| {
             let dir = tmp.path().join(rel);
             std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("dlv"), "").unwrap();
+            runnable_stand_in(&dir.join("dlv"));
             dir
         };
         let on_path = mk("path");
@@ -794,7 +798,7 @@ mod tests {
         for dir in [&first, &second] {
             std::fs::create_dir_all(dir.join("bin")).unwrap();
         }
-        std::fs::write(second.join("bin").join("dlv"), "").unwrap();
+        runnable_stand_in(&second.join("bin").join("dlv"));
         let gopath = std::env::join_paths([
             "",
             "relative",
@@ -806,7 +810,7 @@ mod tests {
             find_dlv(None, None, Some(&gopath), None),
             Some(second.join("bin").join("dlv"))
         );
-        std::fs::write(first.join("bin").join("dlv"), "").unwrap();
+        runnable_stand_in(&first.join("bin").join("dlv"));
         assert_eq!(
             find_dlv(None, None, Some(&gopath), None),
             Some(first.join("bin").join("dlv")),

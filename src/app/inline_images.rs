@@ -1389,8 +1389,8 @@ impl App {
             };
             crate::iterm2_inline::fit_image_auto(&image.bytes, canvas_w, canvas_h, bg)
         };
-        if let Ok(baked) = baked
-            && let Some(raw) = crate::iterm2_inline::build_inline_image_z(
+        let raw = baked.ok().and_then(|baked| {
+            crate::iterm2_inline::build_inline_image_z(
                 self.inline_protocol,
                 &baked,
                 cell_w,
@@ -1406,9 +1406,17 @@ impl App {
                 // illustrations use.
                 crate::iterm2_inline::KITTY_Z_BELOW_TEXT_AND_BG,
             )
-        {
-            let osc = self.wrap_for_terminal(raw);
-            self.overlays.editor[side].set(osc, desired);
+        });
+        match raw {
+            Some(raw) => {
+                let osc = self.wrap_for_terminal(raw);
+                self.overlays.editor[side].set(osc, desired);
+            }
+            // Nothing to draw yet (a PDF whose first page is still
+            // rendering) or nothing drawable: the picture of whatever the
+            // tab showed before must not stay on screen under this file's
+            // name (#2829 review).
+            None => self.disable_editor_image(side),
         }
     }
 

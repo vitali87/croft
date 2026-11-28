@@ -26,7 +26,6 @@ pub(super) use adapters::lldb_dap_missing_message;
 pub(super) use adapters::lldb_dap_path;
 #[cfg(test)]
 pub(super) use adapters::lldb_dap_rank;
-use adapters::*;
 use breakpoint_list::*;
 pub(super) use compounds::finished_settles_pending;
 pub(super) use compounds::pending_abort_reason;

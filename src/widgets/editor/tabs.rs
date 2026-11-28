@@ -101,9 +101,10 @@ impl EditorTabs {
             }
             return;
         }
-        if let Some(page) = ed.pdf_page() {
+        if let Some(page) = ed.pdf_target_page() {
             // One page per wheel event, like the focused preview: the
-            // caller's notches are text lines (3 a tick), not pages.
+            // caller's notches are text lines (3 a tick), not pages. From
+            // the page asked for last, which may still be rendering (#2824).
             let target = if notches >= 0 {
                 page.saturating_add(1)
             } else {
@@ -229,6 +230,24 @@ impl EditorTabs {
                     }
                 }
                 ExternalChange::Unchanged => {}
+            }
+        }
+        report
+    }
+
+    /// The PDF rebuilds that landed since the last ask (#2827), as the
+    /// sweep would have reported them had they rendered there.
+    pub fn take_landed_reloads(&mut self) -> ExternalReloadReport {
+        let mut report = ExternalReloadReport::default();
+        for ed in &mut self.editors {
+            let (Some(outcome), Some(path)) = (ed.pdf_jobs.reload_outcome.take(), ed.path.clone())
+            else {
+                continue;
+            };
+            match outcome {
+                ExternalChange::Reloaded => report.reloaded.push(path),
+                ExternalChange::ReloadFailed => report.failed.push(path),
+                _ => {}
             }
         }
         report
