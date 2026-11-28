@@ -1747,6 +1747,34 @@ fn the_review_comment_pr_lookup_waits_out_a_briefly_busy_gh() {
     release.join().unwrap();
 }
 
+/// The PR lookup behind Add Comment and Submit Review takes only a PR
+/// number for one: an answer that is not one, such as a page of digits no
+/// number has, means no PR, not a PR to comment on.
+#[test]
+fn the_review_comment_pr_lookup_takes_only_a_pr_number() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for (name, script) in [
+        ("words-gh", "#!/bin/sh\necho 'no pull requests found'\n"),
+        (
+            "digits-gh",
+            "#!/bin/sh\nhead -c 1048577 /dev/zero | tr '\\0' 7\n",
+        ),
+    ] {
+        let gh = tmp.path().join(name);
+        std::fs::write(&gh, script).unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        app.review_gh = gh.display().to_string();
+        app.review_pr = None;
+        assert_eq!(app.review_pr_number(tmp.path()), None, "{name}");
+        assert_eq!(
+            app.status, "No PR for this branch — check it out first",
+            "{name}"
+        );
+    }
+}
+
 /// Load x/y#42 through `gh` and wait for its viewed-state read to settle.
 fn open_synced_pr(app: &mut App) {
     app.submit_pr_number("42");

@@ -121,21 +121,6 @@ fn pr_number(program: &str, root: &Path, budget: &Budget) -> Result<Option<Strin
     }
 }
 
-/// gh's first stderr line, which names the problem (scope, rate limit, a
-/// line outside the diff) better than anything croft could say; or that
-/// gh has no account signed in (#917).
-fn gh_error(status: std::process::ExitStatus, stderr: &str) -> String {
-    if crate::gh::signed_out(status) {
-        return String::from(crate::gh::SIGNED_OUT);
-    }
-    stderr
-        .trim()
-        .lines()
-        .next()
-        .unwrap_or("gh failed")
-        .to_string()
-}
-
 /// One job's time with gh: every call the job makes comes out of the same
 /// limit, so a submit that reads the diff and then posts still ends at its
 /// limit, not at twice it (#2787).
@@ -166,10 +151,10 @@ impl Budget {
 
 /// Run `gh` (`program`) with `args` in `root`, handing it `stdin` when
 /// there is one, for at most what is left of `budget`: a write that stalls
-/// on a slow network ends with that said, where it used to wait for good
-/// and every later submit was refused as already running (#2787). Both
-/// outputs are read while it runs, so neither can fill its pipe and stall
-/// gh.
+/// on a slow network ends with that said (#2787). Its stdout, or gh's first
+/// stderr line, which names the problem (scope, rate limit, a line outside
+/// the diff) better than anything croft could say; or that gh is missing or
+/// has no account signed in (#917).
 fn gh(
     program: &str,
     root: &Path,
@@ -177,46 +162,23 @@ fn gh(
     args: &[&str],
     stdin: Option<&str>,
 ) -> Result<String, String> {
-    use crate::proc::{Apart, Bounded, Keep, RunError};
     let limit = budget.left();
     if limit.is_zero() {
         return Err(budget.spent(program));
     }
-    let run = Bounded {
-        stdout: Keep::All { cap: OUTPUT_CAP },
-        stderr: Keep::All { cap: OUTPUT_CAP },
-        apart: Apart::No,
-        limit,
-        retry_busy: true,
-    };
-    let mut cmd = crate::proc::command(program);
-    cmd.args(args).current_dir(root);
-    let ran = match stdin {
-        Some(input) => run.run_fed(&mut cmd, input.as_bytes()),
-        None => run.run(&mut cmd),
-    };
-    let ran = match ran {
-        Ok(ran) => ran,
-        Err(RunError::Spawn(e)) => return Err(crate::gh::spawn_error(&e, Some(root))),
-        Err(RunError::TimedOut) => return Err(budget.spent(program)),
-        Err(RunError::TooLong { .. }) => {
-            return Err(format!(
-                "{program} answered more than {} MiB",
-                OUTPUT_CAP / (1024 * 1024)
-            ));
-        }
-        Err(RunError::Wait(e) | RunError::Pipe(e)) => return Err(format!("gh failed: {e}")),
-    };
-    if ran.status.success() {
-        Ok(ran.stdout.text())
-    } else {
-        Err(gh_error(ran.status, &ran.stderr.text()))
+    let client = crate::gh::Client::new(program, root, limit);
+    match stdin {
+        Some(input) => client.run_fed(args, input.as_bytes()),
+        None => client.run(args),
     }
+    .map(|out| String::from_utf8_lossy(&out).into_owned())
+    .map_err(|e| match e {
+        // Out of time: said against the job's whole limit, not what was
+        // left of it for this one call.
+        crate::gh::Error::NoAnswer(_) if budget.left().is_zero() => budget.spent(program),
+        e => e.first_line(),
+    })
 }
-
-/// The most of either output a write keeps: far past any answer or error
-/// gh gives, so only a runaway one is refused.
-const OUTPUT_CAP: usize = 1024 * 1024 * 1024;
 
 /// Carry out `job` with `program` (normally `gh`) in `root`, in at most
 /// `limit` for all the gh calls it makes together.
