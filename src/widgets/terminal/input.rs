@@ -82,15 +82,3 @@ impl PtyTerminal {
         }
     }
 }
-
-/// Build the OSC 52 escape sequence that asks the host terminal to put
-/// `text` on the system clipboard.
-pub fn osc52_copy_seq(text: &str) -> Vec<u8> {
-    use base64::Engine;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
-    let mut out = Vec::with_capacity(encoded.len() + 8);
-    out.extend_from_slice(b"\x1b]52;c;");
-    out.extend_from_slice(encoded.as_bytes());
-    out.push(0x07);
-    out
-}

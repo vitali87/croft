@@ -9,11 +9,15 @@
 //! A program croft waits for runs through [`Bounded`], which states what
 //! is kept of each output, whether it runs apart from croft's terminal and
 //! how long it may take.
+//!
+//! [`info`] reads what the operating system says about a process that is
+//! already running.
 
 use std::ffi::OsString;
 use std::process::{Command, Stdio};
 
 mod bounded;
+pub mod info;
 #[cfg(test)]
 pub(crate) mod record;
 

@@ -11,6 +11,8 @@
 //! active theme's palette resolves them at paint time and a theme switch
 //! recolours the view without reparsing.
 
+use ratatui::style::Color;
+
 /// A colour named by an SGR sequence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnsiColor {
@@ -489,6 +491,39 @@ pub fn looks_like_ansi(sample: &str) -> bool {
         }
     }
     false
+}
+
+/// Resolve one parsed ANSI colour against the active theme, so the rendered
+/// log matches what a terminal pane would show under the same theme. The low
+/// 16 stay symbolic until here precisely so a theme switch recolours without
+/// reparsing the file.
+pub(crate) fn ansi_color_to_tui(
+    c: crate::ansi_text::AnsiColor,
+    theme: crate::theme::Theme,
+) -> Color {
+    use crate::ansi_text::AnsiColor;
+    match c {
+        AnsiColor::Indexed(i) => {
+            let p = theme.ansi();
+            let (r, g, b) = p[(i as usize).min(15)];
+            Color::Rgb(r, g, b)
+        }
+        // The 6x6x6 cube and the 24-step greyscale ramp are fixed by the
+        // xterm spec, not by the theme, so they are computed rather than
+        // looked up.
+        AnsiColor::Palette256(i) => {
+            let i = i as u16;
+            if i < 232 {
+                let n = i - 16;
+                let lvl = |v: u16| -> u8 { if v == 0 { 0 } else { (55 + v * 40) as u8 } };
+                Color::Rgb(lvl(n / 36), lvl((n / 6) % 6), lvl(n % 6))
+            } else {
+                let v = (8 + (i - 232) * 10) as u8;
+                Color::Rgb(v, v, v)
+            }
+        }
+        AnsiColor::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
 }
 
 #[cfg(test)]

@@ -1492,18 +1492,6 @@ fn pristine_covers_only_an_untouched_interactive_shell() {
     );
 }
 
-#[test]
-fn tpgid_is_read_past_a_command_name_with_spaces_and_parens() {
-    let stat = "4242 (my (odd) sh) S 1 4242 4242 34816 5151 4194560 0 0";
-    assert_eq!(parse_tpgid(stat), Some(5151));
-    assert_eq!(
-        parse_tpgid("1 (init) S 0 1 1 0 -1 4194560"),
-        None,
-        "no terminal"
-    );
-    assert_eq!(parse_tpgid("garbage"), None);
-}
-
 /// A pane host for `argv` on a socket in `dir`, served on a thread.
 #[cfg(target_os = "linux")]
 fn serve_pane(
@@ -2494,15 +2482,6 @@ fn command_output_and_input_extract_and_select() {
         "selection covers exactly the output rows"
     );
     assert_eq!(term.selection_text(), "out1\nout2");
-}
-
-#[test]
-fn human_duration_formats_ms_seconds_minutes() {
-    let d = std::time::Duration::from_millis;
-    assert_eq!(human_duration(d(480)), "480ms");
-    assert_eq!(human_duration(d(3400)), "3.4s");
-    assert_eq!(human_duration(d(59_940)), "59.9s");
-    assert_eq!(human_duration(d(125_000)), "2m 05s");
 }
 
 #[test]
@@ -3856,30 +3835,6 @@ fn cell_in_selection_spans_multiple_rows() {
     assert!(cell_in_selection(3, 2, 1, 5, 3, 2));
     assert!(!cell_in_selection(3, 3, 1, 5, 3, 2));
     assert!(!cell_in_selection(4, 0, 1, 5, 3, 2));
-}
-
-#[test]
-fn osc52_copy_seq_wraps_with_correct_envelope() {
-    let bytes = osc52_copy_seq("hello");
-    assert_eq!(bytes, b"\x1b]52;c;aGVsbG8=\x07");
-}
-
-#[test]
-fn osc52_copy_seq_handles_empty() {
-    assert_eq!(osc52_copy_seq(""), b"\x1b]52;c;\x07");
-}
-
-#[test]
-fn osc52_copy_seq_handles_unicode() {
-    let bytes = osc52_copy_seq("héllo");
-    assert!(bytes.starts_with(b"\x1b]52;c;"));
-    assert_eq!(*bytes.last().unwrap(), 0x07);
-    let body = &bytes[7..bytes.len() - 1];
-    use base64::Engine;
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(body)
-        .unwrap();
-    assert_eq!(decoded, "héllo".as_bytes());
 }
 
 #[test]
@@ -5421,46 +5376,6 @@ fn selection_spanning_scrollback_into_live_extracts_every_line() {
     // the way to the last live line (FFFF = Line(2)).
     let all = extract_selection_text(&t, -3, 0, 2, 19);
     assert_eq!(all, "AAAA\nBBBB\nCCCC\nDDDD\nEEEE\nFFFF");
-}
-
-#[test]
-fn process_name_resolves_a_live_pid() {
-    let me = std::process::id() as i32;
-    let name = process_name(me);
-    assert!(
-        name.as_deref().is_some_and(|n| !n.is_empty()),
-        "the test process resolves to a non-empty name: {name:?}"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn process_cmdline_reads_a_live_process_argv() {
-    // #1846: the plain refresh never read the command line, so this was
-    // always `None` and no pane running `ssh box` read as an ssh session.
-    let mut child = std::process::Command::new("sleep")
-        .arg("30")
-        .spawn()
-        .expect("sleep runs");
-    // `spawn` can return while the child still reads as the test binary
-    // that forked it, before its exec lands; a loaded runner caught that.
-    // Read until the argv is sleep's: a process_cmdline that never reads
-    // the command line still fails here, when the budget runs out.
-    let mut argv = None;
-    crate::test_budget::await_spawned(
-        std::time::Duration::from_millis(200),
-        "the child's argv to read as sleep's",
-        || {
-            argv = process_cmdline(child.id() as i32);
-            argv.as_ref()
-                .is_some_and(|a| a.last().map(String::as_str) == Some("30"))
-        },
-    );
-    let _ = child.kill();
-    let _ = child.wait();
-    let argv = argv.expect("a live child's argv");
-    assert!(argv[0].ends_with("sleep"), "{argv:?}");
-    assert_eq!(argv.last().map(String::as_str), Some("30"), "{argv:?}");
 }
 
 #[test]

@@ -170,18 +170,6 @@ pub fn pair_decorations(marks: &[MarkView]) -> Vec<CommandDecoration> {
     out
 }
 
-/// Compact human form of a command duration: "480ms", "3.4s", "2m 05s".
-pub fn human_duration(d: std::time::Duration) -> String {
-    let secs = d.as_secs_f64();
-    if secs < 1.0 {
-        format!("{}ms", d.as_millis())
-    } else if secs < 60.0 {
-        format!("{secs:.1}s")
-    } else {
-        format!("{}m {:02}s", d.as_secs() / 60, d.as_secs() % 60)
-    }
-}
-
 /// Cap on retained marks per pane (a mark per prompt/command boundary;
 /// thousands would mean a very long session — drop the oldest).
 pub(super) const MARKS_MAX: usize = 2000;

@@ -19,6 +19,9 @@ use std::sync::OnceLock;
 
 use ratatui::style::Color;
 
+mod tones;
+pub use tones::{Tones, tones};
+
 /// VS Code's default dark terminal ANSI palette (the `terminal.ansi*` colors
 /// of the Dark+ theme): black, red, green, yellow, blue, magenta, cyan,
 /// white, then the bright variants. The base for every croft theme that does
