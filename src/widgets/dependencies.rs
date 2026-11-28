@@ -16,8 +16,8 @@
 //! folder like `~/Documents` shows no dependency view at all.
 
 use crate::dependencies::{Dependency, Ecosystem};
-use crate::theme::Theme;
 use crate::widgets::scrollbar;
+use crate::widgets::view_cx::ViewCx;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -102,10 +102,6 @@ pub struct DependenciesPanel {
     /// shows the empty state or the failure instead of spinning on "Loading".
     listing: Listing,
     scroll: usize,
-    pub focus_gradient: bool,
-    pub theme: Theme,
-    pub focused: bool,
-    pub hover_pointer: Option<(u16, u16)>,
 
     pub last_area: Rect,
     pub last_scrollbar: Rect,
@@ -126,10 +122,6 @@ impl DependenciesPanel {
             header: HEADER_GENERIC.to_string(),
             listing: Listing::Loading,
             scroll: 0,
-            focus_gradient: false,
-            theme: Theme::default(),
-            focused: false,
-            hover_pointer: None,
             last_area: Rect::default(),
             last_scrollbar: Rect::default(),
             last_header_row: 0,
@@ -238,12 +230,13 @@ impl Default for DependenciesPanel {
     }
 }
 
-impl Widget for &mut DependenciesPanel {
-    fn render(self, area: Rect, buf: &mut Buffer) {
+impl DependenciesPanel {
+    /// Draw the section into `area` with this frame's [`ViewCx`].
+    pub fn draw(&mut self, cx: &ViewCx, area: Rect, buf: &mut Buffer) {
         let block = crate::widgets::surface::section_block(
-            self.theme,
+            cx.theme,
             Borders::BOTTOM,
-            Style::default().fg(self.theme.ui(COLOR_DIM)),
+            Style::default().fg(cx.theme.ui(COLOR_DIM)),
         );
         let inner = block.inner(area);
         block.render(area, buf);
@@ -269,11 +262,11 @@ impl Widget for &mut DependenciesPanel {
         crate::widgets::surface::paint_section_header(
             buf,
             header_row,
-            self.theme,
+            cx.theme,
             !self.collapsed,
             &self.header,
             Vec::new(),
-            crate::widgets::hover::contains(header_row, self.hover_pointer),
+            crate::widgets::hover::contains(header_row, cx.pointer),
         );
         self.last_header_row = header_y;
         self.last_header_x = inner.x;
@@ -296,7 +289,7 @@ impl Widget for &mut DependenciesPanel {
             };
             Paragraph::new(Line::from(Span::styled(
                 msg,
-                Style::default().fg(self.theme.ui(COLOR_DIM)),
+                Style::default().fg(cx.theme.ui(COLOR_DIM)),
             )))
             .render(
                 Rect {
@@ -339,25 +332,23 @@ impl Widget for &mut DependenciesPanel {
                 width: content_w,
                 height: 1,
             };
-            if let Some(bg) =
-                crate::widgets::hover::row_hover_bg(row_rect, self.hover_pointer, self.theme)
-            {
+            if let Some(bg) = crate::widgets::hover::row_hover_bg(row_rect, cx.pointer, cx.theme) {
                 buf.set_style(row_rect, Style::default().bg(bg));
             }
             let mut spans = vec![
                 Span::styled(
                     format!("{PACKAGE_GLYPH} "),
-                    Style::default().fg(self.theme.ui(COLOR_DIM)),
+                    Style::default().fg(cx.theme.ui(COLOR_DIM)),
                 ),
                 Span::styled(
                     dep.name.clone(),
-                    Style::default().fg(self.theme.ui(COLOR_NAME)),
+                    Style::default().fg(cx.theme.ui(COLOR_NAME)),
                 ),
             ];
             if !dep.version.is_empty() {
                 spans.push(Span::styled(
                     format!(" {}", dep.version),
-                    Style::default().fg(self.theme.ui(COLOR_VERSION)),
+                    Style::default().fg(cx.theme.ui(COLOR_VERSION)),
                 ));
             }
             Paragraph::new(Line::from(spans)).render(row_rect, buf);
@@ -365,7 +356,7 @@ impl Widget for &mut DependenciesPanel {
 
         if let Some(metrics) = bar {
             self.last_scrollbar = metrics.area;
-            scrollbar::render_vertical_on_chrome(buf, metrics, self.focused, self.theme);
+            scrollbar::render_vertical_on_chrome(buf, metrics, cx.focused, cx.theme);
         }
     }
 }
@@ -397,7 +388,7 @@ mod tests {
             height,
         };
         let mut buf = Buffer::empty(area);
-        p.render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         let mut out = String::new();
         for y in 0..height {
             for x in 0..width {

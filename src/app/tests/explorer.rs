@@ -2127,7 +2127,8 @@ fn left_pad_app() -> (tempfile::TempDir, App) {
 fn dependencies_text(app: &mut App) -> String {
     let area = ratatui::layout::Rect::new(0, 0, 40, 6);
     let mut buf = ratatui::buffer::Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut app.dependencies, area, &mut buf);
+    let cx = app.view_cx(app.focus == Pane::Tree && app.sidebar_view == SidebarView::Explorer);
+    app.dependencies.draw(&cx, area, &mut buf);
     (0..area.height)
         .map(|y| {
             (0..area.width)
@@ -2213,7 +2214,8 @@ fn seed_timeline_app() -> (tempfile::TempDir, App, PathBuf) {
 fn timeline_text(app: &mut App) -> String {
     let area = ratatui::layout::Rect::new(0, 0, 40, 8);
     let mut buf = ratatui::buffer::Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut app.timeline, area, &mut buf);
+    let cx = app.view_cx(app.focus == Pane::Tree && app.sidebar_view == SidebarView::Explorer);
+    app.timeline.draw(&cx, area, &mut buf);
     (0..area.height)
         .map(|y| {
             (0..area.width)

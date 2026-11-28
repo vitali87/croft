@@ -5576,18 +5576,12 @@ impl App {
         self.open_editors.focus_gradient = gradient;
         self.open_editors.theme = self.theme;
         self.open_editors.focused = explorer_focused;
-        self.timeline.focus_gradient = gradient;
-        self.timeline.theme = self.theme;
-        self.timeline.focused = explorer_focused;
         self.agent_lane_panel.theme = self.theme;
         self.agent_lane_panel.focused = explorer_focused;
         self.commit_graph.focus_gradient = gradient;
         self.commit_graph.theme = self.theme;
         self.commit_graph.focused =
             self.focus == Pane::Tree && self.sidebar_view == SidebarView::SourceControl;
-        self.dependencies.focus_gradient = gradient;
-        self.dependencies.theme = self.theme;
-        self.dependencies.focused = explorer_focused;
         self.remote.focus_gradient = gradient;
         self.remote.theme = self.theme;
         self.extensions.theme = self.theme;

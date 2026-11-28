@@ -231,6 +231,16 @@ pub(super) fn update_spinner_frame(elapsed_ms: u128) -> &'static str {
 }
 
 impl App {
+    /// What a side-bar or panel view draws with now: the theme and pointer
+    /// as they are this frame, and whether the view has the keyboard.
+    pub(super) fn view_cx(&self, focused: bool) -> crate::widgets::view_cx::ViewCx {
+        crate::widgets::view_cx::ViewCx {
+            theme: self.theme,
+            focused,
+            pointer: self.pointer_cell,
+        }
+    }
+
     /// Mirrors the predicate used in `App::render` to decide whether to call
     /// `frame.set_cursor_position`. Used by the post-draw overlay writer so
     /// it can re-Show the caret after the OSC-1337 image emit only when the
@@ -715,9 +725,7 @@ impl App {
             self.remote.hover_pointer = panel_pointer;
             self.outline.hover_pointer = panel_pointer;
             self.open_editors.hover_pointer = panel_pointer;
-            self.timeline.hover_pointer = panel_pointer;
             self.agent_lane_panel.hover_pointer = panel_pointer;
-            self.dependencies.hover_pointer = panel_pointer;
             self.extensions.hover_pointer = panel_pointer;
             self.testing.hover_pointer = panel_pointer;
             self.commit_graph.hover_pointer = panel_pointer;

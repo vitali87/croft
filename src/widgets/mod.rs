@@ -52,5 +52,6 @@ pub mod terminal;
 pub mod testing;
 pub mod timeline;
 pub mod update_popup;
+pub mod view_cx;
 pub mod workspace_symbols;
 pub mod zoxide_jump;
