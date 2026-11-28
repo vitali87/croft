@@ -840,6 +840,20 @@ fn paint_card_edge(
     }
 }
 
+/// Write `s` at `(x, y)` styled, clipped to the half-open column range
+/// `[x, right)`, and return the column just past what was drawn, so a
+/// view can lay coloured segments left to right without overflowing.
+pub fn put_clipped(buf: &mut Buffer, x: u16, y: u16, right: u16, s: &str, style: Style) -> u16 {
+    if x >= right {
+        return x;
+    }
+    let budget = (right - x) as usize;
+    let clipped: String = s.chars().take(budget).collect();
+    let drawn = clipped.chars().count() as u16;
+    buf.set_string(x, y, &clipped, style);
+    x + drawn
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

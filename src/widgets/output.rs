@@ -10,7 +10,7 @@
 use crate::widgets::view_cx::ViewCx;
 use ratatui::{
     buffer::Buffer,
-    layout::Rect,
+    layout::{Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Clear, Paragraph, Widget},
@@ -27,10 +27,6 @@ const COLOR_INFO: Color = Color::Rgb(0x3b, 0x9e, 0xff);
 
 const CHEVRON_DOWN: char = '\u{eab4}'; // codicon chevron-down
 const CHEVRON_UP: char = '\u{eab7}'; // codicon chevron-up
-
-fn rect_has(r: Rect, x: u16, y: u16) -> bool {
-    r.width > 0 && r.height > 0 && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
-}
 
 fn level_color(level: OutputLevel, theme: crate::theme::Theme) -> Color {
     match level {
@@ -243,12 +239,16 @@ impl OutputPanel {
     /// as a click in the log body (e.g. to focus the pane).
     pub fn click(&mut self, x: u16, y: u16) -> bool {
         if self.dropdown_open {
-            if let Some(&(_, idx)) = self.dropdown_items.iter().find(|(r, _)| rect_has(*r, x, y)) {
+            if let Some(&(_, idx)) = self
+                .dropdown_items
+                .iter()
+                .find(|(r, _)| r.contains(Position::new(x, y)))
+            {
                 self.select(idx);
                 return true;
             }
             // A click on the list's scrollbar track jumps the window.
-            if rect_has(self.dropdown_scrollbar, x, y) {
+            if self.dropdown_scrollbar.contains(Position::new(x, y)) {
                 if let Some(metrics) = scrollbar::vertical_metrics(
                     self.dropdown_scrollbar,
                     self.channels.len(),
@@ -263,7 +263,7 @@ impl OutputPanel {
             self.dropdown_open = false;
             return true;
         }
-        if rect_has(self.dropdown_rect, x, y) {
+        if self.dropdown_rect.contains(Position::new(x, y)) {
             self.dropdown_open = !self.dropdown_open;
             if self.dropdown_open {
                 // Open with the active channel in view however deep it
@@ -272,17 +272,17 @@ impl OutputPanel {
             }
             return true;
         }
-        if rect_has(self.clear_rect, x, y) {
+        if self.clear_rect.contains(Position::new(x, y)) {
             if let Some(c) = self.selected_name() {
                 crate::output::clear(&c);
             }
             return true;
         }
-        if rect_has(self.level_rect, x, y) {
+        if self.level_rect.contains(Position::new(x, y)) {
             self.cycle_level();
             return true;
         }
-        if rect_has(self.rpc_rect, x, y) {
+        if self.rpc_rect.contains(Position::new(x, y)) {
             crate::output::set_trace_enabled(!crate::output::trace_enabled());
             return true;
         }

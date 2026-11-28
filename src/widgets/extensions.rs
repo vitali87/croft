@@ -13,6 +13,7 @@
 //! The filter is local-only: there is no marketplace, so it narrows the
 //! installed list rather than searching a remote registry.
 
+use crate::widgets::surface::put_clipped;
 use crate::widgets::view_cx::ViewCx;
 use std::collections::BTreeSet;
 
@@ -550,19 +551,6 @@ impl Default for ExtensionsPanel {
     }
 }
 
-/// Write `s` at `(x, y)` styled, clipped to the half-open column range
-/// `[x, right)`, returning the column just past what was drawn.
-fn put(buf: &mut Buffer, x: u16, y: u16, right: u16, s: &str, style: Style) -> u16 {
-    if x >= right {
-        return x;
-    }
-    let budget = (right - x) as usize;
-    let clipped: String = s.chars().take(budget).collect();
-    let drawn = clipped.chars().count() as u16;
-    buf.set_string(x, y, &clipped, style);
-    x + drawn
-}
-
 impl ExtensionsPanel {
     /// Draw the view into `area` with this frame's [`ViewCx`].
     pub fn draw(&mut self, cx: &ViewCx, area: Rect, buf: &mut Buffer) {
@@ -581,7 +569,7 @@ impl ExtensionsPanel {
         let pal = Palette::for_theme(cx.theme);
 
         // Header caption.
-        put(
+        put_clipped(
             buf,
             area.x + 1,
             area.y,
@@ -604,7 +592,7 @@ impl ExtensionsPanel {
             };
             self.last_search_area = box_rect;
             buf.set_style(box_rect, Style::default().bg(pal.search_bg));
-            let x = put(
+            let x = put_clipped(
                 buf,
                 box_rect.x + 1,
                 search_y,
@@ -631,7 +619,7 @@ impl ExtensionsPanel {
             // The query/clear area ends just before the refresh icon.
             let text_right = refresh_x.saturating_sub(1);
             if self.filter.is_empty() {
-                put(
+                put_clipped(
                     buf,
                     x,
                     search_y,
@@ -646,7 +634,7 @@ impl ExtensionsPanel {
                 }
             } else {
                 let clear_x = text_right.saturating_sub(1);
-                let after = put(
+                let after = put_clipped(
                     buf,
                     x,
                     search_y,
@@ -705,7 +693,7 @@ impl ExtensionsPanel {
                     2 => "AVAILABLE",
                     _ => "FROM VS CODE",
                 };
-                put(
+                put_clipped(
                     buf,
                     area.x + 1,
                     y,
@@ -758,7 +746,7 @@ impl ExtensionsPanel {
             if let Some(bg) = row_bg {
                 chip_style = chip_style.bg(bg);
             }
-            let x = put(
+            let x = put_clipped(
                 buf,
                 area.x + 1,
                 y,
@@ -766,7 +754,7 @@ impl ExtensionsPanel {
                 &format!("{chip} "),
                 chip_style,
             );
-            put(buf, x, y, name_right, &item.name, name_style);
+            put_clipped(buf, x, y, name_right, &item.name, name_style);
 
             // Installed rows get an enable/disable switch; AVAILABLE catalog
             // rows get a "+ Add" affordance in the same hit zone (toggling it
@@ -776,7 +764,7 @@ impl ExtensionsPanel {
                     .fg(pal.accent)
                     .bg(row_bg.unwrap_or(Color::Reset))
                     .add_modifier(Modifier::BOLD);
-                put(buf, sw_x, y, right, "+Add", add_style);
+                put_clipped(buf, sw_x, y, right, "+Add", add_style);
             } else if !item.vscode {
                 draw_switch(buf, sw_x, y, item.enabled, row_bg, &pal);
             }
@@ -797,7 +785,7 @@ impl ExtensionsPanel {
 
             // Line 2: the blurb.
             let line2_y = y + 1;
-            put(
+            put_clipped(
                 buf,
                 area.x + 3,
                 line2_y,

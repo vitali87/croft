@@ -11,7 +11,7 @@
 
 use ratatui::{
     buffer::Buffer,
-    layout::Rect,
+    layout::{Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Paragraph, Widget},
@@ -290,7 +290,7 @@ impl PortsPanel {
     pub fn row_at(&self, x: u16, y: u16) -> Option<usize> {
         self.row_rects
             .iter()
-            .find(|(r, _)| rect_has(*r, x, y))
+            .find(|(r, _)| r.contains(Position::new(x, y)))
             .map(|(_, idx)| *idx)
     }
 }
@@ -299,10 +299,6 @@ impl Default for PortsPanel {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn rect_has(r: Rect, x: u16, y: u16) -> bool {
-    r.width > 0 && r.height > 0 && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
 }
 
 impl PortsPanel {
