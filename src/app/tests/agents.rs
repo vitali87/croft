@@ -834,6 +834,62 @@ fn unseating_the_navigator_resets_the_turn_note_counters() {
     assert!(app.pair.noted_files.is_empty());
 }
 
+/// #2878: a workspace switch mid-turn tears the seat down like turning the
+/// navigator off, so it resets the turn's note counters too: they survived
+/// into the next seat's first TurnDone, which reported the old seat's notes.
+#[test]
+fn a_workspace_switch_mid_turn_resets_the_turn_note_counters() {
+    use std::time::{Duration, Instant};
+    let tmp = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("collab.sock");
+    {
+        let s = socket.clone();
+        std::thread::spawn(move || {
+            let _ = crate::collab::relay_serve(&s);
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !crate::session::is_alive(&socket) {
+        assert!(Instant::now() < deadline, "relay never came up");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let record = crate::session::PairRecord {
+        model: None,
+        name: "nav".into(),
+        enabled: true,
+        task: None,
+        provider: None,
+        base_url: None,
+    };
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.pair.record_path = tmp.path().join("x.pair.json");
+    app.pair.socket = socket.clone();
+    app.pair.host_lock_path = tmp.path().join("x.host.lock");
+    app.pair.spawn_override = Some(Box::new(local_test_spawn));
+    crate::session::write_pair_record(&app.pair.record_path, &record).unwrap();
+    app.pair.last_check = None;
+    app.maybe_seat_navigator();
+    assert!(app.pair.host.is_some(), "seated: {}", app.status);
+
+    // Mid-turn state: the navigator commented three times in a.rs.
+    app.pair.notes_this_turn = 3;
+    app.pair.last_noted_file = Some(String::from("a.rs"));
+    app.pair.noted_files.insert(String::from("a.rs"));
+
+    app.change_workspace_root(other.path().to_path_buf());
+    assert!(app.pair.host.is_none(), "the old workspace's seat is gone");
+    assert_eq!(
+        app.pair.notes_this_turn, 0,
+        "the old seat's note count must not reach the next seat's TurnDone"
+    );
+    assert!(
+        app.pair.last_noted_file.is_none(),
+        "the old seat's noted file must not either"
+    );
+    assert!(app.pair.noted_files.is_empty());
+}
+
 /// Re-running `croft pair` after a failed seat must retry: the CLI promises
 /// "a running croft seats it within a second", but an enabled→enabled
 /// rewrite has no transition for the death latch to observe. The record's
