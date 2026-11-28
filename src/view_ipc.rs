@@ -1470,15 +1470,23 @@ mod tests {
     fn a_refusal_sent_before_the_request_is_written_is_still_read() {
         use std::os::unix::net::UnixStream;
         let (mut gone, closed) = UnixStream::pair().unwrap();
+        // Shut down, not only dropped: a program another test starts at
+        // this moment holds a copy of `closed` until it runs, and dropping
+        // ours alone leaves that copy's end open (#2820). The copy is held
+        // here, so the write fails whatever runs beside this test.
+        let copy = closed.try_clone().unwrap();
+        closed.shutdown(std::net::Shutdown::Both).unwrap();
         drop(closed);
         assert_eq!(
             gone.write_all(b"{}\n").unwrap_err().kind(),
             std::io::ErrorKind::BrokenPipe,
             "the write this test is about must fail the way a closed croft makes it fail"
         );
+        drop(copy);
 
         let (mut client, mut croft) = UnixStream::pair().unwrap();
         write_reply(&mut croft, &retryable_refusal()).unwrap();
+        croft.shutdown(std::net::Shutdown::Both).unwrap();
         drop(croft);
 
         assert_eq!(
@@ -1497,10 +1505,14 @@ mod tests {
     #[test]
     fn a_broken_pipe_with_no_reply_is_reported_as_the_write_error() {
         let (mut client, croft) = std::os::unix::net::UnixStream::pair().unwrap();
+        // Shut down before it is dropped, with a copy held, as above (#2820).
+        let copy = croft.try_clone().unwrap();
+        croft.shutdown(std::net::Shutdown::Both).unwrap();
         drop(croft);
 
         let err = exchange(&mut client, &ViewRequest::new(Path::new("/tmp/x"))).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe, "{err}");
+        drop(copy);
     }
 
     /// A malformed reply behind a broken pipe is reported as malformed.
@@ -1514,6 +1526,7 @@ mod tests {
         use std::os::unix::net::UnixStream;
         let (mut client, mut croft) = UnixStream::pair().unwrap();
         croft.write_all(b"not a reply\n").unwrap();
+        croft.shutdown(std::net::Shutdown::Both).unwrap();
         drop(croft);
 
         let err = exchange(&mut client, &ViewRequest::new(Path::new("/tmp/x"))).unwrap_err();
