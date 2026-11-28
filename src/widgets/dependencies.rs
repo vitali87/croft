@@ -6,16 +6,16 @@
 //! and is **specific to whichever manifest exists** — it never shows a fixed
 //! language's dependencies in an unrelated folder.
 //!
-//! So this module first detects the workspace's ecosystem(s) from the manifest
-//! files in its root ([`detect_ecosystems`]), then resolves the dependency set
-//! per ecosystem off the render thread ([`fetch_dependencies`]): `cargo
-//! metadata` for Rust, and a direct read of the manifest for Python / Node /
-//! Go. When the root carries no recognised manifest the caller hides the
-//! section entirely (and drops it from the ⋯ menu), so opening a plain folder
-//! like `~/Documents` shows no dependency view at all.
+//! So the caller first detects the workspace's ecosystem(s) from the manifest
+//! files in its root ([`crate::dependencies::detect_ecosystems`]), then
+//! resolves the dependency set per ecosystem off the render thread
+//! ([`crate::dependencies::fetch_dependencies`]): `cargo metadata` for Rust,
+//! and a direct read of the manifest for Python / Node / Go. This module draws
+//! the result. When the root carries no recognised manifest the caller hides
+//! the section entirely (and drops it from the ⋯ menu), so opening a plain
+//! folder like `~/Documents` shows no dependency view at all.
 
-pub(crate) use crate::dependencies::cargo_binary;
-pub use crate::dependencies::{Dependency, Ecosystem, detect_ecosystems, fetch_dependencies};
+use crate::dependencies::{Dependency, Ecosystem};
 use crate::theme::Theme;
 use crate::widgets::scrollbar;
 use ratatui::{

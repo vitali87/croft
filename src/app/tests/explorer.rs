@@ -2148,7 +2148,7 @@ fn a_dependency_lookup_whose_thread_crashed_says_it_could_not_list() {
         crate::jobs::Job::spawn(
             "dependencies",
             crate::jobs::Start::Now,
-            || -> Vec<crate::widgets::dependencies::Dependency> {
+            || -> Vec<crate::dependencies::Dependency> {
                 panic!("the lookup crashed (on purpose, in a test)")
             },
         )
@@ -2175,10 +2175,10 @@ fn a_lookup_for_the_folder_just_left_never_lands_in_the_new_one() {
     let (_tmp, mut app) = left_pad_app();
     // The folder just left still has its lookup out, and it has answered.
     app.deps_fetch = Some(crate::jobs::Job::finished(vec![
-        crate::widgets::dependencies::Dependency {
+        crate::dependencies::Dependency {
             name: "serde".into(),
             version: "1.0.0".into(),
-            ecosystem: crate::widgets::dependencies::Ecosystem::Rust,
+            ecosystem: crate::dependencies::Ecosystem::Rust,
         },
     ]));
     // The re-root that left it.
