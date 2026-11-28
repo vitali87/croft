@@ -379,6 +379,7 @@ struct RowFrame<'a> {
 
 impl Widget for &mut Editor {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        self.settle_semantic_carry();
         self.clamp_to_symbol_view();
         self.sync_tab_cells();
         let block_style = if self.focused {

@@ -76,6 +76,13 @@ pub fn open() {
     GATE.open();
 }
 
+/// Whether a launch is still drawing its first frame. Work the first frame
+/// does not show can be put off while this holds. False outside a launch and
+/// under test, where nothing arms the gate.
+pub fn first_frame_pending() -> bool {
+    GATE.armed.load(Ordering::Acquire)
+}
+
 /// Wait until the first frame is up, if a launch is still drawing it. Call
 /// at the top of a background job the first frame does not need.
 pub fn wait() {
