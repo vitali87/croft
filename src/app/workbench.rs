@@ -1264,7 +1264,7 @@ impl App {
                 self.context_menu.is_some(),
                 self.peek_popup.is_some(),
                 self.hover_popup.is_some(),
-                self.completion_popup.is_some(),
+                self.completion.popup.is_some(),
                 self.signature_help_popup.is_some(),
             ),
             (

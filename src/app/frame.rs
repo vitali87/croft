@@ -1131,14 +1131,14 @@ impl App {
             }
             self.render_scrub_slider(frame);
             if self.focus == Pane::Editor
-                && self.completion_popup.is_some()
+                && self.completion.popup.is_some()
                 && let Some((cx, cy)) = self.editor.cursor_screen_pos()
             {
-                if let Some(popup) = self.completion_popup.as_mut() {
+                if let Some(popup) = self.completion.popup.as_mut() {
                     popup.anchor = (cx, cy);
                     popup.theme = self.theme;
                 }
-                let popup_ref = self.completion_popup.as_ref().unwrap();
+                let popup_ref = self.completion.popup.as_ref().unwrap();
                 let area = popup_ref.area_for(focused_area);
                 if area.width > 0 && area.height > 0 {
                     frame.render_widget(popup_ref, area);
@@ -2629,7 +2629,8 @@ impl App {
                     )),
                     diagnostic,
                     item: self
-                        .completion_popup
+                        .completion
+                        .popup
                         .as_ref()
                         .and_then(|c| c.selected_item())
                         .map(|c| c.label.clone()),

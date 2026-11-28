@@ -24,6 +24,77 @@ pub(super) fn text_hash_before(lines: &[String], (row, col): (usize, usize)) -> 
     Some(hasher.finish())
 }
 
+/// Code completion's own state: the open popup, the request in flight and
+/// where it was asked, whether its reply was incomplete or a re-ask or
+/// typed trigger waits, how it was opened, and the accepted item whose
+/// import is being resolved.
+pub(super) struct CompletionState {
+    /// Active completion popup, when a completion request has been issued
+    /// and the user hasn't dismissed the result. Populated by drain_lsp_completion
+    /// once the worker sends a CompletionResult back.
+    pub(super) popup: Option<crate::widgets::completion_popup::CompletionPopup>,
+    /// Most recent completion request id; later responses with a stale
+    /// id are dropped so a slow earlier response cannot clobber a fresh
+    /// one (e.g. user already moved past the original trigger).
+    pub(super) request_id: Option<u64>,
+    /// Where the caret was (row, char column) when the pending completion was
+    /// requested: the server's edit ranges describe the line then, and the
+    /// accept shifts them by what was typed or deleted since.
+    pub(super) origin: Option<(usize, usize)>,
+    /// The caret position the latest completion request was sent at. Unlike
+    /// `origin` (the session's anchor, kept across re-asks so the
+    /// reply still opens in the word) it moves with every re-ask, because a
+    /// server's ranges describe the line at that very point.
+    pub(super) ask_pos: Option<(usize, usize)>,
+    /// The request position of the reply the open popup's items came from:
+    /// what an accepted item's ranges are shifted from.
+    pub(super) items_pos: Option<(usize, usize)>,
+    /// The pending completion's last reply was marked `isIncomplete` (#1529):
+    /// each word edit re-asks the server, whether or not any of its old items
+    /// are still on screen. Lives only while `request_id` does.
+    pub(super) incomplete: bool,
+    /// A word edit in an incomplete session is waiting to re-ask the server;
+    /// sent after `sync_lsp` so the request follows the edit's `didChange`.
+    pub(super) reask_due: bool,
+    /// A typed key that opens completion (#929) in the file it was typed
+    /// in, waiting like the re-ask: a trigger character or a word begun.
+    pub(super) ask_due: Option<(CompletionTrigger, PathBuf)>,
+    /// The pending completion was asked for, not opened by typing (#929):
+    /// only then does a reply with nothing matching the word say so.
+    pub(super) explicit: bool,
+    /// The pending completion was asked for (Ctrl+Space), so the words of
+    /// the open documents fill in when no server offers anything (#1566).
+    /// A `.` typed asks the server alone: a word list there would open on
+    /// every full stop of a plain-text note.
+    pub(super) words: bool,
+    /// Ids for completions answered here rather than by a server (#1566),
+    /// counting down from the top so they never meet the manager's.
+    pub(super) local_seq: u64,
+    /// The last accepted completion, while its server resolves the
+    /// auto-import it left out of the list (#928).
+    pub(super) resolve: Option<PendingCompletionResolve>,
+}
+
+impl CompletionState {
+    /// No popup, request or resolve yet.
+    pub(super) fn new() -> Self {
+        Self {
+            popup: None,
+            request_id: None,
+            origin: None,
+            ask_pos: None,
+            items_pos: None,
+            incomplete: false,
+            reask_due: false,
+            ask_due: None,
+            explicit: false,
+            words: false,
+            local_seq: u64::MAX,
+            resolve: None,
+        }
+    }
+}
+
 impl App {
     /// Drain LSP completion responses. Drops responses with stale request
     /// ids so a slow earlier reply cannot clobber a fresher popup. Returns
@@ -44,13 +115,14 @@ impl App {
         result: crate::lsp::manager::CompletionResult,
     ) -> bool {
         if self
-            .completion_resolve
+            .completion
+            .resolve
             .as_ref()
             .is_some_and(|p| p.request_id == result.request_id)
         {
             return self.apply_resolved_completion(result);
         }
-        if Some(result.request_id) != self.completion_request_id {
+        if Some(result.request_id) != self.completion.request_id {
             return false;
         }
         // A matching id is not enough: nothing but the open popup clears the
@@ -58,10 +130,10 @@ impl App {
         // on the next line with an empty prefix, and the next Enter accepted
         // its first item instead of breaking the line (#842).
         if !self.completion_origin_covers_caret(&result.path) {
-            self.completion_request_id = None;
+            self.completion.request_id = None;
             return false;
         }
-        self.completion_incomplete = result.is_incomplete;
+        self.completion.incomplete = result.is_incomplete;
         let Some((cx, cy)) = self.editor.cursor_screen_pos() else {
             return false;
         };
@@ -74,13 +146,14 @@ impl App {
         // A server with nothing to offer, or none at all, leaves the words
         // of the open documents, as VS Code's word-based suggestions do
         // (#1566). A server's own list is never mixed with them.
-        let words = self.completion_words && items.is_empty();
+        let words = self.completion.words && items.is_empty();
         if words {
             // An empty reply to an ask already showing its words (the
             // manager answering for a file no server took) changes nothing:
             // rebuilding would only drop the user's place in the list.
             if self
-                .completion_popup
+                .completion
+                .popup
                 .as_ref()
                 .is_some_and(|p| p.request_id == result.request_id)
             {
@@ -96,7 +169,7 @@ impl App {
             if words {
                 self.status = String::from("No suggestions");
             }
-            return self.completion_popup.take().is_some();
+            return self.completion.popup.take().is_some();
         }
         let popup = crate::widgets::completion_popup::CompletionPopup::new(
             items,
@@ -110,8 +183,8 @@ impl App {
             "popup filter: prefix={prefix:?} server={server_count} visible={filtered}"
         ));
         if popup.visible_is_empty() {
-            self.completion_popup = None;
-            if self.completion_explicit {
+            self.completion.popup = None;
+            if self.completion.explicit {
                 self.status =
                     format!("No completions match '{prefix}' ({server_count} from server)");
             }
@@ -119,8 +192,8 @@ impl App {
             // Only now do the popup's items come from this reply: a reply
             // that returned early above left the older items on screen, and
             // those still shift from their own request.
-            self.completion_items_pos = self.completion_ask_pos;
-            self.completion_popup = Some(popup);
+            self.completion.items_pos = self.completion.ask_pos;
+            self.completion.popup = Some(popup);
         }
         true
     }
@@ -130,7 +203,7 @@ impl App {
     /// and only word characters typed since. VS Code likewise cancels its
     /// suggest session the moment the caret leaves the word.
     pub(super) fn completion_origin_covers_caret(&self, path: &Path) -> bool {
-        let Some((row, col)) = self.completion_origin else {
+        let Some((row, col)) = self.completion.origin else {
             return false;
         };
         let caret = self.editor.cursor_col;
@@ -156,7 +229,7 @@ impl App {
         &mut self,
         result: crate::lsp::manager::CompletionResult,
     ) -> bool {
-        let Some(pending) = self.completion_resolve.take() else {
+        let Some(pending) = self.completion.resolve.take() else {
             return false;
         };
         let Some(item) = result.items.into_iter().next() else {
@@ -226,8 +299,8 @@ impl App {
         let Some(body) = self.snippets.exact(&word, lang).map(|s| s.body.clone()) else {
             return false;
         };
-        self.completion_popup = None;
-        self.completion_request_id = None;
+        self.completion.popup = None;
+        self.completion.request_id = None;
         self.expand_snippet(&body, word.chars().count());
         true
     }
@@ -288,22 +361,22 @@ impl App {
         let served = path
             .as_deref()
             .is_some_and(|p| self.lsp.as_ref().is_some_and(|l| l.document_has_server(p)));
-        self.completion_explicit = words;
+        self.completion.explicit = words;
         let words = words && self.word_suggestions != crate::word_suggest::WordSuggestions::Off;
         if asked.is_none() && !words {
             return;
         }
         let id = asked.unwrap_or_else(|| {
-            self.local_completion_seq -= 1;
-            self.local_completion_seq
+            self.completion.local_seq -= 1;
+            self.completion.local_seq
         });
-        self.completion_request_id = Some(id);
-        self.completion_origin = Some((self.editor.cursor_row, self.editor.cursor_col));
-        self.completion_ask_pos = self.completion_origin;
-        self.completion_incomplete = false;
-        self.completion_reask_due = false;
-        self.completion_ask_due = None;
-        self.completion_words = words;
+        self.completion.request_id = Some(id);
+        self.completion.origin = Some((self.editor.cursor_row, self.editor.cursor_col));
+        self.completion.ask_pos = self.completion.origin;
+        self.completion.incomplete = false;
+        self.completion.reask_due = false;
+        self.completion.ask_due = None;
+        self.completion.words = words;
         if words && !served {
             self.apply_completion_result(crate::lsp::manager::CompletionResult {
                 request_id: id,
@@ -497,7 +570,7 @@ impl App {
         // from the session's anchor: a re-ask answers for the caret as it was
         // then, and counting from the anchor again took the letters typed
         // before it twice, swallowing that many characters after the word.
-        let asked_at = self.completion_items_pos.or(self.completion_origin);
+        let asked_at = self.completion.items_pos.or(self.completion.origin);
         let shift: isize = match asked_at {
             Some((r, c)) if r == row => caret as isize - c as isize,
             _ => 0,
@@ -593,8 +666,9 @@ impl App {
         let (row, caret) = (self.editor.cursor_row, self.editor.cursor_col);
         let word = self.editor.word_before_cursor().chars().count();
         let origin = self
-            .completion_items_pos
-            .or(self.completion_origin)
+            .completion
+            .items_pos
+            .or(self.completion.origin)
             .filter(|&(r, _)| r == row);
         let text = item.insert_text.as_ref().unwrap_or(&item.label);
         (!item.is_snippet).then(|| crate::widgets::editor::TextSpanEdit {
@@ -617,7 +691,7 @@ impl App {
         let upto = (self.editor.cursor_row, self.editor.cursor_col);
         let text_hash = text_hash_before(&self.editor.lines, upto)?;
         let request_id = (self.lsp.as_mut()?).request_completion_resolve(path.clone(), item);
-        self.completion_resolve = Some(PendingCompletionResolve {
+        self.completion.resolve = Some(PendingCompletionResolve {
             request_id,
             path,
             start,
@@ -635,42 +709,46 @@ impl App {
     /// popup's filter prefix in place; if no items match the new prefix
     /// the popup dismisses on the next tick.
     pub(super) fn handle_completion_popup_key(&mut self, key: KeyEvent) -> bool {
-        if self.completion_popup.is_none() {
+        if self.completion.popup.is_none() {
             return false;
         }
         match key.code {
             KeyCode::Up => {
-                if let Some(p) = self.completion_popup.as_mut() {
+                if let Some(p) = self.completion.popup.as_mut() {
                     p.move_up();
                 }
                 true
             }
             KeyCode::Down => {
-                if let Some(p) = self.completion_popup.as_mut() {
+                if let Some(p) = self.completion.popup.as_mut() {
                     p.move_down();
                 }
                 true
             }
             KeyCode::Enter | KeyCode::Tab => {
                 let prefix_len = self
-                    .completion_popup
+                    .completion
+                    .popup
                     .as_ref()
                     .map(|p| p.prefix.chars().count())
                     .unwrap_or(0);
                 let text = self
-                    .completion_popup
+                    .completion
+                    .popup
                     .as_ref()
                     .and_then(|p| p.selected_label());
                 let is_snippet = self
-                    .completion_popup
+                    .completion
+                    .popup
                     .as_ref()
                     .is_some_and(|p| p.selected_is_snippet());
                 let item = self
-                    .completion_popup
+                    .completion
+                    .popup
                     .as_ref()
                     .and_then(|p| p.selected_item().cloned());
-                self.completion_popup = None;
-                self.completion_request_id = None;
+                self.completion.popup = None;
+                self.completion.request_id = None;
                 if let Some(item) = item
                     && self.accept_completion_edit(&item)
                 {
@@ -695,8 +773,8 @@ impl App {
                 true
             }
             KeyCode::Esc => {
-                self.completion_popup = None;
-                self.completion_request_id = None;
+                self.completion.popup = None;
+                self.completion.request_id = None;
                 true
             }
             // Ctrl/Alt+Backspace deletes a word (#909): it closes the popup
@@ -715,15 +793,15 @@ impl App {
                     || key.modifiers.contains(KeyModifiers::ALT)
                     || key.modifiers.contains(KeyModifiers::SUPER)
                 {
-                    self.completion_popup = None;
-                    self.completion_request_id = None;
+                    self.completion.popup = None;
+                    self.completion.request_id = None;
                     return false;
                 }
                 self.type_char_in_editor(c);
                 self.refresh_completion_prefix();
                 if !is_word_continuation(c) {
-                    self.completion_popup = None;
-                    self.completion_request_id = None;
+                    self.completion.popup = None;
+                    self.completion.request_id = None;
                 }
                 // `console.` with the list open for `console` asks anew.
                 self.note_completion_typed(c);
@@ -733,8 +811,8 @@ impl App {
                 true
             }
             _ => {
-                self.completion_popup = None;
-                self.completion_request_id = None;
+                self.completion.popup = None;
+                self.completion.request_id = None;
                 false
             }
         }
@@ -743,19 +821,19 @@ impl App {
     pub(super) fn refresh_completion_prefix(&mut self) {
         let prefix = self.editor.word_before_cursor();
         let incomplete = self.note_incomplete_completion_edit();
-        let Some(popup) = self.completion_popup.as_mut() else {
+        let Some(popup) = self.completion.popup.as_mut() else {
             return;
         };
         popup.set_prefix(prefix);
         if !popup.visible_is_empty() {
             return;
         }
-        self.completion_popup = None;
+        self.completion.popup = None;
         // A capped list (`isIncomplete`) only holds what matched the word
         // as it was (#1529): with none of it left, the session still waits
         // on the re-ask for the word as it is.
         if !incomplete {
-            self.completion_request_id = None;
+            self.completion.request_id = None;
         }
     }
 
@@ -763,9 +841,9 @@ impl App {
     /// (#1529): mark a re-ask due, popup shown or not. Returns whether the
     /// session is incomplete.
     pub(super) fn note_incomplete_completion_edit(&mut self) -> bool {
-        let live = self.completion_incomplete && self.completion_request_id.is_some();
+        let live = self.completion.incomplete && self.completion.request_id.is_some();
         if live {
-            self.completion_reask_due = true;
+            self.completion.reask_due = true;
         }
         live
     }
@@ -775,18 +853,18 @@ impl App {
     /// the session's origin so the reply opens while the caret stays in the
     /// word, and ends the session once the caret has left it.
     pub(super) fn send_due_completion_reask(&mut self) {
-        if !std::mem::take(&mut self.completion_reask_due) {
+        if !std::mem::take(&mut self.completion.reask_due) {
             return;
         }
-        if !self.completion_incomplete || self.completion_request_id.is_none() {
+        if !self.completion.incomplete || self.completion.request_id.is_none() {
             return;
         }
         let Some(path) = self.editor.path.clone() else {
             return;
         };
         if self.editor.has_non_text_view() || !self.completion_origin_covers_caret(&path) {
-            self.completion_incomplete = false;
-            self.completion_request_id = None;
+            self.completion.incomplete = false;
+            self.completion.request_id = None;
             return;
         }
         let (line, character) = self
@@ -796,8 +874,8 @@ impl App {
             return;
         };
         let id = lsp.request_completion(path, line, character, CompletionTrigger::Incomplete);
-        self.completion_request_id = Some(id);
-        self.completion_ask_pos = Some((self.editor.cursor_row, self.editor.cursor_col));
+        self.completion.request_id = Some(id);
+        self.completion.ask_pos = Some((self.editor.cursor_row, self.editor.cursor_col));
     }
 
     /// After `c` is typed, open completion as VS Code does (#929): a
@@ -831,9 +909,9 @@ impl App {
         } else {
             return;
         };
-        self.completion_ask_due = Some((trigger, path.to_path_buf()));
-        self.completion_origin = Some((self.editor.cursor_row, self.editor.cursor_col));
-        self.completion_request_id = None;
+        self.completion.ask_due = Some((trigger, path.to_path_buf()));
+        self.completion.origin = Some((self.editor.cursor_row, self.editor.cursor_col));
+        self.completion.request_id = None;
     }
 
     /// Send the ask a typed key left due (#929), after `sync_lsp` like the
@@ -841,14 +919,14 @@ impl App {
     /// same burst would open it on the next line, for the next Enter to
     /// accept. Letters typed after a trigger character make it invoked.
     pub(super) fn send_due_completion_ask(&mut self) {
-        let Some((trigger, path)) = self.completion_ask_due.take() else {
+        let Some((trigger, path)) = self.completion.ask_due.take() else {
             return;
         };
         if !self.completion_origin_covers_caret(&path) {
             return;
         }
         let caret = (self.editor.cursor_row, self.editor.cursor_col);
-        let trigger = match self.completion_origin {
+        let trigger = match self.completion.origin {
             Some(origin) if origin != caret => CompletionTrigger::Invoked,
             _ => trigger,
         };
@@ -1140,7 +1218,7 @@ impl App {
             || already
             || ed.selection.is_some()
             || ed.has_non_text_view()
-            || self.completion_popup.is_some()
+            || self.completion.popup.is_some()
         {
             return changed;
         }
@@ -1177,7 +1255,7 @@ impl App {
     /// language server's replacement is taken whole by Tab only.
     /// Returns whether the key was used.
     pub(super) fn inline_suggestion_key(&mut self, key: KeyEvent) -> bool {
-        if self.completion_popup.is_some() || self.editor.snippet_active() {
+        if self.completion.popup.is_some() || self.editor.snippet_active() {
             return false;
         }
         let Some(ghost) = self.editor.live_ghost_full().cloned() else {
