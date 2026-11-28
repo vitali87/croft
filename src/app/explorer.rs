@@ -2224,6 +2224,11 @@ impl App {
         // that kept them showed the previous project's errors forever.
         self.build_diagnostics.clear();
         self.build_diag_files_by_pane.clear();
+        // Both stores PROBLEMS is built from are empty now: the list and its
+        // badge follow at once, as after Restart Language Servers, instead of
+        // keeping the old workspace's rows until a new server reports (#2896).
+        self.rebuild_problems();
+        self.refresh_problems_badge();
         // Refresh the window/icon title: it was emitted once at startup from
         // the launch dir and never updated, so after a re-root it kept showing
         // the parent (e.g. "Documents") instead of the repo. OSC 0 is

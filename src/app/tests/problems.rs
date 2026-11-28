@@ -1906,3 +1906,58 @@ fn a_drag_begun_on_the_output_scrollbar_leaves_problems_alone_after_a_tab_switch
     );
     app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), bar.x, foot));
 }
+
+/// #2896: after a workspace switch PROBLEMS and its badge list nothing from
+/// the old workspace, as after Restart Language Servers, instead of keeping its
+/// build and language-server problems until a server of the new root reports.
+#[test]
+fn a_workspace_switch_empties_problems_of_the_old_workspace() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let file = a.path().join("t.c");
+    std::fs::write(&file, "int u;\n").unwrap();
+    let mut app = App::new(a.path().to_path_buf()).unwrap();
+    let row = crate::build_matchers::BuildDiag {
+        file: String::from("t.c"),
+        line: 1,
+        col: 5,
+        severity: crate::lsp::manager::DiagnosticSeverity::Warning,
+        message: String::from("unused"),
+        source: String::from("build"),
+        needs_file: false,
+    };
+    app.install_build_diags(
+        7,
+        Some(a.path()),
+        vec![row],
+        crate::build_matchers::DEFAULT_TABSTOP,
+    );
+    let mut by_server = std::collections::HashMap::new();
+    by_server.insert(
+        String::from("clangd"),
+        vec![crate::lsp::manager::Diagnostic {
+            start_line: 0,
+            start_char: 4,
+            end_line: 0,
+            end_char: 5,
+            severity: crate::lsp::manager::DiagnosticSeverity::Warning,
+            message: String::from("unused variable"),
+            tags: Default::default(),
+            code: None,
+            origin: None,
+        }],
+    );
+    app.lsp.diagnostics.insert(file, by_server);
+    app.rebuild_problems();
+    app.refresh_problems_badge();
+    assert_eq!(app.problems.total_count(), 2);
+
+    app.change_workspace_root(b.path().to_path_buf());
+
+    assert_eq!(
+        app.problems.total_count(),
+        0,
+        "PROBLEMS lists nothing from the workspace that was left"
+    );
+    assert_eq!(app.problems_badge_count, 0, "and its badge counts nothing");
+}
