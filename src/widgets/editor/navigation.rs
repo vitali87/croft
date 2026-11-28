@@ -713,14 +713,6 @@ pub(super) fn chars_back(
         .map(|((byte, ch), col)| (col, byte, ch))
 }
 
-/// Convert a char index within `s` to a byte index, saturating at `s.len()`.
-pub(super) fn char_byte(s: &str, char_idx: usize) -> usize {
-    s.char_indices()
-        .nth(char_idx)
-        .map(|(i, _)| i)
-        .unwrap_or(s.len())
-}
-
 /// Char column of the extended grapheme cluster boundary before `col` on
 /// `line`, so one step never stops inside a ZWJ emoji, a flag or a letter with
 /// its combining accent (#1196). Columns stay char-indexed: every cluster

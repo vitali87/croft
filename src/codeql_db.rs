@@ -459,6 +459,35 @@ impl DatabaseStore {
     }
 }
 
+/// The languages CodeQL analyses, as VS Code's Language view lists them.
+pub const LANGUAGES: [&str; 10] = [
+    "C / C++",
+    "C#",
+    "GitHub Actions",
+    "Go",
+    "Java / Kotlin",
+    "JavaScript / TypeScript",
+    "Python",
+    "Ruby",
+    "Rust",
+    "Swift",
+];
+
+/// The extractor id behind each [`LANGUAGES`] entry, in the same order: what
+/// a pack's `extractor:` or `codeql/<id>-all` dependency says.
+pub const LANGUAGE_IDS: [&str; 10] = [
+    "cpp",
+    "csharp",
+    "actions",
+    "go",
+    "java",
+    "javascript",
+    "python",
+    "ruby",
+    "rust",
+    "swift",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -44,6 +44,13 @@ mod typing;
 mod undo;
 mod viewers;
 mod wrap;
+pub use crate::text_edit::apply_span_edits_to_lines;
+pub(crate) use crate::text_edit::normalize_newlines;
+pub(crate) use crate::text_edit::utf16_to_char_col;
+use crate::text_edit::{
+    apply_char_span_edits, char_byte, char_span_edits, map_through_span_edits,
+    position_after_span_edits, view_top_after_span_edits,
+};
 use brackets::*;
 use comments::*;
 pub use diff_view::diff_hit_test;
@@ -54,7 +61,6 @@ pub use disk::SaveCleanup;
 pub use disk::SaveOutcome;
 pub use disk::decode_blob;
 pub use disk::is_permission_denied;
-pub(crate) use disk::normalize_newlines;
 use disk::*;
 pub use gutter::GitMark;
 pub use gutter::LineBlame;
@@ -79,8 +85,6 @@ use on_enter::*;
 use render::*;
 pub use selection::EditorSelection;
 use selection::*;
-pub use span_edits::apply_span_edits_to_lines;
-use span_edits::*;
 pub use tabs::Crumb;
 use tabs::*;
 pub use transforms::CaseTransform;
@@ -1444,21 +1448,6 @@ fn byte_index_of_char(line: &str, chars_in: usize) -> usize {
         .nth(chars_in)
         .map(|(b, _)| b)
         .unwrap_or(line.len())
-}
-
-/// Character column for the LSP UTF-16 offset `u16_off` within `line`. LSP
-/// positions count UTF-16 code units; the editor lays out by character, so a
-/// line containing astral-plane characters (which take two UTF-16 units) needs
-/// this conversion. An offset past the line clamps to the line's char length.
-pub(crate) fn utf16_to_char_col(line: &str, u16_off: u32) -> usize {
-    let mut units: u32 = 0;
-    for (char_idx, ch) in line.chars().enumerate() {
-        if units >= u16_off {
-            return char_idx;
-        }
-        units += ch.len_utf16() as u32;
-    }
-    line.chars().count()
 }
 
 thread_local! {

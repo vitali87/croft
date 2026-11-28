@@ -48,6 +48,7 @@ src/
 ├── word97.rs             Word 97-2003 `.doc` read-only preview for docx.rs: reads the compound file's piece table for the body text (cp1252 or UTF-16 per piece) and the PAPX pages for each paragraph's heading style, list and table role; emits the same markdown, field codes dropped and results kept
 ├── file_index.rs        Quick Open's file index: every file under the workspace roots, walked in parallel under the ignore rules, with dependency caches, build output, VCS stores and macOS's protected folders left out (`is_noise_dir`); Quick Open, the file watcher, CodeQL and test discovery build on it, and the picker that draws it is `widgets/file_finder.rs`
 ├── file_ref.rs          `path:line[:col]` references detected in terminal text (rustc / grep / pytest / Python-traceback forms); backs Cmd/Ctrl+click-to-jump from any terminal pane with zero per-tool problem-matcher config
+├── find.rs              Find and Replace inside one buffer's lines: each line's matches, the count, the next and previous match, Replace All and a replacement's case and escapes, each optionally limited to a range (Find in Selection); the editor's Find bar (`widgets/editor_find.rs`) and the log view search with it
 ├── quickfix.rs           parses the last `grep`/`rg`/`git grep` command line into a pattern plus Search toggles and include/exclude globs, so "Search & Replace from Last grep/rg" seeds and runs the Search sidebar via `SearchPanel::seed`
 ├── git.rs                git for the status line, the Source Control panel and the Explorer, one `GitWorker` per workspace root: the runner every part shares (`run_git`, `git_raw`, `repo_toplevel` and the mutation wrappers that never prompt and leave the terminal alone); each feature lives in a file in `git/` below
 ├── git/                  git's feature files, beside git.rs; each file's `//!` doc says what it holds
@@ -58,7 +59,7 @@ src/
 │   ├── commits.rs        commit and amend with their refusals, undo the last commit, the commit graph's cherry-pick, revert, checkout, tag and reset
 │   ├── contents.rs       a file at HEAD, a commit or an index stage; a conflict re-merged in diff3 style; a path's clean/smudge filter
 │   ├── diffs.rs          staged diffs; against a branch, its merge base or the previous commit; submodule diffs
-│   ├── history.rs        a file's history across renames, the commit graph, a branch's commits, a commit's files, diffs, message and card
+│   ├── history.rs        a file's history across renames, the commit graph and its lane layout (`layout_graph`, pure, run on the fetch thread), a branch's commits, a commit's files, diffs, message and card
 │   ├── messages.rs       one-line summaries of git's output: results, conflicts, errors and refusals
 │   ├── operations.rs     a merge, rebase, cherry-pick, revert or bisect in progress; continuing, skipping or aborting it
 │   ├── patches.rs        applying a hunk or line patch to the index or working tree, CRLF endings kept
@@ -201,7 +202,7 @@ src/
 ├── tasks.rs              auto-detected project tasks read from the manifests the repo already has (tasks.json, Makefile, justfile, package.json, Cargo.toml, pyproject.toml, go.mod, CMakeLists.txt); backs "Tasks: Run Task" and the Cmd+Shift+B default build in a reused named terminal pane
 ├── terminal_session.rs   terminal session restore: pane order, per-pane cwd, names and active index persisted per workspace root in `~/.config/croft/terminal_sessions.json`
 ├── termux.rs            Termux font auto-install: downloads Meslo Nerd Font Mono into ~/.termux/font.ttf (background, no-clobber) so the activity-bar codicon glyphs render
-├── text_edit.rs          `TextSpanEdit`, the one text replacement (UTF-16 or char columns) that language servers, formatters and the editor hand each other; a leaf, so the LSP layer and prettier produce edits without depending on the editor widget that applies them
+├── text_edit.rs          `TextSpanEdit`, the one text replacement (UTF-16 or char columns) that language servers, formatters and the editor hand each other, and how a set of them applies to plain lines (bottom-up, edits at one position joined in the order sent) and moves a position; with the char, byte and UTF-16 column conversions and newline normalising they rest on; a leaf, so the LSP layer and prettier produce and apply edits without depending on the editor widget
 ├── theme.rs              IDE color theme: a `Theme` palette plus `SyntaxPalette`, loaded as data from `[[themes]]` manifest blocks, with `Theme::LOCH` (Croft Loch, the default) as a const fallback, light-theme chrome adaptation, and the `Surfaces` a `surfaces` theme (Croft Loch) paints instead of pane boxes
 ├── triggers.rs           iTerm2-style terminal triggers from `~/.config/croft/triggers.json`: regex rules driving render-time `highlight`, plus `notify`/`bell` scanned in the PTY reader thread
 ├── agent_lane.rs         per-agent ledger of files an agent changed while you looked elsewhere; each row carries a review baseline content hash so it leaves the queue only once seen, and a write during two agents is flagged `shared` rather than guessed
@@ -434,7 +435,7 @@ src/
 └── widgets/
     ├── mod.rs
     ├── command_palette.rs   VS Code Command Palette (Cmd/Ctrl+Shift+P): the fuzzy-filtered picker over command_registry.rs; the App's run_command dispatches each entry
-    ├── commit_graph.rs       the Source Control COMMITS section: a repo-wide commit graph with box-drawing lane rails; `layout_graph` is the pure lane algorithm, run on the fetch thread
+    ├── commit_graph.rs       the Source Control COMMITS section: a repo-wide commit graph with box-drawing lane rails, laid out by `git::layout_graph`
     ├── completion_popup.rs  LSP completion popup (anchored at the cursor, filterable; a list the server marked `isIncomplete` re-asks it on each keystroke with trigger kind 3, keeping the old matches up until the reply replaces them (#1529); `area_for` clamps to the editor pane on all four edges — a popup wider than a narrow pane used to be pushed left past the pane's own edge and paint over the Explorer; rows are sized for label and signature, and `details_area_for` places the selected item's signature and documentation beside the list, or on the far side of it from the caret (#1527))
     ├── signature_help_popup.rs  LSP signature help / parameter hints: a one-line popup above the caret with the active parameter bolded, auto-triggered on `(`/`,` and dismissed on `)`/Esc (manager `RequestSignatureHelp` + `normalise_signature_help`)
     ├── connect_dialog.rs    remote SSH connect modal (host + auth prompt phases)
@@ -460,7 +461,7 @@ src/
     │   ├── render.rs        drawing the editor: each row's text, colours and overlays, the caret, selections and search matches, diagnostics, and how wide each character is drawn
     │   ├── selection.rs     selections: making and clearing them, the selected text, linked editing, and expanding or shrinking a selection by syntax
     │   ├── snippets.rs      snippets and their tab stops, and Emmet: expanding abbreviations, wrapping, and editing the tag at the caret
-    │   ├── span_edits.rs    edits that arrive from elsewhere: language servers, formatters and peers, applied as text spans that keep the caret, the view and the undo history in step
+    │   ├── span_edits.rs    edits that arrive from elsewhere: language servers, formatters and peers, applied (through `text_edit.rs`) as text spans that keep the caret, the view and the undo history in step
     │   ├── symbol_tabs.rs   symbol tabs and sibling tabs of one file: keeping a symbol tab on its symbol, and mirroring a sibling's text, unsaved state and caret
     │   ├── tabs.rs          the editor's tabs: opening, closing, pinning and moving them, previews and diff tabs, the tab strip and its labels, and the breadcrumbs
     │   ├── tests.rs         the editor's own tests
@@ -469,7 +470,7 @@ src/
     │   ├── undo.rs          undo and redo: snapshots, undo groups and coalescing, the stack limits, and the history a closed tab keeps for when its file is opened again
     │   ├── viewers.rs       files the editor shows rather than edits as text: pictures and SVG, PDF pages, spreadsheet and SQLite grids (their edits and saves too), archives, hex, logs and gzip, SARIF, and the Markdown and notebook previews
     │   ├── wrap.rs          soft wrap and comment boxes: the rows each line takes on screen, and drawing and clicking the comment boxes shown between lines
-    ├── editor_find.rs        VS Code-style inline Find bar (`Cmd+F`) with match highlight, Enter/Shift+Enter walk, case/whole-word/regex toggles and a Replace row (`Cmd+Opt+F`); Replace All runs through the same `split_for_highlight` as count and paint
+    ├── editor_find.rs        VS Code-style inline Find bar (`Cmd+F`) with match highlight, Enter/Shift+Enter walk, case/whole-word/regex toggles and a Replace row (`Cmd+Opt+F`); Replace All runs through the same `split_for_highlight` as count and paint; the matching itself is `src/find.rs`
     ├── extensions.rs         Extensions sidebar widget: projects bundled and user manifests into a theme-aware list grouped under BUILT-IN/INSTALLED/AVAILABLE, with pill toggles, +Add, trash, a local filter box and clear/refresh; reports clicks back to App, which owns the state
     ├── file_finder.rs   VS Code-style Quick Open (Cmd+P) fuzzy file picker with tiered match ranking (exact filename > prefix > substring > path > subsequence); the index it searches is `src/file_index.rs`
     ├── file_tree.rs          `ignore::WalkBuilder` backed file tree: lazy children, fs-watcher refresh, multi-select, drag-drop, bulk trash, reveal-path, multi-root section rows, sticky scroll and compact folders: what its parts share (`FileTree`, its constructor, and `Node`, the row its fields hold); each part is in a file in `file_tree/` below
@@ -1828,7 +1829,7 @@ A collapsible, language-aware DEPENDENCIES section, offered as a ⋯-menu Explor
 
 A VS Code-style inline Find bar (Cmd+F) with an active-match orange highlight, Enter / Shift+Enter to walk matches, and case-sensitive / whole-word / regex toggles. The Replace row (Cmd+Opt+F) adds Tab to switch field, Enter to replace-and-advance, and Cmd+Opt+Enter to replace all in one undo step.
 
-**Replace All uses the same enumeration as the display.** It walks matches via the same `split_for_highlight` that the count, paint and navigation use, so it never touches what the bar cannot show, and it recounts afterwards. Code: `split_for_highlight` in `widgets/search/highlight.rs`.
+**Replace All uses the same enumeration as the display.** It walks matches via the same `split_for_highlight` that the count, paint and navigation use, so it never touches what the bar cannot show, and it recounts afterwards. Code: `replace_all_in_lines_in` in `src/find.rs`, over `split_for_highlight` in the search engine.
 
 **Regex replacements expand `$n` captures** plus VS Code's `\n`/`\t` escapes, where a replacement newline splits the line.
 

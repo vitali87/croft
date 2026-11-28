@@ -42,6 +42,7 @@ mod emmet;
 mod file_encoding;
 mod file_index;
 mod file_ref;
+mod find;
 mod fleet;
 mod gh;
 mod ghostty;
