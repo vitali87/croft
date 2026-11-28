@@ -382,6 +382,40 @@ class PureMoves(unittest.TestCase):
             self.assertEqual(code, 0, out)
             self.assertIn("moved    fn src/a/util.rs::find -> src/a/renamed.rs::find", out)
 
+    def test_an_item_that_stays_does_not_take_a_declared_move_up(self):
+        """With `crate::a::inner -> crate::a` declared, an item still in
+        `src/a/inner/util.rs` did not move: its `pub(super)` reach is
+        `crate::a::inner` before and after, so a blank line beside it is
+        not a change. One that does move up to `src/a/util.rs` is read at
+        the new path."""
+        item = "pub(super) fn find() -> u8 {\n    1\n}\n"
+        start = {
+            "src/main.rs": "mod a;\n",
+            "src/a.rs": "mod inner;\n",
+            "src/a/inner.rs": "mod util;\n",
+            "src/a/inner/util.rs": item,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp), dict(start))
+            repo.commit(
+                {"src/a/inner/util.rs": item + "\n"},
+                "move\n\npure-move-module: crate::a::inner -> crate::a",
+            )
+            code, out = repo.check()
+            self.assertEqual(code, 0, out)
+            self.assertNotIn("CHANGED", out)
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp), dict(start))
+            (Path(tmp) / "src/a/inner/util.rs").unlink()
+            (Path(tmp) / "src/a/inner.rs").unlink()
+            repo.commit(
+                {"src/a.rs": "mod util;\n", "src/a/util.rs": item},
+                "move\n\npure-move-module: crate::a::inner -> crate::a",
+            )
+            code, out = repo.check()
+            self.assertEqual(code, 0, out)
+            self.assertIn("moved    fn src/a/inner/util.rs::find -> src/a/util.rs::find", out)
+
     def test_test_only_follows_where_the_item_sits(self):
         """An item is test-only when a module it actually sits in is under
         `#[cfg(test)]`. A release helper in `live::tests` is not made one by
