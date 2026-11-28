@@ -2201,45 +2201,18 @@ impl App {
         // into a child repo left rust-analyzer running `cargo metadata` against
         // the parent, which has no Cargo.toml, so every opened .rs came back as
         // an `unlinked-file` with no hover / completion / semantic tokens.
-        // Spawn a fresh manager rooted at new_root. The old one's Drop shuts
-        // its servers down and waits up to 3 s for them, so it is dropped
-        // off the UI thread, as the build pause does (#737). Clearing
-        // lsp_last_seen makes the next sync_lsp() re-open every live editor tab
-        // against the new servers; the stale diagnostics / progress from the
-        // old root are dropped with it.
-        //
-        // Not while a source build of croft has the servers stopped (#694):
-        // starting them now would put rust-analyzer back beside the compile.
-        // The manager drops either way, and the end of the build starts one
-        // at the new root, since the resume reads `workspace_root()`.
-        if let Some(old) = self.lsp.manager.take() {
-            fs_watch::offload_drop(old);
+        // `LspState::rebind` drops the old manager off the UI thread (#737)
+        // and starts one at the new root, unless a source build of croft has
+        // the servers stopped (#694). What the old servers were sent and
+        // reported goes with them: the next sync_lsp() re-opens every live
+        // tab against the new servers, and their questions, whose answers
+        // would go back to a server that is gone, are dropped (#2880).
+        if let Some(msg) = self.lsp.rebind(&new_root) {
+            // Not stderr: the TUI owns the screen here, and text written
+            // around ratatui stays on it (#537's class of leak).
+            crate::output::push("Language Servers", crate::output::OutputLevel::Error, &msg);
+            self.status = msg;
         }
-        self.lsp.manager = match self.lsp.paused_for_build {
-            true => None,
-            false => match crate::lsp::LspManager::new(new_root.clone()) {
-                Ok(m) => Some(m),
-                Err(e) => {
-                    // Not stderr: the TUI owns the screen here, and text written
-                    // around ratatui stays on it (#537's class of leak).
-                    let msg = format!("Language servers could not restart: {e}");
-                    crate::output::push(
-                        "Language Servers",
-                        crate::output::OutputLevel::Error,
-                        &msg,
-                    );
-                    self.status = msg;
-                    None
-                }
-            },
-        };
-        self.lsp.last_seen.clear();
-        self.lsp.diagnostics.clear();
-        self.lsp.progress.clear();
-        // The questions the old servers asked go with them: an answer goes
-        // back to the server that asked, and it is shut down (#2880).
-        // Dropping one answers "no action", as closing its picker does.
-        self.lsp.questions.clear();
         if self
             .list_picker
             .as_ref()
@@ -2247,10 +2220,6 @@ impl App {
         {
             self.close_list_picker();
         }
-        self.lsp.question = None;
-        // A new manager numbers semantic replies from 0 again (see the
-        // build resume, which hits the same thing).
-        self.lsp.semantic_generation_seen.clear();
         // Build diagnostics describe the OLD workspace's files; a re-root
         // that kept them showed the previous project's errors forever.
         self.build_diagnostics.clear();

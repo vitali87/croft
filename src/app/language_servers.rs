@@ -107,6 +107,37 @@ impl LspState {
             paused_for_build: false,
         }
     }
+
+    /// Start over for the workspace at `root` (#2062): the old manager goes
+    /// (dropped off the UI thread, since its servers take up to 3 s to stop,
+    /// #737) and a new one starts at `root`, and everything the old servers
+    /// were sent or reported is built afresh by [`Self::new`], so a field
+    /// added later is reset by a switch without anyone listing it. Kept:
+    /// whether a croft build has the servers stopped (#694); while it does,
+    /// no manager starts, and the end of the build starts one at the new
+    /// root. Returns why the new manager could not start, if it could not.
+    pub(super) fn rebind(&mut self, root: &Path) -> Option<String> {
+        if let Some(old) = self.manager.take() {
+            fs_watch::offload_drop(old);
+        }
+        let paused_for_build = self.paused_for_build;
+        let (manager, error) = if paused_for_build {
+            (None, None)
+        } else {
+            match crate::lsp::LspManager::new(root.to_path_buf()) {
+                Ok(m) => (Some(m), None),
+                Err(e) => (
+                    None,
+                    Some(format!("Language servers could not restart: {e}")),
+                ),
+            }
+        };
+        *self = Self {
+            paused_for_build,
+            ..Self::new(manager)
+        };
+        error
+    }
 }
 
 /// Where the caret rests in which buffer (#2062): the file, the caret's row
