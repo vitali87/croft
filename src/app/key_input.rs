@@ -689,6 +689,7 @@ impl App {
     /// built-in defaults call their app methods directly, so a command-level
     /// recorder would miss most of what a user does.
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
+        let _turn = crate::proc::UiTurn::enter();
         let key = if self.legacy_ctrl_punct {
             legacy_ctrl_punct(key)
         } else {

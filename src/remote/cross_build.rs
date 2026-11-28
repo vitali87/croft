@@ -190,30 +190,7 @@ pub(super) fn cross_tool_path_from(path: Option<&OsStr>, home: Option<&OsStr>) -
 }
 
 pub(super) fn cross_tool_program(tool: &str) -> Option<PathBuf> {
-    find_executable_in_dirs(tool, &cross_tool_search_dirs())
-}
-
-pub(super) fn find_executable_in_dirs(tool: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
-    dirs.iter()
-        .map(|dir| dir.join(tool))
-        .find(|candidate| is_executable_file(candidate))
-}
-
-pub(super) fn is_executable_file(path: &Path) -> bool {
-    if !path.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path)
-            .map(|m| m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
+    crate::proc::find::first_in(tool, cross_tool_search_dirs())
 }
 
 /// A `Command` for a cross-build tool, resolved to its absolute path and run

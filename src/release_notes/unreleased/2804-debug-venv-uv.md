@@ -1,0 +1,1 @@
+fix: Python debugging finds the same `uv` the Python language servers do, croft's own copy included, where the first F5 failed with "is uv installed and on PATH?" on a machine whose uv is not on croft's PATH (#2804).

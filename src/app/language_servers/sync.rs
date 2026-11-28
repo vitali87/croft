@@ -312,25 +312,10 @@ pub(in crate::app) fn is_shell_script(path: &Path) -> bool {
     crate::lsp::Language::from_path(path) == Some(crate::lsp::Language::BASH)
 }
 
-/// Whether an executable file named `tool` is in one of `path_var`'s
-/// directories, where a server croft starts would look for it.
+/// Whether a program named `tool` is in one of `path_var`'s directories,
+/// where a server croft starts would look for it.
 pub(in crate::app) fn tool_on_path(tool: &str, path_var: Option<&std::ffi::OsStr>) -> bool {
-    path_var.is_some_and(|paths| {
-        std::env::split_paths(paths).any(|dir| {
-            let candidate = dir.join(tool);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                candidate
-                    .metadata()
-                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-            }
-            #[cfg(not(unix))]
-            {
-                candidate.is_file() || candidate.with_extension("exe").is_file()
-            }
-        })
-    })
+    crate::proc::find::on_path_in(tool, path_var).is_some()
 }
 
 /// Collapse a language to the server "family" it shares a managed server with.
