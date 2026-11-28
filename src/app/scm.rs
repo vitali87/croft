@@ -3503,7 +3503,7 @@ impl App {
         );
         // The diff row showing this line; a deletion bar sits on the line
         // after the removed run, so its hunk is the row just above.
-        use crate::widgets::diff::DiffRow;
+        use crate::diff::DiffRow;
         let at = data
             .rows
             .iter()

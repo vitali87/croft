@@ -1,0 +1,1 @@
+refactor: the line diff under every diff view moves out of the diff tab's drawing code into its own module, `src/diff.rs`, which the merge editor, SARIF fixes and fleet now use directly (#2062). Nothing changes in use.

@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-pub use crate::diff::{DIFF_DEADLINE, DiffRow, build_diff_rows, build_diff_rows_within, changed_char_ranges};
+use crate::diff::{DIFF_DEADLINE, DiffRow, build_diff_rows_within};
 use crate::widgets::editor_find::line_matches;
 use crate::widgets::search::SearchOpts;
 
