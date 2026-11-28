@@ -373,7 +373,10 @@ fn reaping_a_closed_pane_never_waits_for_its_shell() {
     let reap = std::time::Instant::now();
     app.reap_closed_terminals();
     let took = reap.elapsed();
-    assert!(app.closed_terminals.is_empty(), "the expired pane is reaped");
+    assert!(
+        app.closed_terminals.is_empty(),
+        "the expired pane is reaped"
+    );
     assert!(
         took < std::time::Duration::from_millis(100),
         "the reap waited {took:?} for the shell to end"
@@ -389,7 +392,10 @@ fn reaping_a_closed_pane_never_waits_for_its_shell() {
     }
     // SAFETY: signal 0 only asks whether the pid exists.
     let alive = unsafe { libc::kill(pid, 0) } == 0;
-    assert!(!alive, "the shell that ignored hang-up was killed and reaped");
+    assert!(
+        !alive,
+        "the shell that ignored hang-up was killed and reaped"
+    );
 }
 
 #[test]
