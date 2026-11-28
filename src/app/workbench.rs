@@ -1668,10 +1668,7 @@ impl App {
                 self.focus_pane(Pane::Tree);
             }
             SidebarView::Testing => self.focus_pane(Pane::Tree),
-            SidebarView::CodeQL => {
-                self.codeql.theme = self.theme;
-                self.focus_pane(Pane::Tree);
-            }
+            SidebarView::CodeQL => self.focus_pane(Pane::Tree),
         }
     }
 

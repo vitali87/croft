@@ -4,6 +4,7 @@
 //! first-run card whose one button adds one. Sections fold like VS Code's
 //! view panes; an empty one starts folded to a one-line summary.
 
+use crate::widgets::view_cx::ViewCx;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -542,8 +543,6 @@ pub struct CodeqlPanel {
     pub scroll: usize,
     /// `None` = every language (VS Code's default).
     pub language: Option<usize>,
-    pub focused: bool,
-    pub theme: crate::theme::Theme,
     /// Frame truth for mouse routing.
     pub last_area: Rect,
     /// The databases the user added, and which one queries run against.
@@ -581,9 +580,6 @@ pub struct CodeqlPanel {
     /// Sections that start folded (an empty one, and Tools) the user
     /// unfolded.
     pub opened: std::collections::HashSet<Section>,
-    /// The pane's frame wears the brand gradient when focused, as the
-    /// Explorer's does. Set by the app.
-    pub focus_gradient: bool,
     /// The rows inside the frame, from the last painted frame: clicks map
     /// to them and the card wraps to their width.
     pub last_inner: Rect,
@@ -1504,9 +1500,9 @@ impl CodeqlPanel {
     /// The colours the pane paints with: the brand's card teal and button
     /// fill under the gradient themes, the theme's accent and button fill
     /// elsewhere, as Source Control's and Run and Debug's cards do.
-    fn palette(&self) -> Palette {
-        let t = self.theme;
-        let brand = self.focus_gradient;
+    fn palette(&self, cx: &ViewCx) -> Palette {
+        let t = cx.theme;
+        let brand = cx.theme.gradient();
         let pick = |on: (u8, u8, u8), off: Color| {
             if brand {
                 crate::gradient::rgb_color(on)
@@ -1769,7 +1765,7 @@ impl CodeqlPanel {
     /// Paint one row of the current database's card: its titled edge, the
     /// language mark and name with the switch chevron, the language, size
     /// and age, and the chips.
-    fn paint_db_card(&self, buf: &mut Buffer, row: Rect, card: DbCard, p: &Palette) {
+    fn paint_db_card(&self, cx: &ViewCx, buf: &mut Buffer, row: Rect, card: DbCard, p: &Palette) {
         let w = row.width;
         if w < 8 {
             return;
@@ -1809,7 +1805,7 @@ impl CodeqlPanel {
                             .language
                             .as_deref()
                             .and_then(language_color)
-                            .map_or(p.dim, |c| self.theme.ui(c));
+                            .map_or(p.dim, |c| cx.theme.ui(c));
                         buf.set_string(left + 2, row.y, "◆", Style::default().fg(mark));
                         buf.set_stringn(
                             left + 4,
@@ -2007,7 +2003,7 @@ impl CodeqlPanel {
 
     /// Paint a row of the Running section: the query's name, or the sweep
     /// in the gradient with the time elapsed.
-    fn paint_running(&self, buf: &mut Buffer, row: Rect, part: RunRow, p: &Palette) {
+    fn paint_running(&self, cx: &ViewCx, buf: &mut Buffer, row: Rect, part: RunRow, p: &Palette) {
         let Some((name, secs)) = &self.running else {
             return;
         };
@@ -2035,7 +2031,7 @@ impl CodeqlPanel {
                 let lit = sweep(n, *secs);
                 for c in 0..n {
                     let (cell, fg) = if lit.contains(&c) {
-                        let fg = if self.focus_gradient {
+                        let fg = if cx.theme.gradient() {
                             let t = if n > 1 {
                                 f32::from(c) / f32::from(n - 1)
                             } else {
@@ -2131,23 +2127,24 @@ struct Palette {
     deleted: Color,
 }
 
-impl Widget for &mut CodeqlPanel {
-    fn render(self, area: Rect, buf: &mut Buffer) {
+impl CodeqlPanel {
+    /// Draw the view into `area` with this frame's [`ViewCx`].
+    pub fn draw(&mut self, cx: &ViewCx, area: Rect, buf: &mut Buffer) {
         self.last_area = area;
         self.last_inner = Rect::default();
         if area.height < 3 || area.width < 8 {
             return;
         }
-        let theme = self.theme;
+        let theme = cx.theme;
         // The Explorer's frame: the brand's chipless title and gradient
         // border when focused under the gradient themes, the legacy chip
         // and solid border elsewhere.
-        let block_style = if self.focused {
+        let block_style = if cx.focused {
             Style::default().fg(theme.ui(Color::Rgb(0x4e, 0x9a, 0xff)))
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let title = if self.focus_gradient {
+        let title = if cx.theme.gradient() {
             Span::styled(
                 " CODEQL ",
                 Style::default()
@@ -2171,8 +2168,8 @@ impl Widget for &mut CodeqlPanel {
             buf,
             area,
             theme,
-            self.focused,
-            self.focus_gradient,
+            cx.focused,
+            cx.theme.gradient(),
         ) {
             buf.set_span(area.x + 1, area.y, &title, title.width() as u16);
         }
@@ -2180,7 +2177,7 @@ impl Widget for &mut CodeqlPanel {
         if inner.height == 0 || inner.width < 4 {
             return;
         }
-        let p = self.palette();
+        let p = self.palette(cx);
         let lines = self.lines();
         self.settle_selection(&lines);
         let rows = inner.height as usize;
@@ -2189,7 +2186,7 @@ impl Widget for &mut CodeqlPanel {
         } else if self.selected >= self.scroll + rows {
             self.scroll = self.selected + 1 - rows;
         }
-        let focused_row = self.focused.then_some(self.selected);
+        let focused_row = cx.focused.then_some(self.selected);
         // The count and duration columns are as wide as their widest entry,
         // measured once a frame rather than once a row.
         let widest = |f: fn(&HistoryRow) -> String| {
@@ -2235,10 +2232,10 @@ impl Widget for &mut CodeqlPanel {
                 Line::Blank => {}
                 Line::Card(card) => self.paint_card(buf, row, card, &p),
                 Line::Button(a, part) => self.paint_button(buf, row, *a, *part, &p),
-                Line::DbCard(card) => self.paint_db_card(buf, row, *card, &p),
+                Line::DbCard(card) => self.paint_db_card(cx, buf, row, *card, &p),
                 Line::History(i) => self.paint_history(buf, row, *i, columns, &p),
                 Line::HistoryDetail(i, detail) => self.paint_detail(buf, row, *i, *detail, &p),
-                Line::Running(part) => self.paint_running(buf, row, *part, &p),
+                Line::Running(part) => self.paint_running(cx, buf, row, *part, &p),
             }
             // The Explorer-style accent bar marks the selected row.
             if selected {
@@ -2728,6 +2725,15 @@ mod tests {
         }
     }
 
+    /// The context [`draw`] paints with: focused, under the Black theme.
+    fn black_cx() -> ViewCx {
+        ViewCx {
+            theme: crate::theme::Theme::BLACK,
+            focused: true,
+            pointer: None,
+        }
+    }
+
     /// Paint `p` focused, under the Black theme, into a 32 x 44 side bar.
     fn draw(p: &mut CodeqlPanel) -> Buffer {
         draw_w(p, 32)
@@ -2735,12 +2741,10 @@ mod tests {
 
     /// [`draw`] into a side bar `w` columns wide.
     fn draw_w(p: &mut CodeqlPanel, w: u16) -> Buffer {
-        p.focused = true;
-        p.focus_gradient = true;
-        p.theme = crate::theme::Theme::BLACK;
         let backend = ratatui::backend::TestBackend::new(w, 44);
         let mut term = ratatui::Terminal::new(backend).unwrap();
-        term.draw(|f| f.render_widget(&mut *p, f.area())).unwrap();
+        term.draw(|f| p.draw(&black_cx(), f.area(), f.buffer_mut()))
+            .unwrap();
         term.backend().buffer().clone()
     }
 
@@ -2821,14 +2825,11 @@ mod tests {
         let fill = crate::gradient::rgb_color(crate::gradient::PRIMARY_BTN_BG);
         for w in [32, 20, 12] {
             let mut p = CodeqlPanel::new();
-            p.focused = true;
-            p.focus_gradient = true;
-            p.theme = crate::theme::Theme::BLACK;
             let area = Rect::new(0, 0, w, 44);
             let mut cell = ratatui::buffer::Cell::default();
             cell.set_bg(panel);
             let mut buf = Buffer::filled(area, cell);
-            (&mut p).render(area, &mut buf);
+            p.draw(&black_cx(), area, &mut buf);
             let idx = p
                 .lines()
                 .iter()
@@ -2934,10 +2935,14 @@ mod tests {
         assert_eq!(buf[(20, y)].bg, sel, "across the row");
         assert_ne!(buf[(20, y + 1)].bg, sel, "and only that row");
         // Unfocused, nothing is marked.
-        p.focused = false;
+        let cx = ViewCx {
+            focused: false,
+            ..black_cx()
+        };
         let backend = ratatui::backend::TestBackend::new(32, 44);
         let mut term = ratatui::Terminal::new(backend).unwrap();
-        term.draw(|f| f.render_widget(&mut p, f.area())).unwrap();
+        term.draw(|f| p.draw(&cx, f.area(), f.buffer_mut()))
+            .unwrap();
         assert_ne!(term.backend().buffer()[(1, y)].symbol(), "▎");
     }
 
@@ -3002,7 +3007,7 @@ mod tests {
         );
         let (mx, my) = find(&buf, "Rust · 214 MB · 2h ago").expect("the meta row");
         assert_eq!((mx, my), (6, y + 1));
-        assert_eq!(buf[(mx, my)].fg, p.palette().dim);
+        assert_eq!(buf[(mx, my)].fg, p.palette(&black_cx()).dim);
         // Too long for the card: the age goes whole, never cut to "3d a".
         p.databases[1].added = now() - 3 * 86400 - 30;
         p.db_sizes.insert("/x/flask".into(), 900 * 1024);
@@ -3034,7 +3039,7 @@ mod tests {
         p.current_db = None;
         let buf = draw(&mut p);
         let (x, y) = find(&buf, "Select a database").expect("the prompt");
-        assert_eq!(buf[(x, y)].fg, p.palette().dim);
+        assert_eq!(buf[(x, y)].fg, p.palette(&black_cx()).dim);
         assert!(row(&buf, y).ends_with("▾ │ │"));
         assert!(find(&buf, "214 MB").is_none(), "no meta row");
     }
@@ -3049,7 +3054,7 @@ mod tests {
             hist("SlowJoin.ql", RunStatus::Cancelled, None, 160),
         ];
         let buf = draw(&mut p);
-        let pal = p.palette();
+        let pal = p.palette(&black_cx());
         let (_, y0) = find(&buf, "✓ UnsafeDeref").expect("the succeeded row");
         let rows: Vec<String> = (y0..y0 + 3).map(|y| row(&buf, y)).collect();
         assert!(rows[0].ends_with("  17    4s │"), "{}", rows[0]);
@@ -3091,7 +3096,7 @@ mod tests {
         // The history leaves the run in flight to the section.
         assert!(!p.lines().contains(&Line::History(0)));
         assert_eq!(p.count(Section::QueryHistory), Some(1));
-        let pal = p.palette();
+        let pal = p.palette(&black_cx());
         let (_, y) = find(&buf, "RUNNING").expect("the section");
         assert!(row(&buf, y).ends_with("esc │"), "the key that cancels");
         let (_, hy) = find(&buf, "QUERY HISTORY").unwrap();
