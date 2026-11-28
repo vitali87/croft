@@ -20,6 +20,8 @@ mod bounded;
 pub(crate) mod find;
 #[cfg(test)]
 pub(crate) mod record;
+#[cfg(test)]
+mod starts;
 mod ui_turn;
 
 pub(crate) use bounded::{Apart, Bounded, Keep, Kept, RunError};
