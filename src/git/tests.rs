@@ -425,7 +425,7 @@ fn commit_graph_of_a_real_merge_lays_out_the_diamond() {
         "HEAD decoration must survive parsing; got {:?}",
         commits[0].refs
     );
-    let rows = crate::widgets::commit_graph::layout_graph(commits);
+    let rows = crate::git::layout_graph(commits);
     let rails: Vec<String> = rows
         .iter()
         .map(|r| r.cells.iter().map(|(ch, _)| *ch).collect())

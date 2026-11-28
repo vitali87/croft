@@ -3,7 +3,7 @@
 //!
 //! **What a step is.** croft dispatches a keystroke three ways — a palette
 //! selection and a user-rebound chord both resolve to a
-//! [`Command`](crate::widgets::command_palette::Command), but the built-in
+//! [`Command`](crate::command_registry::Command), but the built-in
 //! default chords (`Cmd+S`, `Alt+Up`, the debugger keys) call their app
 //! methods straight from `handle_key` and never construct one. Recording at
 //! the command funnel would therefore capture palette work and silently drop

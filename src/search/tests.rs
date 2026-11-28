@@ -1786,8 +1786,7 @@ fn the_scan_prefilter_never_hides_a_real_match() {
     for line in lines {
         for needle in needles {
             for opts in &opt_sets {
-                let real =
-                    !crate::widgets::editor_find::line_matches(line, *opts, needle).is_empty();
+                let real = !crate::find::line_matches(line, *opts, needle).is_empty();
                 if real {
                     assert!(
                         line_may_match(line, needle, *opts),

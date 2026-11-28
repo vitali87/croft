@@ -220,7 +220,7 @@ impl App {
     /// the Queries section, else the workspace root, and is written in the
     /// pack's language, else the Language section's, else none.
     pub(in crate::app) fn prompt_create_codeql_query(&mut self) {
-        use crate::widgets::codeql::LANGUAGE_IDS;
+        use crate::codeql_db::LANGUAGE_IDS;
         use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
         let pack = self
             .codeql

@@ -705,8 +705,7 @@ fn mouse_wheel_over_the_commits_graph_scrolls_it() {
             age_secs: 0,
         })
         .collect();
-    app.commit_graph
-        .set_rows(crate::widgets::commit_graph::layout_graph(commits));
+    app.commit_graph.set_rows(crate::git::layout_graph(commits));
 
     let backend = ratatui::backend::TestBackend::new(100, 40);
     let mut term = ratatui::Terminal::new(backend).unwrap();
@@ -817,7 +816,7 @@ fn a_commit_graph_fetch_whose_thread_crashed_lets_the_next_one_run() {
             || -> (
                 std::path::PathBuf,
                 Option<String>,
-                Vec<crate::widgets::commit_graph::GraphRow>,
+                Vec<crate::git::GraphRow>,
             ) { panic!("the fetch crashed (on purpose, in a test)") },
         )
         .unwrap(),
@@ -860,8 +859,7 @@ fn commits_graph_scrollbar_thumb_drag_follows_the_pointer() {
             age_secs: 0,
         })
         .collect();
-    app.commit_graph
-        .set_rows(crate::widgets::commit_graph::layout_graph(commits));
+    app.commit_graph.set_rows(crate::git::layout_graph(commits));
 
     let backend = ratatui::backend::TestBackend::new(100, 40);
     let mut term = ratatui::Terminal::new(backend).unwrap();
@@ -5113,9 +5111,7 @@ fn commit_graph_app(p: &std::path::Path) -> App {
     app.show_tree = true;
     app.source_control.status.in_repo = true;
     app.commit_graph
-        .set_rows(crate::widgets::commit_graph::layout_graph(
-            crate::git::commit_graph(p, 100),
-        ));
+        .set_rows(crate::git::layout_graph(crate::git::commit_graph(p, 100)));
     draw(&mut app, 110, 44);
     app
 }

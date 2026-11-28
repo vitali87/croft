@@ -44,13 +44,11 @@ mod typing;
 mod undo;
 mod viewers;
 mod wrap;
-pub use crate::text_edit::apply_span_edits_to_lines;
-pub(crate) use crate::text_edit::normalize_newlines;
-pub(crate) use crate::text_edit::utf16_to_char_col;
 use crate::text_edit::{
     apply_char_span_edits, char_byte, char_span_edits, map_through_span_edits,
     position_after_span_edits, view_top_after_span_edits,
 };
+use crate::text_edit::{normalize_newlines, utf16_to_char_col};
 use brackets::*;
 use comments::*;
 pub use diff_view::diff_hit_test;
@@ -989,7 +987,7 @@ pub struct Editor {
     pub active_search_match: Option<(usize, usize, usize)>,
     /// Find in Selection (#1577): while the find bar is limited to a range,
     /// only matches inside it are highlighted.
-    pub find_range: Option<crate::widgets::editor_find::FindRange>,
+    pub find_range: Option<crate::find::FindRange>,
     /// Some when this tab is a read-only image preview rather than a text
     /// buffer. The text fields (`lines`, undo, highlights, …) are left in
     /// their default empty state and the renderer paints metadata only;
@@ -1461,7 +1459,7 @@ thread_local! {
     static TAB_CELLS: std::cell::Cell<usize> = const { std::cell::Cell::new(1) };
 }
 
-use crate::widgets::editor_find::find_window;
+use crate::find::find_window;
 
 /// A merge-conflict accept button (#1169): its label, the shorter one a row
 /// too narrow for every full label gets, and its fill.

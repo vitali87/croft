@@ -179,7 +179,7 @@ impl App {
     pub(in crate::app) fn codeql_search_language(&self) -> Option<&'static str> {
         self.codeql
             .language
-            .and_then(|i| crate::widgets::codeql::LANGUAGE_IDS.get(i).copied())
+            .and_then(|i| crate::codeql_db::LANGUAGE_IDS.get(i).copied())
     }
 
     /// Run the Code Search off the UI thread; [`Self::drain_codeql_code_search`]

@@ -2479,7 +2479,7 @@ mod tests {
     fn every_mapped_command_id_is_a_real_croft_command() {
         for (vscode, croft) in COMMANDS {
             assert!(
-                crate::widgets::command_palette::Command::from_id(croft).is_some(),
+                crate::command_registry::Command::from_id(croft).is_some(),
                 "{vscode} maps to {croft}, which is not a croft command id"
             );
         }
@@ -3114,7 +3114,7 @@ mod tests {
         assert_eq!(report.dropped_keybindings.len(), 1, "sizeToContentWidth");
         for (_, id, _) in &want {
             assert!(
-                crate::widgets::command_palette::Command::from_id(id).is_some(),
+                crate::command_registry::Command::from_id(id).is_some(),
                 "{id} is a croft command"
             );
         }
@@ -3150,7 +3150,7 @@ mod tests {
             ]
         );
         for id in got {
-            assert!(crate::widgets::command_palette::Command::from_id(id).is_some());
+            assert!(crate::command_registry::Command::from_id(id).is_some());
         }
     }
 

@@ -304,11 +304,10 @@ fn a_history_reply_does_not_replace_the_lane_diff() {
 
     // The lane diff is up and showing its own commit.
     app.graph_revspec = Some(String::from("main..lane"));
-    app.commit_graph
-        .set_rows(crate::widgets::commit_graph::layout_graph(vec![row(
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "the lane commit",
-        )]));
+    app.commit_graph.set_rows(crate::git::layout_graph(vec![row(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "the lane commit",
+    )]));
 
     // `commit_at` is a click hit-test and needs rendered geometry, so read
     // the top row the way a click would - after a draw.
@@ -333,7 +332,7 @@ fn a_history_reply_does_not_replace_the_lane_diff() {
     app.graph_fetch = Some(crate::jobs::Job::finished((
         app.active_scm_root.clone(),
         None,
-        crate::widgets::commit_graph::layout_graph(vec![row(
+        crate::git::layout_graph(vec![row(
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "a background history refresh",
         )]),
@@ -350,7 +349,7 @@ fn a_history_reply_does_not_replace_the_lane_diff() {
     app.graph_fetch = Some(crate::jobs::Job::finished((
         app.active_scm_root.clone(),
         Some(String::from("main..lane")),
-        crate::widgets::commit_graph::layout_graph(vec![row(
+        crate::git::layout_graph(vec![row(
             "cccccccccccccccccccccccccccccccccccccccc",
             "the refreshed lane diff",
         )]),

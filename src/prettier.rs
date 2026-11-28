@@ -456,7 +456,7 @@ mod tests {
     fn apply(old: &str, new: &str) -> String {
         let mut l = lines(old);
         let edits = edits_for(&l, new);
-        crate::widgets::editor::apply_span_edits_to_lines(&mut l, &edits);
+        crate::text_edit::apply_span_edits_to_lines(&mut l, &edits);
         l.join("\n")
     }
 

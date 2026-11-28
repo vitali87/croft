@@ -1,7 +1,7 @@
 //! The Source Control COMMITS section: a repo-wide commit graph with
 //! box-drawing lane rails (the tig / lazygit idiom, VS Code's built-in Source
 //! Control Graph). The rows are fetched off-thread by the app via
-//! [`crate::git::commit_graph`], laid out into rails by [`layout_graph`] (pure,
+//! [`crate::git::commit_graph`], laid out into rails by [`crate::git::layout_graph`] (pure,
 //! so it runs on the fetch thread), and handed here with [`set_rows`]; clicking
 //! a row opens that commit's full patch in a read-only editor tab.
 
@@ -14,7 +14,7 @@ use ratatui::{
 };
 
 use crate::git::GraphCommit;
-pub use crate::git::{GraphRow, layout_graph};
+use crate::git::GraphRow;
 use crate::theme::Theme;
 use crate::widgets::scrollbar;
 
@@ -458,6 +458,7 @@ impl Widget for &mut CommitGraphPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::layout_graph;
 
     fn commit(hash: &str, parents: &[&str]) -> GraphCommit {
         GraphCommit {

@@ -1,10 +1,11 @@
 //! The text-edit value that language servers, formatters and the editor pass
-//! between them. A leaf, so the LSP layer can produce edits without depending
-//! on the editor widget that applies them.
+//! between them, how a set of them applies to plain lines, and the column and
+//! newline helpers that rests on. A leaf, so the LSP layer and the formatters
+//! can produce and apply edits without depending on the editor widget.
 
 /// A single text replacement in char-indexed `(row, col)` coordinates, as
 /// produced by an LSP rename `WorkspaceEdit`. Applied by
-/// `widgets::editor::apply_span_edits_to_lines` and `Editor::apply_span_edits`.
+/// [`apply_span_edits_to_lines`] here and by the editor's `apply_span_edits`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TextSpanEdit {
     pub start: (usize, usize),

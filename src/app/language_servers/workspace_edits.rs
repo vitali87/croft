@@ -81,7 +81,7 @@ impl App {
             } else {
                 let content = std::fs::read_to_string(path)?;
                 let mut lines: Vec<String> = content.split('\n').map(str::to_string).collect();
-                occ_count += crate::widgets::editor::apply_span_edits_to_lines(&mut lines, edits);
+                occ_count += crate::text_edit::apply_span_edits_to_lines(&mut lines, edits);
                 std::fs::write(path, lines.join("\n"))?;
                 written.insert(path.clone());
             }

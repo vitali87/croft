@@ -12,7 +12,7 @@ use ratatui::{
     widgets::Widget,
 };
 
-pub use crate::codeql_db::{LANGUAGE_IDS, LANGUAGES};
+use crate::codeql_db::{LANGUAGE_IDS, LANGUAGES};
 
 /// VS Code's `ql-container` views, in its order. The Evaluator Log Viewer is
 /// canary-only there and is left out here for the same reason.
