@@ -282,7 +282,10 @@ pub fn resolve_managed(
             if let Some(command) = go_command(config.name, bin, *version) {
                 let mut resolved = config.clone();
                 resolved.command = command;
-                return Some((resolved, Vec::new()));
+                // gopls runs `go` to load packages: the Go croft found, put
+                // on its PATH when croft's own does not reach it (#2807).
+                let extra = crate::proc::find::go_dir_off_path().into_iter().collect();
+                return Some((resolved, extra));
             }
         }
     }
@@ -363,9 +366,12 @@ pub fn provisioned_command(name: &str, provision: &Provision) -> Option<(String,
         Provision::Binary { bin, bin_path, .. } => {
             binary_command(name, bin, *bin_path).map(|c| (c, Vec::new()))
         }
-        Provision::Go { bin, version, .. } => {
-            go_command(name, bin, *version).map(|c| (c, Vec::new()))
-        }
+        Provision::Go { bin, version, .. } => go_command(name, bin, *version).map(|c| {
+            (
+                c,
+                crate::proc::find::go_dir_off_path().into_iter().collect(),
+            )
+        }),
     }
 }
 
