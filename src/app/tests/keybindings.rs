@@ -2458,7 +2458,7 @@ fn opt_shift_chords_reach_their_own_commands_not_the_shift_chords() {
         let file = tmp.path().join("main.rs");
         std::fs::write(&file, "fn main() {\n    let x = 1;\n}\n").unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.lsp = None;
+        app.lsp.manager = None;
         app.editor.open_pinned(&file).unwrap();
         app.focus_pane(Pane::Editor);
         let side = app.sidebar_view;

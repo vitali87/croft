@@ -14,7 +14,7 @@ impl App {
             self.status = String::from("No file open");
             return;
         };
-        if self.lsp.is_none() {
+        if self.lsp.manager.is_none() {
             self.status = String::from("No language server for this file");
             return;
         }
@@ -27,7 +27,7 @@ impl App {
         // capability).
         let (row, col) = (self.editor.cursor_row, self.editor.cursor_col);
         let (line, character) = self.editor.pos_to_utf16(row, col);
-        let Some(lsp) = self.lsp.as_mut() else {
+        let Some(lsp) = self.lsp.manager.as_mut() else {
             return;
         };
         let id = lsp.request_prepare_rename(path.clone(), line, character);
@@ -80,7 +80,7 @@ impl App {
     pub fn drain_lsp_prepare_rename(&mut self) -> bool {
         let mut results = Vec::new();
         {
-            let Some(lsp) = self.lsp.as_ref() else {
+            let Some(lsp) = self.lsp.manager.as_ref() else {
                 return false;
             };
             while let Some(r) = lsp.drain_prepare_rename() {
@@ -181,7 +181,7 @@ impl App {
     }
 
     pub fn drain_lsp_rename(&mut self) -> bool {
-        let Some(lsp) = self.lsp.as_ref() else {
+        let Some(lsp) = self.lsp.manager.as_ref() else {
             return false;
         };
         let Some(reply) = take_reply(

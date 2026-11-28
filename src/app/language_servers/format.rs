@@ -25,7 +25,7 @@ impl App {
             self.status = String::from("Formatting document with Prettier");
             return;
         }
-        if self.lsp.is_none() {
+        if self.lsp.manager.is_none() {
             self.status = String::from("No language server for this file");
             return;
         }
@@ -34,7 +34,7 @@ impl App {
         // required by the LSP request.
         let (tab_size, insert_spaces) = self.editor.indent_preference();
         let seq = self.format_target_seq(&path);
-        let Some(lsp) = self.lsp.as_mut() else {
+        let Some(lsp) = self.lsp.manager.as_mut() else {
             return;
         };
         let id = lsp.request_formatting(path, tab_size, insert_spaces);
@@ -71,7 +71,7 @@ impl App {
         let end = self.editor.pos_to_utf16(er, ec);
         let (tab_size, insert_spaces) = self.editor.indent_preference();
         let seq = self.format_target_seq(&path);
-        let Some(lsp) = self.lsp.as_mut() else {
+        let Some(lsp) = self.lsp.manager.as_mut() else {
             self.status = String::from("No language server for this file");
             return;
         };
@@ -148,7 +148,7 @@ impl App {
     /// unformatted: a busy, hung or unreachable server left it unsaved for
     /// good (#1491). Returns true when the next frame should redraw.
     pub(in crate::app) fn drain_lsp_format_at(&mut self, now: std::time::Instant) -> bool {
-        let reply = match self.lsp.as_ref() {
+        let reply = match self.lsp.manager.as_ref() {
             Some(lsp) => take_reply(
                 &mut self.format_request_id,
                 || lsp.drain_formatting(),

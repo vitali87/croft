@@ -1258,18 +1258,18 @@ fn an_association_change_reopens_the_file_on_its_new_server() {
     let rs = app.editor.path.clone().unwrap();
     std::fs::write(tmp.path().join("b.go"), "package b\n").unwrap();
     let go = tmp.path().join("b.go");
-    app.lsp_last_seen.insert(rs.clone(), 3);
-    app.lsp_last_seen.insert(go.clone(), 4);
+    app.lsp.last_seen.insert(rs.clone(), 3);
+    app.lsp.last_seen.insert(go.clone(), 4);
     let mut prefs = crate::prefs::Prefs::default();
     prefs
         .files_associations
         .insert(String::from("*.rs"), String::from("python"));
     app.apply_file_associations(&prefs);
     assert!(
-        !app.lsp_last_seen.contains_key(&rs),
+        !app.lsp.last_seen.contains_key(&rs),
         "rerouted file is resent"
     );
-    assert_eq!(app.lsp_last_seen.get(&go), Some(&4), "untouched file stays");
+    assert_eq!(app.lsp.last_seen.get(&go), Some(&4), "untouched file stays");
 }
 
 /// #1574: a folder added to the workspace gets the associations, and one

@@ -14,15 +14,15 @@ impl App {
     /// scales with edits, not with frames. The text keeps the file's final
     /// newline (#911), or every formatter adds one the save doubles.
     pub fn sync_lsp(&mut self) {
-        let Some(lsp) = self.lsp.as_ref() else {
+        let Some(lsp) = self.lsp.manager.as_ref() else {
             return;
         };
         // A language server that exited was restarted (#694). It knows no
         // documents, so forget which ones were sent: every open tab goes out
         // again as a fresh open below, as it does for a new manager.
         if lsp.take_servers_restarted() {
-            self.lsp_last_seen.clear();
-            self.lsp_progress.clear();
+            self.lsp.last_seen.clear();
+            self.lsp.progress.clear();
         }
         let mut current: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
         // `(is_open, path, text, seq, viewport)`. The viewport `(start, end)`
@@ -83,7 +83,7 @@ impl App {
                 continue;
             }
             let seq = tab.edit_seq;
-            let prev = self.lsp_last_seen.get(path).copied();
+            let prev = self.lsp.last_seen.get(path).copied();
             match prev {
                 None => {
                     // A small look-ahead past the visible rows keeps colour
@@ -108,7 +108,7 @@ impl App {
                 _ => {}
             }
         }
-        let lsp = match self.lsp.as_ref() {
+        let lsp = match self.lsp.manager.as_ref() {
             Some(l) => l,
             None => return,
         };
@@ -157,10 +157,11 @@ impl App {
             // silent when no server advertises a colorProvider, which is
             // what keeps the swatches from ever appearing unadvertised.
             lsp.request_document_colors(path.clone(), seq);
-            self.lsp_last_seen.insert(path, seq);
+            self.lsp.last_seen.insert(path, seq);
         }
         let closed: Vec<PathBuf> = self
-            .lsp_last_seen
+            .lsp
+            .last_seen
             .keys()
             .filter(|p| !current.contains(*p))
             .cloned()
@@ -168,10 +169,10 @@ impl App {
         let mut dropped_any = false;
         for p in closed {
             lsp.close_doc(p.clone());
-            self.lsp_last_seen.remove(&p);
+            self.lsp.last_seen.remove(&p);
             // Drop the closed file's diagnostics so the store doesn't grow
             // unbounded across a long session of opening and closing files.
-            dropped_any |= self.lsp_diagnostics.remove(&p).is_some();
+            dropped_any |= self.lsp.diagnostics.remove(&p).is_some();
             // Reopening asks for its lenses again anyway.
             self.code_lens_requested.remove(&p);
         }
@@ -222,7 +223,7 @@ impl App {
     /// servers advertising `workspaceDiagnostics`, so a workspace whose
     /// servers all PUSH never sends a request.
     pub fn refresh_workspace_diagnostics_if_requested(&self) {
-        let Some(lsp) = self.lsp.as_ref() else {
+        let Some(lsp) = self.lsp.manager.as_ref() else {
             return;
         };
         if !lsp.take_diagnostic_refresh() {
@@ -238,12 +239,12 @@ impl App {
     /// quitting croft. The next sync re-opens every tab against the new
     /// servers, which publish their diagnostics afresh.
     pub(in crate::app) fn restart_language_servers(&mut self) {
-        if self.lsp_paused_for_build {
+        if self.lsp.paused_for_build {
             self.status = String::from(LSP_PAUSED_FOR_BUILD);
             return;
         }
         // The old manager's Drop waits for its servers; off the UI thread.
-        if let Some(old) = self.lsp.take() {
+        if let Some(old) = self.lsp.manager.take() {
             fs_watch::offload_drop(old);
         }
         // A format-on-save in flight dies with its server; save unformatted,
@@ -251,7 +252,7 @@ impl App {
         if self.format_request_id.take().is_some() {
             self.complete_pending_save();
         }
-        self.lsp = match crate::lsp::LspManager::new(self.workspace_root().to_path_buf()) {
+        self.lsp.manager = match crate::lsp::LspManager::new(self.workspace_root().to_path_buf()) {
             Ok(m) => {
                 m.set_extra_roots(self.roots.iter().skip(1).map(Path::to_path_buf).collect());
                 Some(m)
@@ -263,13 +264,13 @@ impl App {
                 None
             }
         };
-        self.lsp_last_seen.clear();
-        self.lsp_progress.clear();
+        self.lsp.last_seen.clear();
+        self.lsp.progress.clear();
         // The new manager numbers semantic replies from 0 again.
-        self.semantic_generation_seen.clear();
-        self.lsp_diagnostics.clear();
+        self.lsp.semantic_generation_seen.clear();
+        self.lsp.diagnostics.clear();
         self.rebuild_problems();
-        if self.lsp.is_some() {
+        if self.lsp.manager.is_some() {
             let msg = "Restarted all language servers";
             crate::output::push("Language Servers", crate::output::OutputLevel::Info, msg);
             self.status = String::from(msg);
@@ -280,7 +281,7 @@ impl App {
     /// servers serving the active file, so rust-analyzer's index survives a
     /// restart of ruff. The manager re-opens the tabs once they are back.
     pub(in crate::app) fn restart_language_servers_for_file(&mut self) {
-        if self.lsp_paused_for_build {
+        if self.lsp.paused_for_build {
             self.status = String::from(LSP_PAUSED_FOR_BUILD);
             return;
         }
@@ -288,7 +289,7 @@ impl App {
             self.status = String::from("Restart for This File needs a file open in the editor");
             return;
         };
-        let Some(lsp) = self.lsp.as_ref() else {
+        let Some(lsp) = self.lsp.manager.as_ref() else {
             self.status =
                 String::from("No language servers are running; Restart All starts them again");
             return;

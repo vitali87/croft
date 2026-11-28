@@ -385,7 +385,8 @@ fn tick_timers_and_installs(app: &mut App) -> bool {
     // server, so "installed" becomes "working" without a further action.
     let just_installed = crate::lsp::install::take_just_installed();
     if !just_installed.is_empty() {
-        app.lsp_last_seen
+        app.lsp
+            .last_seen
             .retain(|path, _| !just_installed_covers_path(&just_installed, path));
     }
     voice_changed

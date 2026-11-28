@@ -1400,7 +1400,7 @@ fn only_a_remote_launched_croft_polls_the_build_marker() {
         app.build_marker_checked.is_none(),
         "a local croft read the marker"
     );
-    assert!(app.lsp.is_some());
+    assert!(app.lsp.manager.is_some());
 
     app.update_watch = Some(crate::update_watch::UpdateWatch::start(
         tmp.path().to_path_buf(),

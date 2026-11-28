@@ -1399,7 +1399,7 @@ fn python_module(defs: usize) -> String {
 /// outline keys on it.
 fn note_edit_for_outline(app: &mut App) {
     let path = app.editor.path.clone().unwrap();
-    app.lsp_last_seen.insert(path, app.editor.edit_seq);
+    app.lsp.last_seen.insert(path, app.editor.edit_seq);
 }
 
 fn diag(
@@ -2095,12 +2095,14 @@ fn linked_tick_only(app: &mut App) -> Option<u64> {
 }
 
 fn answer_linked(app: &App, id: u64, ranges: Vec<(u32, u32, u32, u32)>) {
-    app.lsp.as_ref().unwrap().push_linked_editing_for_test(
-        crate::lsp::manager::LinkedEditingResult {
+    app.lsp
+        .manager
+        .as_ref()
+        .unwrap()
+        .push_linked_editing_for_test(crate::lsp::manager::LinkedEditingResult {
             request_id: id,
             ranges,
-        },
-    );
+        });
 }
 
 /// A file with two functions, `fn b` the LAST thing in it (no trailing

@@ -1062,7 +1062,7 @@ impl App {
         for (path, ..) in &saved_paths {
             self.reload_config_for_path(path);
         }
-        if let Some(lsp) = self.lsp.as_ref() {
+        if let Some(lsp) = self.lsp.manager.as_ref() {
             for ((path, ..), text) in saved_paths.iter().zip(saved_texts) {
                 lsp.save_doc(path.clone(), text);
             }
@@ -1366,7 +1366,7 @@ impl App {
     /// PROBLEMS entries) only on `textDocument/didSave`; without this the
     /// panel never refreshes after a save (issue #37).
     pub(super) fn lsp_notify_saved(&mut self) {
-        if let (Some(lsp), Some(path)) = (self.lsp.as_ref(), self.editor.path.clone()) {
+        if let (Some(lsp), Some(path)) = (self.lsp.manager.as_ref(), self.editor.path.clone()) {
             lsp.save_doc(path, self.editor.document_text());
         }
     }
@@ -1395,7 +1395,7 @@ impl App {
                 let text = editor.document_text();
                 self.status = editor.status.clone();
                 self.record_history_snapshot_of(path, seats, described);
-                if let Some(lsp) = self.lsp.as_ref() {
+                if let Some(lsp) = self.lsp.manager.as_ref() {
                     lsp.save_doc(path.to_path_buf(), text);
                 }
                 self.reload_config_for_path(path);
@@ -1657,7 +1657,7 @@ impl App {
         for (path, seats, described, text) in saved {
             self.reload_config_for_path(&path);
             self.approve_saved_edit(&path);
-            if let Some(lsp) = self.lsp.as_ref() {
+            if let Some(lsp) = self.lsp.manager.as_ref() {
                 lsp.save_doc(path.clone(), text);
             }
             self.record_history_snapshot_of(&path, seats, described);
@@ -2477,7 +2477,7 @@ impl App {
         for (path, ..) in &saved {
             self.reload_config_for_path(path);
         }
-        if let Some(lsp) = self.lsp.as_ref() {
+        if let Some(lsp) = self.lsp.manager.as_ref() {
             for ((path, ..), text) in saved.iter().zip(saved_texts) {
                 lsp.save_doc(path.clone(), text);
             }

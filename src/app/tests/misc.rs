@@ -771,7 +771,8 @@ fn show_memory_usage_opens_a_per_subsystem_report() {
             diag(2, 3, DiagnosticSeverity::Error),
         ],
     );
-    app.lsp_diagnostics
+    app.lsp
+        .diagnostics
         .insert(tmp.path().join("a.py"), by_server);
     app.run_command(Command::DeveloperShowMemoryUsage);
     assert_eq!(app.editor.path.as_deref(), Some(Path::new("Memory Usage")));

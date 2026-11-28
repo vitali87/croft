@@ -44,6 +44,71 @@ use sync::*;
 pub(super) use typing::is_signature_help_trigger;
 pub(super) use typing::snippet_completion_item;
 
+/// The language servers' own state on croft's side: the manager that runs
+/// them, what each open buffer last sent them, the diagnostics and
+/// progress they reported, the questions they asked, and whether a croft
+/// build has them stopped.
+pub(super) struct LspState {
+    /// Optional LSP orchestrator. None when LspManager::new failed at
+    /// startup (e.g. the background tokio runtime couldn't spawn); the
+    /// rest of the editor stays fully functional without it.
+    pub(super) manager: Option<crate::lsp::LspManager>,
+    /// Per-path snapshot of the last edit_seq we forwarded to the LSP
+    /// manager. sync_lsp diffs every tick against the current tabs to
+    /// emit did_open / did_change / did_close.
+    pub(super) last_seen: std::collections::HashMap<PathBuf, u64>,
+    /// Newest semantic-token request generation already applied per path.
+    /// `seq` alone is not enough: two full requests can be in flight at the
+    /// same seq (`sync_lsp` plus a server-driven refresh), and the request
+    /// retry loop emits an EMPTY batch once its backoff is exhausted, so a
+    /// late empty loser would otherwise blank a good overlay and be written
+    /// to the content-keyed disk cache.
+    pub(super) semantic_generation_seen: std::collections::HashMap<PathBuf, u64>,
+    /// Diagnostics store: per file, the latest set from each server. Servers
+    /// push complete sets via `textDocument/publishDiagnostics`, so the inner
+    /// map is keyed by server name (ty + ruff can both publish for one file)
+    /// and a server's entry is replaced wholesale on each batch (an empty
+    /// batch removes it). The merged value for the visible file is handed to
+    /// the editor; the store outlives tab switches so re-focusing a file shows
+    /// its squiggles again without waiting for the next server push.
+    pub(super) diagnostics: std::collections::HashMap<
+        PathBuf,
+        std::collections::HashMap<String, Vec<crate::lsp::manager::Diagnostic>>,
+    >,
+    /// Live LSP work-done progress, keyed by server name (e.g. "rust-analyzer"
+    /// -> "Indexing 112/340 33%"). An entry exists only while that server has
+    /// an active task; the status bar surfaces it so a busy-priming server is
+    /// never mistaken for a dead one. Cleared on the server's `End`.
+    pub(super) progress: std::collections::HashMap<String, String>,
+    /// Language-server questions (`window/showMessageRequest`, #1599)
+    /// waiting for the list picker, oldest first, and the one it shows.
+    /// Dropping one answers the server "no action".
+    pub(super) questions: std::collections::VecDeque<LspQuestion>,
+    pub(super) question: Option<LspQuestion>,
+    /// True while this croft has stopped its language servers because a
+    /// source build of croft is compiling on the same host (#694), so the
+    /// servers are restarted once it ends. Only a remote-launched croft
+    /// ever sets it.
+    pub(super) paused_for_build: bool,
+}
+
+impl LspState {
+    /// With `manager` (`None` when it could not start), and nothing synced or
+    /// reported yet.
+    pub(super) fn new(manager: Option<crate::lsp::LspManager>) -> Self {
+        Self {
+            manager,
+            last_seen: std::collections::HashMap::new(),
+            semantic_generation_seen: std::collections::HashMap::new(),
+            diagnostics: std::collections::HashMap::new(),
+            progress: std::collections::HashMap::new(),
+            questions: std::collections::VecDeque::new(),
+            question: None,
+            paused_for_build: false,
+        }
+    }
+}
+
 /// Where the caret rests in which buffer (#2062): the file, the caret's row
 /// and column, and the buffer's edit seq.
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -11,7 +11,7 @@ impl App {
     /// diagnostic pull retires rust-analyzer from reporting while its
     /// client keeps answering.
     pub(in crate::app) fn rust_analyzer_serves_active_file(&self) -> bool {
-        match (self.editor.path.as_deref(), self.lsp.as_ref()) {
+        match (self.editor.path.as_deref(), self.lsp.manager.as_ref()) {
             (Some(path), Some(lsp)) => {
                 lsp.document_served_by(path, crate::lsp::rust_analyzer::SERVER)
             }
@@ -36,7 +36,7 @@ impl App {
         let (line, character) = self
             .editor
             .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
-        let Some(lsp) = self.lsp.as_mut() else {
+        let Some(lsp) = self.lsp.manager.as_mut() else {
             return;
         };
         let id = lsp.request_rust_analyzer(path, request, line, character);
@@ -52,7 +52,7 @@ impl App {
 
     pub fn drain_lsp_rust_analyzer(&mut self) -> bool {
         let mut results = Vec::new();
-        if let Some(lsp) = self.lsp.as_ref() {
+        if let Some(lsp) = self.lsp.manager.as_ref() {
             while let Some(r) = lsp.drain_rust_analyzer() {
                 results.push(r);
             }

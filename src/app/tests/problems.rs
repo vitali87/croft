@@ -160,7 +160,12 @@ fn sync_markdown_lint_stands_down_only_for_files_rumdl_reports_on() {
     assert!(has_md025(&app, &file), "the built-in lint reports MD025");
     assert!(has_md025(&app, &other));
 
-    let lsp = || app.lsp.as_ref().expect("a test App has an LSP manager");
+    let lsp = || {
+        app.lsp
+            .manager
+            .as_ref()
+            .expect("a test App has an LSP manager")
+    };
     lsp().set_document_servers_for_test(&file, &["marksman", "rumdl"]);
     lsp().set_document_servers_for_test(&other, &["marksman"]);
     assert!(app.sync_markdown_lint(), "standing down is a change");
@@ -177,6 +182,7 @@ fn sync_markdown_lint_stands_down_only_for_files_rumdl_reports_on() {
 
     // Retired from pulls, or crashed for good: rumdl leaves the file.
     app.lsp
+        .manager
         .as_ref()
         .unwrap()
         .set_document_servers_for_test(&file, &["marksman"]);
@@ -317,14 +323,14 @@ fn problems_panel_aggregates_the_store_across_files() {
             diag(2, 3, DiagnosticSeverity::Warning),
         ],
     );
-    app.lsp_diagnostics.insert(a, s1);
+    app.lsp.diagnostics.insert(a, s1);
     let b = tmp.path().join("b.rs");
     let mut s2 = std::collections::HashMap::new();
     s2.insert(
         String::from("rustc"),
         vec![diag(0, 1, DiagnosticSeverity::Error)],
     );
-    app.lsp_diagnostics.insert(b, s2);
+    app.lsp.diagnostics.insert(b, s2);
 
     app.rebuild_problems();
     assert_eq!(
@@ -396,7 +402,7 @@ fn typing_in_the_problems_panel_filters_and_esc_clears_before_leaving() {
             },
         ],
     );
-    app.lsp_diagnostics.insert(file.clone(), by_server);
+    app.lsp.diagnostics.insert(file.clone(), by_server);
     app.rebuild_problems();
     app.bottom_panel_tab = BottomPanelTab::Problems;
     app.focus_pane(Pane::Terminal);
@@ -448,7 +454,7 @@ fn clicking_a_problem_row_opens_that_file_at_the_line() {
             origin: None,
         }],
     );
-    app.lsp_diagnostics.insert(file.clone(), by_server);
+    app.lsp.diagnostics.insert(file.clone(), by_server);
     app.rebuild_problems();
     app.bottom_panel_tab = BottomPanelTab::Problems;
 
@@ -495,7 +501,7 @@ fn clicking_a_related_location_row_opens_that_place() {
     };
     let d = crate::lsp::client::convert_diagnostic("rust-analyzer", &wire);
     let by_server = std::collections::HashMap::from([(String::from("rust-analyzer"), vec![d])]);
-    app.lsp_diagnostics.insert(main, by_server);
+    app.lsp.diagnostics.insert(main, by_server);
     app.rebuild_problems();
     assert_eq!(
         app.problems.groups()[0].items[0].related[0].rel_path,
@@ -542,7 +548,7 @@ fn hints_stay_out_of_the_problems_list_and_its_count() {
             diag(10, 12, DiagnosticSeverity::Warning),
         ],
     );
-    app.lsp_diagnostics.insert(a.clone(), by_server);
+    app.lsp.diagnostics.insert(a.clone(), by_server);
     app.rebuild_problems();
     assert_eq!(
         app.problems.total_count(),
@@ -583,13 +589,13 @@ fn a_file_with_only_hints_has_no_problems_group_but_information_is_listed() {
             diag(4, 7, DiagnosticSeverity::Hint),
         ],
     );
-    app.lsp_diagnostics.insert(hints, h);
+    app.lsp.diagnostics.insert(hints, h);
     let mut i = std::collections::HashMap::new();
     i.insert(
         String::from("ty"),
         vec![diag(0, 3, DiagnosticSeverity::Information)],
     );
-    app.lsp_diagnostics.insert(info.clone(), i);
+    app.lsp.diagnostics.insert(info.clone(), i);
     app.rebuild_problems();
     let paths: Vec<&std::path::PathBuf> = app.problems.groups().iter().map(|g| &g.path).collect();
     assert_eq!(paths, vec![&info]);
@@ -609,7 +615,7 @@ fn the_problems_count_paints_an_orange_pill_in_the_tab_strip() {
         String::from("rustc"),
         vec![diag(0, 1, DiagnosticSeverity::Error)],
     );
-    app.lsp_diagnostics.insert(a, s1);
+    app.lsp.diagnostics.insert(a, s1);
     app.rebuild_problems();
     let backend = ratatui::backend::TestBackend::new(140, 50);
     let mut term = ratatui::Terminal::new(backend).unwrap();
@@ -642,7 +648,7 @@ fn croft_loch_problems_count_is_a_tinted_chip_without_caps() {
         String::from("rustc"),
         vec![diag(0, 1, DiagnosticSeverity::Error)],
     );
-    app.lsp_diagnostics.insert(a, s1);
+    app.lsp.diagnostics.insert(a, s1);
     app.rebuild_problems();
     let backend = ratatui::backend::TestBackend::new(140, 50);
     let mut term = ratatui::Terminal::new(backend).unwrap();
@@ -941,7 +947,7 @@ fn the_project_check_count_is_its_own_not_the_panels() {
         String::from("rust-analyzer"),
         vec![diag(0, 4, DiagnosticSeverity::Error)],
     );
-    app.lsp_diagnostics.insert(other.clone(), by_server);
+    app.lsp.diagnostics.insert(other.clone(), by_server);
 
     app.finish_project_check_for_test(
         tmp.path(),
@@ -1079,7 +1085,7 @@ fn problems_shows_diagnostics_for_a_file_that_was_never_opened() {
         String::from("rust-analyzer"),
         vec![diag(0, 4, DiagnosticSeverity::Error)],
     );
-    app.lsp_diagnostics.insert(never.clone(), by_server);
+    app.lsp.diagnostics.insert(never.clone(), by_server);
     app.rebuild_problems();
 
     let paths: Vec<_> = app.problems.groups().iter().map(|g| &g.path).collect();
@@ -1109,7 +1115,7 @@ fn problems_scope_toggle_filters_unopened_files_and_the_badge_follows() {
             String::from("rust-analyzer"),
             vec![diag(0, 4, DiagnosticSeverity::Error)],
         );
-        app.lsp_diagnostics.insert(p.clone(), by_server);
+        app.lsp.diagnostics.insert(p.clone(), by_server);
     }
 
     app.problems.scope = ProblemScope::WholeProject;
@@ -1152,7 +1158,7 @@ fn opening_a_file_refreshes_a_scoped_problems_panel() {
         String::from("rust-analyzer"),
         vec![diag(0, 4, DiagnosticSeverity::Error)],
     );
-    app.lsp_diagnostics.insert(later.clone(), by_server);
+    app.lsp.diagnostics.insert(later.clone(), by_server);
     app.rebuild_problems();
     assert!(
         app.problems.groups().is_empty(),
@@ -1709,7 +1715,7 @@ fn a_hidden_problems_panel_takes_no_right_click() {
             origin: None,
         }],
     );
-    app.lsp_diagnostics.insert(file.clone(), by_server);
+    app.lsp.diagnostics.insert(file.clone(), by_server);
     app.rebuild_problems();
     app.bottom_panel_tab = BottomPanelTab::Problems;
     app.focus_pane(Pane::Editor);
@@ -1781,7 +1787,7 @@ fn pressing_and_dragging_the_problems_scrollbar_scrolls_the_list() {
         .collect();
     let mut by_server = std::collections::HashMap::new();
     by_server.insert(String::from("rustc"), diagnostics);
-    app.lsp_diagnostics.insert(file.clone(), by_server);
+    app.lsp.diagnostics.insert(file.clone(), by_server);
     app.rebuild_problems();
     app.bottom_panel_tab = BottomPanelTab::Problems;
 
@@ -1852,7 +1858,7 @@ fn a_drag_begun_on_the_output_scrollbar_leaves_problems_alone_after_a_tab_switch
         .collect();
     let mut by_server = std::collections::HashMap::new();
     by_server.insert(String::from("rustc"), diagnostics);
-    app.lsp_diagnostics.insert(file.clone(), by_server);
+    app.lsp.diagnostics.insert(file.clone(), by_server);
     app.rebuild_problems();
     // The bus is process-wide, so the channel carries a name no other test
     // uses.

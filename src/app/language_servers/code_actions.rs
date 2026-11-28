@@ -49,7 +49,7 @@ impl App {
             return;
         };
         let ((sr, sc), (er, ec), diagnostics) = self.code_action_request();
-        let Some(lsp) = self.lsp.as_mut() else {
+        let Some(lsp) = self.lsp.manager.as_mut() else {
             self.status = String::from("No language server for this file");
             return;
         };
@@ -61,7 +61,7 @@ impl App {
     }
 
     pub fn drain_lsp_code_actions(&mut self) -> bool {
-        let Some(lsp) = self.lsp.as_ref() else {
+        let Some(lsp) = self.lsp.manager.as_ref() else {
             return false;
         };
         let Some(reply) = take_reply(
@@ -185,7 +185,7 @@ impl App {
             }
         }
         if let Some(cmd) = item.command
-            && let (Some(path), Some(lsp)) = (self.editor.path.clone(), self.lsp.as_mut())
+            && let (Some(path), Some(lsp)) = (self.editor.path.clone(), self.lsp.manager.as_mut())
         {
             lsp.execute_command(path, cmd.command, cmd.arguments);
             // A command-only action (gopls's "Browse documentation") does
@@ -214,7 +214,7 @@ impl App {
         let Some(path) = self.editor.path.clone() else {
             return;
         };
-        let Some(lsp) = self.lsp.as_mut() else {
+        let Some(lsp) = self.lsp.manager.as_mut() else {
             return;
         };
         let id = lsp.request_code_action_resolve(path, item.server, action);

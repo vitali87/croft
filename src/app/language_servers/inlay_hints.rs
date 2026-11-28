@@ -10,7 +10,7 @@ impl App {
     /// edit seq is dropped: its anchors were computed against older text, and
     /// the request fired for the current seq is still in flight.
     pub fn drain_lsp_inlay_hints(&mut self) -> bool {
-        let Some(lsp) = self.lsp.as_ref() else {
+        let Some(lsp) = self.lsp.manager.as_ref() else {
             return false;
         };
         let mut updates = Vec::new();
@@ -38,7 +38,7 @@ impl App {
         seq: u64,
         mut apply: impl FnMut(&mut EditorTabs),
     ) -> bool {
-        if self.lsp_last_seen.get(path) != Some(&seq) {
+        if self.lsp.last_seen.get(path) != Some(&seq) {
             return false;
         }
         let mut applied = false;
@@ -56,7 +56,7 @@ impl App {
     /// reload or when cross-file analysis changes the hints without an edit).
     /// Mirrors [`refresh_semantic_tokens_if_requested`].
     pub fn refresh_inlay_hints_if_requested(&mut self) {
-        let Some(lsp) = self.lsp.as_ref() else {
+        let Some(lsp) = self.lsp.manager.as_ref() else {
             return;
         };
         if !lsp.take_inlay_refresh() {
@@ -69,14 +69,14 @@ impl App {
     /// current edit seq. Shared by the server-driven refresh and the palette
     /// toggle's re-enable path.
     pub(in crate::app) fn request_inlay_hints_for_open_editors(&mut self) {
-        let Some(lsp) = self.lsp.as_ref() else {
+        let Some(lsp) = self.lsp.manager.as_ref() else {
             return;
         };
         for (p, end) in self.inlay_hint_targets() {
             if !self.inlay_hints_enabled_for(path_scope_id(&p)) {
                 continue;
             }
-            if let Some(&seq) = self.lsp_last_seen.get(&p) {
+            if let Some(&seq) = self.lsp.last_seen.get(&p) {
                 lsp.request_inlay_hints(p, end, seq);
             }
         }

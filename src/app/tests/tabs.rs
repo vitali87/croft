@@ -1710,7 +1710,7 @@ fn one_tab_speaks_for_a_file_to_the_language_server() {
     let mut seen = Vec::new();
     for _ in 0..3 {
         app.sync_lsp();
-        seen.push(app.lsp_last_seen.get(&path).copied());
+        seen.push(app.lsp.last_seen.get(&path).copied());
     }
     let active = Some(app.editor.edit_seq);
     assert_eq!(seen, vec![active, active, active], "no tick resends");
@@ -1825,11 +1825,16 @@ fn a_rename_keeps_the_unsaved_edits_of_a_file_open_in_the_other_split_group() {
     assert_eq!(app.editor.path.as_deref(), Some(main_py.as_path()));
     let seq = app.editor_layout.inactive_groups().next().unwrap().edit_seq;
     assert_eq!(
-        app.lsp_last_seen.get(&store),
+        app.lsp.last_seen.get(&store),
         Some(&seq),
         "the other group's file stays open on the server"
     );
-    let held = app.lsp.as_ref().unwrap().synced_text_for_test(&store);
+    let held = app
+        .lsp
+        .manager
+        .as_ref()
+        .unwrap()
+        .synced_text_for_test(&store);
     assert_eq!(
         held.as_deref(),
         Some(unsaved.as_str()),

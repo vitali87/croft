@@ -1583,7 +1583,7 @@ fn stale_document_symbol_reply_must_not_replace_the_fresher_outline() {
     app.open_file_at_launch(&file);
     // The LSP manager tracks this file at edit seq 7; the newest outline
     // request was issued for that seq.
-    app.lsp_last_seen.insert(file.clone(), 7);
+    app.lsp.last_seen.insert(file.clone(), 7);
     app.sync_outline();
     assert!(
         app.outline
@@ -3414,6 +3414,7 @@ fn an_empty_jump_reply_says_nothing_was_found_and_clears_the_request() {
     app.request_definition_at_cursor();
     let id = app.definition_request_id.expect("F12 sent a request");
     app.lsp
+        .manager
         .as_ref()
         .unwrap()
         .push_definition_for_test(DefinitionResult {
@@ -3428,6 +3429,7 @@ fn an_empty_jump_reply_says_nothing_was_found_and_clears_the_request() {
     app.request_declaration_at_cursor();
     let id = app.declaration_request_id.expect("a declaration request");
     app.lsp
+        .manager
         .as_ref()
         .unwrap()
         .push_declaration_for_test(DeclarationResult {
@@ -3444,6 +3446,7 @@ fn an_empty_jump_reply_says_nothing_was_found_and_clears_the_request() {
         .type_definition_request_id
         .expect("a type definition request");
     app.lsp
+        .manager
         .as_ref()
         .unwrap()
         .push_type_definition_for_test(TypeDefinitionResult {
@@ -3467,6 +3470,7 @@ fn a_stale_jump_reply_changes_nothing_and_a_found_target_still_jumps() {
     app.request_definition_at_cursor();
     let id = app.definition_request_id.expect("F12 sent a request");
     app.lsp
+        .manager
         .as_ref()
         .unwrap()
         .push_definition_for_test(DefinitionResult {
@@ -3478,6 +3482,7 @@ fn a_stale_jump_reply_changes_nothing_and_a_found_target_still_jumps() {
     assert_eq!(app.definition_request_id, Some(id), "still waiting");
 
     app.lsp
+        .manager
         .as_ref()
         .unwrap()
         .push_definition_for_test(DefinitionResult {
@@ -3615,6 +3620,7 @@ fn a_peek_definition_reply_opens_the_peek_popup_instead_of_jumping() {
         .expect("Alt+F12 sent a peek request");
     assert_eq!(app.definition_request_id, None, "and no jump request");
     app.lsp
+        .manager
         .as_ref()
         .unwrap()
         .push_definition_for_test(DefinitionResult {
@@ -3635,6 +3641,7 @@ fn a_peek_definition_reply_opens_the_peek_popup_instead_of_jumping() {
     app.request_definition_at_cursor();
     let jump = app.definition_request_id.expect("F12 sent a request");
     app.lsp
+        .manager
         .as_ref()
         .unwrap()
         .push_definition_for_test(DefinitionResult {
@@ -3675,6 +3682,7 @@ fn a_resting_caret_asks_for_its_highlights_once() {
         "no second request while the reply is out"
     );
     app.lsp
+        .manager
         .as_ref()
         .unwrap()
         .push_document_highlights_for_test(DocumentHighlightsResult {

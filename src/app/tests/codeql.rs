@@ -405,6 +405,7 @@ fn adding_codeql_registers_its_language_server_without_a_relaunch() {
     let ql = Language("ql");
     let registered = |app: &App| {
         app.lsp
+            .manager
             .as_ref()
             .expect("a language-server manager")
             .server_registered(ql, "codeql")
@@ -420,14 +421,14 @@ fn adding_codeql_registers_its_language_server_without_a_relaunch() {
     // What it reported on a file never opened, beside a built-in lint's.
     let unopened = tmp.path().join("Unopened.ql");
     let error = || diag(0, 1, crate::lsp::manager::DiagnosticSeverity::Error);
-    let stored = app.lsp_diagnostics.entry(unopened.clone()).or_default();
+    let stored = app.lsp.diagnostics.entry(unopened.clone()).or_default();
     stored.insert(String::from("codeql"), vec![error()]);
     stored.insert(String::from("Markdown Lint"), vec![error()]);
 
     app.set_extension_enabled("codeql", false);
     assert!(!registered(&app), "turned off, its server goes");
     let left = |app: &App| {
-        let mut keys: Vec<String> = app.lsp_diagnostics[&unopened].keys().cloned().collect();
+        let mut keys: Vec<String> = app.lsp.diagnostics[&unopened].keys().cloned().collect();
         keys.sort();
         keys
     };
@@ -440,6 +441,7 @@ fn adding_codeql_registers_its_language_server_without_a_relaunch() {
         pulled: false,
     };
     app.lsp
+        .manager
         .as_ref()
         .unwrap()
         .push_diagnostics_for_test(report());
@@ -453,6 +455,7 @@ fn adding_codeql_registers_its_language_server_without_a_relaunch() {
     app.set_extension_enabled("codeql", true);
     assert!(registered(&app), "turned back on, it returns");
     app.lsp
+        .manager
         .as_ref()
         .unwrap()
         .push_diagnostics_for_test(report());
@@ -5726,13 +5729,15 @@ fn a_baseline_log_marks_results_new_or_unchanged_and_lists_what_disappeared() {
     app.sync_sarif_diagnostics();
     let c = tmp.path().join("c.js");
     assert!(
-        app.lsp_diagnostics
+        app.lsp
+            .diagnostics
             .get(&c)
             .is_none_or(|m| m.values().all(Vec::is_empty)),
         "absent results publish no diagnostics"
     );
     assert!(
-        app.lsp_diagnostics
+        app.lsp
+            .diagnostics
             .get(&tmp.path().join("d.js"))
             .is_some_and(|m| m.values().any(|v| !v.is_empty()))
     );

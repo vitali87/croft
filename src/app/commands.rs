@@ -81,12 +81,12 @@ impl App {
     /// set as they are now (#1842): one added, removed or toggled serves its
     /// files, or stops serving them, without a relaunch.
     pub(super) fn reload_lsp_extensions(&mut self) {
-        if self.lsp.is_none() {
+        if self.lsp.manager.is_none() {
             return;
         }
         let sources = crate::lsp::manifest::read_extension_sources(&self.extensions_dir());
         let sources: Vec<&str> = sources.iter().map(String::as_str).collect();
-        let gone = match self.lsp.as_mut() {
+        let gone = match self.lsp.manager.as_mut() {
             Some(lsp) => lsp.reload_extensions(&sources, &self.disabled_extensions),
             None => return,
         };
@@ -96,11 +96,12 @@ impl App {
         // The worker withdraws what a server it stops reported only on the
         // documents it held open; what it reported on files never opened
         // would stay in PROBLEMS with nothing left to clear it.
-        for by_source in self.lsp_diagnostics.values_mut() {
+        for by_source in self.lsp.diagnostics.values_mut() {
             by_source
                 .retain(|key, _| !gone.contains(&crate::lsp::manager::diagnostics_source(key)));
         }
-        self.lsp_diagnostics
+        self.lsp
+            .diagnostics
             .retain(|_, by_source| !by_source.is_empty());
         self.rebuild_problems();
     }
@@ -355,7 +356,7 @@ impl App {
             .map(|(name, lines, bytes)| ChannelMem { name, lines, bytes })
             .collect();
         let mut servers: std::collections::BTreeMap<&str, ServerMem> = Default::default();
-        for by_server in self.lsp_diagnostics.values() {
+        for by_server in self.lsp.diagnostics.values() {
             // A server's pushed and pulled entries are one file (#1102).
             let mut counted = std::collections::HashSet::new();
             for (key, diags) in by_server {

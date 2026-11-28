@@ -1764,7 +1764,7 @@ fn fix_with_navigator_lands_on_the_diagnostic_and_refuses_without_a_seat() {
             origin: None,
         }],
     );
-    app.lsp_diagnostics.insert(file.clone(), by_server);
+    app.lsp.diagnostics.insert(file.clone(), by_server);
     assert!(app.drain_lsp_diagnostics());
     assert!(app.rebuild_problems());
     let (path, item) = {
@@ -3373,6 +3373,7 @@ fn app_with_server_suggestions(tmp: &std::path::Path, line: &str) -> App {
     let mut app = app_with_open_file(tmp, "a.rs", &format!("{line}\n"));
     let path = app.editor.path.clone().unwrap();
     app.lsp
+        .manager
         .as_ref()
         .unwrap()
         .set_inline_completion_for_test(&path);
@@ -3404,12 +3405,14 @@ fn answer_server_inline(app: &mut App, id: u64, text: &str, range: std::ops::Ran
         text: text.to_string(),
         range: Some((0, range.start, 0, range.end)),
     });
-    app.lsp.as_ref().unwrap().push_inline_completion_for_test(
-        crate::lsp::manager::InlineCompletionResult {
+    app.lsp
+        .manager
+        .as_ref()
+        .unwrap()
+        .push_inline_completion_for_test(crate::lsp::manager::InlineCompletionResult {
             request_id: id,
             item,
-        },
-    );
+        });
     app.tick_inline_complete();
 }
 
@@ -3518,7 +3521,7 @@ fn a_proposals_diagnostics_show_in_the_popup_not_the_buffer() {
     let file = tmp.path().join("a.py");
     std::fs::write(&file, "x = 1\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.lsp = None;
+    app.lsp.manager = None;
     let _hook = queue_edit_proposal(&mut app, tmp.path(), &file, "1", "nope_undefined");
     app.sync_approval_check();
     assert!(
@@ -3552,7 +3555,7 @@ fn a_proposals_diagnostics_show_in_the_popup_not_the_buffer() {
         pulled: false,
     }]);
     assert!(
-        !app.lsp_diagnostics.contains_key(&file),
+        !app.lsp.diagnostics.contains_key(&file),
         "the buffer's diagnostics are the buffer's"
     );
     let screen = draw_screen(&mut app, 110, 30);
@@ -3590,7 +3593,13 @@ fn a_checked_proposal_hands_back_a_buffer_held_in_another_split_group() {
     app.split_editor_dir(editor_layout::SplitDir::Horizontal, true);
     app.editor.open(&notes).unwrap();
     app.sync_lsp();
-    let synced = |app: &App| app.lsp.as_ref().unwrap().synced_text_for_test(&file);
+    let synced = |app: &App| {
+        app.lsp
+            .manager
+            .as_ref()
+            .unwrap()
+            .synced_text_for_test(&file)
+    };
     let _hook = queue_edit_proposal(&mut app, tmp.path(), &file, "1", "nope_undefined");
     app.sync_approval_check();
     assert_eq!(synced(&app).as_deref(), Some("x = nope_undefined\n"));
@@ -3620,7 +3629,7 @@ fn a_real_server_flags_the_proposal_before_approval() {
     let file = tmp.path().join("a.py");
     std::fs::write(&file, "x = 1\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    if app.lsp.is_none() {
+    if app.lsp.manager.is_none() {
         eprintln!("SKIPPED: no language server manager");
         return;
     }
@@ -3644,7 +3653,7 @@ fn a_real_server_flags_the_proposal_before_approval() {
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    assert!(!app.lsp_diagnostics.contains_key(&file));
+    assert!(!app.lsp.diagnostics.contains_key(&file));
 }
 
 /// An agent's edit proposal, end to end through the App: the hook's

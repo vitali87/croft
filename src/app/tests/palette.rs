@@ -1794,7 +1794,7 @@ fn palette_go_to_symbol_in_workspace_opens_the_picker() {
 fn typing_in_the_picker_without_a_language_server_reports_unsupported() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(tmp.path(), "a.rs", "fn main() {}");
-    app.lsp = None;
+    app.lsp.manager = None;
     app.open_workspace_symbols("");
     app.handle_key(key(KeyCode::Char('m'), KeyModifiers::NONE))
         .unwrap();

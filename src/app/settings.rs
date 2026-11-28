@@ -1188,7 +1188,8 @@ impl App {
             .filter_map(picked)
             .collect();
         let servers_before: Vec<(PathBuf, Option<crate::lsp::Language>)> = self
-            .lsp_last_seen
+            .lsp
+            .last_seen
             .keys()
             .map(|p| (p.clone(), crate::lsp::manager::path_to_language(p)))
             .collect();
@@ -1210,11 +1211,11 @@ impl App {
             if crate::lsp::manager::path_to_language(&path) == before {
                 continue;
             }
-            if let Some(lsp) = self.lsp.as_ref() {
+            if let Some(lsp) = self.lsp.manager.as_ref() {
                 lsp.close_doc(path.clone());
             }
-            self.lsp_last_seen.remove(&path);
-            dropped_any |= self.lsp_diagnostics.remove(&path).is_some();
+            self.lsp.last_seen.remove(&path);
+            dropped_any |= self.lsp.diagnostics.remove(&path).is_some();
             self.code_lens_requested.remove(&path);
         }
         if dropped_any {

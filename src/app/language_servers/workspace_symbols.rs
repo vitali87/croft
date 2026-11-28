@@ -84,7 +84,7 @@ impl App {
         if query.is_empty() {
             return;
         }
-        let Some(lsp) = self.lsp.as_mut() else {
+        let Some(lsp) = self.lsp.manager.as_mut() else {
             if let Some(p) = self.workspace_symbols.as_mut() {
                 p.loading = false;
                 p.unsupported = true;
@@ -117,7 +117,7 @@ impl App {
 
     pub fn drain_lsp_workspace_symbols(&mut self) -> bool {
         let mut results = Vec::new();
-        if let Some(lsp) = self.lsp.as_ref() {
+        if let Some(lsp) = self.lsp.manager.as_ref() {
             while let Some(r) = lsp.drain_workspace_symbols() {
                 results.push(r);
             }

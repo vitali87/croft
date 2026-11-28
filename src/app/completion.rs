@@ -101,7 +101,12 @@ impl App {
     /// true when the popup state changed and the next frame should redraw.
     pub fn drain_lsp_completion(&mut self) -> bool {
         let mut changed = false;
-        while let Some(result) = self.lsp.as_ref().and_then(|lsp| lsp.drain_completion()) {
+        while let Some(result) = self
+            .lsp
+            .manager
+            .as_ref()
+            .and_then(|lsp| lsp.drain_completion())
+        {
             changed |= self.apply_completion_result(result);
         }
         changed
@@ -354,13 +359,16 @@ impl App {
         let (line, character) = self
             .editor
             .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
-        let asked = match (path.clone(), self.lsp.as_mut()) {
+        let asked = match (path.clone(), self.lsp.manager.as_mut()) {
             (Some(path), Some(lsp)) => Some(lsp.request_completion(path, line, character, trigger)),
             _ => None,
         };
-        let served = path
-            .as_deref()
-            .is_some_and(|p| self.lsp.as_ref().is_some_and(|l| l.document_has_server(p)));
+        let served = path.as_deref().is_some_and(|p| {
+            self.lsp
+                .manager
+                .as_ref()
+                .is_some_and(|l| l.document_has_server(p))
+        });
         self.completion.explicit = words;
         let words = words && self.word_suggestions != crate::word_suggest::WordSuggestions::Off;
         if asked.is_none() && !words {
@@ -442,7 +450,7 @@ impl App {
         let (line, character) = self
             .editor
             .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
-        let Some(lsp) = self.lsp.as_mut() else {
+        let Some(lsp) = self.lsp.manager.as_mut() else {
             return;
         };
         let id = lsp.request_signature_help(path, line, character);
@@ -490,7 +498,7 @@ impl App {
     /// Drain LSP signatureHelp responses, dropping stale ids. An empty reply
     /// closes any open popup; otherwise the popup is re-anchored to the caret.
     pub fn drain_lsp_signature_help(&mut self) -> bool {
-        let Some(lsp) = self.lsp.as_ref() else {
+        let Some(lsp) = self.lsp.manager.as_ref() else {
             return false;
         };
         let mut changed = false;
@@ -690,7 +698,8 @@ impl App {
         let path = self.editor.path.clone()?;
         let upto = (self.editor.cursor_row, self.editor.cursor_col);
         let text_hash = text_hash_before(&self.editor.lines, upto)?;
-        let request_id = (self.lsp.as_mut()?).request_completion_resolve(path.clone(), item);
+        let request_id =
+            (self.lsp.manager.as_mut()?).request_completion_resolve(path.clone(), item);
         self.completion.resolve = Some(PendingCompletionResolve {
             request_id,
             path,
@@ -870,7 +879,7 @@ impl App {
         let (line, character) = self
             .editor
             .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
-        let Some(lsp) = self.lsp.as_mut() else {
+        let Some(lsp) = self.lsp.manager.as_mut() else {
             return;
         };
         let id = lsp.request_completion(path, line, character, CompletionTrigger::Incomplete);
@@ -887,7 +896,7 @@ impl App {
         let Some(path) = self.editor.path.as_deref() else {
             return;
         };
-        let lsp = self.lsp.as_ref();
+        let lsp = self.lsp.manager.as_ref();
         let Some(triggers) = lsp.and_then(|l| l.completion_triggers(path)) else {
             return;
         };
@@ -1051,7 +1060,7 @@ impl App {
     /// (LSP 3.18): it then answers instead of the model (#607).
     pub(super) fn editor_offers_inline_completion(&self) -> bool {
         let path = self.editor.path.as_deref();
-        path.zip(self.lsp.as_ref())
+        path.zip(self.lsp.manager.as_ref())
             .is_some_and(|(p, lsp)| lsp.document_offers_inline_completion(p))
     }
 
@@ -1059,7 +1068,7 @@ impl App {
     /// answers for the caret and the text it was asked about.
     pub(super) fn land_inline_lsp(&mut self) -> bool {
         let mut results = Vec::new();
-        if let Some(lsp) = self.lsp.as_ref() {
+        if let Some(lsp) = self.lsp.manager.as_ref() {
             while let Some(r) = lsp.drain_inline_completion() {
                 results.push(r);
             }
@@ -1224,7 +1233,7 @@ impl App {
         }
         if self.editor_offers_inline_completion() {
             let (line, character) = self.editor.cursor_position_utf16();
-            if let Some(lsp) = self.lsp.as_mut() {
+            if let Some(lsp) = self.lsp.manager.as_mut() {
                 let id = lsp.request_inline_completion(path.clone(), line, character);
                 self.inline_asked = Some((path.clone(), seq, row, col));
                 self.inline_lsp = Some((id, path, seq, row, col));

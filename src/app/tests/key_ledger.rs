@@ -1485,7 +1485,7 @@ fn build(ctx: &Context) -> Built {
     let cache = crate::session_state::CacheDirForThisTestThread::set(&tmp.path().join("cache"));
     let mut app = App::new(root.clone()).unwrap();
     super::golden::without_user_files(&mut app, &tmp.path().join("config"));
-    app.lsp = None;
+    app.lsp.manager = None;
     app.is_remote = false;
     app.selected_debug_config = Some(String::from("Ledger"));
     let quiet = PtyTerminal::new_running(
