@@ -630,7 +630,7 @@ fn only_a_picture_whose_cells_changed_counts_as_covered() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let mut buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 40, 20));
-    app.minimap_img_rect = Rect::new(30, 0, 4, 10);
+    app.minimap.img_rect = Rect::new(30, 0, 4, 10);
     app.source_control.last_hero_area = Rect::new(2, 2, 10, 4);
     app.note_pictures_before_popups(&buf);
     buf[(31, 3)].set_symbol("x");

@@ -2769,13 +2769,13 @@ fn cmd_k_opt_arrows_split_the_editor_toward_the_arrow() {
 fn cmd_k_shift_m_moves_the_minimap_to_the_other_edge() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(tmp.path(), "a.txt", "hi");
-    let start = app.minimap_side;
+    let start = app.minimap.side;
     let shift_m = key(KeyCode::Char('M'), KeyModifiers::SHIFT);
     cmd_k_then(&mut app, shift_m);
-    assert!(app.minimap_side != start, "the first press moves it");
+    assert!(app.minimap.side != start, "the first press moves it");
     assert!(!app.terminal_maximized, "not Cmd+K M's terminal maximize");
     cmd_k_then(&mut app, shift_m);
-    assert!(app.minimap_side == start, "the second press moves it back");
+    assert!(app.minimap.side == start, "the second press moves it back");
 }
 
 #[test]

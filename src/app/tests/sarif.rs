@@ -243,7 +243,7 @@ fn sarif_columns_are_chosen_with_c_shown_on_rows_and_remembered() {
         app.editor.open(&log).unwrap();
         // The row is read at a fixed width; the minimap strip, drawn in
         // every terminal since #1231, would take six of its columns.
-        app.minimap_visible = false;
+        app.minimap.visible = false;
         assert!(
             app.editor.sarif.as_ref().unwrap().columns.is_empty(),
             "none by default"

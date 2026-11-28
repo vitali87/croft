@@ -2209,7 +2209,7 @@ fn zen_mode_hides_all_chrome_then_restores_the_snapshot() {
 /// two together, as VS Code centres an editor with its minimap.
 fn editor_column(app: &App) -> (u16, u16) {
     let text = app.editor.last_full_area;
-    let strip = if app.minimap_visible && app.minimap_room {
+    let strip = if app.minimap.visible && app.minimap.room {
         MINIMAP_WIDTH_CELLS
     } else {
         0
@@ -2225,7 +2225,7 @@ fn zen_mode_centres_the_editor_in_a_wide_window() {
     let (_tmp, mut app) = zen_app();
     app.toggle_zen_mode();
     draw_screen(&mut app, 200, 30);
-    assert!(app.minimap_visible && app.minimap_room, "the minimap shows");
+    assert!(app.minimap.visible && app.minimap.room, "the minimap shows");
     assert_eq!(
         editor_column(&app),
         (40, 120),
@@ -4457,7 +4457,7 @@ fn every_customize_layout_row_has_a_palette_command_that_does_the_same() {
             app.secondary_side_bar_visible,
             app.show_terminal,
             app.status_bar_visible,
-            app.minimap_visible,
+            app.minimap.visible,
             app.sidebar_auto_hide,
             app.side_bar_position,
             app.panel_alignment,

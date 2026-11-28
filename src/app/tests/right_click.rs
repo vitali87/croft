@@ -148,7 +148,7 @@ pub(super) fn the_minimap_menu() {
     app.cell_pixel = None;
     app.editor.open(&path).unwrap();
     draw(&mut app, 160, H);
-    let strip = app.minimap_img_rect;
+    let strip = app.minimap.img_rect;
     assert!(strip.width > 0, "the minimap is drawn");
     right_click(&mut app, strip.x + 1, strip.y + 2);
     check(

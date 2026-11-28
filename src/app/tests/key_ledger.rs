@@ -882,8 +882,8 @@ fn fields(app: &App, root: &Path, read: &[String; 5], hide_ids: bool) -> Fields 
         vec![
             ("quit", on(app.quit)),
             ("drop_to_local", on(app.drop_to_local)),
-            ("minimap", on(app.minimap_visible)),
-            ("minimap_left", on(app.minimap_side == MinimapSide::Left)),
+            ("minimap", on(app.minimap.visible)),
+            ("minimap_left", on(app.minimap.side == MinimapSide::Left)),
             ("wrap", on(ed.wrap_enabled())),
             ("zen", on(app.zen_mode())),
             ("aux", on(app.secondary_side_bar_visible)),

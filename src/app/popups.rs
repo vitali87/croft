@@ -226,7 +226,7 @@ impl App {
             let r = Rect::new(l.cell_x, l.cell_y, l.cell_w, l.cell_h);
             spots.push((PictureSpot::Markdown, r));
         }
-        spots.push((PictureSpot::Minimap, self.minimap_img_rect));
+        spots.push((PictureSpot::Minimap, self.minimap.img_rect));
         if let Some(l) = o.welcome.layout() {
             let r = Rect::new(l.cell_x, l.cell_y, l.cell_w, l.cell_h);
             spots.push((PictureSpot::Welcome, r));

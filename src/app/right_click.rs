@@ -66,7 +66,7 @@ impl App {
         // Minimap strip right-click: the VS Code-style options menu
         // (Minimap toggle + Side submenu). Checked first so the strip
         // wins over the editor pane it sits beside.
-        if rect_contains(self.minimap_img_rect, col, row) {
+        if rect_contains(self.minimap.img_rect, col, row) {
             return Some(MenuTarget::Minimap);
         }
         // A COMMITS graph row (#1627): the commit's actions.

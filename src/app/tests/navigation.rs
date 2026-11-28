@@ -2293,9 +2293,9 @@ fn a_symbol_tab_minimap_draws_and_maps_only_its_symbol() {
     assert_eq!(app.editor.minimap_span(), (3, 6));
     // `  fn b`: column 0 is indentation.
     assert!(!lit(&app.editor.minimap_rgba(4, 3, 3, bg, fg)));
-    app.minimap_img_rect = Rect::new(0, 0, 2, 3);
+    app.minimap.img_rect = Rect::new(0, 0, 2, 3);
     app.cell_pixel = Some((1, 1));
-    app.minimap_content_h = 3;
+    app.minimap.content_h = 3;
     app.minimap_scroll_to_row(0);
     assert_eq!(
         app.editor.cursor_row, 3,
@@ -2379,10 +2379,10 @@ fn switching_between_same_length_symbol_tabs_repaints_the_minimap() {
     let strip = Rect::new(100, 1, 6, 20);
     app.editor.select(a);
     app.update_minimap_overlay(strip);
-    assert_eq!(app.minimap_base.as_ref().map(|m| m.sig.5), Some((0, 3)));
+    assert_eq!(app.minimap.base.as_ref().map(|m| m.sig.5), Some((0, 3)));
     app.editor.select(b);
     app.update_minimap_overlay(strip);
-    assert_eq!(app.minimap_base.as_ref().map(|m| m.sig.5), Some((3, 6)));
+    assert_eq!(app.minimap.base.as_ref().map(|m| m.sig.5), Some((3, 6)));
     app.editor.selection = Some(crate::widgets::editor::EditorSelection {
         anchor: (3, 0),
         head: (4, 2),

@@ -2038,7 +2038,7 @@ fn minimap_rebakes_for_typing_at_most_every_few_hundred_ms() {
         "a keystroke right after a bake waits"
     );
     assert!(!app.tick_minimap(), "not due yet");
-    app.minimap_baked_at = Some(std::time::Instant::now() - super::MINIMAP_EDIT_REBAKE);
+    app.minimap.baked_at = Some(std::time::Instant::now() - super::MINIMAP_EDIT_REBAKE);
     assert!(app.tick_minimap(), "the wait is over: redraw");
     assert!(
         !app.tick_minimap(),
@@ -2131,7 +2131,7 @@ fn a_syntax_pass_that_outlives_the_keystroke_lands_on_a_later_tick() {
         "the focused tab"
     );
 
-    app.minimap_baked_at = Some(std::time::Instant::now() - super::MINIMAP_EDIT_REBAKE);
+    app.minimap.baked_at = Some(std::time::Instant::now() - super::MINIMAP_EDIT_REBAKE);
     app.update_minimap_overlay(strip);
     assert_ne!(
         app.minimap_image_payload().map(|(o, _)| o.to_string()),
@@ -2261,7 +2261,7 @@ fn the_minimap_draws_as_braille_without_inline_images() {
     let (_tmp, mut app) = text_minimap_app();
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
-    let strip = app.minimap_img_rect;
+    let strip = app.minimap.img_rect;
     assert_eq!(strip.width, 6, "the strip is carved: {strip:?}");
     assert!(
         braille_in(&term, strip) > 0,
@@ -2285,7 +2285,7 @@ fn a_loch_tab_strip_and_header_seam_run_through_the_minimap_column() {
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let t = crate::theme::tones(app.theme).expect("Loch is the default");
-    let strip = app.minimap_img_rect;
+    let strip = app.minimap.img_rect;
     let top = app.editor.last_full_area.y;
     let seam_y = app.editor.last_body.y;
     let buf = term.backend().buffer();
@@ -2364,7 +2364,7 @@ fn loch_layout_icons_rest_muted_and_lift_on_a_chip() {
 fn a_click_on_the_text_minimap_jumps_to_that_part_of_the_file() {
     let (_tmp, mut app) = text_minimap_app();
     draw(&mut app, 160, 40);
-    let strip = app.minimap_img_rect;
+    let strip = app.minimap.img_rect;
     assert!(strip.height > 0);
     assert_eq!(app.editor.scroll, 0);
     // 300 lines at one dot row each fill 75 cell rows; the strip is shorter,
@@ -2384,7 +2384,7 @@ fn the_minimap_stays_on_the_active_group_in_a_split() {
     assert!(app.editor_layout.is_split());
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(200, 40)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
-    let strip = app.minimap_img_rect;
+    let strip = app.minimap.img_rect;
     let active = app.editor.last_full_area;
     assert_eq!(strip.width, 6, "a split keeps the minimap: {strip:?}");
     assert!(braille_in(&term, strip) > 0, "{}", screen_text(&term));
@@ -2401,7 +2401,7 @@ fn the_minimap_off_draws_no_strip() {
     assert_eq!(app.status, "Minimap off");
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
-    assert_eq!(app.minimap_img_rect, Rect::default());
+    assert_eq!(app.minimap.img_rect, Rect::default());
     let screen = screen_text(&term);
     assert!(
         !screen.chars().any(|c| is_braille(&c.to_string())),

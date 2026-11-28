@@ -2115,35 +2115,11 @@ pub struct App {
     /// painted, so the diff alone emits nothing; the Kitty path skips the
     /// image-eviction wipe (the typing-blink fix), so resize owns its own.
     resize_repaint_needed: bool,
-    /// VS Code-style editor minimap (rasterized document preview in a right/left
-    /// strip). On by default; toggled and re-sided from the strip's right-click
-    /// menu.
-    minimap_visible: bool,
-    minimap_side: MinimapSide,
-    /// Cached whole-file raster; recomposited (not rebaked) on scroll.
-    minimap_base: Option<MinimapBase>,
-    /// Hit-test rect of the on-screen minimap image (text-aligned rows), for
-    /// click-to-scroll and the right-click menu. Empty when the minimap is off.
-    minimap_img_rect: Rect,
+    /// The editor minimap's side, raster, text strip and hit rect
+    /// (see [`inline_images::MinimapState`]).
+    minimap: inline_images::MinimapState,
     /// Which pictures a pop-up was drawn over this frame (#2663).
     picture_cover: popups::PictureCover,
-    /// Pixel height the lines are mapped into within the image (top-aligned;
-    /// `<=` the image's pixel height for short files). Click mapping divides by
-    /// this, not the full strip height, so clicks land on the right line.
-    minimap_content_h: u32,
-    /// When the minimap image was last baked, and whether an edit since then
-    /// is waiting for the next bake (see [`MINIMAP_EDIT_REBAKE`]).
-    minimap_baked_at: Option<std::time::Instant>,
-    minimap_edit_pending: bool,
-    /// The strip was last drawn as braille text, where the terminal cannot
-    /// draw images (#1231); `minimap_content_h` then counts dot rows.
-    minimap_text: bool,
-    /// The braille cells for the text strip, rebuilt only when the same
-    /// signature the image bake keys on changes.
-    minimap_text_cache: Option<(MinimapSig, Vec<BrailleCell>)>,
-    /// Whether the editor was wide enough for the strip on the last frame,
-    /// so turning the minimap on can say why it does not show.
-    minimap_room: bool,
     /// What each small chrome image (the PROBLEMS badge, Run and Debug
     /// icon, sidebar illustrations) was last sent over, keyed by overlay,
     /// for [`App::chrome_image_due`]. Keys not checked in a frame (the image
@@ -4153,17 +4129,8 @@ impl App {
             inline_protocol: crate::iterm2_inline::detect_inline_image_protocol(),
             sixel_supported: false,
             resize_repaint_needed: false,
-            minimap_visible: layout_prefs.minimap,
-            minimap_side: MinimapSide::Right,
-            minimap_base: None,
-            minimap_img_rect: Rect::default(),
+            minimap: inline_images::MinimapState::new(layout_prefs.minimap),
             picture_cover: popups::PictureCover::default(),
-            minimap_content_h: 0,
-            minimap_baked_at: None,
-            minimap_edit_pending: false,
-            minimap_text: false,
-            minimap_text_cache: None,
-            minimap_room: true,
             chrome_sent: std::collections::HashMap::new(),
             chrome_seen: std::collections::HashSet::new(),
             clipboard_reader: read_system_clipboard,
