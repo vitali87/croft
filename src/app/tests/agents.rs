@@ -971,6 +971,10 @@ fn a_workspace_switch_that_drops_this_windows_session_ends_its_stream() {
         "the session this window hosted is gone"
     );
     assert!(
+        app.collab.config.is_none(),
+        "with the socket it was hosted on, so it does not reconnect"
+    );
+    assert!(
         app.collab.stream.is_none(),
         "and so is the stream it carried, badge and all"
     );

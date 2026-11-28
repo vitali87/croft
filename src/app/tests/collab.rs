@@ -896,6 +896,66 @@ fn changing_the_workspace_root_drops_stale_collab_carets() {
     );
 }
 
+/// #2062: a workspace switch starts the multiplayer side over as
+/// `CollabState::rebind` says. A session croft was launched into stays live,
+/// with its socket, stream, connect throttle, last caret sent and name-tag
+/// flag; the old root's merge bases and peers' carets go. The pattern names
+/// every field, so a field added later has to say here whether a switch
+/// starts it over.
+#[test]
+fn a_workspace_switch_keeps_a_launched_session_and_drops_the_old_roots_files() {
+    let (_tmp, _file, _owner, mut guest) = collab_owner_and_guest_on_plan();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let config = guest.collab.config.clone();
+    let connected = guest.collab.last_connect;
+    guest
+        .collab
+        .offline_base
+        .insert(String::from("plan.txt"), String::from("base"));
+    guest.collab.carets.insert(
+        7,
+        CollabCaret {
+            file: String::from("plan.txt"),
+            row: 1,
+            col: 0,
+            name: String::from("owner"),
+            last_moved: std::time::Instant::now(),
+        },
+    );
+    guest.collab.caret_sent = Some((String::from("plan.txt"), 1, 2));
+    guest.collab.labels_visible = true;
+    guest.collab.stream = Some(CollabStreamInfo {
+        file: String::from("plan.txt"),
+        name: String::from("nav"),
+        site: 2,
+        undo_group: 77,
+    });
+
+    guest.change_workspace_root(elsewhere.path().to_path_buf());
+
+    let crate::app::agents_collab::CollabState {
+        session,
+        config: config_after,
+        last_connect,
+        offline_base,
+        carets,
+        caret_sent,
+        labels_visible,
+        stream,
+    } = &guest.collab;
+    assert!(session.is_some(), "a launched session stays connected");
+    assert_eq!(
+        *config_after, config,
+        "with the socket it was launched into"
+    );
+    assert_eq!(*last_connect, connected);
+    assert!(offline_base.is_empty(), "old-root merge bases go");
+    assert!(carets.is_empty(), "old-root peer carets go");
+    assert_eq!(*caret_sent, Some((String::from("plan.txt"), 1, 2)));
+    assert!(*labels_visible);
+    assert_eq!(stream.as_ref().map(|s| s.undo_group), Some(77));
+}
+
 /// A solo guest viewport never hosts the navigator: the owner's croft does,
 /// or two hosts would fight over one seat.
 #[test]

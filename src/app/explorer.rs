@@ -2326,37 +2326,25 @@ impl App {
         // collab owner, that session goes too (a fresh activation
         // self-appoints against the new root).
         let (host, host_lock) = self.pair.rebind(&new_root);
-        if let Some(host) = host {
-            let sites = host.caret_sites();
-            self.collab.carets.retain(|s, _| !sites.contains(s));
+        if let Some(_host) = host {
             self.status = String::from("Navigator unseated (workspace changed)");
         }
         self.clear_problem_fix();
         self.editor.comment_focus = None;
-        if host_lock.is_some() {
-            self.collab.session = None;
-            self.collab.config = None;
-            // With the session gone, the pilot's "stream ended" message can
-            // never arrive, so the stream ends here, as that message would
-            // end it: its undo step closes and its badge goes (#2891).
-            if let Some(stream) = self.collab.stream.take() {
-                for ed in self
-                    .editor_layout
-                    .all_groups_mut(&mut self.editor)
-                    .flat_map(|g| g.editors.iter_mut())
-                {
-                    ed.end_remote_undo_group(stream.undo_group);
-                }
+        // The multiplayer session starts over with the navigator: one this
+        // window hosted ends with the host lock, and old-root merge bases
+        // and peer carets go (`CollabState::rebind`). A stream that ended
+        // with the session closes its undo step here (#2891).
+        if let Some(stream) = self.collab.rebind(host_lock.is_some()) {
+            for ed in self
+                .editor_layout
+                .all_groups_mut(&mut self.editor)
+                .flat_map(|g| g.editors.iter_mut())
+            {
+                ed.end_remote_undo_group(stream.undo_group);
             }
         }
         drop(host_lock);
-        // Old-root merge bases are keyed by root-relative file, like the
-        // carets below: never let them merge into a same-named file here.
-        self.collab.offline_base.clear();
-        // Old-workspace carets are keyed by root-relative file, so a
-        // same-named file under the new root would wear a departed peer's
-        // caret. The live session repopulates its own on the next poll.
-        self.collab.carets.clear();
         // The new primary's saved folder set comes back with it (#153),
         // the same way its terminal layout does: re-rooting into a
         // workspace restores that workspace's arrangement.
