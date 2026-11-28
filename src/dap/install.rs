@@ -95,8 +95,7 @@ pub fn ensure_debug_venv() -> Result<PathBuf> {
 /// uv the language servers use (#2804): on PATH, else croft's own copy or
 /// one where uv's installer puts it.
 fn ensure_debug_venv_in(home: &Path, path_var: Option<&std::ffi::OsStr>) -> Result<PathBuf> {
-    let py = debug_venv_python_in(home);
-    if py.exists() {
+    if let Some(py) = debug_venv_ready_in(home) {
         return Ok(py);
     }
     // One build at a time: a launch made while another prepares the venv
@@ -106,22 +105,27 @@ fn ensure_debug_venv_in(home: &Path, path_var: Option<&std::ffi::OsStr>) -> Resu
     let _building = BUILDING
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if py.exists() {
+    if let Some(py) = debug_venv_ready_in(home) {
         return Ok(py);
     }
+    let py = debug_venv_python_in(home);
     let dir = home.join(".croft").join("debug-venv");
     let uv = crate::lsp::install::uv_program_on(Some(home), path_var)
         .context("uv is not installed; install it (https://docs.astral.sh/uv) to debug Python")?;
     // Never on croft's terminal: uv paints progress bars on stderr, and an
     // inherited TTY would spray them over the running TUI (same class as the
     // pdftoppm trailer-dictionary spray).
-    let mut venv = Command::new(&uv);
-    venv.args(["venv", "-p", PYTHON_VERSION]).arg(&dir);
-    setup_step(&mut venv, "`uv venv`", |why| {
-        format!(
-            "`uv venv -p {PYTHON_VERSION}` failed (is CPython {PYTHON_VERSION} available?): {why}"
-        )
-    })?;
+    // A venv left without debugpy, by an install that failed or never
+    // finished, gets debugpy now rather than a second `uv venv`.
+    if !py.exists() {
+        let mut venv = Command::new(&uv);
+        venv.args(["venv", "-p", PYTHON_VERSION]).arg(&dir);
+        setup_step(&mut venv, "`uv venv`", |why| {
+            format!(
+                "`uv venv -p {PYTHON_VERSION}` failed (is CPython {PYTHON_VERSION} available?): {why}"
+            )
+        })?;
+    }
     let mut pip = Command::new(&uv);
     pip.args(["pip", "install", "--python"])
         .arg(&py)
@@ -130,6 +134,34 @@ fn ensure_debug_venv_in(home: &Path, path_var: Option<&std::ffi::OsStr>) -> Resu
         format!("`uv pip install debugpy` failed: {why}")
     })?;
     Ok(py)
+}
+
+/// The debug venv's interpreter under the home folder `home`, once the venv
+/// is whole: its `python` there and debugpy installed beside it. A venv
+/// whose `uv pip install debugpy` has not finished, or failed, is not ready
+/// (#2803): `python -m debugpy.adapter` would fail under it.
+fn debug_venv_ready_in(home: &Path) -> Option<PathBuf> {
+    let py = debug_venv_python_in(home);
+    let venv = home.join(".croft").join("debug-venv");
+    (py.exists() && debugpy_installed(&venv)).then_some(py)
+}
+
+/// Whether debugpy is installed in the venv at `venv`: its package in the
+/// venv's `lib/python3.*/site-packages`, read without starting Python.
+fn debugpy_installed(venv: &Path) -> bool {
+    std::fs::read_dir(venv.join("lib"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|entry| {
+            entry.file_name().to_string_lossy().starts_with("python")
+                && entry
+                    .path()
+                    .join("site-packages")
+                    .join("debugpy")
+                    .join("__init__.py")
+                    .is_file()
+        })
 }
 
 /// The debug venv's interpreter under the home folder `home`.
@@ -217,8 +249,7 @@ impl DebugTooling for MachineTooling {
         match tooling {
             Tooling::Python => {
                 let home = std::env::var_os("HOME")?;
-                let py = debug_venv_python_in(Path::new(&home));
-                py.exists().then_some(Ready::Python(py))
+                debug_venv_ready_in(Path::new(&home)).map(Ready::Python)
             }
             Tooling::Js => {
                 let server = js_debug_server_path(&js_debug_dir()?);
@@ -705,6 +736,50 @@ mod tests {
             std::fs::read_to_string(&calls).unwrap(),
             "venv -p\npip install\n"
         );
+    }
+
+    /// #2803: a venv whose `python` is there but debugpy is not, from an
+    /// install that failed or has not finished, is not ready, and the next
+    /// setup installs debugpy into it rather than building it again.
+    #[test]
+    fn a_debug_venv_without_debugpy_is_not_ready_and_gets_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = tempfile::tempdir().unwrap();
+        let py = home.path().join(".croft/debug-venv/bin/python");
+        std::fs::create_dir_all(py.parent().unwrap()).unwrap();
+        std::fs::write(&py, "").unwrap();
+        assert_eq!(debug_venv_ready_in(home.path()), None, "no debugpy yet");
+        let dist = home.path().join(".croft/servers/uv-dist");
+        std::fs::create_dir_all(&dist).unwrap();
+        let calls = home.path().join("uv-calls");
+        let site = home
+            .path()
+            .join(".croft/debug-venv/lib/python3.14/site-packages/debugpy");
+        let uv = dist.join("uv");
+        std::fs::write(
+            &uv,
+            format!(
+                "#!/bin/sh\necho \"$1 $2\" >> '{}'\n\
+                 if [ \"$1\" = pip ]; then mkdir -p '{}' && : > '{}/__init__.py'; fi\n",
+                calls.display(),
+                site.display(),
+                site.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&uv, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        let path_var = std::env::join_paths([empty.path()]).unwrap();
+        assert_eq!(
+            ensure_debug_venv_in(home.path(), Some(&path_var)).unwrap(),
+            py
+        );
+        assert_eq!(
+            std::fs::read_to_string(&calls).unwrap(),
+            "pip install\n",
+            "debugpy installed into the venv there"
+        );
+        assert_eq!(debug_venv_ready_in(home.path()), Some(py));
     }
 
     /// #2805: GOPATH may list several folders, as `go` reads it; delve is

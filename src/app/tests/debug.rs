@@ -6613,6 +6613,9 @@ struct HeldTooling {
     will_be: crate::dap::install::Ready,
     fail: Option<String>,
     prepared: std::sync::atomic::AtomicUsize,
+    /// Looks ready as soon as preparing starts, before it is done, as the
+    /// debug venv's `python` is there before debugpy is installed.
+    looks_ready_early: std::sync::atomic::AtomicBool,
 }
 
 impl crate::dap::install::DebugTooling for HeldTooling {
@@ -6621,6 +6624,12 @@ impl crate::dap::install::DebugTooling for HeldTooling {
     }
 
     fn prepare(&self, _: crate::dap::install::Tooling) -> Result<(), String> {
+        if self
+            .looks_ready_early
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            *self.ready.lock().unwrap() = Some(self.will_be.clone());
+        }
         self.prepared
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let _ = self.release.lock().unwrap().recv();
@@ -6657,6 +6666,7 @@ fn app_with_held_tooling(
         will_be: will_be(&root),
         fail: fail.map(String::from),
         prepared: std::sync::atomic::AtomicUsize::new(0),
+        looks_ready_early: std::sync::atomic::AtomicBool::new(false),
     });
     app.debug_tooling = tooling.clone();
     (tmp, app, tooling, tx)
@@ -6740,4 +6750,153 @@ fn a_js_debug_launch_says_why_its_debugger_could_not_be_set_up() {
     settle_debug_setup(&mut app);
     assert_eq!(app.status, "Debugger setup failed: offline");
     assert!(app.run_debug.feedback_is_error);
+}
+
+/// Wait until the held tooling's preparing has started.
+fn preparing_started(tooling: &HeldTooling) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while tooling.prepared.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "preparing never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// #2803 review: a debugger that looks ready while its setup still runs
+/// (the venv's `python` is there, debugpy not yet) is not taken: a second
+/// F5 then waits on the same setup, says so, and the launch starts once,
+/// when the setup is done.
+#[test]
+fn a_second_launch_waits_while_its_debugger_is_still_being_set_up() {
+    let (_tmp, mut app, tooling, release) = app_with_held_tooling(
+        "main.py",
+        |root| crate::dap::install::Ready::Python(root.join("no-such-python")),
+        None,
+    );
+    tooling
+        .looks_ready_early
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    app.start_debug_session();
+    preparing_started(&tooling);
+    app.status.clear();
+    app.start_debug_session();
+    assert_eq!(
+        app.status, "Setting up the Python debugger…",
+        "the second F5 waits for the setup, and says so"
+    );
+    assert_eq!(app.parked_setup_launches(), 1);
+    release.send(()).unwrap();
+    settle_debug_setup(&mut app);
+    assert!(
+        app.status.starts_with("Failed to start debugger"),
+        "the launch ran once the setup was done: {}",
+        app.status
+    );
+}
+
+/// #2803 review: Debug Test is a newer launch, so one still waiting for
+/// its debugger is dropped rather than started later in its place.
+#[test]
+fn debug_test_drops_a_launch_waiting_for_its_debugger() {
+    let (tmp, mut app, _tooling, release) = app_with_held_tooling(
+        "main.js",
+        |root| crate::dap::install::Ready::Js {
+            node: String::from("node"),
+            server: root.join("dapDebugServer.js"),
+        },
+        None,
+    );
+    app.start_debug_session();
+    assert_eq!(app.parked_setup_launches(), 1);
+    let notes = tmp.path().canonicalize().unwrap().join("notes.txt");
+    std::fs::write(&notes, "").unwrap();
+    app.editor.open_pinned(&notes).unwrap();
+    app.debug_named_test_now(String::from("test_adds"));
+    assert_eq!(
+        app.parked_setup_launches(),
+        0,
+        "the older launch no longer waits to replace the test"
+    );
+    release.send(()).unwrap();
+    settle_debug_setup(&mut app);
+    assert!(app.debug_sessions.is_empty(), "nothing older started");
+}
+
+/// #2803 review: a launch waiting for its debugger was asked for in the
+/// workspace it was made in; switching workspaces drops it.
+#[test]
+fn switching_workspace_drops_a_launch_waiting_for_its_debugger() {
+    let (_tmp, mut app, _tooling, _release) = app_with_held_tooling(
+        "main.py",
+        |root| crate::dap::install::Ready::Python(root.join("no-such-python")),
+        None,
+    );
+    app.start_debug_session();
+    assert_eq!(app.parked_setup_launches(), 1);
+    let other = tempfile::tempdir().unwrap();
+    app.change_workspace_root(other.path().to_path_buf());
+    assert_eq!(app.parked_setup_launches(), 0);
+}
+
+/// A compound of two Python members, both waiting for the debugger, with
+/// `stop_all` as given, and a member `A` already running that ends at once.
+fn compound_with_members_waiting_for_setup(
+    stop_all: bool,
+) -> (tempfile::TempDir, App, std::sync::mpsc::Sender<()>) {
+    let (tmp, mut app, _tooling, release) = app_with_held_tooling(
+        "s.py",
+        |root| crate::dap::install::Ready::Python(root.join("no-such-python")),
+        None,
+    );
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".vscode")).unwrap();
+    std::fs::write(
+        root.join(".vscode/launch.json"),
+        format!(
+            r#"{{"version":"0.2.0","configurations":[
+                {{"name":"P1","type":"python","request":"launch","program":"s.py"}},
+                {{"name":"P2","type":"python","request":"launch","program":"s.py"}}],
+              "compounds":[{{"name":"Set","configurations":["P1","P2"],"stopAll":{stop_all}}}]}}"#
+        ),
+    )
+    .unwrap();
+    let compound = crate::dap::configs::discover_compounds(&root)
+        .into_iter()
+        .find(|c| c.name == "Set")
+        .expect("the compound parses");
+    app.launch_compound(&compound);
+    assert_eq!(app.parked_setup_launches(), 2, "{}", app.status);
+    app.debug_sessions.push("A", stub_member(true));
+    app.debug_sessions.focus(0);
+    poll_until_shrinks(&mut app, 1);
+    (tmp, app, release)
+}
+
+/// #2803 review: with `stopAll`, a member ending stops the members still
+/// waiting for their debugger too: they never start after it.
+#[test]
+fn stop_all_stops_members_still_waiting_for_their_debugger() {
+    let (_tmp, mut app, release) = compound_with_members_waiting_for_setup(true);
+    assert_eq!(app.parked_setup_launches(), 0);
+    assert_eq!(
+        app.status,
+        "A ended — stopAll stopped the rest of the compound"
+    );
+    release.send(()).unwrap();
+    settle_debug_setup(&mut app);
+    assert!(app.debug_sessions.is_empty(), "no member started after");
+}
+
+/// #2803 review: without `stopAll`, a member ending while the rest wait for
+/// their debugger does not end the set: they still start.
+#[test]
+fn a_member_ending_while_the_rest_wait_for_their_debugger_keeps_the_set() {
+    let (_tmp, app, _release) = compound_with_members_waiting_for_setup(false);
+    assert_eq!(app.parked_setup_launches(), 2, "the rest still wait");
+    assert_eq!(
+        app.status,
+        "A ended — the rest start when their debugger is set up · Shift+F5 stops all"
+    );
 }

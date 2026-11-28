@@ -79,8 +79,7 @@ impl App {
         // Same as every other launch path: a parked older launch must not
         // fire later and replace this one (#567), nor one waiting for its
         // debugger to be set up (#2803).
-        self.pending_debug_launch = None;
-        self.forget_parked_setup_launches();
+        self.supersede_waiting_launches();
         self.debug_build = None;
         // Zero-config "Debug active file" declares no postDebugTask.
         self.debug_post_tasks.clear();

@@ -33,17 +33,26 @@ pub(in crate::app) struct DebugSetup {
     tooling: Tooling,
     job: crate::jobs::Job<Result<(), String>>,
     waiting: Vec<ParkedLaunch>,
+    /// A member of the set its launches join ended while this was being
+    /// prepared: the set has not ended while they wait, so its
+    /// `postDebugTask`s wait for them too, and run here if they never start.
+    set_end_deferred: bool,
 }
 
 impl App {
     /// The tooling `tooling` names, when it is ready; else it is prepared on
     /// a job, `then` waits for it, and `None` says the launch is parked.
+    ///
+    /// While a job prepares it, it is not ready, whatever it looks like: a
+    /// venv's `python` is there before debugpy is installed in it, and a
+    /// launch let through then fails where it should wait.
     pub(in crate::app) fn debugger_or_park(
         &mut self,
         tooling: Tooling,
         then: impl FnOnce() -> ParkedLaunch,
     ) -> Option<Ready> {
-        if let Some(ready) = self.debug_tooling.ready(tooling) {
+        let preparing = self.debug_setups.iter().any(|s| s.tooling == tooling);
+        if !preparing && let Some(ready) = self.debug_tooling.ready(tooling) {
             return Some(ready);
         }
         let then = then();
@@ -61,6 +70,7 @@ impl App {
                     tooling,
                     job,
                     waiting: vec![then],
+                    set_end_deferred: false,
                 }),
                 Err(e) => {
                     self.debug_error(format!("Debugger setup failed: {e}"));
@@ -104,12 +114,43 @@ impl App {
     pub(in crate::app) fn forget_parked_setup_launches(&mut self) {
         for setup in &mut self.debug_setups {
             setup.waiting.clear();
+            setup.set_end_deferred = false;
         }
+    }
+
+    /// Drop every launch still waiting to start, behind its
+    /// `preLaunchTask` (#567) or for its debugger (#2803). Every launch the
+    /// user starts does this first: left in place, an older one would start
+    /// when its wait ends and replace the newer one.
+    pub(in crate::app) fn supersede_waiting_launches(&mut self) {
+        self.pending_debug_launch = None;
+        self.forget_parked_setup_launches();
     }
 
     /// How many launches wait for a debugger.
     pub(in crate::app) fn parked_setup_launches(&self) -> usize {
         self.debug_setups.iter().map(|s| s.waiting.len()).sum()
+    }
+
+    /// How many compound members wait for a debugger to join the running
+    /// set: while any do, a member ending does not end the set.
+    pub(in crate::app) fn members_waiting_for_setup(&self) -> usize {
+        self.debug_setups
+            .iter()
+            .flat_map(|s| &s.waiting)
+            .filter(|launch| launch.joins())
+            .count()
+    }
+
+    /// A member of the set ended while others wait for their debugger: the
+    /// set ends, and its `postDebugTask`s run, once they have run too, or
+    /// here if their debugger cannot be set up.
+    pub(in crate::app) fn defer_set_end_to_setup(&mut self) {
+        for setup in &mut self.debug_setups {
+            if setup.waiting.iter().any(ParkedLaunch::joins) {
+                setup.set_end_deferred = true;
+            }
+        }
     }
 
     /// Settle the debugger jobs that have answered: start what waited on
@@ -130,17 +171,30 @@ impl App {
                 )),
             };
             let setup = self.debug_setups.remove(i);
-            settled.push((setup.waiting, answer));
+            settled.push((setup.waiting, setup.set_end_deferred, answer));
         }
         let changed = !settled.is_empty();
-        for (waiting, answer) in settled {
+        // What could start starts first, so a set whose other member could
+        // not is seen still running.
+        settled.sort_by_key(|(_, _, answer)| answer.is_err());
+        for (waiting, deferred, answer) in settled {
             match answer {
                 Ok(()) => {
                     for launch in waiting {
                         self.resume_parked_launch(launch);
                     }
                 }
-                Err(why) if !waiting.is_empty() => self.debug_error(why),
+                Err(why) if !waiting.is_empty() => {
+                    self.debug_error(why);
+                    // The set's end waited for these; nothing else runs or
+                    // waits, so it has ended now.
+                    if deferred
+                        && self.debug_sessions.is_empty()
+                        && self.members_waiting_for_setup() == 0
+                    {
+                        self.run_post_debug_tasks();
+                    }
+                }
                 Err(_) => {}
             }
         }

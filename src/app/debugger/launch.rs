@@ -198,8 +198,7 @@ impl App {
         if !self.debug_sessions.is_empty() {
             self.debug_stop();
         }
-        self.pending_debug_launch = None;
-        self.forget_parked_setup_launches();
+        self.supersede_waiting_launches();
         self.debug_build = None;
         self.pending_cargo_launches.clear();
         // A new run: the previous run's cleanup is not this one's.

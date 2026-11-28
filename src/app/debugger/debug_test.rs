@@ -41,6 +41,9 @@ impl App {
     }
 
     pub(in crate::app) fn debug_named_test_now(&mut self, name: String) {
+        // A launch still waiting to start would replace this test's session
+        // when its wait ends (#567, #2803).
+        self.supersede_waiting_launches();
         let file = self.editor.path.clone();
         self.debug_test_in(name, file);
     }

@@ -283,8 +283,7 @@ impl App {
         stop_all: bool,
     ) {
         self.debug_stop();
-        self.pending_debug_launch = None;
-        self.forget_parked_setup_launches();
+        self.supersede_waiting_launches();
         let root = self.active_workspace_root();
         let tasks = crate::tasks::discover_tasks(&root);
         let task = match crate::tasks::find_task(tasks, task_label) {
@@ -397,8 +396,7 @@ impl App {
         // left in place, that task's exit would launch its config and stop
         // this set (#567). The task-gated path reaches here via `take()`, so
         // this only ever drops a STALE parking.
-        self.pending_debug_launch = None;
-        self.forget_parked_setup_launches();
+        self.supersede_waiting_launches();
         self.debug_build = None;
         let total = members.len();
         let mut started = 0usize;
@@ -580,7 +578,7 @@ impl App {
         if !self.debug_sessions.is_empty() {
             self.debug_stop();
         }
-        self.pending_debug_launch = None;
+        self.supersede_waiting_launches();
         self.debug_build = None;
         let root = self.active_workspace_root();
         let tasks = crate::tasks::discover_tasks(&root);
@@ -628,6 +626,22 @@ impl App {
         self.run_debug.feedback_is_error = false;
         self.status =
             format!("{ended} ended — showing {focused}; running: {running} · Shift+F5 stops all");
+    }
+
+    /// A member of the set ended before the rest started: they wait for
+    /// their debugger to be set up (#2803), and start when it is ready.
+    pub(in crate::app) fn report_member_ended_before_the_rest(&mut self, ended: &str) {
+        let what = self
+            .debug_compound
+            .as_deref()
+            .map_or_else(String::new, |c| format!(" compound {c}"));
+        self.run_debug.feedback = Some(format!(
+            "Debugging{what}: {ended} ended; the rest start when their debugger is set up"
+        ));
+        self.run_debug.feedback_is_error = false;
+        self.status = format!(
+            "{ended} ended — the rest start when their debugger is set up · Shift+F5 stops all"
+        );
     }
 
     /// Move the UI to the session at `index` (#567). `events` holds what the

@@ -339,9 +339,13 @@ impl App {
                     );
                     gone.session.disconnect();
                 }
-                // `stopAll: true` (#567): the siblings go too, and the rest
-                // of this arm reports the ended run as for a lone session.
-                let stopped_all = self.debug_stop_all && !self.debug_sessions.is_empty();
+                // `stopAll: true` (#567): the siblings go too, those still
+                // waiting for their debugger among them (#2803), and the
+                // rest of this arm reports the ended run as for a lone
+                // session.
+                let waiting = self.members_waiting_for_setup();
+                let stopped_all =
+                    self.debug_stop_all && (!self.debug_sessions.is_empty() || waiting > 0);
                 if stopped_all {
                     self.debug_stop();
                     self.status =
@@ -351,6 +355,13 @@ impl App {
                     // Siblings are still running, so the debugger is not torn
                     // down: the view moves to one of them.
                     self.report_member_ended(&ended_name);
+                    return true;
+                }
+                if !stopped_all && waiting > 0 {
+                    // Siblings still wait for their debugger (#2803): the set
+                    // has not ended, so its `postDebugTask`s wait for them.
+                    self.defer_set_end_to_setup();
+                    self.report_member_ended_before_the_rest(&ended_name);
                     return true;
                 }
                 // The watchdog reparents to init the moment the server dies;
