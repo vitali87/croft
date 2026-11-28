@@ -935,7 +935,7 @@ impl Editor {
                         .iter()
                         .enumerate()
                         .filter(|(_, line)| {
-                            crate::widgets::search::split_for_highlight(line, &needle, opts)
+                            crate::search::split_for_highlight(line, &needle, opts)
                                 .iter()
                                 // A zero-width match (`^`, `\b`, `q*`) paints no
                                 // cell in the text, so it gets no tick either.

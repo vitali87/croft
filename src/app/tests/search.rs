@@ -191,7 +191,7 @@ fn changing_workspace_root_retargets_search_at_the_new_explorer_root() {
     let inner = tmp.path().join("inner");
     std::fs::create_dir_all(&inner).unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.search.hits.push(crate::widgets::search::SearchHit {
+    app.search.hits.push(crate::search::SearchHit {
         path: tmp.path().join("stale.txt"),
         line_no: 1,
         line_text: String::from("stale"),
@@ -236,7 +236,7 @@ fn mouse_wheel_over_search_panel_scrolls_the_results_list() {
     };
     // 1000 hits, well past anything that can fit in 30 rows.
     app.search.hits = (0..1000)
-        .map(|i| crate::widgets::search::SearchHit {
+        .map(|i| crate::search::SearchHit {
             path: tmp.path().join("a.txt"),
             line_no: i + 1,
             line_text: format!("line {i}"),
@@ -370,7 +370,7 @@ fn search_panel_paints_a_scrollbar_when_hits_exceed_visible_rows() {
     app.sidebar_view = SidebarView::Search;
     app.show_tree = true;
     app.search.hits = (0..500)
-        .map(|i| crate::widgets::search::SearchHit {
+        .map(|i| crate::search::SearchHit {
             path: tmp.path().join("a.txt"),
             line_no: i + 1,
             line_text: format!("line {i}"),
@@ -1042,7 +1042,7 @@ fn point_at(app: &mut App, (column, row): (u16, u16)) {
 /// follows the row under the pointer, not the file that was there.
 #[test]
 fn a_search_result_hint_follows_the_rows_that_move_under_a_resting_pointer() {
-    use crate::widgets::search::{SearchEvent, SearchHit};
+    use crate::search::{SearchEvent, SearchHit};
     let tmp = tempfile::tempdir().unwrap();
     let hit = |name: &str| SearchHit {
         path: tmp.path().join(name).join("mod.rs"),
@@ -1184,7 +1184,7 @@ fn grep_scope_app() -> (tempfile::TempDir, App) {
 /// The files of [`grep_scope_app`] the seeded Search (and so Replace All)
 /// would cover.
 fn seeded_scope(app: &App, root: &std::path::Path) -> Vec<&'static str> {
-    let filter = crate::widgets::search::PathFilter::new(&app.search.include, &app.search.exclude);
+    let filter = crate::search::PathFilter::new(&app.search.include, &app.search.exclude);
     ["docs/guide.md", "src/style.py", "vendor/lib.py"]
         .into_iter()
         .filter(|rel| filter.allows(root, &root.join(rel)))
@@ -1995,7 +1995,7 @@ fn every_find_bar_title_fits_the_bar_it_is_painted_in() {
         width: 60,
         height: 12,
     };
-    let opts = crate::widgets::search::SearchOpts::default();
+    let opts = crate::search::SearchOpts::default();
 
     // Every arm of the title match, with the WHOLE title it must paint, and
     // how to reach it. `match_index` matters as much as the count: the
@@ -2347,7 +2347,7 @@ fn line_joins_counted_deletes_and_find_stay_in_the_symbol() {
 
     // Find wraps within the symbol: from `fn a`'s `}`, the next `}` is
     // that same one, not `fn b`'s.
-    let opts = crate::widgets::search::SearchOpts::default();
+    let opts = crate::search::SearchOpts::default();
     let m = app.editor_find_step(true, "}", opts, 2, 0, true).unwrap();
     assert_eq!(m.row, 2);
 
@@ -2563,7 +2563,8 @@ fn a_search_editor_rerun_drops_a_selection_its_results_no_longer_have() {
 /// letters still type.
 #[test]
 fn search_toggles_and_details_answer_the_keyboard() {
-    use crate::widgets::search::{SearchField, SearchOpts};
+    use crate::search::SearchOpts;
+    use crate::widgets::search::SearchField;
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.set_sidebar_view(SidebarView::Search);
@@ -2636,7 +2637,7 @@ fn alt_p_toggles_preserve_case_in_the_search_side_bar() {
 /// whose predecessor's events are dropped.
 #[test]
 fn toggling_preserve_case_mid_search_keeps_the_search_live() {
-    use crate::widgets::search::SearchEvent;
+    use crate::search::SearchEvent;
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.set_sidebar_view(SidebarView::Search);
@@ -2674,7 +2675,7 @@ fn toggling_preserve_case_mid_search_keeps_the_search_live() {
 /// looked at anything.
 #[test]
 fn a_search_run_again_drops_what_the_earlier_run_still_sends() {
-    use crate::widgets::search::{SearchEvent, SearchHit};
+    use crate::search::{SearchEvent, SearchHit};
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.set_sidebar_view(SidebarView::Search);
@@ -2715,7 +2716,7 @@ fn a_search_run_again_drops_what_the_earlier_run_still_sends() {
 /// instead of replacing only what was found, and coming back runs it again.
 #[test]
 fn a_search_stopped_by_leaving_search_runs_again_on_coming_back() {
-    use crate::widgets::search::{SearchEvent, SearchRequest};
+    use crate::search::{SearchEvent, SearchRequest};
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(
         tmp.path().join("a.txt"),
@@ -2771,7 +2772,7 @@ fn a_search_stopped_by_leaving_search_runs_again_on_coming_back() {
 /// runs it again.
 #[test]
 fn a_search_whose_scan_crashed_stops_and_can_be_run_again() {
-    use crate::widgets::search::SearchEvent;
+    use crate::search::SearchEvent;
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.set_sidebar_view(SidebarView::Search);
@@ -2806,7 +2807,7 @@ fn a_search_whose_scan_crashed_stops_and_can_be_run_again() {
 /// cancel keeps the run finished.
 #[test]
 fn a_search_left_and_reopened_before_its_cancel_lands_runs_again() {
-    use crate::widgets::search::{SearchEvent, SearchRequest};
+    use crate::search::{SearchEvent, SearchRequest};
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.set_sidebar_view(SidebarView::Search);
@@ -2844,7 +2845,7 @@ fn a_search_left_and_reopened_before_its_cancel_lands_runs_again() {
 /// its hits for the old root and its end must not fill the cleared list.
 #[test]
 fn a_new_root_after_leaving_search_drops_the_stopped_runs_events() {
-    use crate::widgets::search::{SearchEvent, SearchHit};
+    use crate::search::{SearchEvent, SearchHit};
     let tmp = tempfile::tempdir().unwrap();
     let new_root = tmp.path().join("sub");
     std::fs::create_dir(&new_root).unwrap();
@@ -2884,7 +2885,7 @@ fn a_new_root_after_leaving_search_drops_the_stopped_runs_events() {
 /// coming back to Search runs it again.
 #[test]
 fn a_finished_search_is_not_replaced_after_the_folders_change() {
-    use crate::widgets::search::{SearchEvent, SearchHit};
+    use crate::search::{SearchEvent, SearchHit};
     let tmp = tempfile::tempdir().unwrap();
     let added = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("a.txt"), "needle\n").unwrap();
@@ -2937,7 +2938,7 @@ fn a_finished_search_is_not_replaced_after_the_folders_change() {
 /// search is not taken as finished.
 #[test]
 fn a_new_root_drops_the_old_roots_search() {
-    use crate::widgets::search::{SearchEvent, SearchHit};
+    use crate::search::{SearchEvent, SearchHit};
     let tmp = tempfile::tempdir().unwrap();
     let new_root = tmp.path().join("sub");
     std::fs::create_dir(&new_root).unwrap();
@@ -3039,7 +3040,7 @@ fn search_commands_run_from_the_palette_reveal_the_side_bar() {
 /// flips one (`Ctrl+Alt+C` is not Match Case).
 #[test]
 fn search_alt_toggles_stay_inside_the_search_inputs() {
-    use crate::widgets::search::SearchOpts;
+    use crate::search::SearchOpts;
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(tmp.path(), "a.txt", "foo");
     app.set_sidebar_view(SidebarView::Search);
@@ -3150,7 +3151,7 @@ fn search_results_are_announced_with_the_count_and_the_selected_match() {
         None,
         "no results, nothing selected"
     );
-    let hit = |file: &str, line_no: usize, text: &str| crate::widgets::search::SearchHit {
+    let hit = |file: &str, line_no: usize, text: &str| crate::search::SearchHit {
         path: tmp.path().join(file),
         line_no,
         line_text: text.into(),
@@ -3175,7 +3176,7 @@ fn search_announces_every_match_on_a_line() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.focus = Pane::Tree;
     app.sidebar_view = SidebarView::Search;
-    app.search.hits = vec![crate::widgets::search::SearchHit {
+    app.search.hits = vec![crate::search::SearchHit {
         path: tmp.path().join("b.py"),
         line_no: 3,
         line_text: "total += total".into(),
@@ -3340,7 +3341,7 @@ fn a_click_on_the_find_bar_puts_the_caret_under_it() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let mut find = crate::widgets::editor_find::EditorFind::new(
         String::from("needle"),
-        crate::widgets::search::SearchOpts::default(),
+        crate::search::SearchOpts::default(),
     );
     find.last_rect = ratatui::layout::Rect {
         x: 10,
@@ -3367,7 +3368,7 @@ fn a_click_on_the_find_bar_from_another_pane_focuses_the_editor() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let mut find = crate::widgets::editor_find::EditorFind::new(
         String::from("needle"),
-        crate::widgets::search::SearchOpts::default(),
+        crate::search::SearchOpts::default(),
     );
     find.last_rect = ratatui::layout::Rect {
         x: 10,
@@ -3397,7 +3398,7 @@ fn a_longer_whole_query_puts_the_find_caret_at_its_end() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.editor_find = Some(crate::widgets::editor_find::EditorFind::new(
         String::from("ab"),
-        crate::widgets::search::SearchOpts::default(),
+        crate::search::SearchOpts::default(),
     ));
     app.editor_find_set_query(String::from("abcdef"));
     let st = app.editor_find.as_ref().unwrap();

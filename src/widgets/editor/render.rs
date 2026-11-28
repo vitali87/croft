@@ -2400,7 +2400,7 @@ pub(super) fn paint_search_highlight(
     text_width: u16,
     raw_line: &str,
     needle: &str,
-    opts: crate::widgets::search::SearchOpts,
+    opts: crate::search::SearchOpts,
     row: &RowCells,
     active_match_on_line: Option<(usize, usize)>,
     cells: Option<&crate::cell_map::CellMap>,
@@ -2422,7 +2422,7 @@ pub(super) fn paint_search_highlight(
             None => inactive_style,
         }
     };
-    let segments = crate::widgets::search::split_for_highlight(raw_line, needle, opts);
+    let segments = crate::search::split_for_highlight(raw_line, needle, opts);
     // `abs_col` tracks the absolute character index in the original line.
     // Columns before the row's start are scrolled out; the rest map
     // through the row's geometry and are painted inside `text_width`.

@@ -1,0 +1,1 @@
+refactor: the app, the editor, the terminal, the file tree, the diff tab, the find bars, the search editor and the log view name the search engine at `crate::search`, and the Search view re-exports nothing (#2062). Nothing changes in use.

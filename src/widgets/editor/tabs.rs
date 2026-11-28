@@ -39,7 +39,7 @@ impl EditorTabs {
             tab_strip: Box::default(),
             last_full_area: Rect::default(),
             search_highlight_term: None,
-            search_highlight_opts: crate::widgets::search::SearchOpts::default(),
+            search_highlight_opts: crate::search::SearchOpts::default(),
             hover_pointer: None,
             released_bookmarks: Vec::new(),
         }
@@ -55,11 +55,7 @@ impl EditorTabs {
     /// search mode (case / whole-word / regex) re-paints the file with
     /// the matching rule. Also persists term + opts so editors created
     /// after this call (e.g. after a close + reopen) inherit them.
-    pub fn set_search_highlight(
-        &mut self,
-        term: Option<String>,
-        opts: crate::widgets::search::SearchOpts,
-    ) {
+    pub fn set_search_highlight(&mut self, term: Option<String>, opts: crate::search::SearchOpts) {
         let normalised = term.filter(|s| !s.is_empty());
         let cleared = normalised.is_none();
         self.search_highlight_term = normalised.clone();

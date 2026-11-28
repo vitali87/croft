@@ -1139,13 +1139,13 @@ impl App {
         search.extend(p.search_exclude.iter().cloned());
         if search != self.search.project_exclude {
             self.search.project_exclude = search;
-            if !crate::widgets::search::as_typed(&self.search.query).is_empty() {
+            if !crate::search::as_typed(&self.search.query).is_empty() {
                 self.submit_search_query();
             }
         }
         if p.files_exclude != self.files_exclude {
             self.files_exclude = p.files_exclude.clone();
-            self.tree.exclude = crate::widgets::search::PathFilter::excluding(&self.files_exclude);
+            self.tree.exclude = crate::search::PathFilter::excluding(&self.files_exclude);
             self.tree.refresh_children(0);
         }
     }

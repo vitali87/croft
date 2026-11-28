@@ -1604,7 +1604,7 @@ fn terminal_find_matches_are_an_amber_tint_on_croft_loch_and_gold_when_boxed() {
     wait_for_grid(&term, |ls| ls.iter().any(|l| l.starts_with("find the")));
     term.set_search(
         Some(String::from("needle")),
-        crate::widgets::search::SearchOpts::default(),
+        crate::search::SearchOpts::default(),
     );
     let area = Rect::new(0, 0, 60, 10);
     term.last_inner = Rect::new(1, 1, 58, 8);
@@ -3695,7 +3695,7 @@ fn grid_lines_exposes_output_for_terminal_find() {
             let hit = crate::widgets::editor_find::find_next_match(
                 &lines,
                 needle,
-                crate::widgets::search::SearchOpts::default(),
+                crate::search::SearchOpts::default(),
                 0,
                 0,
                 false,

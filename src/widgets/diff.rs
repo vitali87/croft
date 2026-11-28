@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::diff::{DIFF_DEADLINE, DiffRow, build_diff_rows_within};
+use crate::search::SearchOpts;
 use crate::widgets::editor_find::line_matches;
-use crate::widgets::search::SearchOpts;
 
 /// Max selected-text length that still drives occurrence highlighting,
 /// matching VS Code's default `editor.selectionHighlightMaxLength`. Kept in

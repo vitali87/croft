@@ -375,7 +375,7 @@ pub struct PtyTerminal {
     /// Set by the app's terminal find bar; the render loop paints every
     /// occurrence on each visible row.
     search_needle: Option<String>,
-    search_opts: crate::widgets::search::SearchOpts,
+    search_opts: crate::search::SearchOpts,
     /// The active match painted in the brighter accent, versus the muted
     /// highlight on every other occurrence (VS Code's current-vs-other match
     /// colours). Stored as `(clock_rec, line_rec, col, len)` — the line is
