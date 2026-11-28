@@ -117,9 +117,12 @@ pub struct PdfState {
 /// waits for its page's links.
 #[derive(Default)]
 pub struct PdfJobs {
-    /// The page asked for and its rasterisation. A newer page turn replaces
-    /// it: the latest one asked for is the one shown.
+    /// The page being rendered: one at a time, so holding a page key never
+    /// piles up renderers.
     render: Option<PageJob<Vec<u8>>>,
+    /// The page asked for while one renders, rendered after it: the latest
+    /// one asked for is the one shown.
+    next_page: Option<u32>,
     /// The page count, read after the open.
     count: Option<crate::jobs::Job<Option<u32>>>,
     /// End was pressed before the count was in: go to the last page once it
@@ -139,6 +142,12 @@ impl PdfJobs {
     /// Whether any of a PDF's work is still running.
     pub fn busy(&self) -> bool {
         self.render.is_some() || self.count.is_some() || self.links.is_some()
+    }
+
+    /// The page being rendered now, for a test.
+    #[cfg(test)]
+    pub fn rendering_page(&self) -> Option<u32> {
+        self.render.as_ref().map(|(page, _)| *page)
     }
 }
 
@@ -2002,9 +2011,8 @@ impl Editor {
     /// renders, else the one on screen.
     pub fn pdf_target_page(&self) -> Option<u32> {
         self.pdf_jobs
-            .render
-            .as_ref()
-            .map(|(page, _)| *page)
+            .next_page
+            .or_else(|| self.pdf_jobs.render.as_ref().map(|(page, _)| *page))
             .or_else(|| self.pdf_page())
     }
 
@@ -2022,6 +2030,8 @@ impl Editor {
         if page == u32::MAX && pdf.page_count.is_none() {
             // Still being read: go there once it is in.
             if self.pdf_jobs.count.is_some() {
+                // The newest wish: a page asked for before it is dropped.
+                self.pdf_jobs.next_page = None;
                 self.pdf_jobs.last_page_wanted = true;
                 return false;
             }
@@ -2039,13 +2049,21 @@ impl Editor {
         let Some(pdf) = self.image.as_ref().and_then(|i| i.pdf.clone()) else {
             return false;
         };
+        // A page asked for after End, while the count was still being read,
+        // is the newer wish: End is dropped.
+        self.pdf_jobs.last_page_wanted = false;
         if Some(new_page) == self.pdf_target_page() {
             return false;
         }
+        if self.pdf_jobs.render.is_some() {
+            // One render at a time: this page goes after the one running
+            // ([`Self::poll_pdf_jobs`]), replacing any asked for before it.
+            self.pdf_jobs.next_page = Some(new_page);
+            return false;
+        }
         if new_page == pdf.current_page {
-            // Back to the page on screen: whatever was asked for since is
-            // dropped.
-            self.pdf_jobs.render = None;
+            // Back to the page on screen, with nothing rendering.
+            self.pdf_jobs.next_page = None;
             return false;
         }
         let (source, backend) = (pdf.source_path.clone(), pdf.backend);
@@ -2096,17 +2114,33 @@ impl Editor {
                 crate::jobs::Poll::Pending => {}
                 crate::jobs::Poll::Done(Ok(bytes)) => {
                     self.pdf_jobs.render = None;
-                    changed |= self.show_pdf_page(page, bytes);
+                    match self.pdf_jobs.next_page.take() {
+                        // The reader went back to the page on screen while
+                        // this one rendered: it stays.
+                        Some(next) if Some(next) == self.pdf_page() => {}
+                        next => {
+                            changed |= self.show_pdf_page(page, bytes);
+                            if let Some(next) = next.filter(|&next| next != page) {
+                                self.render_pdf_page(next);
+                            }
+                        }
+                    }
                 }
                 crate::jobs::Poll::Done(Err(e)) => {
                     self.pdf_jobs.render = None;
                     self.status = format!("PDF page {page} failed: {e}");
                     changed = true;
+                    if let Some(next) = self.pdf_jobs.next_page.take() {
+                        self.render_pdf_page(next);
+                    }
                 }
                 crate::jobs::Poll::Died => {
                     self.pdf_jobs.render = None;
                     self.status = format!("PDF page {page} failed: it stopped before it finished");
                     changed = true;
+                    if let Some(next) = self.pdf_jobs.next_page.take() {
+                        self.render_pdf_page(next);
+                    }
                 }
             }
         }

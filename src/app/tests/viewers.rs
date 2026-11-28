@@ -2189,6 +2189,54 @@ fn a_pdf_page_turn_does_not_wait_for_the_render() {
     assert_eq!(current_pdf_page(&mut app), 3);
 }
 
+/// Holding a page key renders one page at a time (#2824 review): the page
+/// asked for last waits for the one rendering, instead of a renderer per key
+/// repeat piling up.
+#[test]
+fn holding_a_pdf_page_key_renders_one_page_at_a_time() {
+    require_pdf_backend();
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("doc.pdf");
+    write_three_page_pdf(&path);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&path).unwrap();
+    app.focus_pane(Pane::Editor);
+    settle_pdf(&mut app);
+    for _ in 0..2 {
+        app.handle_key(key(KeyCode::Right, KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(
+        app.editor.pdf_jobs.rendering_page(),
+        Some(2),
+        "the first press's page is the only one rendering"
+    );
+    assert_eq!(app.editor.pdf_target_page(), Some(3));
+    assert_eq!(
+        current_pdf_page(&mut app),
+        3,
+        "the last page asked for lands"
+    );
+}
+
+/// End pressed before the page count is in, then Home: Home is the newer
+/// wish and wins (#2824 review).
+#[test]
+fn home_after_an_early_end_stays_on_the_first_pdf_page() {
+    require_pdf_backend();
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("doc.pdf");
+    write_three_page_pdf(&path);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&path).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Home, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(current_pdf_page(&mut app), 1, "Home came after End");
+}
+
 /// End pressed right after the open, before the page count is in, goes to
 /// the last page once it is: the count is read on a job (#2824).
 #[test]
