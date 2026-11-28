@@ -512,7 +512,7 @@ fn ctrl_shift_t_globally_splits_terminal() {
 fn clicking_terminal_add_button_splits() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.terminal_add_buttons = vec![Rect {
+    app.panel_hits.add_buttons = vec![Rect {
         x: 50,
         y: 30,
         width: 3,
@@ -535,7 +535,7 @@ fn clicking_terminal_close_button_drops_active_terminal() {
     app.split_terminal().unwrap();
     assert_eq!(app.terminals.len(), 2);
     assert_eq!(app.active_terminal, 1);
-    app.terminal_close_buttons = vec![
+    app.panel_hits.close_buttons = vec![
         Rect {
             x: 10,
             y: 30,
@@ -572,7 +572,7 @@ fn clicking_close_button_on_non_active_terminal_drops_that_specific_terminal() {
     assert_eq!(app.active_terminal, 2);
     let pid_left = app.terminals[0].pid();
     let pid_right = app.terminals[2].pid();
-    app.terminal_close_buttons = vec![
+    app.panel_hits.close_buttons = vec![
         Rect {
             x: 10,
             y: 30,
@@ -630,20 +630,23 @@ fn the_focus_button_on_the_panel_row_maximizes_the_active_pane() {
     let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
     app.active_terminal = 1;
     term.draw(|f| app.render(f)).unwrap();
-    let b = app.terminal_focus_button;
+    let b = app.panel_hits.focus_button;
     assert!(b.width > 0, "two or more terminals paint the focus button");
     assert_eq!(
-        b.y, app.terminal_tab_rect.y,
+        b.y, app.panel_hits.terminal_tab.y,
         "it sits on the panel's tab row"
     );
-    assert!(b.x > app.terminal_tab_rect.right(), "right of the tabs");
+    assert!(
+        b.x > app.panel_hits.terminal_tab.right(),
+        "right of the tabs"
+    );
     assert!(painted(&term, b).contains('\u{eb4c}'), "the ⛶ glyph");
     left_click(&mut app, b.x + 1, b.y);
     assert!(app.terminal_pane_maximized, "the click enters focus mode");
     assert_eq!(app.active_terminal, 1, "on the pane that was active");
 
     term.draw(|f| app.render(f)).unwrap();
-    let b = app.terminal_focus_button;
+    let b = app.panel_hits.focus_button;
     assert!(
         painted(&term, b).contains('\u{eb4d}'),
         "the button turns into restore"
@@ -674,10 +677,10 @@ fn the_panel_row_chevron_maximizes_and_restores_the_whole_panel() {
 fn chevron_round_trip(app: &mut App, term: &mut ratatui::Terminal<ratatui::backend::TestBackend>) {
     let panel_rows = |app: &App| app.terminals[0].last_area.height;
     let split_rows = panel_rows(app);
-    let b = app.panel_maximize_button;
+    let b = app.panel_hits.maximize_button;
     assert!(b.width > 0, "the panel paints its maximize button");
-    assert_eq!(b.y, app.terminal_tab_rect.y, "on the panel's tab row");
-    let focus = app.terminal_focus_button;
+    assert_eq!(b.y, app.panel_hits.terminal_tab.y, "on the panel's tab row");
+    let focus = app.panel_hits.focus_button;
     assert!(focus.width > 0 && b.x >= focus.right(), "rightmost, past ⛶");
     assert!(painted(term, b).contains('\u{eab7}'), "chevron-up");
 
@@ -688,7 +691,7 @@ fn chevron_round_trip(app: &mut App, term: &mut ratatui::Terminal<ratatui::backe
         panel_rows(app) > split_rows,
         "the panes grow over the editor"
     );
-    let b = app.panel_maximize_button;
+    let b = app.panel_hits.maximize_button;
     assert!(
         painted(term, b).contains('\u{eab4}'),
         "chevron-down restores"
@@ -708,18 +711,25 @@ fn chevron_round_trip(app: &mut App, term: &mut ratatui::Terminal<ratatui::backe
 #[test]
 fn the_focus_button_needs_two_terminals_and_the_terminal_tab() {
     let (_tmp, mut app, mut term) = app_with_terminal_panes(1);
-    assert_eq!(app.terminal_focus_button, Rect::default(), "one terminal");
-    assert!(app.panel_maximize_button.width > 0);
+    assert_eq!(app.panel_hits.focus_button, Rect::default(), "one terminal");
+    assert!(app.panel_hits.maximize_button.width > 0);
 
     app.split_terminal().unwrap();
     app.bottom_panel_tab = BottomPanelTab::Problems;
     term.draw(|f| app.render(f)).unwrap();
-    assert_eq!(app.terminal_focus_button, Rect::default(), "PROBLEMS tab");
-    assert!(app.panel_maximize_button.width > 0, "the chevron stays");
+    assert_eq!(app.panel_hits.focus_button, Rect::default(), "PROBLEMS tab");
+    assert!(
+        app.panel_hits.maximize_button.width > 0,
+        "the chevron stays"
+    );
 
     app.show_terminal = false;
     term.draw(|f| app.render(f)).unwrap();
-    assert_eq!(app.panel_maximize_button, Rect::default(), "hidden panel");
+    assert_eq!(
+        app.panel_hits.maximize_button,
+        Rect::default(),
+        "hidden panel"
+    );
 }
 
 /// Negative (#1980 review): a window shrunk to one row gives the panel's one
@@ -731,9 +741,9 @@ fn a_one_row_window_keeps_no_panel_row_targets() {
     let (_tmp, mut app, mut term) = app_with_terminal_panes(2);
     app.toggle_terminal_maximize();
     term.draw(|f| app.render(f)).unwrap();
-    assert!(app.panel_maximize_button.width > 0, "precondition");
-    assert!(app.terminal_focus_button.width > 0, "precondition");
-    assert!(app.terminal_tab_rect.width > 0, "precondition");
+    assert!(app.panel_hits.maximize_button.width > 0, "precondition");
+    assert!(app.panel_hits.focus_button.width > 0, "precondition");
+    assert!(app.panel_hits.terminal_tab.width > 0, "precondition");
 
     let mut one = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 1)).unwrap();
     one.draw(|f| app.render(f)).unwrap();
@@ -741,9 +751,9 @@ fn a_one_row_window_keeps_no_panel_row_targets() {
         !painted(&one, Rect::new(0, 0, 160, 1)).contains("TERMINAL"),
         "setup: no tab row is on screen"
     );
-    assert_eq!(app.panel_maximize_button, Rect::default());
-    assert_eq!(app.terminal_focus_button, Rect::default());
-    assert_eq!(app.terminal_tab_rect, Rect::default());
+    assert_eq!(app.panel_hits.maximize_button, Rect::default());
+    assert_eq!(app.panel_hits.focus_button, Rect::default());
+    assert_eq!(app.panel_hits.terminal_tab, Rect::default());
 }
 
 /// Negative (#1980): on a panel too narrow for the tabs and the controls, the
@@ -758,24 +768,24 @@ fn the_panel_row_controls_never_cover_a_tab() {
     for w in (30..=70).step_by(4) {
         draw(&mut app, w, 30);
         let tabs = [
-            app.problems_tab_rect,
-            app.output_tab_rect,
-            app.terminal_tab_rect,
-            app.ports_tab_rect,
-            app.captures_tab_rect,
+            app.panel_hits.problems_tab,
+            app.panel_hits.output_tab,
+            app.panel_hits.terminal_tab,
+            app.panel_hits.ports_tab,
+            app.panel_hits.captures_tab,
         ];
         let last_tab = tabs.iter().map(|r| r.right()).max().unwrap();
-        for b in [app.panel_maximize_button, app.terminal_focus_button] {
+        for b in [app.panel_hits.maximize_button, app.panel_hits.focus_button] {
             assert!(
                 b.is_empty() || b.x > last_tab,
                 "width {w}: control {b:?} overlaps a tab ending at {last_tab}"
             );
         }
         if w == 30 {
-            assert_eq!(app.panel_maximize_button, Rect::default(), "no room");
+            assert_eq!(app.panel_hits.maximize_button, Rect::default(), "no room");
         }
     }
-    assert!(app.terminal_focus_button.width > 0, "room for both at 70");
+    assert!(app.panel_hits.focus_button.width > 0, "room for both at 70");
 }
 
 /// Croft Loch hangs a lone terminal's `∨ +` on the tab row, between the last
@@ -788,22 +798,22 @@ fn croft_loch_hangs_a_lone_terminals_buttons_on_the_tab_row() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.show_tree = false;
     draw(&mut app, 140, 40);
-    let strip_y = app.terminal_tab_rect.y;
+    let strip_y = app.panel_hits.terminal_tab.y;
     let tabs_end = [
-        app.problems_tab_rect,
-        app.output_tab_rect,
-        app.terminal_tab_rect,
-        app.ports_tab_rect,
-        app.captures_tab_rect,
+        app.panel_hits.problems_tab,
+        app.panel_hits.output_tab,
+        app.panel_hits.terminal_tab,
+        app.panel_hits.ports_tab,
+        app.panel_hits.captures_tab,
     ]
     .iter()
     .map(|r| r.right())
     .max()
     .unwrap();
     let (add, caret, chevron) = (
-        app.terminal_add_buttons[0],
-        app.terminal_profile_buttons[0],
-        app.panel_maximize_button,
+        app.panel_hits.add_buttons[0],
+        app.panel_hits.profile_buttons[0],
+        app.panel_hits.maximize_button,
     );
     assert_eq!((add.y, caret.y), (strip_y, strip_y), "on the tab row");
     assert!(
@@ -825,14 +835,17 @@ fn croft_loch_hangs_a_lone_terminals_buttons_on_the_tab_row() {
     assert_eq!(app.terminals.len(), 2, "the `+` still splits");
     // Two panes: the buttons go back to each pane's own top row.
     draw(&mut app, 140, 40);
-    assert_eq!(app.terminal_add_buttons[0].y, app.terminals[0].last_area.y);
+    assert_eq!(
+        app.panel_hits.add_buttons[0].y,
+        app.terminals[0].last_area.y
+    );
     // Croft Black keeps them on the pane, as before.
     let mut black = App::new(tmp.path().to_path_buf()).unwrap();
     black.apply_theme(crate::theme::Theme::BLACK);
     black.show_tree = false;
     draw(&mut black, 140, 40);
     assert_eq!(
-        black.terminal_add_buttons[0].y,
+        black.panel_hits.add_buttons[0].y,
         black.terminals[0].last_area.y
     );
 }
@@ -929,18 +942,18 @@ fn maximized_terminal_fills_width_and_lists_others_in_rail() {
         }
     }
     assert_eq!(
-        app.terminal_rail_rects.len(),
+        app.panel_hits.rail_rows.len(),
         3,
         "the right-side rail lists every terminal"
     );
-    let xs: std::collections::HashSet<u16> = app.terminal_rail_rects.iter().map(|r| r.x).collect();
+    let xs: std::collections::HashSet<u16> = app.panel_hits.rail_rows.iter().map(|r| r.x).collect();
     assert_eq!(xs.len(), 1, "rail rows stack vertically in one column");
-    let ys: std::collections::HashSet<u16> = app.terminal_rail_rects.iter().map(|r| r.y).collect();
+    let ys: std::collections::HashSet<u16> = app.panel_hits.rail_rows.iter().map(|r| r.y).collect();
     assert_eq!(ys.len(), 3, "each rail row sits on its own line");
     // One restore control for the panel, on its tab row, rather than one on
     // the maximized pane (#1980).
-    assert!(app.terminal_focus_button.width > 0);
-    assert_eq!(app.terminal_focus_button.y, app.terminal_tab_rect.y);
+    assert!(app.panel_hits.focus_button.width > 0);
+    assert_eq!(app.panel_hits.focus_button.y, app.panel_hits.terminal_tab.y);
 }
 
 #[test]
@@ -971,7 +984,8 @@ fn a_clamped_rail_never_paints_past_its_own_column() {
     term.draw(|f| app.render(f)).unwrap();
 
     assert!(
-        app.terminal_rail_rects
+        app.panel_hits
+            .rail_rows
             .iter()
             .any(|r| r.width < TERMINAL_RAIL_W),
         "this layout must actually clamp the rail, or the test proves nothing"
@@ -984,7 +998,7 @@ fn a_clamped_rail_never_paints_past_its_own_column() {
             .symbol()
             .to_string()
     };
-    for rail in &app.terminal_rail_rects {
+    for rail in &app.panel_hits.rail_rows {
         let past = rail.x + rail.width;
         // Inside the rail the label must actually be painted, or a future
         // layout change could shrink the rail until nothing bleeds and the
@@ -1018,14 +1032,14 @@ fn rail_is_a_fixed_narrow_column_showing_four_label_chars() {
     app.terminals[0].set_manual_name(Some(String::from("zsh")));
     app.terminals[1].set_manual_name(Some(String::from("a-very-long-terminal-pane-name")));
     term.draw(|f| app.render(f)).unwrap();
-    for r in &app.terminal_rail_rects {
+    for r in &app.panel_hits.rail_rows {
         assert_eq!(
             r.width, TERMINAL_RAIL_W,
             "the rail must always be exactly {TERMINAL_RAIL_W} cells wide"
         );
     }
     // The long name is cut to its first 4 characters in the rail row.
-    let rail = app.terminal_rail_rects[1];
+    let rail = app.panel_hits.rail_rows[1];
     let cells: String = (rail.x..rail.x + rail.width)
         .map(|x| {
             term.backend()
@@ -1062,7 +1076,7 @@ fn croft_loch_rail_marks_the_active_terminal_with_the_selected_row() {
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let buf = term.backend().buffer();
-    let (on, off) = (app.terminal_rail_rects[0], app.terminal_rail_rects[1]);
+    let (on, off) = (app.panel_hits.rail_rows[0], app.panel_hits.rail_rows[1]);
     let bar = &buf[(on.x, on.y)];
     assert_eq!(
         (bar.symbol(), bar.fg),
@@ -1091,7 +1105,7 @@ fn clicking_rail_row_switches_terminal_and_stays_maximized() {
     let backend = ratatui::backend::TestBackend::new(180, 40);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
-    let r = app.terminal_rail_rects[0];
+    let r = app.panel_hits.rail_rows[0];
     app.handle_mouse(crossterm::event::MouseEvent {
         kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
         column: r.x + 1,
@@ -1161,8 +1175,8 @@ fn assert_pane_pill_clears_its_buttons(name: &str) {
     // new one free to be overpainted - the same bug this test exists for,
     // three columns over.
     let families: [(&str, &Vec<Rect>, char); 1] =
-        [("collapse", &app.terminal_collapse_buttons, '\u{eab5}')];
-    for (i, pill) in app.terminal_label_rects.iter().enumerate() {
+        [("collapse", &app.panel_hits.collapse_buttons, '\u{eab5}')];
+    for (i, pill) in app.panel_hits.pane_labels.iter().enumerate() {
         let painted: Vec<(&str, Rect, char)> = families
             .iter()
             .filter(|(_, rects, _)| rects[i].width > 0)
@@ -1226,7 +1240,8 @@ fn a_rail_taller_than_the_panel_scrolls_instead_of_dropping_terminals() {
     term.draw(|f| app.render(f)).unwrap();
 
     let live = |app: &App| -> usize {
-        app.terminal_rail_rects
+        app.panel_hits
+            .rail_rows
             .iter()
             .filter(|r| r.width > 0)
             .count()
@@ -1236,19 +1251,19 @@ fn a_rail_taller_than_the_panel_scrolls_instead_of_dropping_terminals() {
         "this layout must actually overflow the rail, or the test proves nothing"
     );
     assert_eq!(
-        app.terminal_rail_rects.len(),
+        app.panel_hits.rail_rows.len(),
         app.terminals.len(),
         "off-window rows still hold a placeholder so a rect's position names \
          its terminal"
     );
     // The active terminal is the last one, past the window's bottom edge.
     assert!(
-        app.terminal_rail_rects[app.active_terminal].width > 0,
+        app.panel_hits.rail_rows[app.active_terminal].width > 0,
         "the rail must scroll to keep the active terminal visible"
     );
 
     // The wheel reaches the terminals the window has scrolled past.
-    let rail = app.terminal_rail_area;
+    let rail = app.panel_hits.rail;
     assert!(
         rail.width > 0,
         "the rail records its own area for the wheel"
@@ -1263,7 +1278,7 @@ fn a_rail_taller_than_the_panel_scrolls_instead_of_dropping_terminals() {
     }
     term.draw(|f| app.render(f)).unwrap();
     assert!(
-        app.terminal_rail_rects[0].width > 0,
+        app.panel_hits.rail_rows[0].width > 0,
         "scrolling the rail up must reach the first terminal"
     );
 }
@@ -1310,7 +1325,7 @@ fn add_button_wins_over_terminal_splitter_on_same_row() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     // Splitter and button share the row, as they do in real layout.
     app.terminal_splitter_y = Some(30);
-    app.terminal_add_buttons = vec![Rect {
+    app.panel_hits.add_buttons = vec![Rect {
         x: 50,
         y: 30,
         width: 3,
@@ -1409,7 +1424,8 @@ fn clicking_the_profile_caret_opens_an_anchored_shell_menu() {
     app.show_terminal = true;
     draw(&mut app, 140, 50);
     let caret = *app
-        .terminal_profile_buttons
+        .panel_hits
+        .profile_buttons
         .first()
         .expect("the profile caret is rendered on the pane header");
     assert!(app.context_menu.is_none());
@@ -1535,7 +1551,7 @@ fn a_drag_held_over_one_pane_does_not_flip_flop_between_frames() {
         row: y,
         modifiers: KeyModifiers::NONE,
     };
-    let grab = app.terminal_label_rects[0];
+    let grab = app.panel_hits.pane_labels[0];
     let dest = app.terminals[1].last_area;
     let (dx, dy) = (dest.x + dest.width / 2, dest.y + dest.height / 2);
     app.handle_mouse(mouse(
@@ -1583,7 +1599,7 @@ fn dragging_a_pane_label_and_a_rail_row_reorders_terminals_end_to_end() {
         row: y,
         modifiers: KeyModifiers::NONE,
     };
-    let grab = app.terminal_label_rects[0];
+    let grab = app.panel_hits.pane_labels[0];
     assert!(grab.width > 0, "pane label pill must record a drag handle");
     let dest = app.terminals[2].last_area;
     app.handle_mouse(mouse(
@@ -1601,8 +1617,8 @@ fn dragging_a_pane_label_and_a_rail_row_reorders_terminals_end_to_end() {
     // Maximize mode: drag the top rail row onto the bottom one.
     app.terminal_pane_maximized = true;
     term.draw(|f| app.render(f)).unwrap();
-    let from_row = app.terminal_rail_rects[0];
-    let to_row = app.terminal_rail_rects[2];
+    let from_row = app.panel_hits.rail_rows[0];
+    let to_row = app.panel_hits.rail_rows[2];
     assert!(from_row.width > 0 && to_row.width > 0, "rail rows painted");
     app.handle_mouse(mouse(
         MouseEventKind::Down(MouseButton::Left),
@@ -2101,7 +2117,7 @@ fn clicking_a_collapsed_strip_gives_the_pane_its_width_back() {
     app.toggle_terminal_collapse(2);
     term.draw(|f| app.render(f)).unwrap();
 
-    let strip = app.terminal_strip_rects[2];
+    let strip = app.panel_hits.collapsed_strips[2];
     assert_eq!(strip.width, 1, "a collapsed pane is one column wide");
     assert!(strip.height > 1, "the strip runs the height of the panel");
     // Anywhere down the strip, not only the chevron: one column is a small
@@ -2342,7 +2358,7 @@ fn every_collapsed_pane_recovers_from_its_strip_in_every_layout() {
                          perturbation legitimately unfolds panes the case \
                          needs its own assertion, not a skip"
                     );
-                    let strip = app.terminal_strip_rects[idx];
+                    let strip = app.panel_hits.collapsed_strips[idx];
                     assert_eq!(
                         strip.width, 1,
                         "pane {idx} keeps a one-column strip after {perturb} \
@@ -2375,7 +2391,7 @@ fn a_collapsed_strip_carries_the_pane_name_down_its_column() {
     app.toggle_terminal_collapse(1);
     term.draw(|f| app.render(f)).unwrap();
 
-    let strip = app.terminal_strip_rects[1];
+    let strip = app.panel_hits.collapsed_strips[1];
     let column: String = (strip.y..strip.y + strip.height)
         .map(|y| {
             term.backend()
@@ -2412,7 +2428,7 @@ fn the_leftmost_pane_comes_back_from_its_strip() {
     app.toggle_terminal_collapse(0);
     term.draw(|f| app.render(f)).unwrap();
 
-    let strip = app.terminal_strip_rects[0];
+    let strip = app.panel_hits.collapsed_strips[0];
     assert_eq!(strip.width, 1, "precondition: pane 0's strip is painted");
     assert!(app.terminals[0].collapsed, "precondition: pane 0 is folded");
 
@@ -2433,7 +2449,7 @@ fn the_leftmost_panes_strip_offers_expand_terminal() {
     let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
     app.toggle_terminal_collapse(0);
     term.draw(|f| app.render(f)).unwrap();
-    let strip = app.terminal_strip_rects[0];
+    let strip = app.panel_hits.collapsed_strips[0];
     assert_eq!(strip.width, 1, "precondition: pane 0's strip is painted");
 
     app.handle_mouse(mouse(
@@ -2468,7 +2484,7 @@ fn a_long_pane_name_never_paints_past_the_end_of_its_strip() {
     let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
     app.toggle_terminal_collapse(1);
     term.draw(|f| app.render(f)).unwrap();
-    let height = app.terminal_strip_rects[1].height;
+    let height = app.panel_hits.collapsed_strips[1].height;
     assert!(
         height > 2,
         "the strip must be tall enough for a name to overrun"
@@ -2480,7 +2496,7 @@ fn a_long_pane_name_never_paints_past_the_end_of_its_strip() {
     for len in 1..=(height as usize + 2) {
         app.terminals[1].set_manual_name(Some(MARK.repeat(len)));
         term.draw(|f| app.render(f)).unwrap();
-        let strip = app.terminal_strip_rects[1];
+        let strip = app.panel_hits.collapsed_strips[1];
         assert_eq!(strip.width, 1, "still one column at name length {len}");
         // Containment, counted over the WHOLE screen rather than probed at
         // the row below the strip: that probe reads `None` whenever the panel
@@ -2636,7 +2652,7 @@ fn a_folded_strips_menu_offers_nothing_that_acts_on_the_active_pane() {
     app.broadcast_input = true;
     app.toggle_terminal_collapse(1);
     term.draw(|f| app.render(f)).unwrap();
-    let strip = app.terminal_strip_rects[1];
+    let strip = app.panel_hits.collapsed_strips[1];
     assert_eq!(strip.width, 1, "precondition: the strip is painted");
 
     app.handle_mouse(mouse(
@@ -2846,7 +2862,7 @@ fn a_pane_named_in_wide_characters_still_marks_its_strip() {
     app.terminals[1].set_manual_name(Some(String::from("\u{9805}\u{76ee}")));
     app.toggle_terminal_collapse(1);
     term.draw(|f| app.render(f)).unwrap();
-    let strip = app.terminal_strip_rects[1];
+    let strip = app.panel_hits.collapsed_strips[1];
     assert_eq!(strip.width, 1, "precondition: the strip is painted");
     assert!(strip.height > 2, "precondition: room below the chevron");
 

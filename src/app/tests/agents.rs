@@ -1376,14 +1376,14 @@ fn an_agent_pane_is_badged_and_a_prompt_fires_waiting_once() {
         text.contains("1 agent \u{b7} 1 waiting"),
         "the chip counts it:\n{text}"
     );
-    assert!(app.status_agents_rect.width > 0, "and is clickable");
+    assert!(app.status_hits.agents.width > 0, "and is clickable");
 
     // Clicking the chip from the editor with the panel collapsed reveals
     // the pane, not just focuses it.
     app.show_terminal = false;
     app.focus_pane(Pane::Editor);
     term.draw(|frame| app.render(frame)).unwrap();
-    let chip = app.status_agents_rect;
+    let chip = app.status_hits.agents;
     assert!(
         chip.width > 0,
         "the chip is painted while the panel is hidden"

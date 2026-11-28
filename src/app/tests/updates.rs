@@ -408,7 +408,7 @@ fn an_update_offer_raises_the_bottom_left_card_later_folds_it_and_skip_dismisses
         assert!(app.staged_install.is_none(), "Later stages nothing");
 
         // The pill opens the card again.
-        let pill = app.status_offer_rect;
+        let pill = app.status_hits.offer;
         assert!(pill.width > 0, "the pill is a click target");
         left_click(&mut app, pill.x + 2, pill.y);
         assert!(app.update_toast.as_ref().is_some_and(|t| t.open));

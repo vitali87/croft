@@ -233,6 +233,132 @@ struct LayoutIconAreas {
     customize: Rect,
 }
 
+/// Where each clickable item of the status bar was drawn this frame. Empty
+/// when the bar is hidden or the item does not fit.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct StatusHitAreas {
+    /// The status message's own cells; a click opens the Messages output
+    /// channel, where every message is kept in full (#1609).
+    message: Rect,
+    /// The problem counts; a click opens PROBLEMS.
+    diagnostics: Rect,
+    /// The running CodeQL query's chip; a click cancels it (#578).
+    codeql: Rect,
+    /// The croft update pills ("Update ready", the drift rebuild hint); a
+    /// click does what the updater chord does (#865).
+    update: Rect,
+    /// The "Update Available" pill under the update card; a click opens or
+    /// folds the card.
+    offer: Rect,
+    /// The `Ln X, Col Y` readout. A click opens the Go to Line prompt: a
+    /// readout becomes a control, as in VS Code.
+    position: Rect,
+    /// The indentation, encoding, line-ending and language items; a click
+    /// opens the picker that changes each.
+    indent: Rect,
+    encoding: Rect,
+    eol: Rect,
+    language: Rect,
+    /// The agents chip; empty when no agent is seated.
+    agents: Rect,
+}
+
+/// Where each tab and button of the panel was drawn this frame. The lists are
+/// in lock-step with `terminals`: a pane that is hidden or has no such button
+/// holds an empty rect, so a button's position names its terminal.
+#[derive(Debug, Default, PartialEq)]
+struct PanelHitAreas {
+    /// The "PROBLEMS", "OUTPUT", "PORTS", "CAPTURES" and "TERMINAL" tabs.
+    problems_tab: Rect,
+    output_tab: Rect,
+    ports_tab: Rect,
+    captures_tab: Rect,
+    terminal_tab: Rect,
+    /// The panel's maximize / restore button (#1980), the click form of
+    /// `Ctrl+Shift+J`: grow the panel over the editor, or give the editor its
+    /// rows back. Rightmost on the panel's tab row, on every tab, since it
+    /// sizes the whole panel.
+    maximize_button: Rect,
+    /// The focus-mode (`⛶`) button at the right of the panel's tab row
+    /// (#1980): it maximizes the ACTIVE terminal across the panel, or restores
+    /// the split. One button for the panel rather than one per pane, because
+    /// the mode rearranges every pane at once. Empty with fewer than two
+    /// terminals or off the TERMINAL tab.
+    focus_button: Rect,
+    /// The "[+]" buttons. Empty when every pane is too narrow for the label.
+    add_buttons: Vec<Rect>,
+    /// The profile-caret (`⌄`) buttons. Clicking one opens the profile picker.
+    profile_buttons: Vec<Rect>,
+    /// The "[-]" buttons. Empty when only one terminal is open: closing the
+    /// last one would leave the pane empty, which croft forbids.
+    close_buttons: Vec<Rect>,
+    /// The pane name pills at each pane's top-left. A press on one starts a
+    /// drag-reorder. Empty with one terminal.
+    pane_labels: Vec<Rect>,
+    /// The collapse (`‹`) buttons (#313). A pane that is already collapsed,
+    /// too narrow for the glyph, or maximized holds an empty rect.
+    collapse_buttons: Vec<Rect>,
+    /// The one-column strips collapsed panes leave behind (#313). Clicking
+    /// anywhere down a strip gives that pane its width back; expanded panes
+    /// hold an empty rect. The WHOLE strip is the target, not just the
+    /// chevron: one column is already a small thing to hit without also
+    /// demanding the right row.
+    collapsed_strips: Vec<Rect>,
+    /// The maximize-mode rail's rows down the panel's right edge. Clicking one
+    /// hands that terminal the maximized pane. Empty outside maximize mode.
+    rail_rows: Vec<Rect>,
+    /// The maximize rail's own column, so the wheel can scroll it.
+    rail: Rect,
+}
+
+impl PanelHitAreas {
+    /// Empty every area, keeping the lists' room so a frame allocates
+    /// nothing. The fields are named without `..`, so a new one is a compile
+    /// error here until it is reset too.
+    fn reset(&mut self) {
+        let Self {
+            problems_tab,
+            output_tab,
+            ports_tab,
+            captures_tab,
+            terminal_tab,
+            maximize_button,
+            focus_button,
+            add_buttons,
+            profile_buttons,
+            close_buttons,
+            pane_labels,
+            collapse_buttons,
+            collapsed_strips,
+            rail_rows,
+            rail,
+        } = self;
+        for area in [
+            problems_tab,
+            output_tab,
+            ports_tab,
+            captures_tab,
+            terminal_tab,
+            maximize_button,
+            focus_button,
+            rail,
+        ] {
+            *area = Rect::default();
+        }
+        for list in [
+            add_buttons,
+            profile_buttons,
+            close_buttons,
+            pane_labels,
+            collapse_buttons,
+            collapsed_strips,
+            rail_rows,
+        ] {
+            list.clear();
+        }
+    }
+}
+
 /// Result of [`compute_chrome_layout`]: the rectangles for each workspace
 /// region within the horizontal `main` band. Hidden regions are `None` and
 /// consume no width.
@@ -2409,50 +2535,12 @@ pub struct App {
     /// group's own `last_full_area` is only its share once the editor is
     /// split, so a geometric hit-test must start from this instead.
     editor_layout_area: Rect,
-    /// Hit-test rectangles of the "[+]" buttons - one per terminal pane,
-    /// indexed in lock-step with `terminals`. Empty when the pane is hidden
-    /// or every pane is too narrow for the label.
-    terminal_add_buttons: Vec<Rect>,
-    /// Hit-test rectangles of the profile-caret (`⌄`) buttons - one per pane,
-    /// in lock-step with `terminals`. Clicking one opens the profile picker.
-    terminal_profile_buttons: Vec<Rect>,
-    /// Hit-test rectangles of the "[-]" buttons - one per terminal pane,
-    /// indexed in lock-step with `terminals`. Empty when only one terminal
-    /// is open (closing the last one would leave the pane empty, which we
-    /// explicitly forbid) or the pane is hidden.
-    terminal_close_buttons: Vec<Rect>,
-    /// Hit rect of the focus-mode (`⛶`) button at the right of the panel's
-    /// tab row (#1980): it maximizes the ACTIVE terminal across the panel, or
-    /// restores the split. One button for the panel rather than one per pane,
-    /// because the mode rearranges every pane at once. Empty with fewer than
-    /// two terminals, off the TERMINAL tab, or while the panel is hidden.
-    terminal_focus_button: Rect,
-    /// Hit rect of the panel's maximize / restore button (#1980), the click
-    /// form of `Ctrl+Shift+J`: grow the panel over the editor, or give the
-    /// editor its rows back. Rightmost on the panel's tab row, on every tab,
-    /// since it sizes the whole panel. Empty while the panel is hidden.
-    panel_maximize_button: Rect,
-    /// Hit-test rectangles of the maximize-mode rail rows down the panel's
-    /// right edge, in lock-step with `terminals`. Clicking one hands that
-    /// terminal the maximized pane. Empty outside maximize mode.
-    terminal_rail_rects: Vec<Rect>,
-    /// The maximize rail's own column, so the wheel can scroll it. Empty
-    /// whenever the rail is not on screen.
-    terminal_rail_area: Rect,
     /// First terminal shown in the rail when there are more terminals than
     /// rows. Clamped during paint, so nothing else has to keep it honest.
     terminal_rail_scroll: usize,
     /// Which terminal the rail last scrolled into view, so the reveal fires
     /// when the active pane changes and never fights a deliberate wheel.
     terminal_rail_revealed: Option<usize>,
-    /// Hit-test rectangles of the pane name pills at each pane's top-left, in
-    /// lock-step with `terminals`. A press on one starts a drag-reorder;
-    /// hidden or unlabeled panes hold an empty rect. Empty with one terminal.
-    terminal_label_rects: Vec<Rect>,
-    /// Hit-test rectangles of the collapse (`‹`) buttons, in lock-step with
-    /// `terminals` (#313). A pane that is hidden, already collapsed, too
-    /// narrow for the glyph, or maximized holds an empty rect.
-    terminal_collapse_buttons: Vec<Rect>,
     /// Extensions whose programs the user has allowed to run (the MCP
     /// consent set, loaded once from prefs and kept current when a consent
     /// is granted here), so a viewer's gate is a set lookup rather than a
@@ -2472,12 +2560,6 @@ pub struct App {
     /// scrollback so the rendered log view can index it from disk (#257).
     /// `~/.cache/croft/scrollback` normally; a test points it at a temp dir.
     scrollback_dir: PathBuf,
-    /// Hit-test rectangles of the one-column strips collapsed panes leave
-    /// behind, in lock-step with `terminals` (#313). Clicking anywhere down a
-    /// strip gives that pane its width back; expanded panes hold an empty
-    /// rect. The WHOLE strip is the target, not just the chevron: one column
-    /// is already a small thing to hit without also demanding the right row.
-    terminal_strip_rects: Vec<Rect>,
     /// Index of the terminal being drag-reordered (grabbed by its pane label
     /// or its maximize-rail row). The reorder is live: crossing another pane
     /// or rail row moves the terminal there immediately, and this follows it.
@@ -2559,20 +2641,10 @@ pub struct App {
     /// While it runs, cadence ticks start no other; one whose thread crashed
     /// is no longer running (#2569).
     label_pass: Option<crate::jobs::Job<terminal_panes::LabelPass>>,
-    /// Hit-test rect of the "PROBLEMS" tab in the panel tab strip. Empty when
-    /// the panel is hidden.
-    problems_tab_rect: Rect,
-    /// Hit-test rect of the "OUTPUT" tab in the panel tab strip. Empty when the
-    /// panel is hidden.
-    output_tab_rect: Rect,
-    /// Hit-test rect of the "PORTS" tab in the panel tab strip. Empty when the
-    /// panel is hidden.
-    ports_tab_rect: Rect,
-    /// Hit-test rect of the "CAPTURES" tab in the panel tab strip.
-    captures_tab_rect: Rect,
-    /// Hit-test rect of the "TERMINAL" tab in the panel tab strip. Empty when
-    /// the panel is hidden.
-    terminal_tab_rect: Rect,
+    /// Where the panel's tabs and buttons are this frame. The frame resets it
+    /// whole before it draws the panel, so a tab or button not drawn this
+    /// frame has no area and a click there does nothing.
+    panel_hits: PanelHitAreas,
     /// Last pointer cell reported by a `Moved` event. Render-time hover
     /// hit-testing (the Black theme's teal pill behind the terminal `-`/`+`
     /// buttons) reads this instead of tracking enter/leave transitions.
@@ -3195,14 +3267,10 @@ pub struct App {
     shortcuts_modal: Option<crate::widgets::shortcuts::ShortcutsModal>,
     /// The Settings editor (#612).
     settings_editor: Option<crate::widgets::settings_editor::SettingsEditor>,
-    shortcuts_hit_rect: Option<Rect>,
-    /// Status-bar clickable-segment hit rects, recorded each render. Empty when
-    /// the bar is hidden or the segment doesn't fit. Diagnostics → PROBLEMS;
-    /// encoding / EOL / language → their respective "change" pickers.
-    status_diag_rect: Rect,
-    /// The status message's own cells; a click opens the Messages output
-    /// channel, where every message is kept in full (#1609).
-    status_message_rect: Rect,
+    /// Where the status bar's clickable items are this frame. The status bar
+    /// resets it whole before it draws, so an item not drawn this frame has no
+    /// area and a click there does nothing.
+    status_hits: StatusHitAreas,
     /// The last status message logged to the Messages channel, so each one
     /// is logged once, when it first shows (#1609).
     status_logged: String,
@@ -3211,18 +3279,6 @@ pub struct App {
     /// (Ln/Col, encoding, language) takes the whole bar (#1609). The next
     /// key or click hands the room back.
     status_wide: bool,
-    /// The running CodeQL query's status-bar chip; a click cancels it (#578).
-    status_codeql_rect: Rect,
-    /// The croft update pills ("Update ready", the drift rebuild hint); a
-    /// click does what the updater chord does (#865).
-    status_update_rect: Rect,
-    /// The "Update Available" pill under the update card; a click opens or
-    /// folds the card.
-    status_offer_rect: Rect,
-    status_indent_rect: Rect,
-    status_encoding_rect: Rect,
-    status_eol_rect: Rect,
-    status_language_rect: Rect,
     connect_dialog: Option<crate::widgets::connect_dialog::ConnectDialog>,
     connect_auth: Option<crate::remote_connect::SshAuth>,
     install_session: Option<crate::install_session::InstallSession>,
@@ -3349,11 +3405,6 @@ pub struct App {
     agents: crate::agents::AgentTable,
     /// Agent transitions from the last sample, drained on the tick.
     agent_events: std::collections::VecDeque<crate::agents::AgentEvent>,
-    /// Hit rect of the status bar's agents chip; empty when no agent is seated.
-    status_agents_rect: Rect,
-    /// Hit rect of the status bar's `Ln X, Col Y` readout. A click opens the
-    /// Go to Line prompt: a readout becomes a control, as in VS Code.
-    status_position_rect: Rect,
     /// User-defined problem matchers (#252): `matchers.json` (user config
     /// dir + workspace `.croft/`), batch-scanned at the FinishedCommand
     /// boundary alongside the built-in table. Swapped wholesale on reload.
@@ -4617,10 +4668,6 @@ impl App {
             editor_layout_area: Rect::default(),
             sidebar_splitter_x: None,
             terminal_splitter_y: None,
-            terminal_add_buttons: Vec::new(),
-            terminal_profile_buttons: Vec::new(),
-            terminal_close_buttons: Vec::new(),
-            terminal_collapse_buttons: Vec::new(),
             consented_extensions: crate::startup_trace::after(
                 "extension consents read",
                 crate::prefs::Prefs::load_or_default().mcp_consented,
@@ -4632,14 +4679,8 @@ impl App {
                 crate::profiles::active()
             },
             scrollback_dir: crate::session_state::dirs_cache_croft().join("scrollback"),
-            terminal_strip_rects: Vec::new(),
-            terminal_focus_button: Rect::default(),
-            panel_maximize_button: Rect::default(),
-            terminal_rail_rects: Vec::new(),
-            terminal_rail_area: Rect::default(),
             terminal_rail_scroll: 0,
             terminal_rail_revealed: None,
-            terminal_label_rects: Vec::new(),
             terminal_drag_from: None,
             editor_tab_drag_from: None,
             terminal_pointer_forwarded: None,
@@ -4656,11 +4697,7 @@ impl App {
             fleet_command: String::new(),
             last_label_refresh: std::time::Instant::now(),
             label_pass: None,
-            problems_tab_rect: Rect::default(),
-            output_tab_rect: Rect::default(),
-            ports_tab_rect: Rect::default(),
-            captures_tab_rect: Rect::default(),
-            terminal_tab_rect: Rect::default(),
+            panel_hits: PanelHitAreas::default(),
             pointer_cell: None,
             hovered_activity_icon: None,
             hovered_layout_icon: None,
@@ -4736,18 +4773,9 @@ impl App {
             vim_visual_line: false,
             shortcuts_modal: None,
             settings_editor: None,
-            shortcuts_hit_rect: None,
-            status_diag_rect: Rect::default(),
-            status_message_rect: Rect::default(),
+            status_hits: StatusHitAreas::default(),
             status_logged: String::new(),
             status_wide: false,
-            status_codeql_rect: Rect::default(),
-            status_update_rect: Rect::default(),
-            status_offer_rect: Rect::default(),
-            status_indent_rect: Rect::default(),
-            status_encoding_rect: Rect::default(),
-            status_eol_rect: Rect::default(),
-            status_language_rect: Rect::default(),
             connect_dialog: None,
             connect_auth: None,
             install_session: None,
@@ -4828,8 +4856,6 @@ impl App {
                 crate::agents::AgentTable::load(&crate::agents::agents_path()),
             ),
             agent_events: std::collections::VecDeque::new(),
-            status_agents_rect: Rect::default(),
-            status_position_rect: Rect::default(),
             matchers,
             watch_set,
             task_matcher_by_pane: std::collections::HashMap::new(),

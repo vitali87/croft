@@ -709,7 +709,7 @@ impl App {
         }
         // So does a click (#1609), except on the message itself, which opens
         // its full text below.
-        let on_message = rect_contains(self.status_message_rect, m.column, m.row);
+        let on_message = rect_contains(self.status_hits.message, m.column, m.row);
         if matches!(m.kind, MouseEventKind::Down(_)) && !on_message {
             self.status_wide = false;
         }
@@ -920,58 +920,50 @@ impl App {
                 _ => {}
             }
         }
-        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
-            && self
-                .shortcuts_hit_rect
-                .is_some_and(|r| rect_contains(r, m.column, m.row))
-        {
-            self.open_shortcuts_modal();
-            return;
-        }
         // Clickable status-bar segments: encoding / EOL / language open a
         // "change" picker; the diagnostics counts jump to the PROBLEMS panel.
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
-            if rect_contains(self.status_language_rect, m.column, m.row) {
+            if rect_contains(self.status_hits.language, m.column, m.row) {
                 self.open_status_language_menu(
-                    self.status_language_rect.x,
-                    self.status_language_rect.y,
+                    self.status_hits.language.x,
+                    self.status_hits.language.y,
                 );
                 return;
             }
-            if rect_contains(self.status_eol_rect, m.column, m.row) {
-                self.open_status_eol_menu(self.status_eol_rect.x, self.status_eol_rect.y);
+            if rect_contains(self.status_hits.eol, m.column, m.row) {
+                self.open_status_eol_menu(self.status_hits.eol.x, self.status_hits.eol.y);
                 return;
             }
-            if rect_contains(self.status_encoding_rect, m.column, m.row) {
+            if rect_contains(self.status_hits.encoding, m.column, m.row) {
                 self.open_status_encoding_menu(
-                    self.status_encoding_rect.x,
-                    self.status_encoding_rect.y,
+                    self.status_hits.encoding.x,
+                    self.status_hits.encoding.y,
                 );
                 return;
             }
-            if rect_contains(self.status_position_rect, m.column, m.row) {
+            if rect_contains(self.status_hits.position, m.column, m.row) {
                 self.open_go_to_line_prompt();
                 return;
             }
-            if rect_contains(self.status_indent_rect, m.column, m.row) {
-                self.open_status_indent_menu(self.status_indent_rect.x, self.status_indent_rect.y);
+            if rect_contains(self.status_hits.indent, m.column, m.row) {
+                self.open_status_indent_menu(self.status_hits.indent.x, self.status_hits.indent.y);
                 return;
             }
-            if rect_contains(self.status_codeql_rect, m.column, m.row) {
+            if rect_contains(self.status_hits.codeql, m.column, m.row) {
                 self.cancel_codeql_run();
                 return;
             }
-            if rect_contains(self.status_offer_rect, m.column, m.row) {
+            if rect_contains(self.status_hits.offer, m.column, m.row) {
                 if let Some(t) = self.update_toast.as_mut() {
                     t.open = !t.open;
                 }
                 return;
             }
-            if rect_contains(self.status_update_rect, m.column, m.row) {
+            if rect_contains(self.status_hits.update, m.column, m.row) {
                 self.update_croft();
                 return;
             }
-            if rect_contains(self.status_diag_rect, m.column, m.row) {
+            if rect_contains(self.status_hits.diagnostics, m.column, m.row) {
                 self.set_bottom_panel_tab(BottomPanelTab::Problems);
                 return;
             }
@@ -979,7 +971,7 @@ impl App {
                 self.show_status_messages();
                 return;
             }
-            if rect_contains(self.status_agents_rect, m.column, m.row) {
+            if rect_contains(self.status_hits.agents, m.column, m.row) {
                 self.focus_agent_pane();
                 return;
             }
@@ -1739,7 +1731,8 @@ impl App {
                     // cleared whenever the panel is not painted, so a stale
                     // strip cannot deaden the seam later.
                     let on_strip = self
-                        .terminal_strip_rects
+                        .panel_hits
+                        .collapsed_strips
                         .iter()
                         .any(|r| rect_contains(*r, m.column, m.row));
                     if (m.column == x || m.column == x.saturating_sub(1))
@@ -1858,32 +1851,32 @@ impl App {
                 // win the hit-test before the splitter-drag handler claims the
                 // click (same precedence as the "[+]" / "[-]" buttons below).
                 // The panel's own controls share that row (#1980).
-                if rect_contains(self.panel_maximize_button, m.column, m.row) {
+                if rect_contains(self.panel_hits.maximize_button, m.column, m.row) {
                     self.toggle_terminal_maximize();
                     return;
                 }
-                if rect_contains(self.terminal_focus_button, m.column, m.row) {
+                if rect_contains(self.panel_hits.focus_button, m.column, m.row) {
                     self.focus_pane(Pane::Terminal);
                     self.toggle_terminal_pane_maximize();
                     return;
                 }
-                if rect_contains(self.problems_tab_rect, m.column, m.row) {
+                if rect_contains(self.panel_hits.problems_tab, m.column, m.row) {
                     self.set_bottom_panel_tab(BottomPanelTab::Problems);
                     return;
                 }
-                if rect_contains(self.output_tab_rect, m.column, m.row) {
+                if rect_contains(self.panel_hits.output_tab, m.column, m.row) {
                     self.set_bottom_panel_tab(BottomPanelTab::Output);
                     return;
                 }
-                if rect_contains(self.terminal_tab_rect, m.column, m.row) {
+                if rect_contains(self.panel_hits.terminal_tab, m.column, m.row) {
                     self.set_bottom_panel_tab(BottomPanelTab::Terminal);
                     return;
                 }
-                if rect_contains(self.ports_tab_rect, m.column, m.row) {
+                if rect_contains(self.panel_hits.ports_tab, m.column, m.row) {
                     self.set_bottom_panel_tab(BottomPanelTab::Ports);
                     return;
                 }
-                if rect_contains(self.captures_tab_rect, m.column, m.row) {
+                if rect_contains(self.panel_hits.captures_tab, m.column, m.row) {
                     self.set_bottom_panel_tab(BottomPanelTab::Captures);
                     return;
                 }
@@ -1998,7 +1991,8 @@ impl App {
                 // click. Each terminal pane has its own pair so the user
                 // can kill any pane, not only the active one.
                 if let Some(idx) = self
-                    .terminal_close_buttons
+                    .panel_hits
+                    .close_buttons
                     .iter()
                     .position(|r| rect_contains(*r, m.column, m.row))
                 {
@@ -2009,7 +2003,8 @@ impl App {
                     return;
                 }
                 if let Some(idx) = self
-                    .terminal_profile_buttons
+                    .panel_hits
+                    .profile_buttons
                     .iter()
                     .position(|r| rect_contains(*r, m.column, m.row))
                 {
@@ -2017,7 +2012,8 @@ impl App {
                     return;
                 }
                 if let Some(idx) = self
-                    .terminal_collapse_buttons
+                    .panel_hits
+                    .collapse_buttons
                     .iter()
                     .position(|r| rect_contains(*r, m.column, m.row))
                 {
@@ -2028,7 +2024,8 @@ impl App {
                 // splitter and the pane body below: anything that claims the
                 // click first makes a folded pane impossible to unfold.
                 if let Some(idx) = self
-                    .terminal_strip_rects
+                    .panel_hits
+                    .collapsed_strips
                     .iter()
                     .position(|r| rect_contains(*r, m.column, m.row))
                 {
@@ -2036,7 +2033,8 @@ impl App {
                     return;
                 }
                 if let Some(idx) = self
-                    .terminal_rail_rects
+                    .panel_hits
+                    .rail_rows
                     .iter()
                     .position(|r| rect_contains(*r, m.column, m.row))
                 {
@@ -2048,7 +2046,8 @@ impl App {
                     return;
                 }
                 if let Some(idx) = self
-                    .terminal_label_rects
+                    .panel_hits
+                    .pane_labels
                     .iter()
                     .position(|r| rect_contains(*r, m.column, m.row))
                 {
@@ -2062,7 +2061,8 @@ impl App {
                     return;
                 }
                 if self
-                    .terminal_add_buttons
+                    .panel_hits
+                    .add_buttons
                     .iter()
                     .any(|r| rect_contains(*r, m.column, m.row))
                 {
@@ -3125,7 +3125,8 @@ impl App {
                     // rearrange under the pointer, and `move_terminal` keeps
                     // the dragged pane active.
                     let target = if self.terminal_pane_maximized && self.terminals.len() > 1 {
-                        self.terminal_rail_rects
+                        self.panel_hits
+                            .rail_rows
                             .iter()
                             .position(|r| rect_contains(*r, m.column, m.row))
                     } else {
@@ -3531,7 +3532,7 @@ impl App {
                         self.editor.scroll_down(3);
                     }
                 } else if self.scroll_inactive_group_at(m.column, m.row, 3) {
-                } else if rect_contains(self.terminal_rail_area, m.column, m.row) {
+                } else if rect_contains(self.panel_hits.rail, m.column, m.row) {
                     // The rail is its own scrollable list, like VS Code's
                     // terminal tabs. Paint clamps the offset.
                     self.terminal_rail_scroll = self.terminal_rail_scroll.saturating_add(1);
@@ -3607,7 +3608,7 @@ impl App {
                         self.editor.scroll_up(3);
                     }
                 } else if self.scroll_inactive_group_at(m.column, m.row, -3) {
-                } else if rect_contains(self.terminal_rail_area, m.column, m.row) {
+                } else if rect_contains(self.panel_hits.rail, m.column, m.row) {
                     self.terminal_rail_scroll = self.terminal_rail_scroll.saturating_sub(1);
                 } else if let Some(idx) = terminal_hit {
                     let shift = m.modifiers.contains(KeyModifiers::SHIFT);

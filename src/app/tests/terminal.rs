@@ -3188,22 +3188,104 @@ fn each_terminal_paints_its_own_add_close_buttons_when_multiple_open() {
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     assert_eq!(
-        app.terminal_add_buttons.len(),
+        app.panel_hits.add_buttons.len(),
         3,
         "each terminal pane must record its own [+] hit rect"
     );
     assert_eq!(
-        app.terminal_close_buttons.len(),
+        app.panel_hits.close_buttons.len(),
         3,
         "each terminal pane must record its own [-] hit rect when more than one is open"
     );
     // Distinct columns: the buttons must sit on different panes.
-    let xs: std::collections::HashSet<u16> = app.terminal_add_buttons.iter().map(|r| r.x).collect();
+    let xs: std::collections::HashSet<u16> =
+        app.panel_hits.add_buttons.iter().map(|r| r.x).collect();
     assert_eq!(
         xs.len(),
         3,
         "add-button rects must be on three distinct columns"
     );
+}
+
+/// A frame that stops drawing the panel's panes or the panel itself leaves
+/// none of what it drew clickable: those cells now belong to whatever is
+/// drawn there, the PROBLEMS view or the editor.
+#[test]
+fn a_frame_without_the_terminal_panes_or_the_panel_leaves_none_of_their_buttons_clickable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.split_terminal().unwrap();
+    app.split_terminal().unwrap();
+    app.terminal_pane_maximized = true;
+    let backend = ratatui::backend::TestBackend::new(180, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let hits = &app.panel_hits;
+    assert!(!hits.terminal_tab.is_empty() && !hits.maximize_button.is_empty());
+    assert!(
+        !hits.focus_button.is_empty(),
+        "three panes have the focus-mode button"
+    );
+    assert!(
+        !hits.rail.is_empty() && hits.rail_rows.len() == 3,
+        "the rail lists all three"
+    );
+    assert_eq!(hits.add_buttons.len(), 3, "one [+] slot per pane");
+
+    app.bottom_panel_tab = BottomPanelTab::Problems;
+    term.draw(|f| app.render(f)).unwrap();
+    let hits = &app.panel_hits;
+    assert!(!hits.problems_tab.is_empty(), "the tab row is still drawn");
+    assert!(
+        hits.focus_button.is_empty(),
+        "focus mode is a TERMINAL-tab button"
+    );
+    assert!(
+        hits.rail.is_empty() && hits.rail_rows.is_empty(),
+        "no rail behind PROBLEMS"
+    );
+    for (name, list) in [
+        ("add", &hits.add_buttons),
+        ("profile", &hits.profile_buttons),
+        ("close", &hits.close_buttons),
+        ("label", &hits.pane_labels),
+        ("collapse", &hits.collapse_buttons),
+        ("strip", &hits.collapsed_strips),
+    ] {
+        assert!(
+            list.is_empty(),
+            "no {name} button behind PROBLEMS: {list:?}"
+        );
+    }
+
+    app.show_terminal = false;
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(
+        app.panel_hits,
+        PanelHitAreas::default(),
+        "nothing of a hidden panel"
+    );
+}
+
+/// A frame without the status bar leaves none of its items clickable: the
+/// row is the editor's or the panel's now.
+#[test]
+fn a_frame_without_the_status_bar_leaves_none_of_its_items_clickable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.status = "Saved".into();
+    let backend = ratatui::backend::TestBackend::new(120, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(!app.status_hits.message.is_empty(), "the message is drawn");
+    assert!(
+        !app.status_hits.diagnostics.is_empty(),
+        "the counts are drawn"
+    );
+
+    app.status_bar_visible = false;
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(app.status_hits, StatusHitAreas::default());
 }
 
 #[test]
@@ -3215,7 +3297,7 @@ fn clicking_restore_button_returns_to_split_layout() {
     let backend = ratatui::backend::TestBackend::new(180, 40);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
-    let r = app.terminal_focus_button;
+    let r = app.panel_hits.focus_button;
     assert!(r.width > 0, "the panel row paints a restore button");
     app.handle_mouse(crossterm::event::MouseEvent {
         kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
@@ -3233,7 +3315,7 @@ fn clicking_restore_button_returns_to_split_layout() {
         "all panes are visible again after restore"
     );
     assert!(
-        app.terminal_rail_rects.is_empty(),
+        app.panel_hits.rail_rows.is_empty(),
         "the rail disappears with the split restored"
     );
 }
@@ -6796,7 +6878,7 @@ fn the_minus_button_still_closes_and_the_chevron_collapses() {
     // test that only exercised one of them.
     let (_tmp, mut app, _term) = app_with_terminal_panes(3);
 
-    let fold = app.terminal_collapse_buttons[1];
+    let fold = app.panel_hits.collapse_buttons[1];
     assert!(fold.width > 0, "the collapse button must be painted");
     app.handle_mouse(mouse(
         MouseEventKind::Down(MouseButton::Left),
@@ -6806,7 +6888,7 @@ fn the_minus_button_still_closes_and_the_chevron_collapses() {
     assert_eq!(app.terminals.len(), 3, "collapsing must never close a pane");
     assert!(app.terminals[1].collapsed, "the clicked pane folded");
 
-    let close = app.terminal_close_buttons[0];
+    let close = app.panel_hits.close_buttons[0];
     assert!(close.width > 0, "the close button must be painted");
     app.handle_mouse(mouse(
         MouseEventKind::Down(MouseButton::Left),
@@ -6929,7 +7011,7 @@ fn right_clicking_a_collapsed_strip_offers_to_expand_it() {
     let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
     app.toggle_terminal_collapse(1);
     term.draw(|f| app.render(f)).unwrap();
-    let strip = app.terminal_strip_rects[1];
+    let strip = app.panel_hits.collapsed_strips[1];
     assert_eq!(strip.width, 1, "precondition: the strip is painted");
 
     app.handle_mouse(mouse(
@@ -7032,7 +7114,7 @@ fn maximizing_from_a_folded_strip_shows_the_pane_the_menu_named() {
     let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
     app.toggle_terminal_collapse(1);
     term.draw(|f| app.render(f)).unwrap();
-    let strip = app.terminal_strip_rects[1];
+    let strip = app.panel_hits.collapsed_strips[1];
     let folded_width = app.terminals[1].last_area.width;
 
     app.handle_mouse(mouse(
@@ -7069,7 +7151,7 @@ fn maximizing_from_a_folded_strip_shows_the_pane_the_menu_named() {
         app.terminals[1].last_area.width
     );
     assert!(
-        app.terminal_strip_rects.iter().all(|r| r.width == 0),
+        app.panel_hits.collapsed_strips.iter().all(|r| r.width == 0),
         "no strip survives maximize, or a click could land on a pane that is not painted"
     );
 }
@@ -8353,7 +8435,7 @@ fn a_click_while_asking_cannot_move_the_paste_to_another_pane() {
     // pane's rail row must not send it there instead.
     let (mut app, _tmp) = two_pane_paste_app();
     app.handle_paste(TWO_LINES);
-    let other = app.terminal_rail_rects[1];
+    let other = app.panel_hits.rail_rows[1];
     left_click(&mut app, other.x + 1, other.y);
     assert_eq!(app.active_terminal, 0, "the click is ignored while asking");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
