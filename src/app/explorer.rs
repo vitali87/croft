@@ -2350,6 +2350,11 @@ impl App {
         self.pair.navigator_notes.clear();
         self.pair.commentary_buf.clear();
         self.pair.turn_origin = None;
+        // The turn counters die with the seat, as on turning it off: kept,
+        // the next seat's first TurnDone reported this one's notes (#2878).
+        self.pair.notes_this_turn = 0;
+        self.pair.last_noted_file = None;
+        self.pair.noted_files.clear();
         self.clear_problem_fix();
         self.editor.comment_focus = None;
         if self.pair.host_lock.take().is_some() {
