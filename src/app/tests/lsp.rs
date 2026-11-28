@@ -4357,6 +4357,65 @@ fn a_server_question_is_answered_with_the_picked_action() {
     assert_eq!(app.status, "gopls: Ignore");
 }
 
+/// #2062: after a workspace switch the language servers' state is a fresh
+/// one with a manager at the new root, apart from what `LspState::rebind`
+/// keeps. The pattern names every field, so a field added later has to say
+/// here whether a switch starts it over.
+#[test]
+fn a_workspace_switch_leaves_the_language_servers_fresh_for_the_new_root() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let mut app = App::new(a.path().to_path_buf()).unwrap();
+    let file = a.path().join("a.rs");
+    // What the old servers were sent and reported.
+    app.lsp.last_seen.insert(file.clone(), 3);
+    app.lsp.semantic_generation_seen.insert(file.clone(), 2);
+    app.lsp.diagnostics.insert(file.clone(), Default::default());
+    app.lsp
+        .progress
+        .insert(String::from("rust-analyzer"), String::from("Indexing 1/2"));
+    let _answer = go_mod_question(&mut app);
+
+    app.change_workspace_root(b.path().to_path_buf());
+
+    let crate::app::language_servers::LspState {
+        manager,
+        last_seen,
+        semantic_generation_seen,
+        diagnostics,
+        progress,
+        questions,
+        question,
+        paused_for_build,
+    } = &app.lsp;
+    assert_eq!(
+        manager.as_ref().map(|m| m.workspace_root().to_path_buf()),
+        Some(b.path().to_path_buf()),
+        "a manager runs at the new root"
+    );
+    assert!(last_seen.is_empty());
+    assert!(semantic_generation_seen.is_empty());
+    assert!(diagnostics.is_empty());
+    assert!(progress.is_empty());
+    assert!(questions.is_empty());
+    assert!(question.is_none());
+    assert!(!paused_for_build);
+}
+
+/// #2062: while a croft build has the servers stopped, a workspace switch
+/// starts none, and keeps the pause, so the end of the build starts them at
+/// the new root.
+#[test]
+fn a_workspace_switch_during_a_build_pause_keeps_the_servers_stopped() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let mut app = App::new(a.path().to_path_buf()).unwrap();
+    app.lsp.paused_for_build = true;
+    app.change_workspace_root(b.path().to_path_buf());
+    assert!(app.lsp.manager.is_none(), "no servers beside the build");
+    assert!(app.lsp.paused_for_build, "the end of the build starts them");
+}
+
 /// #2880: a workspace switch drops the questions the old workspace's
 /// servers asked, and closes the picker showing one: those servers are shut
 /// down with the workspace, so an answer picked afterwards went nowhere while
