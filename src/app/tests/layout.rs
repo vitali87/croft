@@ -4559,20 +4559,25 @@ fn bottom_panel_hover_follows_the_pointer() {
 }
 
 /// #2068: with the secondary side bar open, the Explorer's own OUTLINE
-/// section shows the Explorer's focus. The secondary bar drew its Outline
-/// unfocused by clearing the flag both share, every frame, and never put
-/// it back.
+/// section shows the Explorer's focus: its scrollbar thumb takes the focused
+/// colour while the Explorer has the keyboard and the plain one after. The
+/// secondary bar drew its Outline unfocused by clearing a flag both shared,
+/// every frame, and never put it back; each now draws with its own context.
 #[test]
 fn the_secondary_side_bar_leaves_the_explorer_outline_s_focus_alone() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.secondary_side_bar_visible = true;
+    let (mut app, _) = secondary_outline_app(&tmp, 120);
     app.set_sidebar_view(SidebarView::Explorer);
-    draw(&mut app, 140, 40);
-    assert!(app.outline.focused, "the Explorer has focus");
+    let focused = app.theme.scrollbar_thumb_focused();
+    let thumb_lit = |app: &mut App| {
+        let buf = draw_buffer(app, 140, 40);
+        let bar = app.outline.last_scrollbar;
+        assert!(bar.height > 0, "the Explorer's OUTLINE scrolls");
+        (bar.y..bar.bottom()).any(|y| buf[(bar.x, y)].bg == focused)
+    };
+    assert!(thumb_lit(&mut app), "the Explorer has focus");
     app.focus_pane(Pane::Editor);
-    draw(&mut app, 140, 40);
-    assert!(!app.outline.focused, "and then it does not");
+    assert!(!thumb_lit(&mut app), "and then it does not");
 }
 
 /// #2062: the activity-bar table keeps every view icon where it was: the

@@ -563,7 +563,7 @@ src/
     │   ├── text.rs          reading the grid as text: visible and wrapped lines, logical rows across soft wraps, find lines, and the screen as ANSI with its colours
     ├── update_popup.rs   the update popup as a card in the manner of Ghostty's: glyph and title, a label / value grid of the release, rounded pill buttons with the one primary action flush right, and a link row under a divider; framed per theme (gradient box, `surfaces` card, accent line) and pure, handing back where each control landed
     ├── timeline.rs      collapsible TIMELINE section: the active file's git history (`git log --follow`) fetched off-thread, two rows per commit (summary + author/age), click-to-open the commit's diff; a ⋯-menu Explorer sub-view
-    ├── view_cx.rs        `ViewCx`, what a side-bar or panel view draws with this frame (the theme, whether it has the keyboard, the cell under the pointer), built by the app when it draws and passed to the view's `draw`, so no view keeps a copy that can go stale; TIMELINE and DEPENDENCIES take it so far
+    ├── view_cx.rs        `ViewCx`, what a side-bar or panel view draws with this frame (the theme, whether it has the keyboard, the cell under the pointer), built by the app when it draws and passed to the view's `draw`, so no view keeps a copy that can go stale; the Explorer's sections (OPEN EDITORS, OUTLINE, TIMELINE, DEPENDENCIES, the agent lane) take it so far, and the secondary side bar draws its Outline with one that says unfocused
     └── zoxide_jump.rs   Cmd+Z zoxide jump popup: fuzzy directory jumper that re-roots + cd's the terminal
 tests/cli.rs             integration tests for the CLI surface
 ```

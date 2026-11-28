@@ -275,15 +275,10 @@ impl App {
         };
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        self.outline.theme = self.theme;
-        self.outline.focus_gradient = self.theme.gradient();
-        self.outline.hover_pointer = self.pointer_cell;
-        // The bar never takes focus, so its Outline draws unfocused. The flag
-        // is the Explorer's OUTLINE section's too, drawn after this, so it
-        // goes back to what focus says (#2068).
-        let explorer_focused = std::mem::replace(&mut self.outline.focused, false);
-        self.with_secondary_outline(|outline| frame.render_widget(outline, inner));
-        self.outline.focused = explorer_focused;
+        // The bar never takes focus, so its Outline draws unfocused, while the
+        // Explorer's OUTLINE section draws with the Explorer's focus (#2068).
+        let cx = self.view_cx(false);
+        self.with_secondary_outline(|outline| outline.draw(&cx, inner, frame.buffer_mut()));
     }
 
     /// Run `f` on the Outline as the secondary side bar shows it: that bar's

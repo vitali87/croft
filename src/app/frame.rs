@@ -723,9 +723,6 @@ impl App {
             self.source_control.hover_pointer = panel_pointer;
             self.run_debug.hover_pointer = panel_pointer;
             self.remote.hover_pointer = panel_pointer;
-            self.outline.hover_pointer = panel_pointer;
-            self.open_editors.hover_pointer = panel_pointer;
-            self.agent_lane_panel.hover_pointer = panel_pointer;
             self.extensions.hover_pointer = panel_pointer;
             self.testing.hover_pointer = panel_pointer;
             self.commit_graph.hover_pointer = panel_pointer;

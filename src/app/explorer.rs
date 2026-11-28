@@ -1345,11 +1345,13 @@ impl App {
                         );
                     }
                 }
-                ExplorerView::OpenEditors => frame.render_widget(&mut self.open_editors, rect),
-                ExplorerView::Outline => frame.render_widget(&mut self.outline, rect),
+                ExplorerView::OpenEditors => self.open_editors.draw(&cx, rect, frame.buffer_mut()),
+                ExplorerView::Outline => self.outline.draw(&cx, rect, frame.buffer_mut()),
                 ExplorerView::Timeline => self.timeline.draw(&cx, rect, frame.buffer_mut()),
                 ExplorerView::Dependencies => self.dependencies.draw(&cx, rect, frame.buffer_mut()),
-                ExplorerView::AgentLane => frame.render_widget(&mut self.agent_lane_panel, rect),
+                ExplorerView::AgentLane => {
+                    self.agent_lane_panel.draw(&cx, rect, frame.buffer_mut())
+                }
             }
         }
     }

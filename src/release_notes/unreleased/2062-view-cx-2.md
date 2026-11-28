@@ -1,0 +1,1 @@
+refactor: OPEN EDITORS, OUTLINE and the agent lane draw with the theme, focus and pointer the app hands them each frame, and the secondary side bar draws its Outline with a context that says unfocused instead of clearing and restoring the Explorer's focus flag around it (#2062). Nothing changes in use.

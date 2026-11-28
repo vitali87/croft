@@ -15,8 +15,8 @@ use ratatui::{
     widgets::{Borders, Paragraph, Widget},
 };
 
-use crate::theme::Theme;
 use crate::widgets::scrollbar;
+use crate::widgets::view_cx::ViewCx;
 
 const COLOR_DIM: Color = Color::Rgb(0x60, 0x68, 0x78);
 const COLOR_NAME: Color = Color::Rgb(0xCC, 0xCC, 0xCC);
@@ -43,10 +43,6 @@ pub struct OpenEditorsPanel {
     pub collapsed: bool,
     items: Vec<OpenEditorItem>,
     scroll: usize,
-    pub focus_gradient: bool,
-    pub theme: Theme,
-    pub focused: bool,
-    pub hover_pointer: Option<(u16, u16)>,
 
     pub last_area: Rect,
     pub last_scrollbar: Rect,
@@ -74,10 +70,6 @@ impl OpenEditorsPanel {
             collapsed: true,
             items: Vec::new(),
             scroll: 0,
-            focus_gradient: false,
-            theme: Theme::default(),
-            focused: false,
-            hover_pointer: None,
             last_area: Rect::default(),
             last_scrollbar: Rect::default(),
             save_all_btn: Rect::default(),
@@ -105,10 +97,6 @@ impl OpenEditorsPanel {
 
     pub fn toggle_collapse(&mut self) {
         self.collapsed = !self.collapsed;
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
     }
 
     pub fn scroll_down(&mut self, n: usize) {
@@ -196,12 +184,13 @@ impl Default for OpenEditorsPanel {
     }
 }
 
-impl Widget for &mut OpenEditorsPanel {
-    fn render(self, area: Rect, buf: &mut Buffer) {
+impl OpenEditorsPanel {
+    /// Draw the section into `area` with this frame's [`ViewCx`].
+    pub fn draw(&mut self, cx: &ViewCx, area: Rect, buf: &mut Buffer) {
         let block = crate::widgets::surface::section_block(
-            self.theme,
+            cx.theme,
             Borders::BOTTOM,
-            Style::default().fg(self.theme.ui(COLOR_DIM)),
+            Style::default().fg(cx.theme.ui(COLOR_DIM)),
         );
         let inner = block.inner(area);
         block.render(area, buf);
@@ -221,7 +210,7 @@ impl Widget for &mut OpenEditorsPanel {
         let header_y = inner.y;
         let chevron = format!(
             "{} ",
-            crate::widgets::surface::chevron(self.theme, !self.collapsed)
+            crate::widgets::surface::chevron(cx.theme, !self.collapsed)
         );
         const TITLE: &str = "OPEN EDITORS";
         // The header's own text, measured in cells, so the Save All action
@@ -239,11 +228,11 @@ impl Widget for &mut OpenEditorsPanel {
         crate::widgets::surface::paint_section_header(
             buf,
             header_row,
-            self.theme,
+            cx.theme,
             !self.collapsed,
             TITLE,
             Vec::new(),
-            crate::widgets::hover::contains(header_row, self.hover_pointer),
+            crate::widgets::hover::contains(header_row, cx.pointer),
         );
         self.last_header_row = header_y;
         self.last_header_x = inner.x;
@@ -263,13 +252,13 @@ impl Widget for &mut OpenEditorsPanel {
                 width: 1 + PAD,
                 height: 1,
             };
-            let hovered = crate::widgets::hover::contains(rect, self.hover_pointer);
+            let hovered = crate::widgets::hover::contains(rect, cx.pointer);
             crate::widgets::header_pill::render(
                 buf,
                 x,
                 header_y,
                 crate::widgets::header_pill::SAVE_ALL_GLYPH,
-                self.theme,
+                cx.theme,
                 hovered,
             );
             self.save_all_btn = rect;
@@ -287,7 +276,7 @@ impl Widget for &mut OpenEditorsPanel {
         if self.items.is_empty() {
             Paragraph::new(Line::from(Span::styled(
                 "No open editors",
-                Style::default().fg(self.theme.ui(COLOR_DIM)),
+                Style::default().fg(cx.theme.ui(COLOR_DIM)),
             )))
             .render(
                 Rect {
@@ -320,11 +309,11 @@ impl Widget for &mut OpenEditorsPanel {
         let visible = (body_h as usize).min(self.items.len().saturating_sub(self.scroll));
         self.visible_rows = visible as u16;
         self.last_scroll = self.scroll;
-        let brand = self.focus_gradient;
+        let brand = cx.theme.gradient();
         let sel_bg = if brand {
             crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG)
         } else {
-            self.theme.ui(Color::Rgb(0x09, 0x4d, 0x77))
+            cx.theme.ui(Color::Rgb(0x09, 0x4d, 0x77))
         };
 
         for row in 0..visible {
@@ -341,16 +330,16 @@ impl Widget for &mut OpenEditorsPanel {
             // Dirty tabs lead with a filled dot in the dirty colour; clean tabs
             // pad the same column so the names stay aligned.
             let (marker, marker_color) = if item.dirty {
-                ("● ", self.theme.ui(COLOR_DIRTY))
+                ("● ", cx.theme.ui(COLOR_DIRTY))
             } else {
-                ("  ", self.theme.ui(COLOR_DIM))
+                ("  ", cx.theme.ui(COLOR_DIM))
             };
             let name_style = if item.active {
                 Style::default()
-                    .fg(self.theme.ui(Color::White))
+                    .fg(cx.theme.ui(Color::White))
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(self.theme.ui(COLOR_NAME))
+                Style::default().fg(cx.theme.ui(COLOR_NAME))
             };
             let spans = vec![
                 Span::styled(marker, Style::default().fg(marker_color)),
@@ -360,7 +349,7 @@ impl Widget for &mut OpenEditorsPanel {
             let style = if item.active {
                 Style::default().bg(sel_bg)
             } else if let Some(bg) =
-                crate::widgets::hover::row_hover_bg(row_rect, self.hover_pointer, self.theme)
+                crate::widgets::hover::row_hover_bg(row_rect, cx.pointer, cx.theme)
             {
                 Style::default().bg(bg)
             } else {
@@ -372,7 +361,7 @@ impl Widget for &mut OpenEditorsPanel {
 
         if let Some(metrics) = bar {
             self.last_scrollbar = metrics.area;
-            scrollbar::render_vertical_on_chrome(buf, metrics, self.focused, self.theme);
+            scrollbar::render_vertical_on_chrome(buf, metrics, cx.focused, cx.theme);
         }
     }
 }
@@ -430,7 +419,7 @@ mod tests {
             height: 6,
         };
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         let drawn = p.row_at(2);
         assert!(drawn.is_some(), "a row is drawn there");
         let before = p.scroll;
@@ -451,7 +440,7 @@ mod tests {
             height: 6,
         };
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         assert_eq!(p.row_at(0), None, "header row is not an item");
         assert_eq!(p.row_at(1), Some(0));
         assert_eq!(p.row_at(2), Some(1));
@@ -467,7 +456,7 @@ mod tests {
             height,
         };
         let mut buf = Buffer::empty(area);
-        p.render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         let mut out = String::new();
         for y in 0..height {
             for x in 0..width {
