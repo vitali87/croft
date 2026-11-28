@@ -70,7 +70,7 @@ pub fn render(
     theme: crate::theme::Theme,
     hovered: bool,
 ) {
-    if crate::widgets::surface::tones(theme).is_some() {
+    if crate::theme::tones(theme).is_some() {
         buf.set_string(x, y, glyph.to_string(), action_style(theme, hovered));
         return;
     }
@@ -113,7 +113,7 @@ pub fn render(
 /// recedes behind the titles beside it, and hover lifts it to body text on a
 /// faint chip: the accent is kept for what has focus or is selected.
 pub fn action_style(theme: crate::theme::Theme, hovered: bool) -> Style {
-    if let Some(t) = crate::widgets::surface::tones(theme) {
+    if let Some(t) = crate::theme::tones(theme) {
         return if hovered {
             Style::default().fg(t.strong()).bg(t.hover_on(t.chrome))
         } else {
@@ -240,7 +240,7 @@ mod tests {
     #[test]
     fn croft_loch_header_buttons_are_quiet_until_hovered() {
         let loch = crate::theme::Theme::LOCH;
-        let t = crate::widgets::surface::tones(loch).unwrap();
+        let t = crate::theme::tones(loch).unwrap();
         let mut buf = Buffer::empty(Rect::new(0, 0, 6, 1));
         render(&mut buf, 2, 0, REFRESH_GLYPH, loch, false);
         assert_eq!(buf[(2, 0)].fg, t.muted());

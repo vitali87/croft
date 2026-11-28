@@ -23,7 +23,7 @@ impl FileTree {
             self.theme.ignored_fg()
         } else if let Some(dec) = self.git_decoration(path) {
             self.theme.git_decoration_fg(dec)
-        } else if let Some(t) = crate::widgets::surface::tones(self.theme) {
+        } else if let Some(t) = crate::theme::tones(self.theme) {
             // Croft Loch's body ink: the named White follows the host
             // terminal's palette and is usually pure #fff.
             t.text()
@@ -36,7 +36,7 @@ impl FileTree {
     /// most of the way toward the muted ink under `surfaces`, so folders
     /// read by their shape and a long tree is not a column of gold.
     pub(super) fn folder_icon_fg(&self, color: Color) -> Color {
-        match (crate::widgets::surface::tones(self.theme), color) {
+        match (crate::theme::tones(self.theme), color) {
             (Some(t), Color::Rgb(r, g, b)) => {
                 crate::gradient::rgb_color(crate::gradient::lerp_rgb((r, g, b), t.muted, 0.45))
             }

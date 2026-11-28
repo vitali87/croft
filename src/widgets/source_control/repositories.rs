@@ -73,7 +73,7 @@ impl SourceControlPanel {
         if y >= bottom {
             return y;
         }
-        let tones = crate::widgets::surface::tones(self.theme);
+        let tones = crate::theme::tones(self.theme);
         buf.set_stringn(
             inner.x + 1,
             y,

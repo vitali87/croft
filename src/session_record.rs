@@ -249,7 +249,7 @@ impl Owner {
         crate::hot_exit::start_time_of(self.pid) == Some(self.started)
             && i32::try_from(self.pid)
                 .ok()
-                .and_then(crate::widgets::terminal::process_cmdline)
+                .and_then(crate::proc::info::process_cmdline)
                 .is_some_and(|cmd| is_recorder(&cmd))
     }
 }

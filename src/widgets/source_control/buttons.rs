@@ -126,7 +126,7 @@ pub fn render_rounded_button(buf: &mut Buffer, area: Rect, label: &str, bg: Colo
 /// white on Croft Dark.
 pub fn primary_button_colors(theme: crate::theme::Theme, focus_gradient: bool) -> (Color, Color) {
     let teal = crate::gradient::rgb_color(crate::gradient::PRIMARY_BTN_BG);
-    match crate::widgets::surface::tones(theme) {
+    match crate::theme::tones(theme) {
         Some(t) => (teal, t.strong()),
         None => (
             if focus_gradient {
@@ -185,7 +185,7 @@ pub fn render_button(
     theme: crate::theme::Theme,
     hovered: bool,
 ) {
-    if crate::widgets::surface::tones(theme).is_none() {
+    if crate::theme::tones(theme).is_none() {
         render_rounded_button(buf, area, label, bg, fg);
         return;
     }

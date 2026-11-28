@@ -7,8 +7,7 @@ use tempfile::TempDir;
 /// The plain name ink on the default theme (Croft Loch's body text):
 /// what an unchanged, unignored row's name wears.
 fn plain_ink() -> Color {
-    crate::widgets::surface::tones(crate::theme::Theme::default())
-        .map_or(Color::White, |t| t.text())
+    crate::theme::tones(crate::theme::Theme::default()).map_or(Color::White, |t| t.text())
 }
 
 fn fixture() -> (TempDir, FileTree) {
@@ -575,7 +574,8 @@ fn explorer_header_toolbar_is_withheld_when_the_panel_is_unfocused() {
 /// them, and the focus lip starts one cell past the title.
 #[test]
 fn croft_loch_explorer_is_an_unboxed_surface_with_a_focus_aware_selection() {
-    use crate::widgets::surface::{ROW_BAR, tones};
+    use crate::theme::tones;
+    use crate::widgets::surface::ROW_BAR;
     let loch = crate::theme::Theme::from_id("loch");
     let s = loch.surfaces().unwrap();
     let t = tones(loch).unwrap();
@@ -628,7 +628,8 @@ fn croft_loch_explorer_is_an_unboxed_surface_with_a_focus_aware_selection() {
 /// codicon pair the panel uses.
 #[test]
 fn croft_loch_tree_type_ramp_keeps_weight_for_the_root_alone() {
-    use crate::widgets::surface::{CHEVRON_UNFOLDED, tones};
+    use crate::theme::tones;
+    use crate::widgets::surface::CHEVRON_UNFOLDED;
     let loch = crate::theme::Theme::LOCH;
     let t = tones(loch).unwrap();
     let area = Rect::new(0, 0, 30, 8);
@@ -674,7 +675,7 @@ fn croft_loch_tree_type_ramp_keeps_weight_for_the_root_alone() {
 /// selected row's parent; the root's level has none.
 #[test]
 fn croft_loch_draws_thin_indent_guides_and_brightens_the_active_one() {
-    use crate::widgets::surface::tones;
+    use crate::theme::tones;
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
     fs::create_dir_all(root.join("a/b")).unwrap();
@@ -733,7 +734,7 @@ fn croft_loch_draws_thin_indent_guides_and_brightens_the_active_one() {
 /// scrollbar lane keeps the chrome.
 #[test]
 fn croft_loch_hover_marks_and_sticky_band_use_the_tones() {
-    use crate::widgets::surface::tones;
+    use crate::theme::tones;
     let loch = crate::theme::Theme::LOCH;
     let t = tones(loch).unwrap();
     let (_tmp, mut tree) = fixture();
@@ -827,7 +828,7 @@ fn a_selected_row_is_not_overridden_by_hovering_it() {
         "selection outranks hover so the row never dims to the hover lift"
     );
     let loch = crate::theme::Theme::LOCH;
-    let t = crate::widgets::surface::tones(loch).unwrap();
+    let t = crate::theme::tones(loch).unwrap();
     tree.theme = loch;
     let mut buf = Buffer::empty(area);
     (&mut tree).render(area, &mut buf);

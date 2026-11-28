@@ -2284,7 +2284,7 @@ fn a_loch_tab_strip_and_header_seam_run_through_the_minimap_column() {
     let (_tmp, mut app) = text_minimap_app();
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
-    let t = crate::widgets::surface::tones(app.theme).expect("Loch is the default");
+    let t = crate::theme::tones(app.theme).expect("Loch is the default");
     let strip = app.minimap_img_rect;
     let top = app.editor.last_full_area.y;
     let seam_y = app.editor.last_body.y;
@@ -2303,7 +2303,7 @@ fn a_loch_tab_strip_and_header_seam_run_through_the_minimap_column() {
 fn a_modal_quick_input_takes_the_accent_off_the_editor_seam() {
     let (_tmp, mut app) = text_minimap_app();
     app.focus_pane(Pane::Editor);
-    let t = crate::widgets::surface::tones(app.theme).expect("Loch is the default");
+    let t = crate::theme::tones(app.theme).expect("Loch is the default");
     let seam = |app: &mut App| {
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
         term.draw(|f| app.render(f)).unwrap();
@@ -2343,7 +2343,7 @@ fn loch_layout_icons_rest_muted_and_lift_on_a_chip() {
     app.chrome_bake = None;
     app.overlays.activity.clear_images();
     draw(&mut app, 160, 40);
-    let t = crate::widgets::surface::tones(app.theme).expect("Loch is the default");
+    let t = crate::theme::tones(app.theme).expect("Loch is the default");
     let side = app.layout_icon_areas.toggle_side_bar;
     let cust = app.layout_icon_areas.customize;
     assert!(side.width == 2 && cust.width == 2);

@@ -552,7 +552,7 @@ pub(super) fn activity_sponsor_block(bar: Rect, codeql_shown: bool) -> Rect {
 /// pointer), and the hue lifted toward the foreground for the label, so a
 /// count badge reads in its own colour without a hard block of it.
 pub(super) fn chip_tint(
-    t: crate::widgets::surface::Tones,
+    t: crate::theme::Tones,
     hue: (u8, u8, u8),
     hovered: bool,
 ) -> (Color, Color) {
@@ -1460,7 +1460,7 @@ impl App {
         let inactive_color = self.theme.activity_icon_inactive();
         // Codicons have no bold weight; on Croft Loch bold would only set
         // off some terminals' bold-as-bright, so its glyphs stay regular.
-        let tones = crate::widgets::surface::tones(self.theme);
+        let tones = crate::theme::tones(self.theme);
         let glyph_mods = if tones.is_some() {
             Modifier::empty()
         } else {
@@ -1982,7 +1982,7 @@ impl App {
         // A `surfaces` theme floats the hint as a raised card in body text,
         // the accent only on its edge, rather than accent text in an accent
         // box on the canvas.
-        let tones = crate::widgets::surface::tones(self.theme);
+        let tones = crate::theme::tones(self.theme);
         let (bg, fg) = match tones {
             Some(t) => (t.raised(), t.text()),
             None => (self.theme.editor_bg(), accent),

@@ -829,7 +829,7 @@ impl App {
             return;
         }
         let brand = self.theme.gradient();
-        let tones = crate::widgets::surface::tones(self.theme);
+        let tones = crate::theme::tones(self.theme);
         // Same selected-row treatment as the OPEN EDITORS list, so the rail
         // reads as the same family of chrome in both themes.
         let sel_bg = if brand {
@@ -1642,7 +1642,7 @@ impl App {
                     format!(
                         "Command in {} finished: exit {code} in {}",
                         t.label(),
-                        crate::widgets::terminal::human_duration(f.dur)
+                        crate::command_history::human_duration(f.dur)
                     ),
                 ));
             }
@@ -1908,7 +1908,7 @@ impl App {
                         let named: Vec<(i32, i32, String)> = targets
                             .into_iter()
                             .filter_map(|(sp, fg)| {
-                                crate::widgets::terminal::process_name(fg).map(|n| (sp, fg, n))
+                                crate::proc::info::process_name(fg).map(|n| (sp, fg, n))
                             })
                             .collect();
                         // The ssh-pane offer (#364) rides this thread: only a
@@ -1921,7 +1921,7 @@ impl App {
                             crate::remote::ssh_pane_samples(
                                 &named,
                                 crate::remote::discover_ssh_targets,
-                                crate::widgets::terminal::process_cmdline,
+                                crate::proc::info::process_cmdline,
                             )
                         });
                         // Only a script runtime pays the argv read (#1380): its
@@ -1930,7 +1930,7 @@ impl App {
                             .into_iter()
                             .map(|(sp, fg, n)| {
                                 let script = crate::agents::is_script_runtime(&n)
-                                    .then(|| crate::widgets::terminal::process_cmdline(fg))
+                                    .then(|| crate::proc::info::process_cmdline(fg))
                                     .flatten()
                                     .and_then(|argv| crate::agents::script_name(&argv));
                                 (sp, n, script)

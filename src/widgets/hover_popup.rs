@@ -169,7 +169,7 @@ impl HoverPopup {
 
 impl Widget for &HoverPopup {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        if let Some(t) = surface::tones(self.theme) {
+        if let Some(t) = crate::theme::tones(self.theme) {
             if self.compact && self.lines.len() == 1 && area.height == 3 {
                 paint_pill(buf, area, &self.lines[0], t);
             } else {
@@ -213,7 +213,7 @@ impl HoverPopup {
     /// styled line per text line, so the wrapping `area_for` measures is
     /// the wrapping drawn. The card's shadow keeps off the anchor's row: a
     /// hover placed just above a symbol must not dim the symbol.
-    fn render_card(&self, area: Rect, buf: &mut Buffer, t: surface::Tones) {
+    fn render_card(&self, area: Rect, buf: &mut Buffer, t: crate::theme::Tones) {
         let inner_w = area.width.saturating_sub(2);
         let block = Block::default()
             .borders(Borders::ALL)
@@ -265,7 +265,7 @@ const DIVIDER: &str = "────────";
 
 /// Body prose on a `surfaces` card: between the body ink and the muted one,
 /// so the signature above it leads and the docs still read at length.
-pub(crate) fn prose_ink(t: surface::Tones) -> Color {
+pub(crate) fn prose_ink(t: crate::theme::Tones) -> Color {
     crate::gradient::rgb_color(crate::gradient::lerp_rgb(t.muted, t.text, 0.5))
 }
 
@@ -484,7 +484,7 @@ fn highlight_block(lines: &[String], lang: Option<LangKind>) -> Vec<Vec<HiSpan>>
 fn card_lines(
     lines: &[String],
     roles: &[CardLine],
-    t: surface::Tones,
+    t: crate::theme::Tones,
     inner_w: u16,
 ) -> Vec<Line<'static>> {
     let ink = |l: &str, fg: Color| Line::from(Span::styled(l.to_string(), Style::default().fg(fg)));
@@ -513,7 +513,7 @@ fn card_lines(
 /// half-block caps, on the middle row of the 3-row `area` that placement and
 /// the hit tests measure. The rows above and below are left as they are, so
 /// a hint reads as a label beside what it names rather than a boxed card.
-fn paint_pill(buf: &mut Buffer, area: Rect, label: &str, t: surface::Tones) {
+fn paint_pill(buf: &mut Buffer, area: Rect, label: &str, t: crate::theme::Tones) {
     let area = area.intersection(buf.area);
     if area.width < 3 || area.height < 2 {
         return;
@@ -876,7 +876,7 @@ mod tests {
     #[test]
     fn croft_loch_hover_is_a_quiet_card_with_a_type_ramp() {
         let theme = loch();
-        let t = surface::tones(theme).unwrap();
+        let t = crate::theme::tones(theme).unwrap();
         let text = format!("Error: bad\n{DIVIDER}\nfn foo() -> u8\ndocs here");
         let mut p = HoverPopup::new(text, (10, 20));
         p.theme = theme;
@@ -903,7 +903,7 @@ mod tests {
     #[test]
     fn croft_loch_compact_tooltip_is_a_one_row_pill() {
         let theme = loch();
-        let t = surface::tones(theme).unwrap();
+        let t = crate::theme::tones(theme).unwrap();
         let mut p = HoverPopup::new_compact("Refresh".into(), (10, 12));
         p.theme = theme;
         let area = p.area_for(VP);
@@ -999,7 +999,7 @@ mod tests {
     #[test]
     fn croft_loch_symbol_hover_is_typeset() {
         let theme = loch();
-        let t = surface::tones(theme).unwrap();
+        let t = crate::theme::tones(theme).unwrap();
         let mut p = HoverPopup::new(RA_HOVER.into(), (10, 20)).about_symbol(Some(LangKind::Rust));
         p.theme = theme;
         let plain = HoverPopup::new(RA_HOVER.into(), (10, 20));
@@ -1032,7 +1032,7 @@ mod tests {
     #[test]
     fn croft_loch_hover_never_shadows_the_hovered_line() {
         let theme = loch();
-        let t = surface::tones(theme).unwrap();
+        let t = crate::theme::tones(theme).unwrap();
         let mut p = HoverPopup::new("fn foo() -> u8\nDocs.".into(), (10, 12));
         p.theme = theme;
         let area = p.area_for(VP);

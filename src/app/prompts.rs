@@ -80,7 +80,7 @@ impl App {
         // A `surfaces` theme: the title in the strong ink on the card (no
         // chip), the caret and the prompt mark in the accent (the field has
         // the keyboard), the value in body text and the hint muted.
-        let tones = crate::widgets::surface::tones(self.theme);
+        let tones = crate::theme::tones(self.theme);
         let cursor_fg = match tones {
             Some(t) => t.accent(),
             None if grad => rgb_color(GRAD_TL),

@@ -238,7 +238,7 @@ pub fn render_symbol_picker(
     } else {
         theme.ui(picker_colours::SELECTION)
     };
-    let tones = crate::widgets::surface::tones(theme);
+    let tones = crate::theme::tones(theme);
 
     if inner.height == 0 || inner.width == 0 {
         return;
@@ -405,7 +405,7 @@ pub(crate) fn paint_selected(
     list: Rect,
     selected: usize,
     scroll: usize,
-    t: crate::widgets::surface::Tones,
+    t: crate::theme::Tones,
 ) {
     let Some(row) = selected.checked_sub(scroll) else {
         return;
@@ -526,7 +526,7 @@ mod tests {
     fn croft_loch_selects_a_row_with_the_band_and_bar() {
         use crate::widgets::surface;
         let theme = crate::theme::Theme::from_id("loch");
-        let t = surface::tones(theme).unwrap();
+        let t = crate::theme::tones(theme).unwrap();
         let mut p = picker();
         p.select_next();
         let area = Rect::new(0, 0, 100, 30);

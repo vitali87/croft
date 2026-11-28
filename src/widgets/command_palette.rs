@@ -278,7 +278,7 @@ pub fn render_command_palette(
     center: bool,
     backdrop: bool,
 ) {
-    if let Some(t) = crate::widgets::surface::tones(theme) {
+    if let Some(t) = crate::theme::tones(theme) {
         render_palette_card(palette, area, buf, theme, t, center, backdrop);
         return;
     }
@@ -455,7 +455,7 @@ fn render_palette_card(
     area: Rect,
     buf: &mut Buffer,
     theme: crate::theme::Theme,
-    t: crate::widgets::surface::Tones,
+    t: crate::theme::Tones,
     center: bool,
     backdrop: bool,
 ) {
@@ -641,7 +641,7 @@ mod tests {
     /// the accent, which stays for the selection).
     #[test]
     fn croft_loch_palette_rows_split_the_category_and_mark_the_match() {
-        let t = crate::widgets::surface::tones(crate::theme::Theme::from_id("loch")).unwrap();
+        let t = crate::theme::tones(crate::theme::Theme::from_id("loch")).unwrap();
         let (palette, buf) = loch_palette("toggle terminal", Rect::new(0, 0, 120, 40));
         let rect = palette.last_rect;
         let y = rect.y + 3;
@@ -702,7 +702,7 @@ mod tests {
     /// Croft Loch: no results is one centred, muted, italic line.
     #[test]
     fn croft_loch_palette_says_when_nothing_matches() {
-        let t = crate::widgets::surface::tones(crate::theme::Theme::from_id("loch")).unwrap();
+        let t = crate::theme::tones(crate::theme::Theme::from_id("loch")).unwrap();
         let (palette, buf) = loch_palette("zzqqxxj", Rect::new(0, 0, 100, 30));
         assert!(palette.results.is_empty());
         let rect = palette.last_rect;

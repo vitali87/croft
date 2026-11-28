@@ -764,7 +764,7 @@ fn change_section_header_carries_a_count_pill() {
 #[test]
 fn croft_loch_commit_message_is_a_raised_well_with_a_hairline_edge() {
     use ratatui::buffer::Buffer;
-    let t = crate::widgets::surface::tones(crate::theme::Theme::LOCH).unwrap();
+    let t = crate::theme::tones(crate::theme::Theme::LOCH).unwrap();
     let mut p = SourceControlPanel::new();
     p.theme = crate::theme::Theme::LOCH;
     p.set_status(dummy_status_with_branch("main"), Vec::new());
@@ -871,7 +871,7 @@ fn croft_loch_commit_placeholder_is_whole_at_every_side_bar_width() {
 #[test]
 fn croft_loch_commit_is_a_one_row_split_pill() {
     use ratatui::buffer::Buffer;
-    let t = crate::widgets::surface::tones(crate::theme::Theme::LOCH).unwrap();
+    let t = crate::theme::tones(crate::theme::Theme::LOCH).unwrap();
     let mut p = SourceControlPanel::new();
     p.theme = crate::theme::Theme::LOCH;
     p.set_status(dummy_status_with_branch("main"), Vec::new());
@@ -935,7 +935,8 @@ fn croft_loch_commit_is_a_one_row_split_pill() {
 /// quiet count chip, and the branch glyph muted rather than the accent.
 #[test]
 fn croft_loch_change_rows_lead_with_the_name_and_wear_the_band() {
-    use crate::widgets::surface::{ROW_BAR, tones};
+    use crate::theme::tones;
+    use crate::widgets::surface::ROW_BAR;
     use ratatui::buffer::Buffer;
     let t = tones(crate::theme::Theme::LOCH).unwrap();
     let mut p = SourceControlPanel::new();
@@ -997,7 +998,7 @@ fn croft_loch_change_rows_lead_with_the_name_and_wear_the_band() {
 #[test]
 fn croft_loch_repository_rows_keep_the_chrome() {
     use ratatui::buffer::Buffer;
-    let t = crate::widgets::surface::tones(crate::theme::Theme::LOCH).unwrap();
+    let t = crate::theme::tones(crate::theme::Theme::LOCH).unwrap();
     let mut p = SourceControlPanel::new();
     p.theme = crate::theme::Theme::LOCH;
     p.status = dummy_status_with_branch("trunk");
@@ -1344,7 +1345,7 @@ fn empty_state_init_button_paints_a_visible_label_at_narrow_widths() {
 #[test]
 fn croft_loch_initialize_button_is_a_one_row_pill_on_the_card() {
     use crate::git::GitStatus;
-    let t = crate::widgets::surface::tones(crate::theme::Theme::LOCH).unwrap();
+    let t = crate::theme::tones(crate::theme::Theme::LOCH).unwrap();
     let teal = crate::gradient::rgb_color(crate::gradient::PRIMARY_BTN_BG);
     let mut p = SourceControlPanel::new();
     p.theme = crate::theme::Theme::LOCH;

@@ -52,7 +52,7 @@ impl PtyTerminal {
     /// the accent eased a quarter of the way into the canvas, so success
     /// reads as on-palette and quieter than a failure's red.
     pub(super) fn quiet_ok_ink(&self) -> Color {
-        match crate::widgets::surface::tones(self.theme) {
+        match crate::theme::tones(self.theme) {
             Some(t) => {
                 crate::gradient::rgb_color(crate::gradient::lerp_rgb(t.accent, t.canvas, 0.25))
             }
@@ -197,7 +197,7 @@ impl Widget for &mut PtyTerminal {
         let mut redacted_spans = 0usize;
         // Croft Loch's inks and fills, looked up once per frame for the find
         // highlight's amber tint rather than once per cell.
-        let tones = crate::widgets::surface::tones(self.theme);
+        let tones = crate::theme::tones(self.theme);
         for y in 0..rows {
             // Find matches on this row once, then paint them per cell below.
             // Match positions are char indices in the spacer-skipped row text
@@ -614,7 +614,7 @@ impl Widget for &mut PtyTerminal {
             if let Some(text) = header {
                 // Croft Loch pins the command on the raised surface in body
                 // text, the scroll depth muted: a quiet card, not a banner.
-                let tones = crate::widgets::surface::tones(self.theme);
+                let tones = crate::theme::tones(self.theme);
                 let bg = tones.map_or(self.theme.ui(Color::Rgb(0x25, 0x2b, 0x36)), |t| t.raised());
                 let command_style = match tones {
                     Some(t) => Style::default().fg(t.text()).bg(bg),

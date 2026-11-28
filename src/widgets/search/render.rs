@@ -159,7 +159,7 @@ pub(super) fn render_field(
     // Croft Loch writes the field in its ink ramp: the text in body ink,
     // the placeholder and an idle lead glyph muted. A boxed theme keeps its
     // historical colours.
-    let tones = crate::widgets::surface::tones(theme);
+    let tones = crate::theme::tones(theme);
     let lead_w: u16 = if args.lead_glyph.is_some() { 2 } else { 0 };
     if let Some(g) = args.lead_glyph {
         let lead_color = match tones {
@@ -286,7 +286,7 @@ impl Widget for &mut SearchPanel {
 
         // Croft Loch's inks and fills; `None` on a boxed theme, which keeps
         // the colours below exactly as they were.
-        let tones = crate::widgets::surface::tones(self.theme);
+        let tones = crate::theme::tones(self.theme);
 
         // Row 0: "SEARCH" header (top-left) plus the VS Code SEARCH header
         // actions (refresh / clear) at the top-right. Croft Loch titles the

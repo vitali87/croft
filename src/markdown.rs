@@ -588,10 +588,10 @@ fn output_spans(
         .map(|sp| {
             let mut st = Style::default();
             if let Some(c) = sp.style.fg {
-                st = st.fg(crate::widgets::editor::ansi_color_to_tui(c, theme));
+                st = st.fg(crate::ansi_text::ansi_color_to_tui(c, theme));
             }
             if let Some(c) = sp.style.bg {
-                st = st.bg(crate::widgets::editor::ansi_color_to_tui(c, theme));
+                st = st.bg(crate::ansi_text::ansi_color_to_tui(c, theme));
             }
             if sp.style.bold {
                 st = st.add_modifier(Modifier::BOLD);

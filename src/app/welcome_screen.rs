@@ -246,7 +246,7 @@ impl App {
         // Croft Loch places it in its own stack (a Start row, or a chip in
         // the Start list's place), so this bottom button is the boxed
         // themes' alone.
-        if crate::widgets::surface::tones(self.theme).is_none()
+        if crate::theme::tones(self.theme).is_none()
             && !self.tour_done
             && self.tour.is_none()
             && outer_area.height > 6
@@ -395,7 +395,7 @@ impl App {
         let block_w = block_right.saturating_sub(block_left);
         // Croft Loch composes its own page: one centred column with a Start
         // list, the release card shortened rather than the list dropped.
-        if let Some(t) = crate::widgets::surface::tones(self.theme) {
+        if let Some(t) = crate::theme::tones(self.theme) {
             self.render_welcome_loch(frame, area, t, block_left, block_w);
             return;
         }
@@ -712,7 +712,7 @@ impl App {
         &mut self,
         frame: &mut ratatui::Frame,
         area: Rect,
-        t: crate::widgets::surface::Tones,
+        t: crate::theme::Tones,
         block_left: u16,
         block_w: u16,
     ) {

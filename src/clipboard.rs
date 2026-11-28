@@ -151,7 +151,7 @@ pub fn send_osc52(text: &str) {
     #[cfg(not(test))]
     {
         use std::io::Write;
-        let bytes = crate::widgets::terminal::osc52_copy_seq(text);
+        let bytes = osc52_copy_seq(text);
         let mut out = std::io::stdout();
         let _ = out.write_all(&bytes);
         let _ = out.flush();

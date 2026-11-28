@@ -382,7 +382,7 @@ impl Widget for &mut CommitGraphPanel {
             // band (greyed while COMMITS has not the keys) on a card, the
             // list blue on a plain panel.
             let picked = self.selected == Some(self.scroll + row);
-            let tones = crate::widgets::surface::tones(self.theme);
+            let tones = crate::theme::tones(self.theme);
             if picked {
                 match tones {
                     Some(t) => crate::widgets::surface::paint_selected_row(

@@ -82,7 +82,7 @@ struct Palette {
 impl Palette {
     fn of(theme: Theme) -> Self {
         let primary = theme.button();
-        if let Some(t) = crate::widgets::surface::tones(theme) {
+        if let Some(t) = crate::theme::tones(theme) {
             // The refined inks: the title strong, labels muted, values in
             // body text; secondary pills a lift off the card (the keycap
             // chip's), the link glyph muted until the pointer is on it.
@@ -157,7 +157,7 @@ pub fn pill_spans(label: &str, fill: Color, fg: Color) -> [Span<'static>; 3] {
 /// at its normal weight (the card's title is its one bold thing). The same
 /// width either way.
 fn card_pill_spans(theme: Theme, label: &str, fill: Color, fg: Color) -> [Span<'static>; 3] {
-    if crate::widgets::surface::tones(theme).is_none() {
+    if crate::theme::tones(theme).is_none() {
         return pill_spans(label, fill, fg);
     }
     [
@@ -335,7 +335,7 @@ impl<A: Copy> Card<A> {
             // The divider runs the card's full width and joins a line
             // border with tees; a `surfaces` card edge has no line to join,
             // so its rule runs edge to edge in the rim and meets the edge.
-            let surfaces = crate::widgets::surface::tones(theme).is_some();
+            let surfaces = crate::theme::tones(theme).is_some();
             let span = if surfaces {
                 rect.x..rect.right()
             } else {
@@ -545,7 +545,7 @@ mod tests {
     #[test]
     fn croft_loch_pills_use_half_block_caps_and_the_divider_spans_the_card() {
         let theme = Theme::from_id("loch");
-        let t = crate::widgets::surface::tones(theme).unwrap();
+        let t = crate::theme::tones(theme).unwrap();
         let c = card();
         let h = c.height(WIDTH);
         let area = Rect::new(0, 0, WIDTH, h);

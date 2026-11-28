@@ -200,7 +200,7 @@ pub fn render_process_picker(
     } else {
         theme.ui(picker_colours::SELECTION)
     };
-    let tones = crate::widgets::surface::tones(theme);
+    let tones = crate::theme::tones(theme);
 
     if inner.height == 0 || inner.width == 0 {
         return;

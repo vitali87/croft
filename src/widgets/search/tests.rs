@@ -1514,7 +1514,7 @@ fn leading_context_of_wide_characters_is_dropped_whole() {
 fn loch_results_panel(tmp: &TempDir) -> SearchPanel {
     let mut panel = SearchPanel::new(tmp.path().to_path_buf());
     assert!(
-        crate::widgets::surface::tones(panel.theme).is_some(),
+        crate::theme::tones(panel.theme).is_some(),
         "the default theme is Croft Loch"
     );
     panel.query = "needle".into();
@@ -1550,7 +1550,8 @@ fn cell_of(buf: &Buffer, label: &str) -> (u16, u16) {
 /// with its inks a step up, and the file name is never a teal chip.
 #[test]
 fn croft_loch_result_rows_use_the_ink_ramp_and_the_selected_row_band() {
-    use crate::widgets::surface::{ROW_BAR, selected_row_fill, tones};
+    use crate::theme::tones;
+    use crate::widgets::surface::{ROW_BAR, selected_row_fill};
     let tmp = TempDir::new().unwrap();
     let mut panel = loch_results_panel(&tmp);
     let t = tones(panel.theme).unwrap();
@@ -1599,7 +1600,7 @@ fn croft_loch_result_rows_use_the_ink_ramp_and_the_selected_row_band() {
 #[test]
 fn croft_loch_result_line_numbers_stay_readable_on_every_row() {
     use crate::theme::contrast_ratio;
-    use crate::widgets::surface::tones;
+    use crate::theme::tones;
     let rgb = |c: Color| match c {
         Color::Rgb(r, g, b) => (r, g, b),
         other => panic!("an RGB colour, not {other:?}"),
@@ -1627,7 +1628,8 @@ fn croft_loch_result_line_numbers_stay_readable_on_every_row() {
 /// at 4.5:1 or better.
 #[test]
 fn croft_loch_result_matches_are_an_amber_tint_of_their_row() {
-    use crate::widgets::surface::{match_style, selected_row_fill, tones};
+    use crate::theme::tones;
+    use crate::widgets::surface::{match_style, selected_row_fill};
     let tmp = TempDir::new().unwrap();
     let mut panel = loch_results_panel(&tmp);
     let t = tones(panel.theme).unwrap();
@@ -1661,7 +1663,8 @@ fn croft_loch_result_matches_are_an_amber_tint_of_their_row() {
 /// neutral hover fill, and its match is tinted over that lift.
 #[test]
 fn croft_loch_hovered_result_rows_take_the_neutral_lift() {
-    use crate::widgets::surface::{match_style, tones};
+    use crate::theme::tones;
+    use crate::widgets::surface::match_style;
     let tmp = TempDir::new().unwrap();
     let mut panel = loch_results_panel(&tmp);
     let t = tones(panel.theme).unwrap();
@@ -1687,7 +1690,7 @@ fn croft_loch_hovered_result_rows_take_the_neutral_lift() {
 fn croft_loch_summary_and_title_follow_the_ink_ramp() {
     let tmp = TempDir::new().unwrap();
     let mut panel = loch_results_panel(&tmp);
-    let t = crate::widgets::surface::tones(panel.theme).unwrap();
+    let t = crate::theme::tones(panel.theme).unwrap();
     panel.focused = true;
     let buf = render_panel(&mut panel, 40);
     let (x, y) = cell_of(&buf, "2 results in 1 file");

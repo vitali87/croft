@@ -1312,7 +1312,7 @@ impl App {
                     // Croft Loch: every stacked section ends on a hairline,
                     // so the tree's blank bottom padding row takes the same
                     // seam when a section follows it.
-                    if let Some(t) = crate::widgets::surface::tones(self.theme)
+                    if let Some(t) = crate::theme::tones(self.theme)
                         && rect.bottom() < area.bottom()
                         && rect.height > 1
                     {

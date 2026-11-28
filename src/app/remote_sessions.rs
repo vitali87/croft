@@ -346,7 +346,7 @@ impl App {
             self.status = String::from("This pane is not running anything");
             return;
         };
-        let Some(cmd) = crate::widgets::terminal::process_cmdline(fg) else {
+        let Some(cmd) = crate::proc::info::process_cmdline(fg) else {
             self.status = String::from("Could not read what this pane is running");
             return;
         };

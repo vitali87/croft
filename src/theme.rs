@@ -825,7 +825,7 @@ impl Theme {
     pub fn indent_guide(self) -> Color {
         // A `surfaces` theme draws structure in its seam tone, so guides
         // read as the same hairlines that part its panes.
-        if let Some(t) = crate::widgets::surface::tones(self) {
+        if let Some(t) = tones(self) {
             return t.hairline();
         }
         self.blend_over_bg((0x88, 0x88, 0x88), 0.38)
@@ -843,7 +843,7 @@ impl Theme {
     /// #707070 on the dark default). Same grey, blended stronger.
     pub fn indent_guide_active(self) -> Color {
         // One ink step above the hairline the other guides wear.
-        if let Some(t) = crate::widgets::surface::tones(self) {
+        if let Some(t) = tones(self) {
             return t.faint();
         }
         self.blend_over_bg((0x88, 0x88, 0x88), 0.80)
@@ -854,7 +854,7 @@ impl Theme {
     /// own dark grey on a boxed theme; the faint ink on a `surfaces` theme,
     /// so the gutter follows the theme's palette instead of the host's.
     pub fn line_number_fg(self) -> Color {
-        match crate::widgets::surface::tones(self) {
+        match tones(self) {
             Some(t) => t.faint(),
             None => Color::DarkGray,
         }
@@ -866,7 +866,7 @@ impl Theme {
     /// theme uses its body text ink, so the caret's number sits in the same
     /// grey family as the rest of the chrome.
     pub fn line_number_active(self) -> Color {
-        if let Some(t) = crate::widgets::surface::tones(self) {
+        if let Some(t) = tones(self) {
             t.text()
         } else if self.is_light() {
             Color::Rgb(0x0b, 0x21, 0x6f)
@@ -883,7 +883,7 @@ impl Theme {
     /// own surface, clearly apart from the raised sticky headers and the
     /// teal selection.
     pub fn current_line_bg(self) -> Color {
-        if let Some(t) = crate::widgets::surface::tones(self) {
+        if let Some(t) = tones(self) {
             return t.chrome();
         }
         self.blend_over_bg(self.accent, 0.08)
@@ -914,7 +914,7 @@ impl Theme {
     /// `surfaces` theme floats them on its raised tone, a step above the
     /// chrome-toned current line, so the two bands never read as one.
     pub fn sticky_scroll_bg(self) -> Color {
-        if let Some(t) = crate::widgets::surface::tones(self) {
+        if let Some(t) = tones(self) {
             return t.raised();
         }
         let lift = if self.is_light() {
@@ -998,7 +998,7 @@ impl Theme {
     pub fn scrollbar_thumb(self) -> Color {
         // A `surfaces` theme rests the thumb in its seam tone: present, cool
         // and quiet, the same hairline that parts its panes.
-        if let Some(t) = crate::widgets::surface::tones(self) {
+        if let Some(t) = tones(self) {
             return t.hairline();
         }
         self.blend_over_bg((0x79, 0x79, 0x79), 0.40)
@@ -1008,7 +1008,7 @@ impl Theme {
     /// value, #646464 at 70% alpha). On a `surfaces` theme, the hairline a
     /// quarter of the way to the muted ink: brighter, still the cool grey.
     pub fn scrollbar_thumb_focused(self) -> Color {
-        if let Some(t) = crate::widgets::surface::tones(self) {
+        if let Some(t) = tones(self) {
             return rgb(blend(t.muted, 0.25, t.hairline));
         }
         self.blend_over_bg((0x64, 0x64, 0x64), 0.70)
@@ -1018,7 +1018,7 @@ impl Theme {
     /// boxed theme; the accent on a `surfaces` theme, where every caret is
     /// the one colour that means "you are typing here".
     pub fn secondary_caret_bg(self) -> Color {
-        match crate::widgets::surface::tones(self) {
+        match tones(self) {
             Some(t) => t.accent(),
             None => self.ui(Color::Rgb(0xae, 0xc6, 0xff)),
         }
@@ -1070,7 +1070,7 @@ impl Theme {
     /// Croft Loch rests its icons in the muted ink, so the column recedes
     /// behind the side bar's labels instead of competing with them.
     pub fn activity_icon_inactive_rgb(self) -> (u8, u8, u8) {
-        if let Some(t) = crate::widgets::surface::tones(self) {
+        if let Some(t) = tones(self) {
             return t.muted;
         }
         self.ui_rgb((0x9d, 0xa5, 0xb4))
@@ -1084,7 +1084,7 @@ impl Theme {
     ///
     /// Croft Loch's is the strong ink: the region's one emphasised mark.
     pub fn activity_icon_active_rgb(self) -> (u8, u8, u8) {
-        if let Some(t) = crate::widgets::surface::tones(self) {
+        if let Some(t) = tones(self) {
             return t.strong;
         }
         self.ui_rgb((0xff, 0xff, 0xff))
@@ -1095,7 +1095,7 @@ impl Theme {
     /// and selection differ by more than the pill; every other theme lifts
     /// it all the way to the active ink, as VS Code does.
     pub fn activity_icon_hover_rgb(self) -> (u8, u8, u8) {
-        match crate::widgets::surface::tones(self) {
+        match tones(self) {
             Some(t) => t.text,
             None => self.activity_icon_active_rgb(),
         }
@@ -1135,7 +1135,7 @@ impl Theme {
     /// the muted ink like its neighbours and lets the pink bloom only under
     /// the pointer, so the bar's loudest pixel is not an idle heart.
     pub fn activity_sponsor_rgb(self) -> (u8, u8, u8) {
-        if let Some(t) = crate::widgets::surface::tones(self) {
+        if let Some(t) = tones(self) {
             return t.muted;
         }
         self.ui_rgb((0xdb, 0x61, 0xa2))
@@ -1613,7 +1613,7 @@ mod tests {
     #[test]
     fn croft_loch_editor_washes_come_from_its_tones() {
         let loch = Theme::LOCH;
-        let t = crate::widgets::surface::tones(loch).expect("Loch has surfaces");
+        let t = tones(loch).expect("Loch has surfaces");
         assert_eq!(loch.current_line_bg(), t.chrome());
         assert_ne!(loch.current_line_bg(), loch.sticky_scroll_bg());
         assert_ne!(
@@ -1773,7 +1773,7 @@ mod tests {
     #[test]
     fn croft_loch_activity_icons_rest_muted_and_hover_a_step_below_selected() {
         let loch = Theme::from_id("loch");
-        let t = crate::widgets::surface::tones(loch).unwrap();
+        let t = tones(loch).unwrap();
         assert_eq!(loch.activity_icon_inactive_rgb(), t.muted);
         assert_eq!(loch.activity_icon_hover_rgb(), t.text);
         assert_eq!(loch.activity_icon_active_rgb(), t.strong);

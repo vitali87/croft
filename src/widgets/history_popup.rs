@@ -96,7 +96,7 @@ impl HistoryPopup {
 /// `2m 05s` style, mirroring the decoration duration formatting but from
 /// milliseconds.
 fn dur_label(ms: u64) -> String {
-    crate::widgets::terminal::human_duration(std::time::Duration::from_millis(ms))
+    crate::command_history::human_duration(std::time::Duration::from_millis(ms))
 }
 
 /// Draw the popup into `rect` exactly as given; placement is the caller's
@@ -141,7 +141,7 @@ pub fn render_history_popup(
     } else {
         theme.ui(picker_colours::SELECTION)
     };
-    let tones = crate::widgets::surface::tones(theme);
+    let tones = crate::theme::tones(theme);
 
     // Query line with a block caret, the zoxide-jump idiom.
     let query_style = Style::default()

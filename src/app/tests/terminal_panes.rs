@@ -1051,7 +1051,7 @@ fn rail_is_a_fixed_narrow_column_showing_four_label_chars() {
 fn croft_loch_rail_marks_the_active_terminal_with_the_selected_row() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    let t = crate::widgets::surface::tones(app.theme).expect("Croft Loch is the default");
+    let t = crate::theme::tones(app.theme).expect("Croft Loch is the default");
     app.split_terminal().unwrap();
     app.terminal_pane_maximized = true;
     app.terminals[0].set_manual_name(Some(String::from("zsh")));

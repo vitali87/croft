@@ -119,7 +119,7 @@ impl Notification {
                 let code = exit.map_or_else(|| String::from("?"), |c| c.to_string());
                 let mut s = format!(
                     "Command in {pane} finished: exit {code} in {}",
-                    crate::widgets::terminal::human_duration(*dur)
+                    crate::command_history::human_duration(*dur)
                 );
                 if !cmd.trim().is_empty() {
                     s.push_str(" \u{2014} ");

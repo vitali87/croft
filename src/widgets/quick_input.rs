@@ -33,7 +33,8 @@ use std::borrow::Cow;
 use unicode_width::UnicodeWidthStr;
 
 use crate::theme::Theme;
-use crate::widgets::surface::{self, Tones};
+use crate::theme::Tones;
+use crate::widgets::surface;
 
 /// The fewest list rows a card shows, so a single result (or the empty
 /// state's line) is not wedged between the rule and the footer.
@@ -580,7 +581,7 @@ mod tests {
                 &mut buf,
                 &card,
                 loch(),
-                surface::tones(loch()).unwrap(),
+                crate::theme::tones(loch()).unwrap(),
                 &input("x"),
             );
             assert!(card.rect.bottom() <= h);
@@ -589,7 +590,7 @@ mod tests {
 
     #[test]
     fn the_input_row_has_the_glyph_the_query_the_count_and_the_caret() {
-        let t = surface::tones(loch()).unwrap();
+        let t = crate::theme::tones(loch()).unwrap();
         let area = Rect::new(0, 0, 60, 20);
         let card = Card::layout(area, 50, 12, 3, false);
         let mut buf = Buffer::empty(area);
@@ -621,7 +622,7 @@ mod tests {
 
     #[test]
     fn an_empty_query_shows_the_placeholder_muted_and_italic() {
-        let t = surface::tones(loch()).unwrap();
+        let t = crate::theme::tones(loch()).unwrap();
         let area = Rect::new(0, 0, 60, 20);
         let card = Card::layout(area, 50, 12, 3, false);
         let mut buf = Buffer::empty(area);
@@ -636,7 +637,7 @@ mod tests {
 
     #[test]
     fn the_footer_sits_on_the_chrome_tone_with_the_keys() {
-        let t = surface::tones(loch()).unwrap();
+        let t = crate::theme::tones(loch()).unwrap();
         let area = Rect::new(0, 0, 60, 20);
         let card = Card::layout(area, 50, 12, 3, false);
         let mut buf = Buffer::empty(area);
@@ -659,7 +660,7 @@ mod tests {
 
     #[test]
     fn a_selected_row_puts_the_bar_on_the_cards_edge_and_keycaps_clear_the_rim() {
-        let t = surface::tones(loch()).unwrap();
+        let t = crate::theme::tones(loch()).unwrap();
         let area = Rect::new(0, 0, 60, 20);
         let card = Card::layout(area, 50, 12, 3, false);
         let mut buf = Buffer::empty(area);
@@ -706,7 +707,7 @@ mod tests {
 
     #[test]
     fn a_label_too_long_for_the_row_ends_in_an_ellipsis_and_drops_its_keys() {
-        let t = surface::tones(loch()).unwrap();
+        let t = crate::theme::tones(loch()).unwrap();
         let area = Rect::new(0, 0, 30, 12);
         let card = Card::layout(area, 30, 10, 1, false);
         let mut buf = Buffer::empty(area);
@@ -732,7 +733,7 @@ mod tests {
 
     #[test]
     fn the_empty_state_is_a_centred_muted_italic_line() {
-        let t = surface::tones(loch()).unwrap();
+        let t = crate::theme::tones(loch()).unwrap();
         let area = Rect::new(0, 0, 60, 20);
         let card = Card::layout(area, 50, 12, 0, false);
         let mut buf = Buffer::empty(area);
@@ -749,7 +750,7 @@ mod tests {
 
     #[test]
     fn an_overflowing_list_lights_its_stretch_of_the_right_edge() {
-        let t = surface::tones(loch()).unwrap();
+        let t = crate::theme::tones(loch()).unwrap();
         let area = Rect::new(0, 0, 60, 20);
         let card = Card::layout(area, 50, 10, 40, false);
         let mut buf = Buffer::empty(area);
@@ -765,7 +766,7 @@ mod tests {
     /// band's right end is as square as its left.
     #[test]
     fn the_scroll_thumb_sits_on_the_selected_rows_band() {
-        let t = surface::tones(loch()).unwrap();
+        let t = crate::theme::tones(loch()).unwrap();
         let area = Rect::new(0, 0, 60, 20);
         let card = Card::layout(area, 50, 10, 40, false);
         let mut buf = Buffer::empty(area);
@@ -802,7 +803,7 @@ mod tests {
         assert_eq!(match_offsets("src/foo/bar.rs", "fbr"), [4, 8, 10]);
         assert_eq!(match_offsets("abc", "xyz"), Vec::<usize>::new());
         assert_eq!(match_offsets("abc", "  "), Vec::<usize>::new());
-        let t = surface::tones(loch()).unwrap();
+        let t = crate::theme::tones(loch()).unwrap();
         let spans = highlighted(
             "Toggle",
             6,
@@ -820,7 +821,7 @@ mod tests {
     /// otherwise run down every row as a teal column.
     #[test]
     fn a_match_is_strong_bold_ink_not_the_accent() {
-        let t = surface::tones(loch()).unwrap();
+        let t = crate::theme::tones(loch()).unwrap();
         let hit = hit_style(t);
         assert_eq!(hit.fg, Some(t.strong()));
         assert_ne!(hit.fg, Some(t.accent()));

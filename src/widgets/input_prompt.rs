@@ -537,7 +537,7 @@ pub fn render_input_prompt(
     buf: &mut Buffer,
     theme: crate::theme::Theme,
 ) {
-    if let Some(t) = crate::widgets::surface::tones(theme) {
+    if let Some(t) = crate::theme::tones(theme) {
         render_prompt_card(prompt, screen, buf, theme, t);
         return;
     }
@@ -671,7 +671,7 @@ fn render_prompt_card(
     screen: Rect,
     buf: &mut Buffer,
     theme: crate::theme::Theme,
-    t: crate::widgets::surface::Tones,
+    t: crate::theme::Tones,
 ) {
     let width = (screen.width.saturating_mul(6) / 10)
         .clamp(30, 90)
@@ -1023,7 +1023,7 @@ mod tests {
     /// at its end (no painted block); the keys are in a footer on chrome.
     #[test]
     fn croft_loch_prompt_is_a_card_with_a_field_and_a_footer() {
-        let t = crate::widgets::surface::tones(crate::theme::Theme::from_id("loch")).unwrap();
+        let t = crate::theme::tones(crate::theme::Theme::from_id("loch")).unwrap();
         let mut p = prefilled("v1.2");
         let buf = loch_prompt(&mut p);
         let r = p.last_rect;

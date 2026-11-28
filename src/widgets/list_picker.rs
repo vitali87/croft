@@ -278,7 +278,7 @@ pub fn render_list_picker(
     theme: crate::theme::Theme,
     backdrop: bool,
 ) {
-    if let Some(t) = crate::widgets::surface::tones(theme) {
+    if let Some(t) = crate::theme::tones(theme) {
         render_picker_card(picker, screen, buf, theme, t, backdrop);
         return;
     }
@@ -424,7 +424,7 @@ fn render_picker_card(
     screen: Rect,
     buf: &mut Buffer,
     theme: crate::theme::Theme,
-    t: crate::widgets::surface::Tones,
+    t: crate::theme::Tones,
     backdrop: bool,
 ) {
     use crate::widgets::quick_input::{self as qi, Card, Input, Row};
@@ -589,7 +589,7 @@ mod tests {
     /// with the accent bar on the edge.
     #[test]
     fn croft_loch_picker_asks_its_title_in_the_field() {
-        let t = crate::widgets::surface::tones(crate::theme::Theme::from_id("loch")).unwrap();
+        let t = crate::theme::tones(crate::theme::Theme::from_id("loch")).unwrap();
         let (p, buf) = rendered(crate::theme::Theme::from_id("loch"));
         let r = p.last_rect;
         let line = |y: u16| -> String {

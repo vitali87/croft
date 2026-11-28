@@ -124,8 +124,8 @@ use workbench::*;
 use crate::lsp::manager::CompletionTrigger;
 use crate::lsp::manager::{diagnostics_by_source, diagnostics_source, diagnostics_store_key};
 use crate::paths::croft_cache_dir;
+use crate::proc::info::cwd_of_pid;
 use crate::theme::BRAND_ORANGE;
-use crate::widgets::terminal::cwd_of_pid;
 
 use crate::dependencies::{Dependency, Ecosystem};
 use crate::search::SearchRequest;
@@ -5842,7 +5842,7 @@ fn inlay_hints_on_in(
         .map_or(global, |off| !off)
 }
 
-use crate::widgets::terminal::cwd_is_observable;
+use crate::proc::info::cwd_is_observable;
 
 /// The cells of `r` that lie inside `buf`, row by row.
 fn cells_in(buf: &ratatui::buffer::Buffer, r: Rect) -> Vec<ratatui::buffer::Cell> {

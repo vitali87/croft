@@ -60,7 +60,7 @@ fn croft_loch_draws_the_unsaved_prompt_as_a_tinted_card() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut app, _) = app_with_unsaved_file(tmp.path());
     app.theme = crate::theme::Theme::from_id("loch");
-    let t = crate::widgets::surface::tones(app.theme).unwrap();
+    let t = crate::theme::tones(app.theme).unwrap();
     press_ctrl_q(&mut app);
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
     term.draw(|f| app.render(f)).unwrap();

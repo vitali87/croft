@@ -363,7 +363,7 @@ impl CompletionDetails<'_> {
 impl Widget for CompletionDetails<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let theme = self.popup.theme;
-        let tones = surface::tones(theme);
+        let tones = crate::theme::tones(theme);
         let mut lines: Vec<Line> = Vec::new();
         for (i, l) in self.popup.details_lines().into_iter().enumerate() {
             // The first line is the signature when the item has one.
@@ -422,7 +422,7 @@ fn kind_ink(kind: Option<lsp_types::CompletionItemKind>, theme: crate::theme::Th
         Some(K::MODULE) | Some(K::KEYWORD) => syn.keyword,
         Some(K::CONSTANT) => syn.constant,
         Some(K::VARIABLE) | Some(K::FIELD) | Some(K::PROPERTY) => syn.fg,
-        _ => return surface::tones(theme).map_or(Color::Reset, |t| t.muted()),
+        _ => return crate::theme::tones(theme).map_or(Color::Reset, |t| t.muted()),
     };
     crate::gradient::rgb_color(rgb)
 }
@@ -431,7 +431,12 @@ fn kind_ink(kind: Option<lsp_types::CompletionItemKind>, theme: crate::theme::Th
 /// matched (case-insensitively, from the start) in the accent, the rest in
 /// `ink`. A label the prefix does not open (a match on its filter text)
 /// stays one span.
-fn label_spans(label: &str, prefix: &str, ink: Color, t: surface::Tones) -> Vec<Span<'static>> {
+fn label_spans(
+    label: &str,
+    prefix: &str,
+    ink: Color,
+    t: crate::theme::Tones,
+) -> Vec<Span<'static>> {
     let n = prefix.chars().count();
     let head: String = label.chars().take(n).collect();
     if n == 0 || head.chars().count() < n || !head.eq_ignore_ascii_case(prefix) {
@@ -450,7 +455,7 @@ fn label_spans(label: &str, prefix: &str, ink: Color, t: surface::Tones) -> Vec<
 impl Widget for &CompletionPopup {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let visible = self.visible_indices();
-        let tones = surface::tones(self.theme);
+        let tones = crate::theme::tones(self.theme);
         // Inside the borders, after the kind glyph: what a row has for its
         // label and detail.
         let row_room = area.width.saturating_sub(2 + 3);
@@ -1012,7 +1017,7 @@ mod tests {
     #[test]
     fn croft_loch_rows_mark_the_prefix_and_select_with_the_bar() {
         let theme = crate::theme::Theme::from_id("loch");
-        let t = surface::tones(theme).unwrap();
+        let t = crate::theme::tones(theme).unwrap();
         let mut fun = documented("trim_start", "fn(&self) -> &str", TRIM_DOC);
         fun.kind = Some(lsp_types::CompletionItemKind::FUNCTION);
         let mut p = popup(
@@ -1063,7 +1068,7 @@ mod tests {
     fn croft_loch_selected_row_detail_steps_up_to_body_text() {
         use crate::theme::contrast_ratio;
         let theme = crate::theme::Theme::from_id("loch");
-        let t = surface::tones(theme).unwrap();
+        let t = crate::theme::tones(theme).unwrap();
         let mut p = popup(
             vec![
                 documented("trim", "fn(&self) -> &str", ""),
@@ -1100,7 +1105,7 @@ mod tests {
     #[test]
     fn croft_loch_completion_list_wears_the_quiet_frame() {
         let theme = crate::theme::Theme::from_id("loch");
-        let t = surface::tones(theme).unwrap();
+        let t = crate::theme::tones(theme).unwrap();
         let mut p = popup(vec![item("alpha"), item("beta")], "");
         p.theme = theme;
         let list = p.area_for(VIEW);
@@ -1216,7 +1221,7 @@ mod tests {
     #[test]
     fn croft_loch_cards_never_shadow_the_caret_line_or_the_list() {
         let theme = crate::theme::Theme::from_id("loch");
-        let t = surface::tones(theme).unwrap();
+        let t = crate::theme::tones(theme).unwrap();
         let lit = |vp: Rect| {
             let mut buf = Buffer::empty(vp);
             buf.set_style(vp, Style::default().bg(t.chrome()));
