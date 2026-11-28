@@ -326,7 +326,7 @@ fn tick_language_server_replies(app: &mut App) -> bool {
 /// The debugger, the test runner and its coverage and watch, and the
 /// notice of a red test run.
 fn tick_debugger_and_tests(app: &mut App) -> bool {
-    let dap_changed = app.poll_dap() | app.poll_debug_build();
+    let dap_changed = app.poll_dap() | app.poll_debug_build() | app.poll_debug_setups();
     let tests_changed = app.test_worker.drain(&mut app.testing)
         | app.drain_pending_test_debug()
         | app.drain_pending_cargo_launch();

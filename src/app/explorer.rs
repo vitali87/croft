@@ -2288,6 +2288,9 @@ impl App {
         // refusing NEW debug builds until the stale compile finished.
         self.disarm_failure_breakpoint();
         self.pending_test_debug = None;
+        // A launch waiting for its debugger was asked for in the old
+        // workspace: a Debug Test there would run in this one (#2803).
+        self.forget_parked_setup_launches();
         if self.sidebar_view == SidebarView::Testing {
             self.discover_tests();
         }

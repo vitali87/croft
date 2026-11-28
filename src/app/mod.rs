@@ -3502,6 +3502,11 @@ pub struct App {
     pending_debug_launch: Option<PendingDebugLaunch>,
     /// The `${input:…}` values a launch or task is asking for (#1424).
     input_run: Option<InputRun>,
+    /// Debuggers being prepared off the UI thread, and the launches that
+    /// wait for them (#2803).
+    debug_setups: Vec<debugger::DebugSetup>,
+    /// What prepares a debugger on this machine; a test puts a stand-in here.
+    debug_tooling: std::sync::Arc<dyn crate::dap::install::DebugTooling>,
     /// F5's C/C++ build running off the UI thread (#1359): the source it
     /// debugs and where the build's result arrives. `poll_debug_build`
     /// launches lldb-dap on the program once it is built.
@@ -4889,6 +4894,8 @@ impl App {
             debug_compound: None,
             pending_debug_launch: None,
             input_run: None,
+            debug_setups: Vec::new(),
+            debug_tooling: std::sync::Arc::new(crate::dap::install::MachineTooling),
             debug_build: None,
             pending_attach: None,
             pending_test_debug: None,
