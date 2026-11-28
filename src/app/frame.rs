@@ -878,7 +878,8 @@ impl App {
                     .and_then(|p| collab_file_key(&self.tree.root, p))
             {
                 let navigator_sites = self
-                    .pair_host
+                    .pair
+                    .host
                     .as_ref()
                     .map(|h| h.caret_sites())
                     .unwrap_or_default();
@@ -903,7 +904,8 @@ impl App {
             // The navigator's comment boxes for the active file, same
             // hoisting rule (rows come from poll_pair's per-tick snapshot).
             let author = self
-                .pair_host
+                .pair
+                .host
                 .as_ref()
                 .map(|h| h.name().to_string())
                 .unwrap_or_default();
@@ -912,7 +914,7 @@ impl App {
                 .path
                 .as_ref()
                 .and_then(|p| collab_file_key(&self.tree.root, p))
-                .and_then(|file| self.navigator_notes.get(&file))
+                .and_then(|file| self.pair.navigator_notes.get(&file))
                 .map(|notes| {
                     notes
                         .iter()
@@ -1845,7 +1847,7 @@ impl App {
                 self.theme.ui(Color::Rgb(0x10, 0x13, 0x1a)),
             ));
             spans.push(Span::raw(" "));
-        } else if let Some(host) = &self.pair_host {
+        } else if let Some(host) = &self.pair.host {
             // Resident navigator seated and idle: presence, not attention —
             // the stream badge above takes over whenever it is typing.
             spans.push(Span::styled(

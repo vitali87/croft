@@ -663,7 +663,7 @@ impl App {
         ];
         // The resident navigator's line-scoped ask, only while
         // one is seated (`line` here is 1-based, the box 0-based).
-        if self.pair_host.is_some() {
+        if self.pair.host.is_some() {
             items.push((
                 String::from("Ask Navigator"),
                 MenuAction::AskNavigatorAt {
@@ -765,7 +765,7 @@ impl App {
         }
         // The navigator's selection-scoped ask (GitHub-review
         // style), only while one is seated and lines are selected.
-        if self.pair_host.is_some()
+        if self.pair.host.is_some()
             && let Some((start, end)) = self.editor.selection_rows()
         {
             items.push((

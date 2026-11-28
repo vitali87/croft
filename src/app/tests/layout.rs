@@ -2703,17 +2703,20 @@ fn a_failed_spawner_releases_the_lock_so_another_window_can_host() {
     };
 
     let mut a = App::new(tmp.path().to_path_buf()).unwrap();
-    a.pair_record_path = tmp.path().join("a.pair.json");
-    a.pair_socket = socket.clone();
-    a.pair_host_lock_path = lock_path.clone();
-    a.pair_spawn_override = Some(Box::new(|_| anyhow::bail!("claude is broken")));
-    crate::session::write_pair_record(&a.pair_record_path, &record).unwrap();
-    a.last_pair_check = None;
+    a.pair.record_path = tmp.path().join("a.pair.json");
+    a.pair.socket = socket.clone();
+    a.pair.host_lock_path = lock_path.clone();
+    a.pair.spawn_override = Some(Box::new(|_| anyhow::bail!("claude is broken")));
+    crate::session::write_pair_record(&a.pair.record_path, &record).unwrap();
+    a.pair.last_check = None;
     a.maybe_seat_navigator();
-    assert!(a.pair_host.is_none());
-    assert!(a.navigator_down, "the failure latches, no 1s retry storm");
+    assert!(a.pair.host.is_none());
     assert!(
-        a.pair_host_lock.is_none(),
+        a.pair.navigator_down,
+        "the failure latches, no 1s retry storm"
+    );
+    assert!(
+        a.pair.host_lock.is_none(),
         "a window that cannot host must release the lock"
     );
     assert!(
@@ -2722,15 +2725,15 @@ fn a_failed_spawner_releases_the_lock_so_another_window_can_host() {
     );
 
     let mut b = App::new(tmp.path().to_path_buf()).unwrap();
-    b.pair_record_path = tmp.path().join("b.pair.json");
-    b.pair_socket = socket.clone();
-    b.pair_host_lock_path = lock_path.clone();
-    b.pair_spawn_override = Some(Box::new(local_test_spawn));
-    crate::session::write_pair_record(&b.pair_record_path, &record).unwrap();
-    b.last_pair_check = None;
+    b.pair.record_path = tmp.path().join("b.pair.json");
+    b.pair.socket = socket.clone();
+    b.pair.host_lock_path = lock_path.clone();
+    b.pair.spawn_override = Some(Box::new(local_test_spawn));
+    crate::session::write_pair_record(&b.pair.record_path, &record).unwrap();
+    b.pair.last_check = None;
     b.maybe_seat_navigator();
     assert!(
-        b.pair_host.is_some(),
+        b.pair.host.is_some(),
         "the working window must be able to host: {}",
         b.status
     );

@@ -817,14 +817,14 @@ fn losing_the_relay_reconnects_instead_of_typing_into_the_void() {
 fn a_relay_failure_releases_the_host_lock() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.pair_record_path = tmp.path().join("x.pair.json");
+    app.pair.record_path = tmp.path().join("x.pair.json");
     // A socket inside a directory that does not exist: the relay can never
     // bind it, so ensure_relay fails after its aliveness poll.
-    app.pair_socket = tmp.path().join("missing-dir").join("collab.sock");
-    app.pair_host_lock_path = tmp.path().join("x.host.lock");
-    app.pair_spawn_override = Some(Box::new(|_| panic!("must not reach the spawn")));
+    app.pair.socket = tmp.path().join("missing-dir").join("collab.sock");
+    app.pair.host_lock_path = tmp.path().join("x.host.lock");
+    app.pair.spawn_override = Some(Box::new(|_| panic!("must not reach the spawn")));
     crate::session::write_pair_record(
-        &app.pair_record_path,
+        &app.pair.record_path,
         &crate::session::PairRecord {
             model: None,
             name: "nav".into(),
@@ -835,16 +835,16 @@ fn a_relay_failure_releases_the_host_lock() {
         },
     )
     .unwrap();
-    app.last_pair_check = None;
+    app.pair.last_check = None;
     app.maybe_seat_navigator();
-    assert!(app.pair_host.is_none());
+    assert!(app.pair.host.is_none());
     assert!(
         app.status.contains("relay failed"),
         "the failure is announced: {}",
         app.status
     );
     assert!(
-        app.pair_host_lock.is_none(),
+        app.pair.host_lock.is_none(),
         "a window without a relay cannot host; the lock must be released"
     );
 }

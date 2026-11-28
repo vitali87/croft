@@ -2653,7 +2653,7 @@ fn cmd_k_y_yields_the_active_file_and_commentary_reaches_output() {
 
     let mut cmd = std::process::Command::new("python3");
     cmd.arg(&script).arg(&log).arg("notes");
-    app.pair_host =
+    app.pair.host =
         Some(crate::pair_host::PairHost::spawn_cmd(&socket, "navigator", None, cmd).unwrap());
     assert!(app.handle_cmd_k_chord(key(KeyCode::Char('y'), KeyModifiers::NONE)));
     assert!(

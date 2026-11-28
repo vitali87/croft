@@ -4,11 +4,123 @@
 use super::*;
 
 /// Why the single-host lock was last refused, for announcing each reason
-/// once (see `App::pair_lock_denied`).
+/// once (see `PairState::lock_denied`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum PairLockDenial {
     Busy,
     Io,
+}
+
+/// The AI navigator's own state (docs/MULTIPLAYER.md): its seat and the
+/// workspace's pair record, the single-host lock, the turn being streamed
+/// and the notes it left, and the proactive looks.
+pub(super) struct PairState {
+    /// The resident navigator (docs/MULTIPLAYER.md): the in-process pilot
+    /// host, seated while the workspace's pair record is enabled. Dropping
+    /// it tears the seat down (revert, hang up, grace-kill).
+    pub(super) host: Option<crate::pair_host::PairHost>,
+    /// Where the workspace's pair activation record lives. A field so tests
+    /// point it at a tempdir instead of the real sessions dir.
+    pub(super) record_path: PathBuf,
+    /// The collab socket the navigator (and a self-appointed owner seat)
+    /// uses. A field for the same test reason.
+    pub(super) socket: PathBuf,
+    /// Path of the single-host lock (see [`Self::host_lock`]). A field for the
+    /// same test reason.
+    pub(super) host_lock_path: PathBuf,
+    /// Cadence gate for the pair-record stat (1s, not every tick).
+    pub(super) last_check: Option<std::time::Instant>,
+    /// Per-file (0-based row, body) snapshots of the navigator's anchored
+    /// notes, refreshed each tick from the host; drives the gutter ◆ marks
+    /// and the note popup.
+    pub(super) navigator_notes: std::collections::HashMap<String, Vec<(u64, usize, String)>>,
+    /// The navigator's prose accumulated over the streaming turn; lands as
+    /// one comment box at the turn's origin when the turn ends (boxes are
+    /// the navigator's single voice — there is no OUTPUT channel for it).
+    pub(super) commentary_buf: String,
+    /// Where the current turn was invoked: (collab file key, 0-based row).
+    /// Anchors the turn's commentary box.
+    pub(super) turn_origin: Option<(String, usize)>,
+    /// Notes the navigator left since its turn started, so the TurnDone
+    /// status can surface them instead of overwriting the NoteAdded status.
+    pub(super) notes_this_turn: usize,
+    /// The file the turn's notes LAST landed in (anchors the turn's prose
+    /// when the invocation origin is unknown).
+    pub(super) last_noted_file: Option<String>,
+    /// Every file the turn's notes landed in: the TurnDone hint names the
+    /// file only when there is exactly one ("3 comments in b.rs" was a lie
+    /// when two of them sat in a.rs).
+    pub(super) noted_files: std::collections::BTreeSet<String>,
+    /// Held while this croft is the self-appointed navigator owner: exactly
+    /// one plain croft per workspace may host the pilot (and claim collab
+    /// owner site 1). Released by the OS on exit, so a crashed host hands off.
+    pub(super) host_lock: Option<crate::session::PairHostLock>,
+    /// Set when the pilot died or failed to seat: suppresses the 1s re-seat
+    /// so a broken claude (unauthenticated, missing, crashing) is not
+    /// respawned forever. Cleared when the record is deactivated OR
+    /// rewritten (any `croft pair` run re-arms seating, as the CLI
+    /// promises), so an explicit off/on (or toggle) re-activates. Matches
+    /// the LSP precedent: no auto-respawn within a session; a fresh croft
+    /// retries.
+    pub(super) navigator_down: bool,
+    /// The pair record's raw bytes at the last 1s check: changed bytes mean
+    /// someone ran `croft pair` (even enabled→enabled — every write stamps
+    /// the record, so no rewrite is byte-identical) and clear
+    /// [`Self::navigator_down`]. Content, not mtime: a same-grain rewrite on a
+    /// coarse-timestamp filesystem keeps its mtime.
+    pub(super) last_record_raw: Option<Vec<u8>>,
+    /// Which host-lock refusal has already been announced: the losing
+    /// window keeps polling for takeover every second, and re-announcing
+    /// each poll clobbered its status line forever (and forced a 1 Hz
+    /// repaint). The KIND is latched, not just the fact, so a refusal that
+    /// changes reason (an fd limit clears and another window now holds the
+    /// lock, or the reverse) is announced again rather than leaving a
+    /// message that is no longer true (#337). Per kind, not per message: an
+    /// open failure whose errno changes keeps the first announcement.
+    pub(super) lock_denied: Option<PairLockDenial>,
+    /// Proactive navigator looks (docs/MULTIPLAYER.md): a completed new
+    /// construct plus a typing pause hands the seated navigator a
+    /// comment-only turn on its own. Opt-out via
+    /// `Prefs::disable_proactive_navigator` / the palette toggle.
+    pub(super) proactive_navigator_enabled: bool,
+    /// Per file, the edit_seq the proactive trigger last scanned: one
+    /// buffer state is parsed at most once, however long the pause lasts
+    /// and however often the driver switches tabs across visited files.
+    pub(super) proactive_scanned: std::collections::HashMap<PathBuf, u64>,
+    /// Test seam: builds the PairHost from the config (the real path spawns
+    /// the claude CLI, which a test must never do).
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(super) spawn_override:
+        Option<Box<dyn Fn(&crate::pair::PairConfig) -> anyhow::Result<crate::pair_host::PairHost>>>,
+}
+
+impl PairState {
+    /// Not seated, for the workspace at `root`; `proactive_navigator_enabled`
+    /// is the setting read at start.
+    pub(super) fn new(root: &Path, proactive_navigator_enabled: bool) -> Self {
+        Self {
+            host: None,
+            record_path: crate::session::pair_record_path(root),
+            socket: crate::session::collab_socket_path(root),
+            host_lock_path: crate::session::pair_host_lock_path(root),
+            last_check: None,
+            navigator_notes: std::collections::HashMap::new(),
+            commentary_buf: String::new(),
+            turn_origin: None,
+            notes_this_turn: 0,
+            last_noted_file: None,
+            noted_files: std::collections::BTreeSet::new(),
+            host_lock: None,
+            navigator_down: false,
+            last_record_raw: None,
+            lock_denied: None,
+            proactive_navigator_enabled,
+            proactive_scanned: std::collections::HashMap::new(),
+            #[cfg(test)]
+            spawn_override: None,
+        }
+    }
 }
 
 /// Canonicalise `path` even when it no longer exists.
@@ -778,24 +890,25 @@ impl App {
     /// the owner's croft does.
     pub(super) fn maybe_seat_navigator(&mut self) -> bool {
         let due = self
-            .last_pair_check
+            .pair
+            .last_check
             .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1));
         if !due {
             return false;
         }
-        self.last_pair_check = Some(std::time::Instant::now());
+        self.pair.last_check = Some(std::time::Instant::now());
         // A rewritten record re-arms seating: after a failed seat the user
         // re-runs `croft pair`, and the CLI promises "a running croft seats
         // it within a second" — but an enabled→enabled rewrite has no other
         // observable transition. The record's BYTES are the signal (every
         // write stamps them, and mtime misses a same-grain rewrite on a
         // coarse-timestamp filesystem).
-        let raw = std::fs::read(&self.pair_record_path).ok();
-        if self.last_pair_record_raw != raw {
-            if self.last_pair_record_raw.is_some() {
-                self.navigator_down = false;
+        let raw = std::fs::read(&self.pair.record_path).ok();
+        if self.pair.last_record_raw != raw {
+            if self.pair.last_record_raw.is_some() {
+                self.pair.navigator_down = false;
             }
-            self.last_pair_record_raw = raw.clone();
+            self.pair.last_record_raw = raw.clone();
         }
         let record: Option<crate::session::PairRecord> = raw
             .as_deref()
@@ -804,36 +917,36 @@ impl App {
         if !want {
             // Deactivation clears the death latch, so `croft pair --off`
             // then `croft pair` (or a palette off/on) re-activates.
-            self.navigator_down = false;
-            self.pair_lock_denied = None;
+            self.pair.navigator_down = false;
+            self.pair.lock_denied = None;
             // A fix stream cannot outlive the seat: with the navigator
             // deactivated no TurnDone can arrive, and a marker left here
             // spun the row (and woke the renderer) forever (#374 review).
             self.clear_problem_fix();
-            if let Some(host) = self.pair_host.take() {
+            if let Some(host) = self.pair.host.take() {
                 // Drop tears the seat down; its parked caret goes with it.
                 let sites = host.caret_sites();
                 self.collab_carets.retain(|s, _| !sites.contains(s));
-                self.navigator_notes.clear();
-                self.pair_commentary_buf.clear();
-                self.pair_turn_origin = None;
+                self.pair.navigator_notes.clear();
+                self.pair.commentary_buf.clear();
+                self.pair.turn_origin = None;
                 // The turn counters die with the seat: leaking them made
                 // the NEXT seat's first TurnDone report a dead seat's notes.
-                self.pair_notes_this_turn = 0;
-                self.pair_last_noted_file = None;
-                self.pair_noted_files.clear();
+                self.pair.notes_this_turn = 0;
+                self.pair.last_noted_file = None;
+                self.pair.noted_files.clear();
                 self.editor.comment_focus = None;
                 self.status = String::from("Navigator unseated");
                 return true;
             }
             return false;
         }
-        if self.pair_host.is_some() {
+        if self.pair.host.is_some() {
             return false;
         }
         // The pilot died or failed to seat: do not respawn it every second.
         // The user re-activates (off/on) to try again; a fresh croft retries.
-        if self.navigator_down {
+        if self.pair.navigator_down {
             return false;
         }
         if self
@@ -850,11 +963,11 @@ impl App {
             // would both claim site id 1 and corrupt the shared buffer. Claim
             // the single-host lock first; if another croft holds it, do not
             // host (keep checking — take over when that croft exits).
-            if self.pair_host_lock.is_none() {
-                match crate::session::try_acquire_pair_host_lock(&self.pair_host_lock_path) {
+            if self.pair.host_lock.is_none() {
+                match crate::session::try_acquire_pair_host_lock(&self.pair.host_lock_path) {
                     Ok(lock) => {
-                        self.pair_host_lock = Some(lock);
-                        self.pair_lock_denied = None;
+                        self.pair.host_lock = Some(lock);
+                        self.pair.lock_denied = None;
                     }
                     Err(e) => {
                         // Announced ONCE per reason: the takeover poll keeps
@@ -864,10 +977,10 @@ impl App {
                             crate::session::PairHostLockError::Busy => PairLockDenial::Busy,
                             crate::session::PairHostLockError::Io(_) => PairLockDenial::Io,
                         };
-                        if self.pair_lock_denied == Some(denial) {
+                        if self.pair.lock_denied == Some(denial) {
                             return false;
                         }
-                        self.pair_lock_denied = Some(denial);
+                        self.pair.lock_denied = Some(denial);
                         // Busy and unopenable read the same from here (no
                         // host this tick, poll again) but not to the user:
                         // one has a window to close, the other has a path
@@ -880,28 +993,28 @@ impl App {
                             crate::session::PairHostLockError::Io(e) => format!(
                                 "Navigator '{}': cannot open host lock {}: {e}",
                                 record.name,
-                                self.pair_host_lock_path.display()
+                                self.pair.host_lock_path.display()
                             ),
                         };
                         return true;
                     }
                 }
             }
-            if let Err(e) = crate::collab::ensure_relay(&self.pair_socket) {
+            if let Err(e) = crate::collab::ensure_relay(&self.pair.socket) {
                 self.status = format!("Navigator: relay failed: {e}");
                 // The spawn failure's sibling: this window holds the lock
                 // but cannot host without a relay. Release it so another
                 // window can try; this one retries next second and may
                 // re-acquire.
-                self.pair_host_lock = None;
+                self.pair.host_lock = None;
                 return true;
             }
-            self.collab_config = Some((self.pair_socket.clone(), crate::collab::CollabRole::Owner));
+            self.collab_config = Some((self.pair.socket.clone(), crate::collab::CollabRole::Owner));
             self.last_collab_connect = None; // connect this tick, not in 2s
             self_appointed_now = true;
         }
         let cfg = crate::pair::PairConfig {
-            socket: self.pair_socket.clone(),
+            socket: self.pair.socket.clone(),
             workspace: self.tree.root.clone(),
             name: record.name.clone(),
             model: record.model.clone(),
@@ -917,7 +1030,7 @@ impl App {
             ),
         };
         #[cfg(test)]
-        let spawned = match &self.pair_spawn_override {
+        let spawned = match &self.pair.spawn_override {
             Some(spawn) => spawn(&cfg),
             None => crate::pair_host::PairHost::spawn(cfg),
         };
@@ -929,11 +1042,11 @@ impl App {
                     "Navigator '{}' seated (Cmd+K Q asks, Cmd+K Y yields)",
                     host.title()
                 );
-                self.pair_host = Some(host);
+                self.pair.host = Some(host);
             }
             Err(e) => {
                 self.status = format!("Navigator failed to seat: {e}");
-                self.navigator_down = true; // no 1s retry storm
+                self.pair.navigator_down = true; // no 1s retry storm
                 if self_appointed_now {
                     // A window that cannot host must not block one that can:
                     // undo the self-appointment made moments ago (nothing
@@ -942,7 +1055,7 @@ impl App {
                     // whose PILOT died later keeps both — it is still the
                     // live collab owner and re-seats on re-activation.
                     self.collab_config = None;
-                    self.pair_host_lock = None;
+                    self.pair.host_lock = None;
                 }
             }
         }
@@ -953,7 +1066,7 @@ impl App {
     /// OUTPUT channel, note/turn/death news to the status line, and the
     /// active file's note snapshot for the gutter marks and popup.
     pub(super) fn poll_pair(&mut self) -> bool {
-        let Some(host) = self.pair_host.as_mut() else {
+        let Some(host) = self.pair.host.as_mut() else {
             return false;
         };
         let name = host.name().to_string();
@@ -966,25 +1079,25 @@ impl App {
                     // The navigator's voice is its comment boxes: prose
                     // accumulates and lands as one box when the turn ends.
                     if !text.trim().is_empty() {
-                        if !self.pair_commentary_buf.is_empty() {
-                            self.pair_commentary_buf.push('\n');
+                        if !self.pair.commentary_buf.is_empty() {
+                            self.pair.commentary_buf.push('\n');
                         }
-                        self.pair_commentary_buf.push_str(text.trim_end());
+                        self.pair.commentary_buf.push_str(text.trim_end());
                     }
                 }
                 crate::pair_host::PairEvent::NoteAdded { file, row, body } => {
                     let snippet: String = body.chars().take(60).collect();
                     self.status = format!("{name} commented on {file}:{}: {snippet}", row + 1);
-                    self.pair_notes_this_turn += 1;
-                    self.pair_noted_files.insert(file.clone());
-                    self.pair_last_noted_file = Some(file);
+                    self.pair.notes_this_turn += 1;
+                    self.pair.noted_files.insert(file.clone());
+                    self.pair.last_noted_file = Some(file);
                 }
                 crate::pair_host::PairEvent::TurnDone { cancelled, failed } => {
-                    let mut notes = std::mem::take(&mut self.pair_notes_this_turn);
-                    let mut files = std::mem::take(&mut self.pair_noted_files);
-                    let file = self.pair_last_noted_file.take();
-                    let prose = std::mem::take(&mut self.pair_commentary_buf);
-                    let origin = self.pair_turn_origin.take();
+                    let mut notes = std::mem::take(&mut self.pair.notes_this_turn);
+                    let mut files = std::mem::take(&mut self.pair.noted_files);
+                    let file = self.pair.last_noted_file.take();
+                    let prose = std::mem::take(&mut self.pair.commentary_buf);
+                    let origin = self.pair.turn_origin.take();
                     // Whatever the outcome, the fix turn is over: the row's
                     // spinner stops, and the LSP's next publish decides
                     // whether the row itself goes (#374).
@@ -1016,7 +1129,8 @@ impl App {
                             })
                         });
                         let landed = anchor.as_ref().and_then(|(f, row)| {
-                            self.pair_host
+                            self.pair
+                                .host
                                 .as_ref()
                                 .and_then(|h| h.add_note_now(f, *row, prose.trim()))
                         });
@@ -1058,21 +1172,22 @@ impl App {
         }
         if died {
             let sites = self
-                .pair_host
+                .pair
+                .host
                 .take()
                 .map(|h| h.caret_sites())
                 .unwrap_or_default();
             self.collab_carets.retain(|s, _| !sites.contains(s));
-            self.navigator_notes.clear();
-            self.pair_commentary_buf.clear();
-            self.pair_turn_origin = None;
+            self.pair.navigator_notes.clear();
+            self.pair.commentary_buf.clear();
+            self.pair.turn_origin = None;
             self.clear_problem_fix();
             // The turn counters die with the seat (see the unseat twin).
-            self.pair_notes_this_turn = 0;
-            self.pair_last_noted_file = None;
-            self.pair_noted_files.clear();
+            self.pair.notes_this_turn = 0;
+            self.pair.last_noted_file = None;
+            self.pair.noted_files.clear();
             self.editor.comment_focus = None;
-            self.navigator_down = true; // no auto-respawn; re-activate to retry
+            self.pair.navigator_down = true; // no auto-respawn; re-activate to retry
             return true;
         }
         // Refresh the active file's snapshot every tick: rows move under
@@ -1082,11 +1197,11 @@ impl App {
             .path
             .as_ref()
             .and_then(|p| collab_file_key(&self.tree.root, p))
-            && let Some(host) = &self.pair_host
+            && let Some(host) = &self.pair.host
         {
             let snap = host.notes_snapshot(&file);
-            if self.navigator_notes.get(&file) != Some(&snap) {
-                self.navigator_notes.insert(file, snap);
+            if self.pair.navigator_notes.get(&file) != Some(&snap) {
+                self.pair.navigator_notes.insert(file, snap);
                 changed = true;
             }
         }
@@ -1098,7 +1213,7 @@ impl App {
     /// `selection` carrying selected text when the scope came from one.
     /// Cmd+K Q, the gutter menu, and the body menu all land here.
     pub(super) fn open_ask_navigator(&mut self, range: (usize, usize), selection: String) {
-        let Some(host) = &self.pair_host else {
+        let Some(host) = &self.pair.host else {
             self.status =
                 String::from("Navigator is not active (run croft pair in this workspace)");
             return;
@@ -1136,7 +1251,7 @@ impl App {
     /// is comment-only (host-enforced): its say lands as anchored notes and
     /// commentary, and it must ask before editing.
     pub(super) fn yield_to_navigator(&mut self) {
-        let Some(host) = &self.pair_host else {
+        let Some(host) = &self.pair.host else {
             self.status =
                 String::from("Navigator is not active (run croft pair in this workspace)");
             return;
@@ -1159,7 +1274,7 @@ impl App {
             Ok(()) => {
                 self.status = format!("Yielded {file} to {} (comment-only turn)", host.name());
                 // Anchor the turn's prose commentary at the caret.
-                self.pair_turn_origin = Some((file, self.editor.cursor_row));
+                self.pair.turn_origin = Some((file, self.editor.cursor_row));
             }
             Err(e) => self.status = format!("Yield failed: {e}"),
         }
@@ -1173,10 +1288,10 @@ impl App {
     /// re-engage it (this is RE-engagement, not ambush), and a buffer state
     /// is scanned at most once. Runs once per frame tick; true = turn sent.
     pub(super) fn tick_proactive_navigator(&mut self) -> bool {
-        if !self.proactive_navigator_enabled {
+        if !self.pair.proactive_navigator_enabled {
             return false;
         }
-        let Some(host) = &self.pair_host else {
+        let Some(host) = &self.pair.host else {
             return false;
         };
         if host.is_busy() || self.editor.comment_focus.is_some() {
@@ -1199,10 +1314,10 @@ impl App {
             return false;
         };
         let seq = self.editor.edit_seq;
-        if self.proactive_scanned.get(&path) == Some(&seq) {
+        if self.pair.proactive_scanned.get(&path) == Some(&seq) {
             return false;
         }
-        self.proactive_scanned.insert(path.clone(), seq);
+        self.pair.proactive_scanned.insert(path.clone(), seq);
         let Some(file) = collab_file_key(&self.tree.root, &path) else {
             return false;
         };
@@ -1219,7 +1334,7 @@ impl App {
         match host.send_yield_turn(&file, &content) {
             Ok(()) => {
                 self.status = format!("{} is taking a look at {file}:{}", host.name(), row + 1);
-                self.pair_turn_origin = Some((file, row));
+                self.pair.turn_origin = Some((file, row));
                 true
             }
             Err(_) => false,
@@ -1229,15 +1344,15 @@ impl App {
     /// Palette toggle for the proactive looks, persisted like the inline
     /// blame preference.
     pub(super) fn toggle_proactive_navigator(&mut self) {
-        self.proactive_navigator_enabled = !self.proactive_navigator_enabled;
-        self.status = if self.proactive_navigator_enabled {
+        self.pair.proactive_navigator_enabled = !self.pair.proactive_navigator_enabled;
+        self.status = if self.pair.proactive_navigator_enabled {
             String::from("Navigator proactive comments: on")
         } else {
             String::from("Navigator proactive comments: off")
         };
         if !cfg!(test) {
             self.report_unsaved_setting(crate::prefs::save_proactive_navigator(
-                self.proactive_navigator_enabled,
+                self.pair.proactive_navigator_enabled,
             ));
         }
     }
@@ -1245,7 +1360,7 @@ impl App {
     /// Palette toggle: flip the workspace's pair record and let the next
     /// activation check seat or unseat the pilot (within a second).
     pub(super) fn toggle_navigator(&mut self) {
-        let current = crate::session::read_pair_record(&self.pair_record_path);
+        let current = crate::session::read_pair_record(&self.pair.record_path);
         let enabled = !current.as_ref().is_some_and(|r| r.enabled);
         let record = crate::session::PairRecord {
             model: current.as_ref().and_then(|r| r.model.clone()),
@@ -1261,12 +1376,12 @@ impl App {
             provider: current.as_ref().and_then(|r| r.provider.clone()),
             base_url: current.as_ref().and_then(|r| r.base_url.clone()),
         };
-        if let Some(dir) = self.pair_record_path.parent() {
+        if let Some(dir) = self.pair.record_path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        match crate::session::write_pair_record(&self.pair_record_path, &record) {
+        match crate::session::write_pair_record(&self.pair.record_path, &record) {
             Ok(()) => {
-                self.last_pair_check = None; // act on this tick, not in 1s
+                self.pair.last_check = None; // act on this tick, not in 1s
                 self.status = if enabled {
                     format!("Navigator '{}' activated; seating", record.name)
                 } else {
@@ -1280,10 +1395,10 @@ impl App {
     /// Palette: drop every navigator comment — the pilot's anchors, the
     /// per-file snapshots, and the boxes they feed.
     pub(super) fn clear_navigator_notes(&mut self) {
-        if let Some(host) = &self.pair_host {
+        if let Some(host) = &self.pair.host {
             host.clear_notes();
         }
-        self.navigator_notes.clear();
+        self.pair.navigator_notes.clear();
         self.editor.comment_boxes.clear();
         self.editor.comment_focus = None;
         self.status = String::from("Navigator comments cleared");
@@ -2890,7 +3005,7 @@ impl App {
             self.status = String::from("No captured line is selected");
             return;
         };
-        let Some(host) = &self.pair_host else {
+        let Some(host) = &self.pair.host else {
             self.status =
                 String::from("Navigator is not active (run croft pair in this workspace)");
             return;
@@ -2948,7 +3063,7 @@ impl App {
                 crate::triggers::mask_text(t, &triggers, false)
             });
         let content = self.editor.lines.join("\n");
-        let Some(host) = &self.pair_host else {
+        let Some(host) = &self.pair.host else {
             // Unreachable today (nothing above touches the host), but a
             // silent return would leave the jump's status reading as success.
             self.status = String::from("Navigator is not active");
@@ -2964,7 +3079,7 @@ impl App {
                     row + 1,
                     if opened { "" } else { " (the active file)" }
                 );
-                self.pair_turn_origin = Some((file, row));
+                self.pair.turn_origin = Some((file, row));
             }
             Err(e) => self.status = format!("Ask Navigator failed: {e}"),
         }
@@ -2988,7 +3103,7 @@ impl App {
         item: crate::widgets::problems::ProblemItem,
         hints: Vec<String>,
     ) {
-        let Some(host) = &self.pair_host else {
+        let Some(host) = &self.pair.host else {
             self.status =
                 String::from("Navigator is not active (run croft pair in this workspace)");
             return;
@@ -3022,7 +3137,7 @@ impl App {
         let selection = self.editor.lines.get(row).cloned().unwrap_or_default();
         let instruction = crate::widgets::problems::fix_prompt(&item, &file, &hints);
         let content = self.editor.lines.join("\n");
-        let Some(host) = &self.pair_host else {
+        let Some(host) = &self.pair.host else {
             // Unreachable today (the open above does not touch the seat),
             // but a silent return would leave the jump's status as success.
             self.status = String::from("Navigator is not active");
@@ -3042,7 +3157,7 @@ impl App {
                     "Asked {name} to fix {file}:{}: {what} (Cmd+K X cancels)",
                     row + 1
                 );
-                self.pair_turn_origin = Some((file, row));
+                self.pair.turn_origin = Some((file, row));
                 self.problems.fixing = Some((path, item.line));
                 self.problems_fix_started = Some(std::time::Instant::now());
             }

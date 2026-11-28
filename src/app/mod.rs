@@ -3426,84 +3426,9 @@ pub struct App {
     /// file: drives the status badge and the gutter stop button; cleared by
     /// the pilot's StreamState(inactive) broadcast.
     collab_stream: Option<CollabStreamInfo>,
-    /// The resident navigator (docs/MULTIPLAYER.md): the in-process pilot
-    /// host, seated while the workspace's pair record is enabled. Dropping
-    /// it tears the seat down (revert, hang up, grace-kill).
-    pair_host: Option<crate::pair_host::PairHost>,
-    /// Where the workspace's pair activation record lives. A field so tests
-    /// point it at a tempdir instead of the real sessions dir.
-    pair_record_path: PathBuf,
-    /// The collab socket the navigator (and a self-appointed owner seat)
-    /// uses. A field for the same test reason.
-    pair_socket: PathBuf,
-    /// Path of the single-host lock (see [`pair_host_lock`]). A field for the
-    /// same test reason.
-    pair_host_lock_path: PathBuf,
-    /// Cadence gate for the pair-record stat (1s, not every tick).
-    last_pair_check: Option<std::time::Instant>,
-    /// Per-file (0-based row, body) snapshots of the navigator's anchored
-    /// notes, refreshed each tick from the host; drives the gutter ◆ marks
-    /// and the note popup.
-    navigator_notes: std::collections::HashMap<String, Vec<(u64, usize, String)>>,
-    /// The navigator's prose accumulated over the streaming turn; lands as
-    /// one comment box at the turn's origin when the turn ends (boxes are
-    /// the navigator's single voice — there is no OUTPUT channel for it).
-    pair_commentary_buf: String,
-    /// Where the current turn was invoked: (collab file key, 0-based row).
-    /// Anchors the turn's commentary box.
-    pair_turn_origin: Option<(String, usize)>,
-    /// Notes the navigator left since its turn started, so the TurnDone
-    /// status can surface them instead of overwriting the NoteAdded status.
-    pair_notes_this_turn: usize,
-    /// The file the turn's notes LAST landed in (anchors the turn's prose
-    /// when the invocation origin is unknown).
-    pair_last_noted_file: Option<String>,
-    /// Every file the turn's notes landed in: the TurnDone hint names the
-    /// file only when there is exactly one ("3 comments in b.rs" was a lie
-    /// when two of them sat in a.rs).
-    pair_noted_files: std::collections::BTreeSet<String>,
-    /// Held while this croft is the self-appointed navigator owner: exactly
-    /// one plain croft per workspace may host the pilot (and claim collab
-    /// owner site 1). Released by the OS on exit, so a crashed host hands off.
-    pair_host_lock: Option<crate::session::PairHostLock>,
-    /// Set when the pilot died or failed to seat: suppresses the 1s re-seat
-    /// so a broken claude (unauthenticated, missing, crashing) is not
-    /// respawned forever. Cleared when the record is deactivated OR
-    /// rewritten (any `croft pair` run re-arms seating, as the CLI
-    /// promises), so an explicit off/on (or toggle) re-activates. Matches
-    /// the LSP precedent: no auto-respawn within a session; a fresh croft
-    /// retries.
-    navigator_down: bool,
-    /// The pair record's raw bytes at the last 1s check: changed bytes mean
-    /// someone ran `croft pair` (even enabled→enabled — every write stamps
-    /// the record, so no rewrite is byte-identical) and clear
-    /// [`navigator_down`]. Content, not mtime: a same-grain rewrite on a
-    /// coarse-timestamp filesystem keeps its mtime.
-    last_pair_record_raw: Option<Vec<u8>>,
-    /// Which host-lock refusal has already been announced: the losing
-    /// window keeps polling for takeover every second, and re-announcing
-    /// each poll clobbered its status line forever (and forced a 1 Hz
-    /// repaint). The KIND is latched, not just the fact, so a refusal that
-    /// changes reason (an fd limit clears and another window now holds the
-    /// lock, or the reverse) is announced again rather than leaving a
-    /// message that is no longer true (#337). Per kind, not per message: an
-    /// open failure whose errno changes keeps the first announcement.
-    pair_lock_denied: Option<PairLockDenial>,
-    /// Proactive navigator looks (docs/MULTIPLAYER.md): a completed new
-    /// construct plus a typing pause hands the seated navigator a
-    /// comment-only turn on its own. Opt-out via
-    /// `Prefs::disable_proactive_navigator` / the palette toggle.
-    proactive_navigator_enabled: bool,
-    /// Per file, the edit_seq the proactive trigger last scanned: one
-    /// buffer state is parsed at most once, however long the pause lasts
-    /// and however often the driver switches tabs across visited files.
-    proactive_scanned: std::collections::HashMap<PathBuf, u64>,
-    /// Test seam: builds the PairHost from the config (the real path spawns
-    /// the claude CLI, which a test must never do).
-    #[cfg(test)]
-    #[allow(clippy::type_complexity)]
-    pair_spawn_override:
-        Option<Box<dyn Fn(&crate::pair::PairConfig) -> anyhow::Result<crate::pair_host::PairHost>>>,
+    /// The AI navigator's seat, pair record, host lock, turn and notes
+    /// (see [`agents_collab::PairState`]).
+    pair: agents_collab::PairState,
     /// Test seam: the kernel bridge Select Kernel starts, by kernel name
     /// (the real one runs Python).
     #[cfg(test)]
@@ -4624,25 +4549,7 @@ impl App {
             collab_carets: std::collections::HashMap::new(),
             collab_caret_sent: None,
             collab_stream: None,
-            pair_host: None,
-            pair_record_path: crate::session::pair_record_path(&root),
-            pair_socket: crate::session::collab_socket_path(&root),
-            pair_host_lock_path: crate::session::pair_host_lock_path(&root),
-            last_pair_check: None,
-            navigator_notes: std::collections::HashMap::new(),
-            pair_commentary_buf: String::new(),
-            pair_turn_origin: None,
-            pair_notes_this_turn: 0,
-            pair_last_noted_file: None,
-            pair_host_lock: None,
-            navigator_down: false,
-            last_pair_record_raw: None,
-            pair_lock_denied: None,
-            pair_noted_files: std::collections::BTreeSet::new(),
-            proactive_navigator_enabled: !loaded_prefs.disable_proactive_navigator,
-            proactive_scanned: std::collections::HashMap::new(),
-            #[cfg(test)]
-            pair_spawn_override: None,
+            pair: agents_collab::PairState::new(&root, !loaded_prefs.disable_proactive_navigator),
             #[cfg(test)]
             kernel_start_override: None,
             collab_labels_visible: false,
@@ -5970,7 +5877,7 @@ pub fn run(
     // (process::exit) and self-update (exec) below both bypass Drop, and even
     // a normal return races the detached Drop thread against process exit.
     // shutdown_blocking reverts, hangs up, and grace-kills synchronously.
-    if let Some(host) = app.pair_host.take() {
+    if let Some(host) = app.pair.host.take() {
         host.shutdown_blocking();
     }
     // And every teardown a recent unseat DETACHED (toggle off, record

@@ -410,11 +410,11 @@ fn navigator_record_seats_the_pilot_and_self_appoints_owner() {
     let log = tmp.path().join("stdin.log");
 
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.pair_record_path = tmp.path().join("x.pair.json");
-    app.pair_socket = socket.clone();
-    app.pair_host_lock_path = tmp.path().join("x.pair-host.lock");
+    app.pair.record_path = tmp.path().join("x.pair.json");
+    app.pair.socket = socket.clone();
+    app.pair.host_lock_path = tmp.path().join("x.pair-host.lock");
     let (script2, log2, socket2) = (script.clone(), log.clone(), socket.clone());
-    app.pair_spawn_override = Some(Box::new(move |cfg| {
+    app.pair.spawn_override = Some(Box::new(move |cfg| {
         let mut cmd = std::process::Command::new("python3");
         cmd.arg(&script2).arg(&log2).arg("notes");
         crate::pair_host::PairHost::spawn_cmd(&socket2, &cfg.name, cfg.task.as_deref(), cmd)
@@ -422,10 +422,10 @@ fn navigator_record_seats_the_pilot_and_self_appoints_owner() {
 
     // No record yet: nothing seats.
     assert!(!app.maybe_seat_navigator());
-    assert!(app.pair_host.is_none());
+    assert!(app.pair.host.is_none());
 
     crate::session::write_pair_record(
-        &app.pair_record_path,
+        &app.pair.record_path,
         &crate::session::PairRecord {
             model: None,
             name: "navigator".into(),
@@ -437,9 +437,9 @@ fn navigator_record_seats_the_pilot_and_self_appoints_owner() {
     )
     .unwrap();
     assert!(app.collab_config.is_none(), "plain launch precondition");
-    app.last_pair_check = None;
+    app.pair.last_check = None;
     assert!(app.maybe_seat_navigator());
-    assert!(app.pair_host.is_some(), "pilot must seat");
+    assert!(app.pair.host.is_some(), "pilot must seat");
     assert_eq!(
         app.collab_config,
         Some((socket.clone(), crate::collab::CollabRole::Owner)),
@@ -461,7 +461,8 @@ fn navigator_record_seats_the_pilot_and_self_appoints_owner() {
     // A real parked caret: an ask turn on f.txt (served by this window's
     // owner seat) bootstraps the pilot's replica and parks its caret at the
     // asked row. The seat's identity is its site ids, never its name.
-    app.pair_host
+    app.pair
+        .host
         .as_ref()
         .unwrap()
         .send_ask_turn("f.txt", (1, 1), "", "look here", "l0\nl1\nl2")
@@ -469,7 +470,7 @@ fn navigator_record_seats_the_pilot_and_self_appoints_owner() {
     let deadline = Instant::now() + Duration::from_secs(10);
     let pilot_sites = loop {
         app.poll_collab();
-        let sites = app.pair_host.as_ref().unwrap().caret_sites();
+        let sites = app.pair.host.as_ref().unwrap().caret_sites();
         if sites.iter().any(|s| app.collab_carets.contains_key(s)) {
             break sites;
         }
@@ -493,7 +494,7 @@ fn navigator_record_seats_the_pilot_and_self_appoints_owner() {
 
     // Disabled record: the host unseats on the next check.
     crate::session::write_pair_record(
-        &app.pair_record_path,
+        &app.pair.record_path,
         &crate::session::PairRecord {
             model: None,
             name: "navigator".into(),
@@ -504,9 +505,9 @@ fn navigator_record_seats_the_pilot_and_self_appoints_owner() {
         },
     )
     .unwrap();
-    app.last_pair_check = None;
+    app.pair.last_check = None;
     assert!(app.maybe_seat_navigator());
-    assert!(app.pair_host.is_none(), "pilot must unseat");
+    assert!(app.pair.host.is_none(), "pilot must unseat");
     assert!(
         !pilot_sites
             .iter()
@@ -544,19 +545,19 @@ fn app_seats_local_provider_from_record() {
     let seen: std::rc::Rc<std::cell::RefCell<SeenConfig>> =
         std::rc::Rc::new(std::cell::RefCell::new(None));
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.pair_record_path = tmp.path().join("x.pair.json");
-    app.pair_socket = socket.clone();
-    app.pair_host_lock_path = tmp.path().join("x.pair-host.lock");
+    app.pair.record_path = tmp.path().join("x.pair.json");
+    app.pair.socket = socket.clone();
+    app.pair.host_lock_path = tmp.path().join("x.pair-host.lock");
     // Already the owner (skip the relay bootstrap): the test exercises the
     // provider mapping, not collab connect.
     app.collab_config = Some((socket, crate::collab::CollabRole::Owner));
     let seen2 = seen.clone();
-    app.pair_spawn_override = Some(Box::new(move |cfg| {
+    app.pair.spawn_override = Some(Box::new(move |cfg| {
         *seen2.borrow_mut() = Some((cfg.provider.clone(), cfg.model.clone()));
         anyhow::bail!("captured the config; no seat needed")
     }));
     crate::session::write_pair_record(
-        &app.pair_record_path,
+        &app.pair.record_path,
         &crate::session::PairRecord {
             model: Some("qwen3-coder:30b".into()),
             name: "navigator".into(),
@@ -567,7 +568,7 @@ fn app_seats_local_provider_from_record() {
         },
     )
     .unwrap();
-    app.last_pair_check = None;
+    app.pair.last_check = None;
     assert!(app.maybe_seat_navigator());
     assert_eq!(
         *seen.borrow(),
@@ -591,21 +592,21 @@ fn a_dead_navigator_is_not_respawned_until_reactivated() {
     let socket = tmp.path().join("collab.sock");
     let seats = std::rc::Rc::new(std::cell::Cell::new(0usize));
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.pair_record_path = tmp.path().join("x.pair.json");
-    app.pair_socket = socket.clone();
-    app.pair_host_lock_path = tmp.path().join("x.pair-host.lock");
+    app.pair.record_path = tmp.path().join("x.pair.json");
+    app.pair.socket = socket.clone();
+    app.pair.host_lock_path = tmp.path().join("x.pair-host.lock");
     // Already the owner (skip the relay bootstrap): the test exercises the
     // death latch, not collab connect.
     app.collab_config = Some((socket, crate::collab::CollabRole::Owner));
     let seats2 = seats.clone();
-    app.pair_spawn_override = Some(Box::new(move |_cfg| {
+    app.pair.spawn_override = Some(Box::new(move |_cfg| {
         seats2.set(seats2.get() + 1);
         anyhow::bail!("scripted seat failure");
     }));
 
     let enabled = |a: &mut App| {
         crate::session::write_pair_record(
-            &a.pair_record_path,
+            &a.pair.record_path,
             &crate::session::PairRecord {
                 model: None,
                 name: "nav".into(),
@@ -616,7 +617,7 @@ fn a_dead_navigator_is_not_respawned_until_reactivated() {
             },
         )
         .unwrap();
-        a.last_pair_check = None;
+        a.pair.last_check = None;
     };
 
     // First tick: it tries once, fails, and latches down.
@@ -624,20 +625,20 @@ fn a_dead_navigator_is_not_respawned_until_reactivated() {
     app.maybe_seat_navigator();
     assert_eq!(seats.get(), 1, "one seat attempt");
     assert!(
-        app.navigator_down,
+        app.pair.navigator_down,
         "a failed seat latches the navigator down"
     );
 
     // Many more ticks with the record still enabled: NO respawn storm.
     for _ in 0..5 {
-        app.last_pair_check = None;
+        app.pair.last_check = None;
         app.maybe_seat_navigator();
     }
     assert_eq!(seats.get(), 1, "a latched navigator must not be respawned");
 
     // Deactivate, then re-enable: the latch clears and it tries again.
     crate::session::write_pair_record(
-        &app.pair_record_path,
+        &app.pair.record_path,
         &crate::session::PairRecord {
             model: None,
             name: "nav".into(),
@@ -648,9 +649,9 @@ fn a_dead_navigator_is_not_respawned_until_reactivated() {
         },
     )
     .unwrap();
-    app.last_pair_check = None;
+    app.pair.last_check = None;
     app.maybe_seat_navigator();
-    assert!(!app.navigator_down, "deactivation clears the latch");
+    assert!(!app.pair.navigator_down, "deactivation clears the latch");
     enabled(&mut app);
     app.maybe_seat_navigator();
     assert_eq!(seats.get(), 2, "re-activation retries the seat");
@@ -664,9 +665,9 @@ fn a_dead_navigator_is_not_respawned_until_reactivated() {
 fn toggling_the_navigator_preserves_its_provider() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.pair_record_path = tmp.path().join("pair.json");
+    app.pair.record_path = tmp.path().join("pair.json");
     crate::session::write_pair_record(
-        &app.pair_record_path,
+        &app.pair.record_path,
         &crate::session::PairRecord {
             model: Some(String::from("qwen3-coder:30b")),
             name: String::from("navigator"),
@@ -678,14 +679,14 @@ fn toggling_the_navigator_preserves_its_provider() {
     )
     .unwrap();
     app.toggle_navigator(); // off
-    let mid = crate::session::read_pair_record(&app.pair_record_path).unwrap();
+    let mid = crate::session::read_pair_record(&app.pair.record_path).unwrap();
     assert!(!mid.enabled, "the first toggle really deactivates");
     assert_eq!(mid.name, "navigator");
     assert_eq!(mid.provider.as_deref(), Some("ollama"));
     assert_eq!(mid.base_url.as_deref(), Some("http://localhost:11434"));
     assert_eq!(mid.model.as_deref(), Some("qwen3-coder:30b"));
     app.toggle_navigator(); // back on
-    let r = crate::session::read_pair_record(&app.pair_record_path).unwrap();
+    let r = crate::session::read_pair_record(&app.pair.record_path).unwrap();
     assert!(r.enabled);
     assert_eq!(r.provider.as_deref(), Some("ollama"));
     assert_eq!(r.base_url.as_deref(), Some("http://localhost:11434"));
@@ -715,7 +716,7 @@ fn only_one_croft_self_appoints_the_navigator_owner() {
     }
     let enable = |a: &mut App| {
         crate::session::write_pair_record(
-            &a.pair_record_path,
+            &a.pair.record_path,
             &crate::session::PairRecord {
                 model: None,
                 name: "nav".into(),
@@ -726,36 +727,36 @@ fn only_one_croft_self_appoints_the_navigator_owner() {
             },
         )
         .unwrap();
-        a.last_pair_check = None;
+        a.pair.last_check = None;
     };
 
     // Croft A grabs the single-host lock, self-appoints, and HOSTS (a
     // local-provider seat spawns no child): the lock is only kept by a
     // window that actually holds the seat.
     let mut a = App::new(tmp.path().to_path_buf()).unwrap();
-    a.pair_record_path = tmp.path().join("a.pair.json");
-    a.pair_socket = socket.clone();
-    a.pair_host_lock_path = lock_path.clone();
-    a.pair_spawn_override = Some(Box::new(local_test_spawn));
+    a.pair.record_path = tmp.path().join("a.pair.json");
+    a.pair.socket = socket.clone();
+    a.pair.host_lock_path = lock_path.clone();
+    a.pair.spawn_override = Some(Box::new(local_test_spawn));
     enable(&mut a);
     a.maybe_seat_navigator();
-    assert!(a.pair_host.is_some(), "A must host: {}", a.status);
+    assert!(a.pair.host.is_some(), "A must host: {}", a.status);
     assert!(
-        a.pair_host_lock.is_some(),
+        a.pair.host_lock.is_some(),
         "A must hold the single-host lock"
     );
 
     // Croft B, same workspace: with a live relay, WITHOUT the lock gate it
     // would self-appoint and reach the spawn (panic). The gate must refuse it.
     let mut b = App::new(tmp.path().to_path_buf()).unwrap();
-    b.pair_record_path = tmp.path().join("b.pair.json");
-    b.pair_socket = socket.clone();
-    b.pair_host_lock_path = lock_path.clone();
-    b.pair_spawn_override = Some(Box::new(|_| panic!("a second croft must never host")));
+    b.pair.record_path = tmp.path().join("b.pair.json");
+    b.pair.socket = socket.clone();
+    b.pair.host_lock_path = lock_path.clone();
+    b.pair.spawn_override = Some(Box::new(|_| panic!("a second croft must never host")));
     enable(&mut b);
     b.maybe_seat_navigator();
-    assert!(b.pair_host.is_none(), "B must not host");
-    assert!(b.pair_host_lock.is_none(), "B must not hold the lock");
+    assert!(b.pair.host.is_none(), "B must not host");
+    assert!(b.pair.host_lock.is_none(), "B must not hold the lock");
     assert!(
         b.status.to_lowercase().contains("another croft"),
         "B must say another croft hosts it, got: {}",
@@ -766,7 +767,7 @@ fn only_one_croft_self_appoints_the_navigator_owner() {
     // but re-announcing every second clobbered its status line forever and
     // dirtied a frame at 1 Hz.
     b.status = String::from("Saved src/foo.rs");
-    b.last_pair_check = None;
+    b.pair.last_check = None;
     let redraw = b.maybe_seat_navigator();
     assert!(!redraw, "an unchanged refusal must not dirty the frame");
     assert_eq!(
@@ -803,34 +804,34 @@ fn unseating_the_navigator_resets_the_turn_note_counters() {
         base_url: None,
     };
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.pair_record_path = tmp.path().join("x.pair.json");
-    app.pair_socket = socket.clone();
-    app.pair_host_lock_path = tmp.path().join("x.host.lock");
-    app.pair_spawn_override = Some(Box::new(local_test_spawn));
-    crate::session::write_pair_record(&app.pair_record_path, &record).unwrap();
-    app.last_pair_check = None;
+    app.pair.record_path = tmp.path().join("x.pair.json");
+    app.pair.socket = socket.clone();
+    app.pair.host_lock_path = tmp.path().join("x.host.lock");
+    app.pair.spawn_override = Some(Box::new(local_test_spawn));
+    crate::session::write_pair_record(&app.pair.record_path, &record).unwrap();
+    app.pair.last_check = None;
     app.maybe_seat_navigator();
-    assert!(app.pair_host.is_some(), "seated: {}", app.status);
+    assert!(app.pair.host.is_some(), "seated: {}", app.status);
 
     // Mid-turn state: the navigator commented three times in a.rs.
-    app.pair_notes_this_turn = 3;
-    app.pair_last_noted_file = Some(String::from("a.rs"));
-    app.pair_noted_files.insert(String::from("a.rs"));
+    app.pair.notes_this_turn = 3;
+    app.pair.last_noted_file = Some(String::from("a.rs"));
+    app.pair.noted_files.insert(String::from("a.rs"));
 
     record.enabled = false;
-    crate::session::write_pair_record(&app.pair_record_path, &record).unwrap();
-    app.last_pair_check = None;
+    crate::session::write_pair_record(&app.pair.record_path, &record).unwrap();
+    app.pair.last_check = None;
     app.maybe_seat_navigator();
-    assert!(app.pair_host.is_none(), "unseated");
+    assert!(app.pair.host.is_none(), "unseated");
     assert_eq!(
-        app.pair_notes_this_turn, 0,
+        app.pair.notes_this_turn, 0,
         "a dead seat's note count must not leak into the next seat's TurnDone"
     );
     assert!(
-        app.pair_last_noted_file.is_none(),
+        app.pair.last_noted_file.is_none(),
         "a dead seat's noted file must not leak either"
     );
-    assert!(app.pair_noted_files.is_empty());
+    assert!(app.pair.noted_files.is_empty());
 }
 
 /// Re-running `croft pair` after a failed seat must retry: the CLI promises
@@ -862,50 +863,50 @@ fn a_record_rewrite_re_arms_a_downed_navigator() {
         base_url: None,
     };
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.pair_record_path = tmp.path().join("x.pair.json");
-    app.pair_socket = socket.clone();
-    app.pair_host_lock_path = tmp.path().join("x.host.lock");
-    app.pair_spawn_override = Some(Box::new(|_| anyhow::bail!("claude is broken")));
-    crate::session::write_pair_record(&app.pair_record_path, &record).unwrap();
-    app.last_pair_check = None;
+    app.pair.record_path = tmp.path().join("x.pair.json");
+    app.pair.socket = socket.clone();
+    app.pair.host_lock_path = tmp.path().join("x.host.lock");
+    app.pair.spawn_override = Some(Box::new(|_| anyhow::bail!("claude is broken")));
+    crate::session::write_pair_record(&app.pair.record_path, &record).unwrap();
+    app.pair.last_check = None;
     app.maybe_seat_navigator();
-    assert!(app.navigator_down, "the first seat fails and latches");
+    assert!(app.pair.navigator_down, "the first seat fails and latches");
 
     // Latched: an unchanged record must NOT retry every second.
-    app.last_pair_check = None;
+    app.pair.last_check = None;
     app.maybe_seat_navigator();
-    assert!(app.pair_host.is_none());
+    assert!(app.pair.host.is_none());
 
     // The user fixes the backend and re-runs `croft pair`: the rewritten
     // record re-arms seating — even when the rewrite lands within the same
     // mtime grain (coarse-timestamp filesystems): pin the mtime to the old
     // value so only the CONTENT can carry the signal (every write stamps
     // the record, so an enabled→enabled rewrite is never byte-identical).
-    let old_mtime = std::fs::metadata(&app.pair_record_path)
+    let old_mtime = std::fs::metadata(&app.pair.record_path)
         .unwrap()
         .modified()
         .unwrap();
-    crate::session::write_pair_record(&app.pair_record_path, &record).unwrap();
+    crate::session::write_pair_record(&app.pair.record_path, &record).unwrap();
     let f = std::fs::File::options()
         .write(true)
-        .open(&app.pair_record_path)
+        .open(&app.pair.record_path)
         .unwrap();
     f.set_modified(old_mtime).unwrap();
-    app.pair_spawn_override = Some(Box::new(local_test_spawn));
+    app.pair.spawn_override = Some(Box::new(local_test_spawn));
     // Poll like the app's once-a-second tick: a child forked by a parallel
     // test can share the host lock's file until its exec closes it, which
     // reads as Busy for that one tick.
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        app.last_pair_check = None;
+        app.pair.last_check = None;
         app.maybe_seat_navigator();
-        if app.pair_host.is_some() || Instant::now() >= deadline {
+        if app.pair.host.is_some() || Instant::now() >= deadline {
             break;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(
-        app.pair_host.is_some(),
+        app.pair.host.is_some(),
         "a rewritten record must re-arm the downed navigator: {}",
         app.status
     );
@@ -947,7 +948,7 @@ fn ask_box_opens_from_chord_and_menus_and_sends_the_ask_turn() {
     app.open_file_at_launch(&file);
     let mut cmd = std::process::Command::new("python3");
     cmd.arg(&script).arg(&log).arg("notes");
-    app.pair_host =
+    app.pair.host =
         Some(crate::pair_host::PairHost::spawn_cmd(&socket, "navigator", None, cmd).unwrap());
 
     // Cmd+K Q on the caret line (no selection): single-line scope, 1-based
@@ -1034,44 +1035,48 @@ fn reroot_rebinds_the_navigator_activation_watch() {
     std::fs::write(b.path().join("b.txt"), "b").unwrap();
     let mut app = App::new(a.path().to_path_buf()).unwrap();
     assert_eq!(
-        app.pair_record_path,
+        app.pair.record_path,
         crate::session::pair_record_path(a.path())
     );
 
     // A seat and its boxes from root A are torn down by the move.
-    app.navigator_notes
+    app.pair
+        .navigator_notes
         .insert("a.txt".into(), vec![(1, 0, "n".into())]);
     app.editor.comment_focus = Some(crate::widgets::editor::CommentFocus {
         id: 1,
         reply: String::new(),
         cursor: 0,
     });
-    app.navigator_down = true; // a dead pilot in A must not block B
-    app.last_pair_check = Some(std::time::Instant::now());
+    app.pair.navigator_down = true; // a dead pilot in A must not block B
+    app.pair.last_check = Some(std::time::Instant::now());
 
     app.change_workspace_root(b.path().to_path_buf());
 
     assert_eq!(
-        app.pair_record_path,
+        app.pair.record_path,
         crate::session::pair_record_path(b.path()),
         "the activation watch follows the root"
     );
     assert_eq!(
-        app.pair_socket,
+        app.pair.socket,
         crate::session::collab_socket_path(b.path())
     );
     assert_eq!(
-        app.pair_host_lock_path,
+        app.pair.host_lock_path,
         crate::session::pair_host_lock_path(b.path())
     );
-    assert!(app.navigator_notes.is_empty(), "old root's boxes are gone");
+    assert!(
+        app.pair.navigator_notes.is_empty(),
+        "old root's boxes are gone"
+    );
     assert!(app.editor.comment_focus.is_none());
     assert!(
-        !app.navigator_down,
+        !app.pair.navigator_down,
         "the death latch belongs to the old root"
     );
     assert!(
-        app.last_pair_check.is_none(),
+        app.pair.last_check.is_none(),
         "the new record is checked on the next tick, not in 1s"
     );
 }
@@ -1119,12 +1124,12 @@ fn a_completed_construct_plus_pause_triggers_a_proactive_look() {
     }
     let mut cmd = std::process::Command::new("python3");
     cmd.arg(&script).arg(&log).arg("notes");
-    app.pair_host = Some(crate::pair_host::PairHost::spawn_cmd(&socket, "nav", None, cmd).unwrap());
+    app.pair.host = Some(crate::pair_host::PairHost::spawn_cmd(&socket, "nav", None, cmd).unwrap());
 
     // The navigator's first look: a manual yield; wait the turn out.
     app.yield_to_navigator();
     let deadline = Instant::now() + Duration::from_secs(15);
-    while app.pair_host.as_ref().unwrap().is_busy() {
+    while app.pair.host.as_ref().unwrap().is_busy() {
         assert!(Instant::now() < deadline, "the first look never finished");
         app.poll_collab();
         app.poll_pair();
@@ -1141,7 +1146,7 @@ fn a_completed_construct_plus_pause_triggers_a_proactive_look() {
     app.editor.lines.push("fn beta() {}".into());
     app.editor.edit_seq += 1;
     app.editor.last_edit_at = Some(Instant::now() - Duration::from_secs(3));
-    app.proactive_navigator_enabled = false;
+    app.pair.proactive_navigator_enabled = false;
     assert!(
         !app.tick_proactive_navigator(),
         "the pref must gate the look"
@@ -1151,7 +1156,7 @@ fn a_completed_construct_plus_pause_triggers_a_proactive_look() {
     // stealing the seat now would make their Enter fail against a busy
     // host and lose the typed draft. An open prompt suppresses the look
     // without consuming the scan.
-    app.proactive_navigator_enabled = true;
+    app.pair.proactive_navigator_enabled = true;
     app.open_ask_navigator((0, 0), String::new());
     assert!(app.input_prompt.is_some(), "the ask box must open");
     assert!(
@@ -1164,12 +1169,12 @@ fn a_completed_construct_plus_pause_triggers_a_proactive_look() {
     // anchored at the new function's row.
     assert!(app.tick_proactive_navigator(), "new fn + pause must fire");
     assert_eq!(
-        app.pair_turn_origin,
+        app.pair.turn_origin,
         Some((String::from("f.rs"), beta_row)),
         "the look anchors at the completed construct"
     );
     assert!(
-        app.pair_host.as_ref().unwrap().is_busy(),
+        app.pair.host.as_ref().unwrap().is_busy(),
         "the proactive look is a real turn"
     );
 
@@ -1671,7 +1676,7 @@ fn fix_with_navigator_lands_on_the_diagnostic_and_refuses_without_a_seat() {
     // only thing standing between the row and an eternal spinner.
     app.problems.fixing = Some((file.clone(), 0));
     app.problems_fix_started = Some(std::time::Instant::now());
-    app.last_pair_check = None;
+    app.pair.last_check = None;
     app.maybe_seat_navigator();
     assert!(
         app.problems.fixing.is_none(),
@@ -1725,7 +1730,8 @@ fn a_navigator_note_and_a_review_comment_on_one_line_keep_a_stable_order() {
     std::fs::write(&file, "one\ntwo\nthree\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.open_file_at_launch(&file);
-    app.navigator_notes
+    app.pair
+        .navigator_notes
         .insert("a.rs".into(), vec![(1, 1, "the navigator's note".into())]);
     app.review.boxes = Some((
         file.clone(),
