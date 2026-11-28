@@ -291,7 +291,7 @@ impl App {
         }
         if self.focus == Pane::Tree
             && self.sidebar_view == SidebarView::Extensions
-            && self.extensions.cursor_screen_pos().is_some()
+            && self.extensions.cursor_screen_pos(true).is_some()
         {
             return true;
         }
@@ -718,14 +718,13 @@ impl App {
             // under the cursor (and the remote header pills) can light up,
             // mirroring the editor tab strip and terminal pane buttons.
             let panel_pointer = self.pointer_cell;
+            // The view drawn below is the side bar's current one, so it has
+            // the keyboard exactly when the side bar does.
+            let side_cx = self.view_cx(self.focus == Pane::Tree);
             self.tree.hover_pointer = panel_pointer;
             self.search.hover_pointer = panel_pointer;
             self.source_control.hover_pointer = panel_pointer;
             self.run_debug.hover_pointer = panel_pointer;
-            self.remote.hover_pointer = panel_pointer;
-            self.extensions.hover_pointer = panel_pointer;
-            self.testing.hover_pointer = panel_pointer;
-            self.commit_graph.hover_pointer = panel_pointer;
             // Explorer stacks its toggled sub-views (Open Editors / Folders /
             // Outline / Timeline / Dependencies) inside the usable strip.
             // Every other sidebar view fills it with its single activity widget.
@@ -758,12 +757,13 @@ impl App {
                         };
                         self.commit_graph.has_keys = self.source_control.keys
                             == crate::widgets::source_control::KeyStop::Commits;
-                        frame.render_widget(&mut self.commit_graph, graph_area);
+                        self.commit_graph
+                            .draw(&side_cx, graph_area, frame.buffer_mut());
                     } else {
                         self.commit_graph.last_area = Rect::default();
                     }
                 }
-                SidebarView::Remote => frame.render_widget(&mut self.remote, usable_area),
+                SidebarView::Remote => self.remote.draw(&side_cx, usable_area, frame.buffer_mut()),
                 SidebarView::RunDebug => {
                     // Breakpoints change from many places (F9, the gutter,
                     // the condition and logpoint editors); syncing here keeps
@@ -771,8 +771,13 @@ impl App {
                     self.sync_breakpoint_list();
                     frame.render_widget(&mut self.run_debug, usable_area)
                 }
-                SidebarView::Extensions => frame.render_widget(&mut self.extensions, usable_area),
-                SidebarView::Testing => frame.render_widget(&mut self.testing, usable_area),
+                SidebarView::Extensions => {
+                    self.extensions
+                        .draw(&side_cx, usable_area, frame.buffer_mut())
+                }
+                SidebarView::Testing => {
+                    self.testing.draw(&side_cx, usable_area, frame.buffer_mut())
+                }
                 SidebarView::CodeQL => {
                     self.codeql.focused = self.focus == Pane::Tree;
                     let running = self.codeql_run.as_ref().map(|(_, since)| {
@@ -2538,7 +2543,7 @@ impl App {
         if self.focus == Pane::Tree
             && self.sidebar_view == SidebarView::Extensions
             && pane_caret
-            && let Some((cx, cy)) = self.extensions.cursor_screen_pos()
+            && let Some((cx, cy)) = self.extensions.cursor_screen_pos(true)
         {
             frame.set_cursor_position((cx, cy));
         }

@@ -13,13 +13,13 @@
 //! The filter is local-only: there is no marketplace, so it narrows the
 //! installed list rather than searching a remote registry.
 
+use crate::widgets::view_cx::ViewCx;
 use std::collections::BTreeSet;
 
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Color, Modifier, Style},
-    widgets::Widget,
 };
 
 use crate::lsp::manifest::ExtensionSummary;
@@ -288,11 +288,6 @@ pub fn items_from_vscode(rows: &[crate::vscode_extensions::Comparison]) -> Vec<E
 }
 
 pub struct ExtensionsPanel {
-    pub focused: bool,
-    pub hover_pointer: Option<(u16, u16)>,
-    /// Active theme, pushed by the app each frame so the palette matches the
-    /// rest of the chrome.
-    pub theme: Theme,
     pub last_area: Rect,
     items: Vec<ExtensionItem>,
     /// Local filter query. Narrows the visible list by case-insensitive match on
@@ -327,9 +322,6 @@ pub struct ExtensionsPanel {
 impl ExtensionsPanel {
     pub fn new() -> Self {
         Self {
-            focused: false,
-            hover_pointer: None,
-            theme: Theme::default(),
             last_area: Rect::default(),
             items: Vec::new(),
             filter: String::new(),
@@ -349,8 +341,8 @@ impl ExtensionsPanel {
     /// for the app to drive the host's blinking hardware caret (mirroring
     /// `SourceControlPanel::cursor_screen_pos`). `None` when the panel isn't
     /// focused or hasn't been laid out yet.
-    pub fn cursor_screen_pos(&self) -> Option<(u16, u16)> {
-        if !self.focused {
+    pub fn cursor_screen_pos(&self, focused: bool) -> Option<(u16, u16)> {
+        if !focused {
             return None;
         }
         self.caret_cell
@@ -571,8 +563,9 @@ fn put(buf: &mut Buffer, x: u16, y: u16, right: u16, s: &str, style: Style) -> u
     x + drawn
 }
 
-impl Widget for &mut ExtensionsPanel {
-    fn render(self, area: Rect, buf: &mut Buffer) {
+impl ExtensionsPanel {
+    /// Draw the view into `area` with this frame's [`ViewCx`].
+    pub fn draw(&mut self, cx: &ViewCx, area: Rect, buf: &mut Buffer) {
         self.last_area = area;
         self.row_hits.clear();
         self.last_switch_left = u16::MAX;
@@ -585,7 +578,7 @@ impl Widget for &mut ExtensionsPanel {
         }
         let right = area.x + area.width;
         let bottom = area.y + area.height;
-        let pal = Palette::for_theme(self.theme);
+        let pal = Palette::for_theme(cx.theme);
 
         // Header caption.
         put(
@@ -595,7 +588,7 @@ impl Widget for &mut ExtensionsPanel {
             right,
             "EXTENSIONS",
             Style::default()
-                .fg(self.theme.ui(SECTION_HEADER))
+                .fg(cx.theme.ui(SECTION_HEADER))
                 .add_modifier(Modifier::BOLD),
         );
 
@@ -648,7 +641,7 @@ impl Widget for &mut ExtensionsPanel {
                 );
                 // Caret sits at the text start so the user sees where typing
                 // lands even before the first character, like the commit box.
-                if self.focused {
+                if cx.focused {
                     self.caret_cell = Some((x.min(text_right), search_y));
                 }
             } else {
@@ -664,7 +657,7 @@ impl Widget for &mut ExtensionsPanel {
                 // Caret rides just past the filter text (clamped before the
                 // clear glyph) so the app can blink the host's hardware caret
                 // there instead of leaving the field cursor-less.
-                if self.focused {
+                if cx.focused {
                     self.caret_cell = Some((after.min(clear_x), search_y));
                 }
                 buf.set_string(
@@ -737,7 +730,7 @@ impl Widget for &mut ExtensionsPanel {
             let row_bg = if is_selected {
                 Some(pal.selection)
             } else {
-                crate::widgets::hover::row_hover_bg(row_rect, self.hover_pointer, self.theme)
+                crate::widgets::hover::row_hover_bg(row_rect, cx.pointer, cx.theme)
             };
             if let Some(bg) = row_bg {
                 buf.set_style(row_rect, Style::default().bg(bg));
@@ -760,7 +753,7 @@ impl Widget for &mut ExtensionsPanel {
                 sw_x.saturating_sub(1)
             };
             let (chip, chip_color) =
-                chip_for(&item.id).unwrap_or(('\u{25c6}', self.theme.ui(ICON_CHIP_FALLBACK)));
+                chip_for(&item.id).unwrap_or(('\u{25c6}', cx.theme.ui(ICON_CHIP_FALLBACK)));
             let mut chip_style = Style::default().fg(chip_color);
             if let Some(bg) = row_bg {
                 chip_style = chip_style.bg(bg);
@@ -884,7 +877,7 @@ mod tests {
             },
         ]));
         panel.set_items(its);
-        let (_buf, text) = render(&mut panel, 60, 30);
+        let (_buf, text) = render(&mut panel, &ViewCx::default(), 60, 30);
         assert!(text.contains("FROM VS CODE"), "section header:\n{text}");
         assert!(
             text.contains("built in"),
@@ -940,7 +933,7 @@ mod tests {
             install: None,
         });
         panel.set_items(its);
-        let (_buf, text) = render(&mut panel, 40, 24);
+        let (_buf, text) = render(&mut panel, &ViewCx::default(), 40, 24);
         assert!(
             text.contains(TRASH_GLYPH),
             "a removable row must paint a trash button"
@@ -1012,7 +1005,7 @@ mod tests {
         ]
     }
 
-    fn render(panel: &mut ExtensionsPanel, w: u16, h: u16) -> (Buffer, String) {
+    fn render(panel: &mut ExtensionsPanel, cx: &ViewCx, w: u16, h: u16) -> (Buffer, String) {
         let area = Rect {
             x: 0,
             y: 0,
@@ -1020,7 +1013,7 @@ mod tests {
             height: h,
         };
         let mut buf = Buffer::empty(area);
-        Widget::render(panel, area, &mut buf);
+        panel.draw(cx, area, &mut buf);
         let mut dump = String::new();
         for y in 0..h {
             for x in 0..w {
@@ -1035,7 +1028,7 @@ mod tests {
     fn lists_names_blurbs_a_filter_box_and_a_builtin_header() {
         let mut panel = ExtensionsPanel::new();
         panel.set_items(items());
-        let (_buf, dump) = render(&mut panel, 44, 16);
+        let (_buf, dump) = render(&mut panel, &ViewCx::default(), 44, 16);
         assert!(dump.contains("EXTENSIONS"), "title:\n{dump}");
         assert!(
             dump.contains("Filter extensions"),
@@ -1048,10 +1041,11 @@ mod tests {
 
     #[test]
     fn enabled_state_renders_as_a_pill_switch_not_a_word_label() {
+        let mut cx = ViewCx::default();
         let mut panel = ExtensionsPanel::new();
         panel.set_items(items());
-        panel.theme = Theme::BLACK;
-        let (buf, dump) = render(&mut panel, 44, 16);
+        cx.theme = Theme::BLACK;
+        let (buf, dump) = render(&mut panel, &cx, 44, 16);
         assert!(
             !dump.contains("Enabled"),
             "no 'Enabled' word label:\n{dump}"
@@ -1084,12 +1078,13 @@ mod tests {
 
     #[test]
     fn the_panel_palette_follows_the_active_theme() {
+        let mut cx = ViewCx::default();
         let mut panel = ExtensionsPanel::new();
         panel.set_items(items());
         panel.select(0);
         // Black theme: selected row wears the brand teal fill.
-        panel.theme = Theme::BLACK;
-        let (buf, _) = render(&mut panel, 44, 16);
+        cx.theme = Theme::BLACK;
+        let (buf, _) = render(&mut panel, &cx, 44, 16);
         let y0 = panel.row_hits[0].0;
         assert_eq!(
             buf[(2, y0)].style().bg,
@@ -1097,8 +1092,8 @@ mod tests {
             "Black theme selection is the brand teal"
         );
         // Dark-Blue theme: selected row wears the historical blue fill.
-        panel.theme = Theme::DARK_BLUE;
-        let (buf, _) = render(&mut panel, 44, 16);
+        cx.theme = Theme::DARK_BLUE;
+        let (buf, _) = render(&mut panel, &cx, 44, 16);
         let y0 = panel.row_hits[0].0;
         assert_eq!(
             buf[(2, y0)].style().bg,
@@ -1143,7 +1138,7 @@ mod tests {
     fn row_at_maps_screen_y_to_visible_item_below_the_section_header() {
         let mut panel = ExtensionsPanel::new();
         panel.set_items(items());
-        let _ = render(&mut panel, 44, 16);
+        let _ = render(&mut panel, &ViewCx::default(), 44, 16);
         let y0 = panel.row_hits[0].0;
         assert_eq!(panel.row_at(y0), Some(0), "first cell of row 0");
         assert_eq!(panel.row_at(y0 + 1), Some(0), "second cell still row 0");
@@ -1160,7 +1155,7 @@ mod tests {
     fn clicking_a_rows_switch_zone_is_an_action_not_a_plain_select() {
         let mut panel = ExtensionsPanel::new();
         panel.set_items(items());
-        let _ = render(&mut panel, 44, 16);
+        let _ = render(&mut panel, &ViewCx::default(), 44, 16);
         let y0 = panel.row_hits[0].0;
         let sw_x = panel.last_switch_left;
         assert!(
@@ -1177,7 +1172,7 @@ mod tests {
     fn refresh_button_renders_and_only_its_own_cell_triggers_a_refresh() {
         let mut panel = ExtensionsPanel::new();
         panel.set_items(items());
-        let _ = render(&mut panel, 44, 16);
+        let _ = render(&mut panel, &ViewCx::default(), 44, 16);
         let r = panel.last_refresh_area;
         assert!(r.width > 0, "the refresh icon must render");
         assert!(
@@ -1204,7 +1199,7 @@ mod tests {
         // the extension. The zone must end at the panel's right edge.
         let mut panel = ExtensionsPanel::new();
         panel.set_items(items());
-        let _ = render(&mut panel, 44, 16);
+        let _ = render(&mut panel, &ViewCx::default(), 44, 16);
         let y0 = panel.row_hits[0].0;
         let panel_right = panel.last_area.right();
         assert!(
@@ -1225,14 +1220,14 @@ mod tests {
     fn the_clear_button_appears_only_with_a_filter_and_hit_tests() {
         let mut panel = ExtensionsPanel::new();
         panel.set_items(items());
-        let _ = render(&mut panel, 44, 16);
+        let _ = render(&mut panel, &ViewCx::default(), 44, 16);
         assert_eq!(
             panel.last_clear_area,
             Rect::default(),
             "no clear while empty"
         );
         panel.push_filter_char('p');
-        let _ = render(&mut panel, 44, 16);
+        let _ = render(&mut panel, &ViewCx::default(), 44, 16);
         let c = panel.last_clear_area;
         assert!(c.width > 0, "a non-empty filter lays out a clear button");
         assert!(panel.click_clear(c.x, c.y), "the clear button hit-tests");
@@ -1240,33 +1235,37 @@ mod tests {
 
     #[test]
     fn a_focused_filter_exposes_a_caret_for_the_blinking_hardware_cursor() {
+        let mut cx = ViewCx::default();
         let mut panel = ExtensionsPanel::new();
         panel.set_items(items());
-        panel.focused = true;
+        cx.focused = true;
         // Empty filter: caret sits at the text start, just past the magnifier.
-        let _ = render(&mut panel, 44, 16);
+        let _ = render(&mut panel, &cx, 44, 16);
         let (cx0, cy0) = panel
-            .cursor_screen_pos()
+            .cursor_screen_pos(cx.focused)
             .expect("a focused, empty filter still shows where typing will land");
         assert_eq!(cy0, panel.last_search_area.y, "caret rides the filter row");
         // Typing advances the caret to the right of the entered text so the
         // user sees where the next character goes, like the commit box.
         panel.push_filter_char('p');
         panel.push_filter_char('d');
-        let _ = render(&mut panel, 44, 16);
-        let (cx1, _) = panel.cursor_screen_pos().expect("caret after typing");
+        let _ = render(&mut panel, &cx, 44, 16);
+        let (cx1, _) = panel
+            .cursor_screen_pos(cx.focused)
+            .expect("caret after typing");
         assert!(cx1 > cx0, "caret advances past the typed characters");
     }
 
     #[test]
     fn an_unfocused_filter_exposes_no_caret() {
+        let mut cx = ViewCx::default();
         let mut panel = ExtensionsPanel::new();
         panel.set_items(items());
-        panel.focused = false;
+        cx.focused = false;
         panel.push_filter_char('p');
-        let _ = render(&mut panel, 44, 16);
+        let _ = render(&mut panel, &cx, 44, 16);
         assert!(
-            panel.cursor_screen_pos().is_none(),
+            panel.cursor_screen_pos(cx.focused).is_none(),
             "an unfocused panel must not claim the hardware caret"
         );
     }
