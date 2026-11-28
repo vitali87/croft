@@ -34,7 +34,11 @@ pub(super) fn install_remote_croft(ssh: &SshControl, source_stamp: &str) -> Resu
         anyhow::ensure!(status.success(), "rsync exited with {status}");
         Ok(())
     };
-    match try_prebuilt_install(ssh, source_stamp, &mut ship, &mut |m| println!("{m}")) {
+    // On the user's terminal: croft's screen is not up here.
+    let mut run = |mut step: Command| -> Result<std::process::ExitStatus> { Ok(step.status()?) };
+    match try_prebuilt_install(ssh, source_stamp, &mut ship, &mut run, &mut |m| {
+        println!("{m}")
+    }) {
         Ok(true) => return Ok(()),
         Ok(false) => {}
         Err(e) => eprintln!("Prebuilt install failed ({e:#}); building instead"),
@@ -76,11 +80,13 @@ pub(crate) static FORCE_SOURCE_BUILD: std::sync::atomic::AtomicBool =
 /// target instead of building one. `Ok(true)` = installed; `Ok(false)` = not
 /// applicable (said why); `Err` = attempted and broke. The caller falls back
 /// to the cross-build either way. `ship` copies a local binary to the
-/// remote's `~/.cargo/bin/croft.new` over whichever transport the caller has.
+/// remote's `~/.cargo/bin/croft.new` over whichever transport the caller has;
+/// `run` runs each remote step, as [`place_prebuilt`] says.
 pub(super) fn try_prebuilt_install(
     ssh: &SshControl,
     source_stamp: &str,
     ship: &mut dyn FnMut(&Path) -> Result<()>,
+    run: &mut dyn FnMut(Command) -> Result<std::process::ExitStatus>,
     log: &mut dyn FnMut(String),
 ) -> Result<bool> {
     if FORCE_SOURCE_BUILD.load(std::sync::atomic::Ordering::Relaxed) {
@@ -136,26 +142,38 @@ pub(super) fn try_prebuilt_install(
     log(format!(
         "Installing prebuilt croft v{version} for {triple} ({size_mb:.0} MB) over SSH"
     ));
-    let mkdir = ssh
-        .command()
+    place_prebuilt(ssh, &binary, source_stamp, ship, run)?;
+    log(format!("Installed prebuilt croft v{version} on the remote"));
+    Ok(true)
+}
+
+/// Put the prebuilt `binary` in place on the remote: make its folders, ship
+/// it, then activate it. `run` runs each remote step the way the caller
+/// needs: on the user's terminal for `croft remote`, or with an empty stdin
+/// and its output in the install log for an install inside croft, whose
+/// screen (or the remote session's) is up meanwhile (#2792).
+pub(super) fn place_prebuilt(
+    ssh: &SshControl,
+    binary: &Path,
+    source_stamp: &str,
+    ship: &mut dyn FnMut(&Path) -> Result<()>,
+    run: &mut dyn FnMut(Command) -> Result<std::process::ExitStatus>,
+) -> Result<()> {
+    let mut mkdir = ssh.command();
+    mkdir
         .arg(&ssh.host)
-        .arg("mkdir -p \"$HOME/.cargo/bin\" \"$HOME/.cache/croft\"")
-        .status()
-        .context("creating remote install dirs")?;
+        .arg("mkdir -p \"$HOME/.cargo/bin\" \"$HOME/.cache/croft\"");
+    let mkdir = run(mkdir).context("creating remote install dirs")?;
     anyhow::ensure!(mkdir.success(), "remote mkdir exited with {mkdir}");
-    ship(&binary)?;
-    let activate = ssh
-        .command()
-        .arg(&ssh.host)
-        .arg(activate_command(source_stamp))
-        .status()
-        .context("activating the prebuilt croft on the remote")?;
+    ship(binary)?;
+    let mut activate = ssh.command();
+    activate.arg(&ssh.host).arg(activate_command(source_stamp));
+    let activate = run(activate).context("activating the prebuilt croft on the remote")?;
     anyhow::ensure!(
         activate.success(),
         "remote activation exited with {activate}"
     );
-    log(format!("Installed prebuilt croft v{version} on the remote"));
-    Ok(true)
+    Ok(())
 }
 
 pub(super) fn remote_target_triple(ssh: &SshControl) -> Result<Option<&'static str>> {

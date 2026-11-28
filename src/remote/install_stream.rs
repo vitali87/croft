@@ -151,6 +151,25 @@ pub(super) fn install_log_path() -> PathBuf {
     home.join(".cache").join("croft").join("install.log")
 }
 
+/// Ship the prebuilt `binary` to the remote's `~/.cargo/bin/croft.new` over
+/// the bulk lane, for an install inside croft: rsync's output goes into the
+/// log, and its stdin is empty (#2792).
+pub(super) fn ship_prebuilt_logged(
+    lane: &crate::remote_bulk::BulkLane,
+    ssh: &SshControl,
+    binary: &Path,
+    log_tx: &std::sync::mpsc::Sender<String>,
+) -> Result<()> {
+    let dest = format!("{}:.cargo/bin/croft.new", ssh.host);
+    let status = run_command_streaming(
+        ship_file_rsync_command(lane, &ssh.socket_path, binary, &dest),
+        log_tx,
+    )
+    .context("rsyncing the prebuilt croft to the remote")?;
+    anyhow::ensure!(status.success(), "rsync exited with {status}");
+    Ok(())
+}
+
 pub(super) fn run_command_streaming(
     mut cmd: Command,
     log_tx: &std::sync::mpsc::Sender<String>,
@@ -200,19 +219,14 @@ pub(super) fn install_remote_croft_streaming(
     log_tx: &std::sync::mpsc::Sender<String>,
     confirm_fallback: &mut dyn FnMut(&str) -> bool,
 ) -> Result<()> {
-    // The release binary first (#261), over the same bulk lane.
-    let mut ship = |binary: &Path| -> Result<()> {
-        let dest = format!("{}:.cargo/bin/croft.new", ssh.host);
-        let status = ship_file_rsync_command(lane, &ssh.socket_path, binary, &dest)
-            .status()
-            .context("rsyncing the prebuilt croft to the remote")?;
-        anyhow::ensure!(status.success(), "rsync exited with {status}");
-        Ok(())
-    };
+    // The release binary first (#261), over the same bulk lane. Its steps
+    // run like the build's below: stdin empty, output into the log (#2792).
+    let mut ship = |binary: &Path| ship_prebuilt_logged(lane, ssh, binary, log_tx);
+    let mut run = |step: Command| run_command_streaming(step, log_tx);
     let mut log = |m: String| {
         let _ = log_tx.send(m);
     };
-    match try_prebuilt_install(ssh, source_stamp, &mut ship, &mut log) {
+    match try_prebuilt_install(ssh, source_stamp, &mut ship, &mut run, &mut log) {
         Ok(true) => return Ok(()),
         Ok(false) => {}
         Err(e) => log(format!("Prebuilt install failed ({e:#}); building instead")),
