@@ -4,7 +4,7 @@
 //! for, so each kind's options and streams are written once:
 //!
 //! - [`Ssh::client`]: a command through the shared connection, never
-//!   logging in afresh, with a keepalive, as the session's own commands run;
+//!   asking for a login, with a keepalive, as the session's own commands run;
 //!   [`Ssh::bare_client`] is one without the keepalive, as the relay's
 //!   helpers run;
 //! - [`Ssh::background`], [`Ssh::no_stdin`] and [`Ssh::quiet`]: what a
@@ -34,10 +34,12 @@ pub(crate) struct Ssh(Command);
 
 /// What every client through the connection sets (#2793): through a live
 /// connection neither does anything, since no login happens. Once the
-/// connection has gone, ssh falls back to a fresh login; `BatchMode` makes
-/// that fail at once rather than ask for a password over croft's screen or
-/// the remote session, and the connect timeout makes an unreachable host
-/// fail in 10 s rather than the system's TCP timeout.
+/// connection has gone, ssh falls back to a fresh login. `BatchMode` makes
+/// one that would ask for a password or passphrase fail at once rather than
+/// ask over croft's screen or the remote session; a host that takes a key or
+/// a loaded agent logs in afresh without asking, and the command runs as it
+/// would have through the connection. The connect timeout makes an
+/// unreachable host fail in 10 s rather than the system's TCP timeout.
 const THROUGH_OPTIONS: [&str; 4] = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"];
 
 /// The keepalive the session's own commands add: the link is checked every
@@ -101,8 +103,8 @@ impl Ssh {
     }
 
     /// Through the shared connection at `socket`, never opening a master of
-    /// its own (`-S socket -o ControlMaster=no`) and never logging in afresh
-    /// once it has gone ([`THROUGH_OPTIONS`]).
+    /// its own (`-S socket -o ControlMaster=no`) and never asking for a
+    /// login once it has gone ([`THROUGH_OPTIONS`]).
     pub(crate) fn bare_client(socket: &Path) -> Self {
         let mut ssh = Self::new();
         ssh.0
@@ -248,10 +250,10 @@ mod tests {
     }
 
     /// #2793: every call through the shared connection, rsync's included,
-    /// fails at once rather than log in afresh once the connection has
-    /// gone, and gives up on an unreachable host in 10 s.
+    /// never asks for a login once the connection has gone, and gives up on
+    /// an unreachable host in 10 s.
     #[test]
-    fn a_client_through_the_connection_never_logs_in_afresh() {
+    fn a_client_through_the_connection_never_asks_for_a_login() {
         let socket = Path::new("/tmp/croft-ssh/ctl");
         for client in [
             args(Ssh::client(socket)),
