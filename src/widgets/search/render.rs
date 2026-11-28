@@ -247,22 +247,23 @@ pub(super) fn render_field(
     }
 }
 
-impl Widget for &mut SearchPanel {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let focus_blue = self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff));
+impl SearchPanel {
+    /// Draw the view into `area` with this frame's [`ViewCx`].
+    pub fn draw(&mut self, cx: &ViewCx, area: Rect, buf: &mut Buffer) {
+        let focus_blue = cx.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff));
         // Black theme: inner stroke accents (chevron, input ring, magnifier,
         // cursor) wear the muted brand teal instead of the legacy blue.
-        let accent = if self.focus_gradient {
+        let accent = if cx.theme.gradient() {
             crate::gradient::rgb_color(crate::gradient::INNER_ACCENT)
         } else {
             focus_blue
         };
-        let outer_style = if self.focused {
+        let outer_style = if cx.focused {
             Style::default().fg(focus_blue)
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let outer = crate::widgets::surface::view_block(self.theme, true, outer_style);
+        let outer = crate::widgets::surface::view_block(cx.theme, true, outer_style);
         let inner = outer.inner(area);
         outer.render(area, buf);
         // Black theme: replace the solid focus border with the brand gradient.
@@ -271,9 +272,9 @@ impl Widget for &mut SearchPanel {
         crate::widgets::surface::paint_view_focus(
             buf,
             area,
-            self.theme,
-            self.focused,
-            self.focus_gradient,
+            cx.theme,
+            cx.focused,
+            cx.theme.gradient(),
         );
         self.last_area = area;
         self.last_inner = inner;
@@ -286,16 +287,16 @@ impl Widget for &mut SearchPanel {
 
         // Croft Loch's inks and fills; `None` on a boxed theme, which keeps
         // the colours below exactly as they were.
-        let tones = crate::theme::tones(self.theme);
+        let tones = crate::theme::tones(cx.theme);
 
         // Row 0: "SEARCH" header (top-left) plus the VS Code SEARCH header
         // actions (refresh / clear) at the top-right. Croft Loch titles the
         // view as the Explorer does: the strong ink while it has the
         // keyboard, muted otherwise, and never bold.
         let title_style = match tones {
-            Some(t) => Style::default().fg(if self.focused { t.strong() } else { t.muted() }),
+            Some(t) => Style::default().fg(if cx.focused { t.strong() } else { t.muted() }),
             None => Style::default()
-                .fg(self.theme.ui(Color::Rgb(0xb0, 0xb8, 0xc8)))
+                .fg(cx.theme.ui(Color::Rgb(0xb0, 0xb8, 0xc8)))
                 .add_modifier(Modifier::BOLD),
         };
         buf.set_string(inner.x, inner.y, "SEARCH", title_style);
@@ -314,18 +315,16 @@ impl Widget for &mut SearchPanel {
                 (refresh_x, crate::icons::SEARCH_REFRESH),
                 (clear_x, crate::icons::SEARCH_CLEAR_ALL),
             ] {
-                let hot = self
-                    .hover_pointer
-                    .is_some_and(|(px, py)| py == inner.y && px == x);
+                let hot = cx.pointer.is_some_and(|(px, py)| py == inner.y && px == x);
                 // Croft Loch: the side bar's header actions, muted at rest
                 // and lifted to the strong ink on a faint chip under the
                 // pointer; the accent stays for focus.
                 let style = if tones.is_some() {
-                    crate::widgets::header_pill::action_style(self.theme, hot)
+                    crate::widgets::header_pill::action_style(cx.theme, hot)
                 } else if hot {
                     Style::default().fg(accent)
                 } else {
-                    Style::default().fg(self.theme.ui(Color::Rgb(0x8b, 0x94, 0xa4)))
+                    Style::default().fg(cx.theme.ui(Color::Rgb(0x8b, 0x94, 0xa4)))
                 };
                 buf.set_string(x, inner.y, glyph.to_string(), style);
             }
@@ -346,7 +345,7 @@ impl Widget for &mut SearchPanel {
         // The query row's `Aa ab .*` toggles are inset INSIDE the field at its
         // right edge (VS Code's `.controls`), and the `...` details expander
         // sits in the rightmost cell, just past the field.
-        let bg = self.theme.editor_bg_rgb();
+        let bg = cx.theme.editor_bg_rgb();
         let chevron_x = inner.x;
         let bar_x = inner.x + 2; // left edge of every field's fill bar
         let inner_right = inner.x + inner.width - 1; // last usable column
@@ -374,14 +373,10 @@ impl Widget for &mut SearchPanel {
         let chevron_style = match tones {
             Some(t) => Style::default().fg(t.muted()),
             None => Style::default()
-                .fg(if self.focused {
-                    accent
-                } else {
-                    Color::DarkGray
-                })
+                .fg(if cx.focused { accent } else { Color::DarkGray })
                 .add_modifier(Modifier::BOLD),
         };
-        let chevron_glyph = crate::widgets::surface::chevron(self.theme, self.replace_open);
+        let chevron_glyph = crate::widgets::surface::chevron(cx.theme, self.replace_open);
         buf.set_string(
             chevron_x,
             content_y,
@@ -399,7 +394,7 @@ impl Widget for &mut SearchPanel {
         let mut origins = self.field_origin;
 
         // Query field: filled single row, magnifier lead, inset toggles.
-        let query_focused = self.focused && self.field == SearchField::Query;
+        let query_focused = cx.focused && self.field == SearchField::Query;
         self.query_input_rect = render_field(
             buf,
             FieldArgs {
@@ -416,7 +411,7 @@ impl Widget for &mut SearchPanel {
                 bg,
                 reserve_right: query_reserve,
             },
-            self.theme,
+            cx.theme,
             &mut caret,
             &mut origins[SearchField::Query.index()],
         );
@@ -450,7 +445,7 @@ impl Widget for &mut SearchPanel {
         let inactive_style = Style::default()
             .fg(match tones {
                 Some(t) => t.muted(),
-                None => self.theme.ui(Color::Rgb(0x79, 0x82, 0x8f)),
+                None => cx.theme.ui(Color::Rgb(0x79, 0x82, 0x8f)),
             })
             .bg(toggle_fill);
         self.toggle_y = content_y;
@@ -471,7 +466,7 @@ impl Widget for &mut SearchPanel {
             Some(t) if self.details_open => Style::default().fg(t.accent()),
             Some(t) => Style::default().fg(t.muted()),
             None if self.details_open => Style::default().fg(accent).add_modifier(Modifier::BOLD),
-            None => Style::default().fg(self.theme.ui(Color::Rgb(0x79, 0x82, 0x8f))),
+            None => Style::default().fg(cx.theme.ui(Color::Rgb(0x79, 0x82, 0x8f))),
         };
         buf.set_string(
             ellipsis_x,
@@ -493,13 +488,13 @@ impl Widget for &mut SearchPanel {
         if self.replace_open && next_y + 1 < inner.y + inner.height {
             // A faint hairline between the query and replace fields so they read
             // as two separate inputs instead of one continuous filled container.
-            draw_field_divider(buf, bar_x, query_fill_right, next_y, self.theme);
+            draw_field_divider(buf, bar_x, query_fill_right, next_y, cx.theme);
             next_y += 1;
             // The replace-all action icon sits at the far right (under the ...),
             // and the replace fill ends two cells short of it.
             let replace_all_x = inner_right;
             let replace_fill_right = replace_all_x.saturating_sub(2).max(bar_x + 1);
-            let replace_focused = self.focused && self.field == SearchField::Replace;
+            let replace_focused = cx.focused && self.field == SearchField::Replace;
             self.replace_input_rect = render_field(
                 buf,
                 FieldArgs {
@@ -520,7 +515,7 @@ impl Widget for &mut SearchPanel {
                     bg,
                     reserve_right: 3,
                 },
-                self.theme,
+                cx.theme,
                 &mut caret,
                 &mut origins[SearchField::Replace.index()],
             );
@@ -552,8 +547,8 @@ impl Widget for &mut SearchPanel {
                 Style::default().fg(match tones {
                     // Croft Loch: an action icon, muted like the header's.
                     Some(t) => t.muted(),
-                    None if self.focused => accent,
-                    None => self.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4)),
+                    None if cx.focused => accent,
+                    None => cx.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4)),
                 }),
             );
             self.replace_all_x = replace_all_x;
@@ -572,13 +567,13 @@ impl Widget for &mut SearchPanel {
             let detail_fill_right = inner_right.saturating_sub(1).max(bar_x + 1);
             let caption_style = Style::default().fg(match tones {
                 Some(t) => t.muted(),
-                None => self.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4)),
+                None => cx.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4)),
             });
 
             if next_y + 2 < inner.y + inner.height {
                 // Hairline before the include group, matching the query/replace
                 // separation so every input reads as its own row.
-                draw_field_divider(buf, bar_x, detail_fill_right, next_y, self.theme);
+                draw_field_divider(buf, bar_x, detail_fill_right, next_y, cx.theme);
                 next_y += 1;
                 draw_glob_caption(
                     buf,
@@ -586,10 +581,10 @@ impl Widget for &mut SearchPanel {
                     "files to include",
                     &self.include,
                     caption_style,
-                    self.theme,
+                    cx.theme,
                 );
                 next_y += 1;
-                let inc_focused = self.focused && self.field == SearchField::Include;
+                let inc_focused = cx.focused && self.field == SearchField::Include;
                 self.include_input_rect = render_field(
                     buf,
                     FieldArgs {
@@ -610,7 +605,7 @@ impl Widget for &mut SearchPanel {
                         bg,
                         reserve_right: 0,
                     },
-                    self.theme,
+                    cx.theme,
                     &mut caret,
                     &mut origins[SearchField::Include.index()],
                 );
@@ -618,7 +613,7 @@ impl Widget for &mut SearchPanel {
             }
             if next_y + 2 < inner.y + inner.height {
                 // Hairline before the exclude group, same as above.
-                draw_field_divider(buf, bar_x, detail_fill_right, next_y, self.theme);
+                draw_field_divider(buf, bar_x, detail_fill_right, next_y, cx.theme);
                 next_y += 1;
                 draw_glob_caption(
                     buf,
@@ -626,10 +621,10 @@ impl Widget for &mut SearchPanel {
                     "files to exclude",
                     &self.exclude,
                     caption_style,
-                    self.theme,
+                    cx.theme,
                 );
                 next_y += 1;
-                let exc_focused = self.focused && self.field == SearchField::Exclude;
+                let exc_focused = cx.focused && self.field == SearchField::Exclude;
                 self.exclude_input_rect = render_field(
                     buf,
                     FieldArgs {
@@ -650,7 +645,7 @@ impl Widget for &mut SearchPanel {
                         bg,
                         reserve_right: 0,
                     },
-                    self.theme,
+                    cx.theme,
                     &mut caret,
                     &mut origins[SearchField::Exclude.index()],
                 );
@@ -697,7 +692,7 @@ impl Widget for &mut SearchPanel {
                 Some(t) => ("\u{2581}", Style::default().fg(t.hairline())),
                 None => (
                     "─",
-                    Style::default().fg(self.theme.ui(Color::Rgb(0x40, 0x48, 0x58))),
+                    Style::default().fg(cx.theme.ui(Color::Rgb(0x40, 0x48, 0x58))),
                 ),
             };
             for x in inner.x..inner.x + inner.width {
@@ -710,7 +705,7 @@ impl Widget for &mut SearchPanel {
             if let Some(error) = self.query_error() {
                 // Wrapped, not cut off: the sidebar is narrow and the
                 // reason sits at the end of the message.
-                let style = Style::default().fg(self.theme.ui(Color::Rgb(0xf1, 0x4c, 0x4c)));
+                let style = Style::default().fg(cx.theme.ui(Color::Rgb(0xf1, 0x4c, 0x4c)));
                 let rows = crate::sarif::render::wrap(&error, inner.width.max(1) as usize);
                 let mut y = caption_y;
                 for row in rows {
@@ -745,7 +740,7 @@ impl Widget for &mut SearchPanel {
                     None => Line::from(Span::styled(
                         format!("{results} result{r_s} in {files} file{f_s}"),
                         Style::default()
-                            .fg(self.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4)))
+                            .fg(cx.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4)))
                             .add_modifier(Modifier::ITALIC),
                     )),
                 };
@@ -817,7 +812,7 @@ impl Widget for &mut SearchPanel {
             let mut row_fill = tones.map(|t| t.chrome());
             if !is_selected
                 && let Some(bg) =
-                    crate::widgets::hover::row_hover_bg(row_rect, self.hover_pointer, self.theme)
+                    crate::widgets::hover::row_hover_bg(row_rect, cx.pointer, cx.theme)
             {
                 let fill = Style::default().bg(bg);
                 for rx in 0..row_width {
@@ -840,10 +835,10 @@ impl Widget for &mut SearchPanel {
                     },
                     t,
                     t.chrome,
-                    self.focused,
+                    cx.focused,
                 );
                 row_fill = Some(crate::gradient::rgb_color(
-                    crate::widgets::surface::selected_row_fill(t, t.chrome, self.focused),
+                    crate::widgets::surface::selected_row_fill(t, t.chrome, cx.focused),
                 ));
             }
             // Show just the basename so the matched line itself has room
@@ -889,7 +884,7 @@ impl Widget for &mut SearchPanel {
                 // band says which one is selected.
                 Style::default().fg(t.text())
             } else if is_selected {
-                if self.focus_gradient {
+                if cx.theme.gradient() {
                     Style::default()
                         .fg(Color::White)
                         .bg(crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG))
@@ -897,11 +892,11 @@ impl Widget for &mut SearchPanel {
                 } else {
                     Style::default()
                         .fg(Color::Black)
-                        .bg(self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff)))
+                        .bg(cx.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff)))
                         .add_modifier(Modifier::BOLD)
                 }
             } else {
-                Style::default().fg(self.theme.ui(Color::White))
+                Style::default().fg(cx.theme.ui(Color::White))
             };
             let needle = as_typed(&self.query);
             // High-contrast yellow background like ripgrep / VS Code's
@@ -910,7 +905,7 @@ impl Widget for &mut SearchPanel {
             // the blue row bg instead of fighting it.
             let highlight_style = Style::default()
                 .fg(Color::Black)
-                .bg(self.theme.ui(Color::Rgb(0xff, 0xd7, 0x4a)))
+                .bg(cx.theme.ui(Color::Rgb(0xff, 0xd7, 0x4a)))
                 .add_modifier(Modifier::BOLD);
             // Croft Loch reads a row in two inks: the file name in body
             // text, the line number and the preview muted, with each match
@@ -931,17 +926,14 @@ impl Widget for &mut SearchPanel {
                     Style::default().fg(t.muted()),
                 ),
                 None => (
-                    Style::default().fg(self.theme.ui(Color::Gray)),
-                    Style::default().fg(self.theme.ui(Color::Rgb(0xeb, 0xcb, 0x8b))),
+                    Style::default().fg(cx.theme.ui(Color::Gray)),
+                    Style::default().fg(cx.theme.ui(Color::Rgb(0xeb, 0xcb, 0x8b))),
                 ),
             };
             let match_style = |active: bool| match (tones, row_fill) {
-                (Some(t), Some(fill)) => crate::widgets::surface::match_style(
-                    plain_style.bg(fill),
-                    t,
-                    self.theme,
-                    active,
-                ),
+                (Some(t), Some(fill)) => {
+                    crate::widgets::surface::match_style(plain_style.bg(fill), t, cx.theme, active)
+                }
                 _ => highlight_style,
             };
             let mut active_pending = is_selected;
@@ -976,13 +968,13 @@ impl Widget for &mut SearchPanel {
                     spans.push(Span::styled(
                         chunk,
                         Style::default()
-                            .fg(self.theme.ui(Color::Rgb(0x8b, 0x93, 0xa5)))
+                            .fg(cx.theme.ui(Color::Rgb(0x8b, 0x93, 0xa5)))
                             .add_modifier(Modifier::CROSSED_OUT),
                     ));
                     spans.push(Span::styled(
                         new_text,
                         Style::default()
-                            .fg(self.theme.ui(Color::Rgb(0xb6, 0xee, 0xc4)))
+                            .fg(cx.theme.ui(Color::Rgb(0xb6, 0xee, 0xc4)))
                             .add_modifier(Modifier::BOLD),
                     ));
                     continue;
@@ -999,7 +991,7 @@ impl Widget for &mut SearchPanel {
             buf.set_line(inner.x, y, &line, row_width);
         }
         if let Some(metrics) = scrollbar_metrics {
-            crate::widgets::scrollbar::render_vertical(buf, metrics, self.focused, self.theme);
+            crate::widgets::scrollbar::render_vertical(buf, metrics, cx.focused, cx.theme);
         }
     }
 }

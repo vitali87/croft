@@ -1,6 +1,7 @@
 use crate::git::{ChangeEntry, ChangeKind, ChangeSection, GitStatus};
 use crate::icons;
 use crate::widgets::scrollbar;
+use crate::widgets::view_cx::ViewCx;
 use ratatui::{
     buffer::Buffer,
     layout::{Alignment, Rect},
@@ -71,14 +72,6 @@ pub struct RowActionAreas {
 }
 
 pub struct SourceControlPanel {
-    pub focused: bool,
-    /// True under the Black theme: overpaint the focused outer border with the
-    /// orange→green brand gradient instead of the legacy solid blue. Set by the
-    /// app's focus/theme sync.
-    pub focus_gradient: bool,
-    /// Active color theme; drives the scrollbar track/thumb colors. Set by the
-    /// app's theme sync.
-    pub theme: crate::theme::Theme,
     pub message: String,
     pub message_cursor: usize,
     /// Leading characters scrolled out of view on the left of the
@@ -169,9 +162,6 @@ pub struct SourceControlPanel {
     /// selected row is already staged. Cleared at the top of each render
     /// and re-populated for the visible selected row.
     pub last_row_actions: Option<RowActionAreas>,
-    /// Render-time pointer cell, fed from `App::pointer_cell` each frame so a
-    /// hovered (but unselected) change row can lift to the hover background.
-    pub hover_pointer: Option<(u16, u16)>,
     /// Hit-test rect for the refresh pill at the right of the SOURCE CONTROL
     /// header row, mirroring the Remote Explorer refresh affordance. Clicking
     /// it forces an immediate, un-debounced git re-scan. Empty when the panel
@@ -190,9 +180,6 @@ pub struct SourceControlPanel {
 impl SourceControlPanel {
     pub fn new() -> Self {
         Self {
-            focused: false,
-            focus_gradient: false,
-            theme: crate::theme::Theme::default(),
             message: String::new(),
             message_cursor: 0,
             message_scroll: 0,
@@ -224,7 +211,6 @@ impl SourceControlPanel {
             commit_feedback: None,
             commit_feedback_is_error: false,
             last_row_actions: None,
-            hover_pointer: None,
             header_refresh_btn: Rect::default(),
             last_branch_area: Rect::default(),
             header_more_btn: Rect::default(),

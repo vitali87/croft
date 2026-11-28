@@ -1,3 +1,4 @@
+use crate::widgets::view_cx::ViewCx;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -38,14 +39,6 @@ pub struct SearchPanel {
     pub hits: Vec<SearchHit>,
     pub selected: usize,
     pub scroll: usize,
-    pub focused: bool,
-    /// True under the Black theme: overpaint the focused outer border with the
-    /// orange→green brand gradient instead of the legacy solid blue. Set by the
-    /// app's focus/theme sync.
-    pub focus_gradient: bool,
-    /// Active color theme; drives the scrollbar track/thumb colors. Set by the
-    /// app's theme sync.
-    pub theme: crate::theme::Theme,
     pub last_inner: Rect,
     pub last_area: Rect,
     pub root: PathBuf,
@@ -76,9 +69,6 @@ pub struct SearchPanel {
     /// scrollbar. Empty when there's no overflow. Used by the mouse
     /// handler to route track clicks / drags to `scroll_to_bar_y`.
     pub last_scrollbar: Rect,
-    /// Render-time pointer cell, fed from `App::pointer_cell` each frame so a
-    /// hovered (but unselected) result row can lift to the hover background.
-    pub hover_pointer: Option<(u16, u16)>,
 
     // --- Replace + files-to-include/exclude (VS Code Search sidebar) ---
     /// Replacement text. Editable only while the Replace row is expanded.
@@ -192,9 +182,6 @@ impl SearchPanel {
             hits: Vec::new(),
             selected: 0,
             scroll: 0,
-            focused: false,
-            focus_gradient: false,
-            theme: crate::theme::Theme::default(),
             last_inner: Rect::default(),
             last_area: Rect::default(),
             root,
@@ -211,7 +198,6 @@ impl SearchPanel {
             paste_button_w: 0,
             selection: None,
             last_scrollbar: Rect::default(),
-            hover_pointer: None,
             replace: String::new(),
             include: String::new(),
             exclude: String::new(),

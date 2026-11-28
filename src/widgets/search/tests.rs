@@ -31,10 +31,11 @@ const INPUT_CONTENT_ROW: u16 = 2;
 
 #[test]
 fn cursor_sits_at_input_start_when_query_empty_and_focused() {
+    let mut cx = ViewCx::default();
     use ratatui::buffer::Buffer;
     let tmp = TempDir::new().unwrap();
     let mut panel = SearchPanel::new(tmp.path().to_path_buf());
-    panel.focused = true;
+    cx.focused = true;
     let area = Rect {
         x: 0,
         y: 0,
@@ -42,13 +43,13 @@ fn cursor_sits_at_input_start_when_query_empty_and_focused() {
         height: 12,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+    panel.draw(&cx, area, &mut buf);
     let inner_x = panel.last_inner.x;
     let inner_y = panel.last_inner.y;
     // The caret (driven as the host's blinking hardware caret, like the
     // commit box) sits at the start of the input content when empty.
     assert_eq!(
-        panel.cursor_screen_pos(),
+        panel.cursor_screen_pos(cx.focused),
         Some((inner_x + INPUT_TYPED_COL, inner_y + INPUT_CONTENT_ROW)),
         "caret must sit at the start of the input content area when the query is empty"
     );
@@ -56,10 +57,11 @@ fn cursor_sits_at_input_start_when_query_empty_and_focused() {
 
 #[test]
 fn cursor_sits_after_typed_text_when_query_non_empty_and_focused() {
+    let mut cx = ViewCx::default();
     use ratatui::buffer::Buffer;
     let tmp = TempDir::new().unwrap();
     let mut panel = SearchPanel::new(tmp.path().to_path_buf());
-    panel.focused = true;
+    cx.focused = true;
     panel.query = String::from("foo");
     let area = Rect {
         x: 0,
@@ -68,13 +70,13 @@ fn cursor_sits_after_typed_text_when_query_non_empty_and_focused() {
         height: 12,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+    panel.draw(&cx, area, &mut buf);
     let inner_x = panel.last_inner.x;
     let inner_y = panel.last_inner.y;
     // INPUT_TYPED_COL + "foo" (3 cells) → caret sits 3 cells past the start
     // of typed content.
     assert_eq!(
-        panel.cursor_screen_pos(),
+        panel.cursor_screen_pos(cx.focused),
         Some((inner_x + INPUT_TYPED_COL + 3, inner_y + INPUT_CONTENT_ROW)),
         "caret must sit immediately after the typed query"
     );
@@ -106,7 +108,7 @@ fn header_row_says_search_in_upper_case() {
         height: 10,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+    panel.draw(&ViewCx::default(), area, &mut buf);
     let inner_x = panel.last_inner.x;
     let inner_y = panel.last_inner.y;
     let mut header = String::new();
@@ -131,12 +133,13 @@ fn header_row_says_search_in_upper_case() {
 
 #[test]
 fn input_box_renders_a_thin_focused_border_three_rows_tall() {
+    let mut cx = ViewCx::default();
     use ratatui::buffer::Buffer;
     let tmp = TempDir::new().unwrap();
     let mut panel = SearchPanel::new(tmp.path().to_path_buf());
     // The boxed input; Croft Loch draws it as an underlined field.
-    panel.theme = crate::theme::Theme::BLACK;
-    panel.focused = true;
+    cx.theme = crate::theme::Theme::BLACK;
+    cx.focused = true;
     let area = Rect {
         x: 0,
         y: 0,
@@ -144,7 +147,7 @@ fn input_box_renders_a_thin_focused_border_three_rows_tall() {
         height: 12,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+    panel.draw(&cx, area, &mut buf);
     let dump = buffer_to_string(&buf);
     // The input box must render a single-line top-left corner glyph
     // somewhere in the upper half of the panel.
@@ -175,7 +178,7 @@ fn rendering_at_narrow_widths_does_not_panic() {
                 continue;
             }
             let mut buf = Buffer::empty(area);
-            ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+            panel.draw(&ViewCx::default(), area, &mut buf);
         }
     }
 }
@@ -197,7 +200,7 @@ fn asterisk_keeps_breathing_room_against_the_outer_right_border() {
         height: 12,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+    panel.draw(&ViewCx::default(), area, &mut buf);
     let inner = panel.last_inner;
     // `.*` toggle is 2 cells wide starting at toggle_regex_x.
     let regex_end = panel.toggle_regex_x + 1;
@@ -211,11 +214,12 @@ fn asterisk_keeps_breathing_room_against_the_outer_right_border() {
 
 #[test]
 fn input_row_carries_a_chevron_and_pipe_separated_toggles() {
+    let mut cx = ViewCx::default();
     use ratatui::buffer::Buffer;
     let tmp = TempDir::new().unwrap();
     let mut panel = SearchPanel::new(tmp.path().to_path_buf());
     // The boxed input; Croft Loch draws it as an underlined field.
-    panel.theme = crate::theme::Theme::BLACK;
+    cx.theme = crate::theme::Theme::BLACK;
     let area = Rect {
         x: 0,
         y: 0,
@@ -223,7 +227,7 @@ fn input_row_carries_a_chevron_and_pipe_separated_toggles() {
         height: 10,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+    panel.draw(&cx, area, &mut buf);
     let dump = buffer_to_string(&buf);
     // VS Code's expand-to-replace chevron points RIGHT (▸) while the
     // Replace row is collapsed and flips DOWN (▾) once expanded. A fresh
@@ -235,7 +239,7 @@ fn input_row_carries_a_chevron_and_pipe_separated_toggles() {
     // Now expand the Replace row: the chevron flips to a down-arrow.
     panel.toggle_replace();
     let mut buf2 = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut panel, area, &mut buf2);
+    panel.draw(&cx, area, &mut buf2);
     let dump2 = buffer_to_string(&buf2);
     assert!(
         dump2.contains('▾'),
@@ -269,7 +273,7 @@ fn results_start_below_the_input_box_with_a_separator_in_between() {
         height: 14,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+    panel.draw(&ViewCx::default(), area, &mut buf);
     let dump = buffer_to_string(&buf);
     let row_with_needle = dump
         .lines()
@@ -283,10 +287,11 @@ fn results_start_below_the_input_box_with_a_separator_in_between() {
 
 #[test]
 fn search_panel_does_not_render_paste_button_in_input_row() {
+    let mut cx = ViewCx::default();
     use ratatui::buffer::Buffer;
     let tmp = TempDir::new().unwrap();
     let mut panel = SearchPanel::new(tmp.path().to_path_buf());
-    panel.focused = true;
+    cx.focused = true;
     let area = Rect {
         x: 0,
         y: 0,
@@ -294,7 +299,7 @@ fn search_panel_does_not_render_paste_button_in_input_row() {
         height: 5,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+    panel.draw(&cx, area, &mut buf);
     assert_eq!(
         panel.paste_button_w, 0,
         "paste button should not reserve cells"
@@ -311,10 +316,11 @@ fn search_panel_does_not_render_paste_button_in_input_row() {
 
 #[test]
 fn paste_button_at_returns_false_when_button_hidden() {
+    let mut cx = ViewCx::default();
     use ratatui::buffer::Buffer;
     let tmp = TempDir::new().unwrap();
     let mut panel = SearchPanel::new(tmp.path().to_path_buf());
-    panel.focused = true;
+    cx.focused = true;
     let area = Rect {
         x: 0,
         y: 0,
@@ -322,7 +328,7 @@ fn paste_button_at_returns_false_when_button_hidden() {
         height: 5,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+    panel.draw(&cx, area, &mut buf);
     assert_eq!(panel.paste_button_w, 0);
     assert!(!panel.paste_button_at(0, 1));
     assert!(!panel.paste_button_at(40, 1));
@@ -345,7 +351,7 @@ fn the_sidebar_shows_the_regex_error_in_place_of_the_count() {
         height: 14,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+    panel.draw(&ViewCx::default(), area, &mut buf);
     let text = buffer_to_string(&buf);
     assert!(text.contains("Invalid regex: unclosed group"), "{text}");
     assert!(!text.contains("0 results"), "{text}");
@@ -353,7 +359,7 @@ fn the_sidebar_shows_the_regex_error_in_place_of_the_count() {
     panel.query = r"foo\(".into();
     panel.run_query();
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+    panel.draw(&ViewCx::default(), area, &mut buf);
     let text = buffer_to_string(&buf);
     assert!(text.contains("2 results in 1 file"), "{text}");
     assert!(!text.contains("Invalid regex"), "{text}");
@@ -379,7 +385,7 @@ fn a_long_regex_error_wraps_in_a_narrow_sidebar() {
         height: 14,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+    panel.draw(&ViewCx::default(), area, &mut buf);
     let text = buffer_to_string(&buf);
     let flat: String = text
         .lines()
@@ -402,10 +408,11 @@ fn a_long_regex_error_wraps_in_a_narrow_sidebar() {
 
 #[test]
 fn toggle_at_maps_a_click_on_each_glyph_to_the_right_kind() {
+    let mut cx = ViewCx::default();
     use ratatui::buffer::Buffer;
     let tmp = TempDir::new().unwrap();
     let mut panel = SearchPanel::new(tmp.path().to_path_buf());
-    panel.focused = true;
+    cx.focused = true;
     let area = Rect {
         x: 0,
         y: 0,
@@ -413,7 +420,7 @@ fn toggle_at_maps_a_click_on_each_glyph_to_the_right_kind() {
         height: 12,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+    panel.draw(&cx, area, &mut buf);
     let y = panel.toggle_y;
     // Each toggle is 2 cells; clicking either cell on the same row
     // should map to its kind.
@@ -441,10 +448,11 @@ fn toggle_at_maps_a_click_on_each_glyph_to_the_right_kind() {
 
 #[test]
 fn tooltip_at_labels_each_actionable_control_and_skips_inert_cells() {
+    let mut cx = ViewCx::default();
     use ratatui::buffer::Buffer;
     let tmp = TempDir::new().unwrap();
     let mut panel = SearchPanel::new(tmp.path().to_path_buf());
-    panel.focused = true;
+    cx.focused = true;
     let area = Rect {
         x: 0,
         y: 0,
@@ -452,7 +460,7 @@ fn tooltip_at_labels_each_actionable_control_and_skips_inert_cells() {
         height: 12,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+    panel.draw(&cx, area, &mut buf);
     let y = panel.toggle_y;
     assert_eq!(
         panel.tooltip_at(panel.toggle_case_x, y),
@@ -656,10 +664,10 @@ fn make_panel_with_hits(tmp: &TempDir, n: usize) -> SearchPanel {
 
 #[test]
 fn hovering_an_unselected_result_row_lifts_it() {
+    let mut cx = ViewCx::default();
     let tmp = TempDir::new().unwrap();
     let mut panel = make_panel_with_hits(&tmp, 20);
-    panel.focus_gradient = false; // Croft Dark
-    panel.theme = crate::theme::Theme::DARK_BLUE;
+    cx.theme = crate::theme::Theme::DARK_BLUE;
     panel.selected = 0;
     panel.scroll = 0;
     let area = Rect {
@@ -671,9 +679,9 @@ fn hovering_an_unselected_result_row_lifts_it() {
     // Results start at inner.y + 7 (see the click-mapping in `result_at`);
     // hover the second result row, which is not the selected one.
     let row_y = area.y + 1 + 7 + 1;
-    panel.hover_pointer = Some((area.x + 1, row_y));
+    cx.pointer = Some((area.x + 1, row_y));
     let mut buf = ratatui::buffer::Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+    panel.draw(&cx, area, &mut buf);
     assert_eq!(
         buf[(area.x + 1, row_y)].bg,
         Color::Rgb(0x2b, 0x31, 0x42),
@@ -698,7 +706,7 @@ fn render_preserves_user_scroll_when_selected_is_at_top() {
         height: 30,
     };
     let mut buf = ratatui::buffer::Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+    panel.draw(&ViewCx::default(), area, &mut buf);
     assert_eq!(
         panel.scroll, 30,
         "render must not pull scroll back to selected when the user has wheeled away"
@@ -721,7 +729,7 @@ fn appending_streamed_hits_does_not_reset_user_scroll() {
         height: 30,
     };
     let mut buf = ratatui::buffer::Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+    panel.draw(&ViewCx::default(), area, &mut buf);
     // Streaming batch: another 50 hits arrive.
     let extra: Vec<SearchHit> = (80..130)
         .map(|i| SearchHit {
@@ -732,7 +740,7 @@ fn appending_streamed_hits_does_not_reset_user_scroll() {
         })
         .collect();
     panel.hits.extend(extra);
-    ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+    panel.draw(&ViewCx::default(), area, &mut buf);
     assert_eq!(
         panel.scroll, 30,
         "streaming hits must not reset the user's scroll offset"
@@ -815,7 +823,7 @@ fn an_invalid_include_glob_is_named_above_the_box() {
         height: 16,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+    panel.draw(&ViewCx::default(), area, &mut buf);
     let text: String = (0..area.height)
         .map(|y| {
             (0..area.width)
@@ -845,7 +853,7 @@ fn project_excludes_are_listed_under_the_exclude_box() {
     };
     let render = |panel: &mut SearchPanel| {
         let mut buf = Buffer::empty(area);
-        ratatui::widgets::Widget::render(panel, area, &mut buf);
+        panel.draw(&ViewCx::default(), area, &mut buf);
         (0..area.height)
             .map(|y| {
                 (0..area.width)
@@ -1003,10 +1011,11 @@ fn type_char_lands_in_the_focused_field() {
 /// and a query longer than the row scrolls so the caret stays inside it.
 #[test]
 fn the_caret_follows_its_char_and_a_long_query_scrolls() {
+    let mut cx = ViewCx::default();
     use ratatui::buffer::Buffer;
     let tmp = TempDir::new().unwrap();
     let mut panel = SearchPanel::new(tmp.path().to_path_buf());
-    panel.focused = true;
+    cx.focused = true;
     let area = Rect {
         x: 0,
         y: 0,
@@ -1015,24 +1024,24 @@ fn the_caret_follows_its_char_and_a_long_query_scrolls() {
     };
     let draw = |panel: &mut SearchPanel| {
         let mut buf = Buffer::empty(area);
-        Widget::render(panel, area, &mut buf);
+        panel.draw(&cx, area, &mut buf);
         buf
     };
     for c in "abcdef".chars() {
         panel.type_char(c);
     }
     draw(&mut panel);
-    let (end_x, _) = panel.cursor_screen_pos().unwrap();
+    let (end_x, _) = panel.cursor_screen_pos(cx.focused).unwrap();
     panel.move_caret(|_, _| 3);
     draw(&mut panel);
-    let (mid_x, y) = panel.cursor_screen_pos().unwrap();
+    let (mid_x, y) = panel.cursor_screen_pos(cx.focused).unwrap();
     assert_eq!(end_x - mid_x, 3, "three chars left of the end");
     assert_eq!(y, panel.query_input_rect.y);
     // Far longer than the row: the caret stays inside it either way.
     panel.seed("0123456789".repeat(6), String::new(), String::new());
     let buf = draw(&mut panel);
     let r = panel.query_input_rect;
-    let (cx, cy) = panel.cursor_screen_pos().unwrap();
+    let (cx, cy) = panel.cursor_screen_pos(cx.focused).unwrap();
     assert!(cx >= r.x && cx < r.right(), "caret {cx} inside {r:?}");
     let row: String = (r.x..r.right())
         .map(|x| buf[(x, cy)].symbol().to_string())
@@ -1049,10 +1058,11 @@ fn the_caret_follows_its_char_and_a_long_query_scrolls() {
 /// #1729: a click in the text puts the caret under it.
 #[test]
 fn a_click_in_the_query_places_the_caret_under_it() {
+    let mut cx = ViewCx::default();
     use ratatui::buffer::Buffer;
     let tmp = TempDir::new().unwrap();
     let mut panel = SearchPanel::new(tmp.path().to_path_buf());
-    panel.focused = true;
+    cx.focused = true;
     for c in "abcdef".chars() {
         panel.type_char(c);
     }
@@ -1063,8 +1073,8 @@ fn a_click_in_the_query_places_the_caret_under_it() {
         height: 20,
     };
     let mut buf = Buffer::empty(area);
-    Widget::render(&mut panel, area, &mut buf);
-    let (end_x, _) = panel.cursor_screen_pos().unwrap();
+    panel.draw(&cx, area, &mut buf);
+    let (end_x, _) = panel.cursor_screen_pos(cx.focused).unwrap();
     panel.click_caret(end_x - 4);
     assert_eq!(panel.caret(), 2);
     panel.click_caret(end_x + 5);
@@ -1073,10 +1083,11 @@ fn a_click_in_the_query_places_the_caret_under_it() {
 
 #[test]
 fn focused_query_field_exposes_a_caret_and_paints_no_static_block() {
+    let mut cx = ViewCx::default();
     use ratatui::buffer::Buffer;
     let tmp = TempDir::new().unwrap();
     let mut panel = SearchPanel::new(tmp.path().to_path_buf());
-    panel.focused = true;
+    cx.focused = true;
     panel.type_char('a');
     panel.type_char('b');
     let area = Rect {
@@ -1086,12 +1097,12 @@ fn focused_query_field_exposes_a_caret_and_paints_no_static_block() {
         height: 20,
     };
     let mut buf = Buffer::empty(area);
-    Widget::render(&mut panel, area, &mut buf);
+    panel.draw(&cx, area, &mut buf);
     // The caret sits on the query row so the app can drive the host's
     // blinking hardware caret there, matching the Source Control commit
     // box, instead of painting a static block that never blinks.
     let (cx, cy) = panel
-        .cursor_screen_pos()
+        .cursor_screen_pos(cx.focused)
         .expect("a focused query field must expose a caret position");
     let r = panel.query_input_rect;
     assert_eq!(cy, r.y, "caret rides the query row");
@@ -1107,10 +1118,11 @@ fn focused_query_field_exposes_a_caret_and_paints_no_static_block() {
 
 #[test]
 fn an_unfocused_search_panel_exposes_no_caret() {
+    let mut cx = ViewCx::default();
     use ratatui::buffer::Buffer;
     let tmp = TempDir::new().unwrap();
     let mut panel = SearchPanel::new(tmp.path().to_path_buf());
-    panel.focused = false;
+    cx.focused = false;
     panel.type_char('x');
     let area = Rect {
         x: 0,
@@ -1119,9 +1131,9 @@ fn an_unfocused_search_panel_exposes_no_caret() {
         height: 20,
     };
     let mut buf = Buffer::empty(area);
-    Widget::render(&mut panel, area, &mut buf);
+    panel.draw(&cx, area, &mut buf);
     assert!(
-        panel.cursor_screen_pos().is_none(),
+        panel.cursor_screen_pos(cx.focused).is_none(),
         "an unfocused panel must not claim the hardware caret"
     );
 }
@@ -1141,10 +1153,11 @@ fn backspace_removes_from_the_focused_field() {
 
 #[test]
 fn chevron_ellipsis_and_replace_all_hit_tests_after_render() {
+    let mut cx = ViewCx::default();
     use ratatui::buffer::Buffer;
     let tmp = TempDir::new().unwrap();
     let mut panel = SearchPanel::new(tmp.path().to_path_buf());
-    panel.focused = true;
+    cx.focused = true;
     panel.replace_open = true;
     panel.details_open = true;
     let area = Rect {
@@ -1154,7 +1167,7 @@ fn chevron_ellipsis_and_replace_all_hit_tests_after_render() {
         height: 24,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+    panel.draw(&cx, area, &mut buf);
     assert!(panel.chevron_at(panel.chevron_x, panel.chevron_y));
     assert!(panel.ellipsis_at(panel.ellipsis_x, panel.ellipsis_y));
     assert!(panel.replace_all_at(panel.replace_all_x, panel.replace_all_y));
@@ -1177,12 +1190,12 @@ fn expanded_rows_push_results_start_down() {
         height: 30,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+    panel.draw(&ViewCx::default(), area, &mut buf);
     let collapsed_offset = panel.results_start_offset;
     panel.replace_open = true;
     panel.details_open = true;
     let mut buf2 = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut panel, area, &mut buf2);
+    panel.draw(&ViewCx::default(), area, &mut buf2);
     assert!(
         panel.results_start_offset > collapsed_offset,
         "expanding replace + include/exclude must push results down (was {collapsed_offset}, now {})",
@@ -1206,7 +1219,7 @@ fn collapsed_panel_results_offset_is_five() {
         height: 20,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+    panel.draw(&ViewCx::default(), area, &mut buf);
     // header(0) + blank(1) + query(2) + separator(3) + caption(4) → results
     // begin at row 5. The single-row query field saves two rows versus the
     // old 3-row box (which started results at 7).
@@ -1219,10 +1232,11 @@ fn collapsed_panel_results_offset_is_five() {
 /// Case and names its key; with the row closed there is no chip.
 #[test]
 fn the_replace_row_has_a_preserve_case_toggle() {
+    let mut cx = ViewCx::default();
     use ratatui::buffer::Buffer;
     let tmp = TempDir::new().unwrap();
     let mut panel = SearchPanel::new(tmp.path().to_path_buf());
-    panel.focused = true;
+    cx.focused = true;
     let area = Rect {
         x: 0,
         y: 0,
@@ -1230,11 +1244,11 @@ fn the_replace_row_has_a_preserve_case_toggle() {
         height: 12,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+    panel.draw(&cx, area, &mut buf);
     assert_eq!(panel.toggle_preserve_x, 0, "no replace row, no chip");
     panel.open_replace();
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+    panel.draw(&cx, area, &mut buf);
     let (x, y) = (panel.toggle_preserve_x, panel.toggle_preserve_y);
     assert_ne!(x, 0);
     assert_eq!(buf[(x, y)].symbol(), "A");
@@ -1281,7 +1295,7 @@ fn the_header_counts_occurrences_as_replace_all_does() {
         height: 14,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+    panel.draw(&ViewCx::default(), area, &mut buf);
     let text = buffer_to_string(&buf);
     assert!(text.contains("4 results in 2 files"), "{text}");
     // An unsaved buffer is searched in memory and counts the same way,
@@ -1320,7 +1334,7 @@ fn the_rendered_header_counts_two_matches_on_a_line_as_two() {
         height: 14,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+    panel.draw(&ViewCx::default(), area, &mut buf);
     let text = buffer_to_string(&buf);
     assert!(text.contains("4 results in 2 files"), "{text}");
 }
@@ -1367,7 +1381,7 @@ fn the_header_is_singular_for_one_result_and_counts_files_once() {
         height: 14,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+    panel.draw(&ViewCx::default(), area, &mut buf);
     let text = buffer_to_string(&buf);
     assert!(text.contains("1 result in 1 file"), "{text}");
     assert!(!text.contains("1 results"), "{text}");
@@ -1394,7 +1408,7 @@ fn result_row(buf: &Buffer, path_line: &str) -> String {
 fn the_column_the_scrollbar_takes_has_no_path_hint() {
     let tmp = TempDir::new().unwrap();
     let mut panel = make_panel_with_hits(&tmp, 1);
-    render_panel(&mut panel, 40);
+    render_panel(&mut panel, &ViewCx::default(), 40);
     let fits = panel.results_viewport_height();
     panel.hits.clear();
     panel.add_hits(
@@ -1402,7 +1416,7 @@ fn the_column_the_scrollbar_takes_has_no_path_hint() {
             .map(|i| hit(&tmp.path().join("a.txt"), i + 1))
             .collect(),
     );
-    render_panel(&mut panel, 40);
+    render_panel(&mut panel, &ViewCx::default(), 40);
     let inner = panel.last_inner;
     let (row, right) = (
         inner.y + panel.results_start_offset,
@@ -1419,7 +1433,7 @@ fn the_column_the_scrollbar_takes_has_no_path_hint() {
     assert!(panel.result_path_at(right - 1, row).is_some());
 }
 
-fn render_panel(panel: &mut SearchPanel, width: u16) -> Buffer {
+fn render_panel(panel: &mut SearchPanel, cx: &ViewCx, width: u16) -> Buffer {
     let area = Rect {
         x: 0,
         y: 0,
@@ -1427,7 +1441,7 @@ fn render_panel(panel: &mut SearchPanel, width: u16) -> Buffer {
         height: 14,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(panel, area, &mut buf);
+    panel.draw(cx, area, &mut buf);
     buf
 }
 
@@ -1446,13 +1460,19 @@ fn a_match_past_the_panel_width_drops_leading_context_to_show() {
     let mut panel = SearchPanel::new(tmp.path().to_path_buf());
     panel.query = "note".into();
     panel.run_query();
-    let row = result_row(&render_panel(&mut panel, 40), "a.txt:1:");
+    let row = result_row(
+        &render_panel(&mut panel, &ViewCx::default(), 40),
+        "a.txt:1:",
+    );
     assert!(row.contains("note"), "the match is visible: {row:?}");
     assert!(row.starts_with("a.txt:1: "), "{row:?}");
     assert!(!row.contains('…'), "no ellipsis: {row:?}");
     panel.replace_open = true;
     panel.replace = "memo".into();
-    let row = result_row(&render_panel(&mut panel, 40), "a.txt:1:");
+    let row = result_row(
+        &render_panel(&mut panel, &ViewCx::default(), 40),
+        "a.txt:1:",
+    );
     assert!(
         row.contains("notememo"),
         "the match and its replacement both show: {row:?}"
@@ -1479,7 +1499,7 @@ fn a_match_that_already_shows_renders_as_before() {
     let mut panel = SearchPanel::new(tmp.path().to_path_buf());
     panel.query = "note".into();
     panel.run_query();
-    let buf = render_panel(&mut panel, 40);
+    let buf = render_panel(&mut panel, &ViewCx::default(), 40);
     assert_eq!(
         result_row(&buf, "a.txt:1:"),
         format!("a.txt:1: {}", &near[..28])
@@ -1503,7 +1523,10 @@ fn leading_context_of_wide_characters_is_dropped_whole() {
     let mut panel = SearchPanel::new(tmp.path().to_path_buf());
     panel.query = "note".into();
     panel.run_query();
-    let row = result_row(&render_panel(&mut panel, 40), "a.txt:1:");
+    let row = result_row(
+        &render_panel(&mut panel, &ViewCx::default(), 40),
+        "a.txt:1:",
+    );
     assert!(row.contains("note"), "{row:?}");
     assert!(row.starts_with("a.txt:1: "), "{row:?}");
     assert!(!row.contains('…'), "{row:?}");
@@ -1514,7 +1537,7 @@ fn leading_context_of_wide_characters_is_dropped_whole() {
 fn loch_results_panel(tmp: &TempDir) -> SearchPanel {
     let mut panel = SearchPanel::new(tmp.path().to_path_buf());
     assert!(
-        crate::theme::tones(panel.theme).is_some(),
+        crate::theme::tones(crate::theme::Theme::default()).is_some(),
         "the default theme is Croft Loch"
     );
     panel.query = "needle".into();
@@ -1550,13 +1573,14 @@ fn cell_of(buf: &Buffer, label: &str) -> (u16, u16) {
 /// with its inks a step up, and the file name is never a teal chip.
 #[test]
 fn croft_loch_result_rows_use_the_ink_ramp_and_the_selected_row_band() {
+    let mut cx = ViewCx::default();
     use crate::theme::tones;
     use crate::widgets::surface::{ROW_BAR, selected_row_fill};
     let tmp = TempDir::new().unwrap();
     let mut panel = loch_results_panel(&tmp);
-    let t = tones(panel.theme).unwrap();
-    panel.focused = true;
-    let buf = render_panel(&mut panel, 40);
+    let t = tones(cx.theme).unwrap();
+    cx.focused = true;
+    let buf = render_panel(&mut panel, &cx, 40);
     let band = crate::gradient::rgb_color(selected_row_fill(t, t.chrome, true));
 
     let (x, y) = cell_of(&buf, "a.rs:1:");
@@ -1583,8 +1607,8 @@ fn croft_loch_result_rows_use_the_ink_ramp_and_the_selected_row_band() {
     assert_ne!(buf[(area.x, y2)].symbol(), ROW_BAR);
 
     // Without focus the band greys and the bar goes.
-    panel.focused = false;
-    let buf = render_panel(&mut panel, 40);
+    cx.focused = false;
+    let buf = render_panel(&mut panel, &cx, 40);
     let (_, y) = cell_of(&buf, "a.rs:1:");
     assert_ne!(buf[(area.x, y)].symbol(), ROW_BAR, "no bar without focus");
     assert_eq!(
@@ -1599,6 +1623,7 @@ fn croft_loch_result_rows_use_the_ink_ramp_and_the_selected_row_band() {
 /// ink that sank to about 2:1.
 #[test]
 fn croft_loch_result_line_numbers_stay_readable_on_every_row() {
+    let mut cx = ViewCx::default();
     use crate::theme::contrast_ratio;
     use crate::theme::tones;
     let rgb = |c: Color| match c {
@@ -1607,10 +1632,10 @@ fn croft_loch_result_line_numbers_stay_readable_on_every_row() {
     };
     let tmp = TempDir::new().unwrap();
     let mut panel = loch_results_panel(&tmp);
-    let t = tones(panel.theme).unwrap();
+    let t = tones(cx.theme).unwrap();
     for focused in [true, false] {
-        panel.focused = focused;
-        let buf = render_panel(&mut panel, 40);
+        cx.focused = focused;
+        let buf = render_panel(&mut panel, &cx, 40);
         for label in ["a.rs:1:", "a.rs:2:"] {
             let (x, y) = cell_of(&buf, label);
             let digit = &buf[(x + 5, y)];
@@ -1628,16 +1653,17 @@ fn croft_loch_result_line_numbers_stay_readable_on_every_row() {
 /// at 4.5:1 or better.
 #[test]
 fn croft_loch_result_matches_are_an_amber_tint_of_their_row() {
+    let mut cx = ViewCx::default();
     use crate::theme::tones;
     use crate::widgets::surface::{match_style, selected_row_fill};
     let tmp = TempDir::new().unwrap();
     let mut panel = loch_results_panel(&tmp);
-    let t = tones(panel.theme).unwrap();
-    panel.focused = true;
-    let buf = render_panel(&mut panel, 40);
+    let t = tones(cx.theme).unwrap();
+    cx.focused = true;
+    let buf = render_panel(&mut panel, &cx, 40);
     let band = crate::gradient::rgb_color(selected_row_fill(t, t.chrome, true));
     let tint = |row: Color, active: bool| {
-        match_style(Style::default().bg(row), t, panel.theme, active)
+        match_style(Style::default().bg(row), t, cx.theme, active)
             .bg
             .unwrap()
     };
@@ -1663,21 +1689,22 @@ fn croft_loch_result_matches_are_an_amber_tint_of_their_row() {
 /// neutral hover fill, and its match is tinted over that lift.
 #[test]
 fn croft_loch_hovered_result_rows_take_the_neutral_lift() {
+    let mut cx = ViewCx::default();
     use crate::theme::tones;
     use crate::widgets::surface::match_style;
     let tmp = TempDir::new().unwrap();
     let mut panel = loch_results_panel(&tmp);
-    let t = tones(panel.theme).unwrap();
-    let buf = render_panel(&mut panel, 40);
+    let t = tones(cx.theme).unwrap();
+    let buf = render_panel(&mut panel, &cx, 40);
     let (x, y) = cell_of(&buf, "a.rs:2:");
-    panel.hover_pointer = Some((x, y));
-    let buf = render_panel(&mut panel, 40);
+    cx.pointer = Some((x, y));
+    let buf = render_panel(&mut panel, &cx, 40);
     let lift = t.hover_on(t.chrome);
     assert_eq!(buf[(x, y)].bg, lift);
     assert_eq!(buf[(x, y)].fg, t.text());
     assert_eq!(
         buf[(x + 12, y)].bg,
-        match_style(Style::default().bg(lift), t, panel.theme, false)
+        match_style(Style::default().bg(lift), t, cx.theme, false)
             .bg
             .unwrap()
     );
@@ -1688,11 +1715,12 @@ fn croft_loch_hovered_result_rows_take_the_neutral_lift() {
 /// (strong while focused, muted otherwise, never bold).
 #[test]
 fn croft_loch_summary_and_title_follow_the_ink_ramp() {
+    let mut cx = ViewCx::default();
     let tmp = TempDir::new().unwrap();
     let mut panel = loch_results_panel(&tmp);
-    let t = crate::theme::tones(panel.theme).unwrap();
-    panel.focused = true;
-    let buf = render_panel(&mut panel, 40);
+    let t = crate::theme::tones(cx.theme).unwrap();
+    cx.focused = true;
+    let buf = render_panel(&mut panel, &cx, 40);
     let (x, y) = cell_of(&buf, "2 results in 1 file");
     assert_eq!(buf[(x, y)].fg, t.text(), "the count");
     assert_eq!(buf[(x + 2, y)].fg, t.muted(), "the words");
@@ -1706,12 +1734,12 @@ fn croft_loch_summary_and_title_follow_the_ink_ramp() {
     let (qx, qy) = cell_of(&buf, "needle");
     assert!(qy < y, "the field sits above the summary");
     assert_eq!(buf[(qx, qy)].fg, t.text(), "the query is body text");
-    panel.focused = false;
-    let buf = render_panel(&mut panel, 40);
+    cx.focused = false;
+    let buf = render_panel(&mut panel, &cx, 40);
     assert_eq!(buf[(tx, ty)].fg, t.muted());
     // An empty field's placeholder is muted.
     panel.query.clear();
-    let buf = render_panel(&mut panel, 40);
+    let buf = render_panel(&mut panel, &cx, 40);
     let (px, py) = cell_of(&buf, "Search");
     assert_eq!(buf[(px, py)].fg, t.muted(), "the placeholder is muted");
 }
@@ -1721,12 +1749,12 @@ fn croft_loch_summary_and_title_follow_the_ink_ramp() {
 /// black on the gold block, with no row bar.
 #[test]
 fn croft_black_result_rows_keep_the_teal_chip_and_gold_matches() {
+    let mut cx = ViewCx::default();
     let tmp = TempDir::new().unwrap();
     let mut panel = loch_results_panel(&tmp);
-    panel.theme = crate::theme::Theme::BLACK;
-    panel.focus_gradient = true;
-    panel.focused = true;
-    let buf = render_panel(&mut panel, 40);
+    cx.theme = crate::theme::Theme::BLACK;
+    cx.focused = true;
+    let buf = render_panel(&mut panel, &cx, 40);
     let (x, y) = cell_of(&buf, "a.rs:1:");
     let chip = crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG);
     assert_eq!(buf[(x, y)].bg, chip);
@@ -1759,7 +1787,7 @@ fn a_click_after_a_wheel_step_meets_the_drawn_rows() {
         height: 30,
     };
     let mut buf = ratatui::buffer::Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+    panel.draw(&ViewCx::default(), area, &mut buf);
     let y = panel.last_inner.y + panel.results_start_offset + 1;
     let drawn = panel.hit_at_y(y);
     assert!(drawn.is_some(), "a row is drawn there");

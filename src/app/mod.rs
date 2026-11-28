@@ -5510,9 +5510,6 @@ impl App {
             self.close_terminal_find();
         }
         self.tree.focused = self.focus == Pane::Tree && self.sidebar_view == SidebarView::Explorer;
-        self.search.focused = self.focus == Pane::Tree && self.sidebar_view == SidebarView::Search;
-        self.source_control.focused =
-            self.focus == Pane::Tree && self.sidebar_view == SidebarView::SourceControl;
         self.editor.focused = self.focus == Pane::Editor;
         // Inactive groups are by definition NOT the focused editor group, so
         // their borders never light up even while the editor pane holds focus.
@@ -5550,10 +5547,6 @@ impl App {
         self.apply_view_prefs();
         self.tree.focus_gradient = gradient;
         self.tree.theme = self.theme;
-        self.search.focus_gradient = gradient;
-        self.search.theme = self.theme;
-        self.source_control.focus_gradient = gradient;
-        self.source_control.theme = self.theme;
         self.refresh_scm_repositories();
         self.problems.fix_glyph = match self.problems_fix_started {
             Some(t) => update_spinner_frame(t.elapsed().as_millis()),

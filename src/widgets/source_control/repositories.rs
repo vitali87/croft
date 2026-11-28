@@ -61,6 +61,7 @@ impl SourceControlPanel {
     /// then, as the change list's does.
     pub(super) fn render_repositories_section(
         &mut self,
+        cx: &ViewCx,
         inner: Rect,
         y: u16,
         buf: &mut Buffer,
@@ -73,17 +74,14 @@ impl SourceControlPanel {
         if y >= bottom {
             return y;
         }
-        let tones = crate::theme::tones(self.theme);
+        let tones = crate::theme::tones(cx.theme);
         buf.set_stringn(
             inner.x + 1,
             y,
             "REPOSITORIES",
             inner.width.saturating_sub(1) as usize,
             Style::default()
-                .fg(tones.map_or_else(
-                    || self.theme.ui(Color::Rgb(0x8a, 0x92, 0xa4)),
-                    |t| t.muted(),
-                ))
+                .fg(tones.map_or_else(|| cx.theme.ui(Color::Rgb(0x8a, 0x92, 0xa4)), |t| t.muted()))
                 .add_modifier(Modifier::BOLD),
         );
         y += 1;
@@ -108,7 +106,7 @@ impl SourceControlPanel {
             // selected-row band and bar, the label is body text and the
             // branch muted.
             if let Some(t) = tones {
-                let hovered = crate::widgets::hover::contains(rect, self.hover_pointer);
+                let hovered = crate::widgets::hover::contains(rect, cx.pointer);
                 // Clear the row onto the chrome first: in the no-repo state
                 // the overview paints over the empty-state card's top.
                 for x in rect.left()..rect.right() {
@@ -126,7 +124,7 @@ impl SourceControlPanel {
                         },
                         t,
                         t.chrome,
-                        self.focused && has_keys,
+                        cx.focused && has_keys,
                     );
                 } else if hovered {
                     buf.set_style(rect, Style::default().bg(t.hover_on(t.chrome)));
@@ -148,13 +146,13 @@ impl SourceControlPanel {
                 let left_w = line.width() as u16;
                 if row.changes > 0 {
                     let count = row.changes.to_string();
-                    let cx = (rect.x + rect.width).saturating_sub(count.len() as u16 + 1);
-                    if cx > rect.x + left_w {
+                    let count_x = (rect.x + rect.width).saturating_sub(count.len() as u16 + 1);
+                    if count_x > rect.x + left_w {
                         buf.set_string(
-                            cx,
+                            count_x,
                             y,
                             &count,
-                            Style::default().fg(self.theme.ui(Color::Rgb(0xe0, 0x9a, 0x4e))),
+                            Style::default().fg(cx.theme.ui(Color::Rgb(0xe0, 0x9a, 0x4e))),
                         );
                     }
                 }
@@ -162,14 +160,13 @@ impl SourceControlPanel {
                 y += 1;
                 continue;
             }
-            let hover_bg =
-                crate::widgets::hover::row_hover_bg(rect, self.hover_pointer, self.theme);
+            let hover_bg = crate::widgets::hover::row_hover_bg(rect, cx.pointer, cx.theme);
             let (bg, fg) = if picked {
-                (self.theme.selection(), self.theme.ui(Color::White))
+                (cx.theme.selection(), cx.theme.ui(Color::White))
             } else if let Some(h) = hover_bg {
-                (h, self.theme.ui(Color::Gray))
+                (h, cx.theme.ui(Color::Gray))
             } else {
-                (Color::Reset, self.theme.ui(Color::Gray))
+                (Color::Reset, cx.theme.ui(Color::Gray))
             };
             for x in rect.x..rect.x + rect.width {
                 buf[(x, y)].set_bg(bg);
@@ -189,15 +186,15 @@ impl SourceControlPanel {
             );
             if row.changes > 0 {
                 let count = row.changes.to_string();
-                let cx = (rect.x + rect.width).saturating_sub(count.len() as u16 + 1);
-                if cx > rect.x + left.len() as u16 {
+                let count_x = (rect.x + rect.width).saturating_sub(count.len() as u16 + 1);
+                if count_x > rect.x + left.len() as u16 {
                     buf.set_string(
-                        cx,
+                        count_x,
                         y,
                         &count,
                         Style::default()
                             .bg(bg)
-                            .fg(self.theme.ui(Color::Rgb(0xe0, 0x9a, 0x4e))),
+                            .fg(cx.theme.ui(Color::Rgb(0xe0, 0x9a, 0x4e))),
                     );
                 }
             }

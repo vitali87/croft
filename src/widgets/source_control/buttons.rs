@@ -13,11 +13,17 @@ impl SourceControlPanel {
     /// with a second action rather than two blocks, and the chevron centres
     /// in the face right of the seam. Each half lifts on its own under the
     /// pointer; the gap lifts with the caret it is painted as.
-    pub(super) fn render_soft_split_button(&self, buf: &mut Buffer, main: Rect, caret: Rect) {
+    pub(super) fn render_soft_split_button(
+        &self,
+        cx: &ViewCx,
+        buf: &mut Buffer,
+        main: Rect,
+        caret: Rect,
+    ) {
         use crate::widgets::surface::{CHEVRON_UNFOLDED, paint_soft_button};
-        let (fill, fg) = primary_button_colors(self.theme, self.focus_gradient);
+        let (fill, fg) = primary_button_colors(cx.theme, cx.theme.gradient());
         let lift = |r: Rect| {
-            if crate::widgets::hover::contains(r, self.hover_pointer) {
+            if crate::widgets::hover::contains(r, cx.pointer) {
                 lift_button(fill)
             } else {
                 fill

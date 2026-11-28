@@ -50,6 +50,7 @@ impl SourceControlPanel {
     /// Click-to-select: returns the entry index now selected, if the
     /// click landed on an entry row. Resets the multi-selection to just
     /// this row — Cmd+A is the way to opt into multi.
+    #[cfg(test)]
     pub fn select_change_at(&mut self, y: u16) -> Option<usize> {
         let idx = self.entry_at_y(y)?;
         self.selected_change = Some(idx);
@@ -70,6 +71,7 @@ impl SourceControlPanel {
         self.multi_selection.len()
     }
 
+    #[cfg(test)]
     pub fn changes_count(&self) -> usize {
         self.entries.len()
     }

@@ -30,10 +30,10 @@ fn backspace_at_start_is_noop() {
 
 #[test]
 fn hovering_an_unselected_change_row_lifts_it() {
+    let mut cx = ViewCx::default();
     use ratatui::buffer::Buffer;
     let mut p = SourceControlPanel::new();
-    p.focus_gradient = false; // Croft Dark
-    p.theme = crate::theme::Theme::DARK_BLUE;
+    cx.theme = crate::theme::Theme::DARK_BLUE;
     p.status.in_repo = true;
     p.selected_change = None; // nothing selected
     p.entries = vec![
@@ -55,12 +55,12 @@ fn hovering_an_unselected_change_row_lifts_it() {
         height: 24,
     };
     let mut buf = Buffer::empty(area);
-    (&mut p).render(area, &mut buf);
+    p.draw(&cx, area, &mut buf);
     // list_layout = [Header(Changes), Entry(0), Entry(1)]; hover Entry(1).
     let row_y = p.last_list_area.y + 2;
-    p.hover_pointer = Some((p.last_list_area.x, row_y));
+    cx.pointer = Some((p.last_list_area.x, row_y));
     let mut buf = Buffer::empty(area);
-    (&mut p).render(area, &mut buf);
+    p.draw(&cx, area, &mut buf);
     assert_eq!(
         buf[(p.last_list_area.x, row_y)].bg,
         Color::Rgb(0x2b, 0x31, 0x42),
@@ -80,7 +80,7 @@ fn header_refresh_pill_renders_in_repo_and_hit_tests() {
         height: 24,
     };
     let mut buf = Buffer::empty(area);
-    (&mut p).render(area, &mut buf);
+    p.draw(&ViewCx::default(), area, &mut buf);
     let btn = p.header_refresh_btn;
     assert!(btn.width > 0, "the refresh pill must render inside a repo");
     // The cod-refresh glyph lands in the header row.
@@ -113,7 +113,7 @@ fn long_commit_feedback_wraps_inside_the_panel() {
         height: 30,
     };
     let mut buf = Buffer::empty(Rect { width: 80, ..area });
-    (&mut p).render(area, &mut buf);
+    p.draw(&ViewCx::default(), area, &mut buf);
     let row = |y: u16, xs: std::ops::Range<u16>| -> String {
         xs.map(|x| buf[(x, y)].symbol().to_string()).collect()
     };
@@ -163,7 +163,7 @@ fn short_commit_feedback_stays_on_one_line() {
         p.status.in_repo = true;
         p.commit_feedback = feedback.map(String::from);
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         p.last_list_area.y
     };
     assert_eq!(list_top(Some("[main 548c72d] Merge")), list_top(Some("x")));
@@ -181,7 +181,7 @@ fn header_refresh_pill_absent_without_a_repo() {
         height: 24,
     };
     let mut buf = Buffer::empty(area);
-    (&mut p).render(area, &mut buf);
+    p.draw(&ViewCx::default(), area, &mut buf);
     assert_eq!(
         p.header_refresh_btn.width, 0,
         "no refresh pill in the no-repo empty state",
@@ -273,7 +273,7 @@ fn header_pills_stay_clear_of_a_translated_title() {
         };
         let mut buf = Buffer::empty(area);
         crate::i18n::with_test_catalog(&format!(r#"{{"SOURCE CONTROL": "{title}"}}"#), || {
-            (&mut p).render(area, &mut buf);
+            p.draw(&ViewCx::default(), area, &mut buf);
         });
         let inner = p.last_inner;
         let header: String = (inner.x..inner.x + inner.width)
@@ -304,7 +304,7 @@ fn header_row_says_source_control_inside_the_panel_not_on_the_outer_border() {
         height: 30,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+    p.draw(&ViewCx::default(), area, &mut buf);
     let dump = buffer_to_string(&buf);
     // Header lives on the first inner row in light-grey-bold.
     let inner_top = dump.lines().nth(1).expect("inner row 0");
@@ -345,7 +345,7 @@ fn placeholder_text_never_overflows_past_the_input_box_right_border() {
         height: 30,
     };
     let mut buf = Buffer::empty(buf_area);
-    ratatui::widgets::Widget::render(&mut p, panel_area, &mut buf);
+    p.draw(&ViewCx::default(), panel_area, &mut buf);
     let placeholder_row = p.last_input_area.y + 1;
     // Every cell past the panel's right edge must be blank — the
     // panel area is 0..28, so columns 28..80 are the editor band.
@@ -379,7 +379,7 @@ fn typed_message_text_never_overflows_past_the_input_box_right_border() {
         height: 30,
     };
     let mut buf = Buffer::empty(buf_area);
-    ratatui::widgets::Widget::render(&mut p, panel_area, &mut buf);
+    p.draw(&ViewCx::default(), panel_area, &mut buf);
     let row = p.last_input_area.y + 1;
     for x in panel_area.right()..buf_area.right() {
         let sym = buf[(x, row)].symbol().to_string();
@@ -415,7 +415,7 @@ fn commit_feedback_shows_its_first_line_and_stays_inside_the_panel() {
         height: 30,
     };
     let mut buf = Buffer::empty(buf_area);
-    ratatui::widgets::Widget::render(&mut p, panel_area, &mut buf);
+    p.draw(&ViewCx::default(), panel_area, &mut buf);
     for y in buf_area.top()..buf_area.bottom() {
         for x in panel_area.right()..buf_area.right() {
             let sym = buf[(x, y)].symbol();
@@ -448,7 +448,7 @@ fn a_short_feedback_is_drawn_whole_and_an_error_stays_inside_the_panel() {
         p.commit_feedback_is_error = is_error;
         let panel_area = Rect::new(0, 0, 28, 30);
         let mut buf = Buffer::empty(Rect::new(0, 0, 80, 30));
-        ratatui::widgets::Widget::render(&mut p, panel_area, &mut buf);
+        p.draw(&ViewCx::default(), panel_area, &mut buf);
         (buf, panel_area)
     };
     let text = |buf: &Buffer, area: Rect| -> String {
@@ -481,10 +481,11 @@ fn a_short_feedback_is_drawn_whole_and_an_error_stays_inside_the_panel() {
 
 #[test]
 fn long_commit_message_keeps_the_caret_visible_and_scrolls_to_show_the_tail() {
+    let mut cx = ViewCx::default();
     use ratatui::buffer::Buffer;
     let mut p = SourceControlPanel::new();
     p.set_status(dummy_status_with_branch("main"), Vec::new());
-    p.focused = true;
+    cx.focused = true;
     // A workspace temp path is far longer than the ~22-cell input box.
     // Typing it leaves the cursor at the end.
     let long = "/var/folders/8r/rz52gwd56wz0yw3sqc7xprgm0000gn/T/croft";
@@ -496,9 +497,9 @@ fn long_commit_message_keeps_the_caret_visible_and_scrolls_to_show_the_tail() {
         height: 30,
     };
     let mut buf = Buffer::empty(panel_area);
-    ratatui::widgets::Widget::render(&mut p, panel_area, &mut buf);
+    p.draw(&cx, panel_area, &mut buf);
     assert!(
-        p.cursor_screen_pos().is_some(),
+        p.cursor_screen_pos(cx.focused).is_some(),
         "the caret must stay visible when the message is longer than the input box; otherwise the user can't see what they're editing and the box feels frozen"
     );
     let row = p.last_input_area.y + 1;
@@ -565,10 +566,11 @@ fn delete_key_forward_deletes_in_the_commit_message() {
 
 #[test]
 fn input_box_is_three_rows_tall_with_a_focus_aware_border() {
+    let mut cx = ViewCx::default();
     use ratatui::buffer::Buffer;
     let mut p = SourceControlPanel::new();
     p.set_status(dummy_status_with_branch("main"), Vec::new());
-    p.focused = true;
+    cx.focused = true;
     let area = Rect {
         x: 0,
         y: 0,
@@ -576,7 +578,7 @@ fn input_box_is_three_rows_tall_with_a_focus_aware_border() {
         height: 30,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+    p.draw(&cx, area, &mut buf);
     assert_eq!(
         p.last_input_area.height, 3,
         "commit-message input must be 3 rows tall to match the chunky aesthetic"
@@ -596,7 +598,7 @@ fn commit_button_is_chunky_three_row_full_width_block() {
         height: 30,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+    p.draw(&ViewCx::default(), area, &mut buf);
     assert_eq!(
         p.last_button_area.height, 3,
         "Commit button must be 3 rows tall (chunky) like the mockup"
@@ -612,10 +614,11 @@ fn commit_button_is_chunky_three_row_full_width_block() {
 
 #[test]
 fn branch_row_uses_the_source_control_codicon_in_cyan() {
+    let mut cx = ViewCx::default();
     use ratatui::buffer::Buffer;
     // The cyan glyph is the boxed themes'; Croft Loch mutes it (below).
     let mut p = SourceControlPanel::new();
-    p.theme = crate::theme::Theme::BLACK;
+    cx.theme = crate::theme::Theme::BLACK;
     p.set_status(dummy_status_with_branch("main"), Vec::new());
     let area = Rect {
         x: 0,
@@ -624,7 +627,7 @@ fn branch_row_uses_the_source_control_codicon_in_cyan() {
         height: 20,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+    p.draw(&cx, area, &mut buf);
     let inner = p.last_inner;
     let row_y = inner.y + 2;
     // The branch glyph is cod-source-control (U+EA68) in cyan.
@@ -642,7 +645,7 @@ fn branch_row_uses_the_source_control_codicon_in_cyan() {
     }
     let x = hit.expect("branch row must carry the cod-source-control (U+EA68) Y-fork glyph");
     let style = buf[(x, row_y)].style();
-    let expected = p.theme.ui(ratatui::style::Color::Rgb(0x88, 0xc0, 0xd0));
+    let expected = cx.theme.ui(ratatui::style::Color::Rgb(0x88, 0xc0, 0xd0));
     assert_eq!(
         style.fg,
         Some(expected),
@@ -667,11 +670,12 @@ fn branch_row_uses_the_source_control_codicon_in_cyan() {
 
 #[test]
 fn commit_button_uses_rounded_border_corners() {
+    let mut cx = ViewCx::default();
     use ratatui::buffer::Buffer;
     // The line-art corners are the boxed themes'; Croft Loch's soft
     // split button has its own test.
     let mut p = SourceControlPanel::new();
-    p.theme = crate::theme::Theme::BLACK;
+    cx.theme = crate::theme::Theme::BLACK;
     p.set_status(dummy_status_with_branch("main"), Vec::new());
     let area = Rect {
         x: 0,
@@ -680,7 +684,7 @@ fn commit_button_uses_rounded_border_corners() {
         height: 20,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+    p.draw(&cx, area, &mut buf);
     let b = p.last_button_area;
     assert!(b.height >= 3 && b.width >= 4, "button must be laid out");
     let tl = buf[(b.x, b.y)].symbol().to_string();
@@ -738,7 +742,7 @@ fn change_section_header_carries_a_count_pill() {
         height: 40,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+    p.draw(&ViewCx::default(), area, &mut buf);
     let dump = buffer_to_string(&buf);
     assert!(
         dump.contains("CHANGES"),
@@ -763,18 +767,19 @@ fn change_section_header_carries_a_count_pill() {
 /// muted ink, with the keys as a faint hint at the field's right edge.
 #[test]
 fn croft_loch_commit_message_is_a_raised_well_with_a_hairline_edge() {
+    let mut cx = ViewCx::default();
     use ratatui::buffer::Buffer;
     let t = crate::theme::tones(crate::theme::Theme::LOCH).unwrap();
     let mut p = SourceControlPanel::new();
-    p.theme = crate::theme::Theme::LOCH;
+    cx.theme = crate::theme::Theme::LOCH;
     p.set_status(dummy_status_with_branch("main"), Vec::new());
     let area = Rect::new(0, 0, 40, 30);
-    let render = |p: &mut SourceControlPanel| {
+    let render = |p: &mut SourceControlPanel, cx: &ViewCx| {
         let mut buf = Buffer::empty(area);
-        ratatui::widgets::Widget::render(&mut *p, area, &mut buf);
+        p.draw(cx, area, &mut buf);
         buf
     };
-    let buf = render(&mut p);
+    let buf = render(&mut p, &cx);
     let r = p.last_input_area;
     assert_eq!(r.height, 3);
     assert_eq!(buf[(r.x + 3, r.y)].symbol(), "\u{2581}", "top edge");
@@ -799,10 +804,10 @@ fn croft_loch_commit_message_is_a_raised_well_with_a_hairline_edge() {
             );
         }
     }
-    p.focused = true;
-    let buf = render(&mut p);
+    cx.focused = true;
+    let buf = render(&mut p, &cx);
     assert_eq!(buf[(r.x + 3, r.y)].fg, t.accent(), "the accent with focus");
-    assert_eq!(p.cursor_screen_pos(), Some((r.x + 2, r.y + 1)));
+    assert_eq!(p.cursor_screen_pos(cx.focused), Some((r.x + 2, r.y + 1)));
 }
 
 /// Croft Loch's empty commit field fits every side-bar width: "Message"
@@ -811,6 +816,7 @@ fn croft_loch_commit_message_is_a_raised_well_with_a_hairline_edge() {
 /// mid-word, and the caret keeps its cell.
 #[test]
 fn croft_loch_commit_placeholder_is_whole_at_every_side_bar_width() {
+    let mut cx = ViewCx::default();
     use ratatui::buffer::Buffer;
     let hints = [
         "\u{23ce} commit \u{b7} \u{21e7}\u{23ce} newline",
@@ -819,11 +825,11 @@ fn croft_loch_commit_placeholder_is_whole_at_every_side_bar_width() {
     let mut seen = [false; 3];
     for width in 16u16..=64 {
         let mut p = SourceControlPanel::new();
-        p.theme = crate::theme::Theme::LOCH;
+        cx.theme = crate::theme::Theme::LOCH;
         p.set_status(dummy_status_with_branch("main"), Vec::new());
         let area = Rect::new(0, 0, width, 30);
         let mut buf = Buffer::empty(area);
-        ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+        p.draw(&cx, area, &mut buf);
         let r = p.last_input_area;
         // The text cells: a cell of padding inside each edge.
         let (x0, x1) = (r.x + 2, r.right() - 2);
@@ -850,11 +856,11 @@ fn croft_loch_commit_placeholder_is_whole_at_every_side_bar_width() {
     // A normal side bar (the 30-column one the screenshots use) has
     // room for the commit key at least.
     let mut p = SourceControlPanel::new();
-    p.theme = crate::theme::Theme::LOCH;
+    cx.theme = crate::theme::Theme::LOCH;
     p.set_status(dummy_status_with_branch("main"), Vec::new());
     let area = Rect::new(0, 0, 30, 30);
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+    p.draw(&cx, area, &mut buf);
     let r = p.last_input_area;
     let row: String = (r.x..r.right())
         .map(|x| buf[(x, r.y + 1)].symbol())
@@ -870,14 +876,15 @@ fn croft_loch_commit_placeholder_is_whole_at_every_side_bar_width() {
 /// targets are the boxed theme's rects.
 #[test]
 fn croft_loch_commit_is_a_one_row_split_pill() {
+    let mut cx = ViewCx::default();
     use ratatui::buffer::Buffer;
     let t = crate::theme::tones(crate::theme::Theme::LOCH).unwrap();
     let mut p = SourceControlPanel::new();
-    p.theme = crate::theme::Theme::LOCH;
+    cx.theme = crate::theme::Theme::LOCH;
     p.set_status(dummy_status_with_branch("main"), Vec::new());
     let area = Rect::new(0, 0, 40, 30);
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+    p.draw(&cx, area, &mut buf);
     let (m, c) = (p.last_button_area, p.last_commit_caret_area);
     assert_eq!((m.height, c.x), (3, m.x + m.width + 1), "same targets");
     let teal = crate::gradient::rgb_color(crate::gradient::PRIMARY_BTN_BG);
@@ -911,15 +918,15 @@ fn croft_loch_commit_is_a_one_row_split_pill() {
         crate::widgets::surface::CHEVRON_UNFOLDED.to_string(),
         "the chevron centred right of the seam"
     );
-    p.hover_pointer = Some((m.x + 1, m.y));
+    cx.pointer = Some((m.x + 1, m.y));
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+    p.draw(&cx, area, &mut buf);
     assert_ne!(buf[(m.x + 1, face_y)].bg, teal, "the hovered half lifts");
     assert_eq!(buf[(c.x + 1, face_y)].bg, teal, "the other half stays");
     assert_eq!(buf[(m.x + 1, m.y)].bg, t.chrome(), "only the face lifts");
-    p.hover_pointer = Some((c.x + 1, c.bottom() - 1));
+    cx.pointer = Some((c.x + 1, c.bottom() - 1));
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+    p.draw(&cx, area, &mut buf);
     assert_eq!(buf[(m.x + 1, face_y)].bg, teal);
     assert_ne!(buf[(c.x, face_y)].bg, teal, "the caret half lifts");
     assert_eq!(
@@ -935,12 +942,13 @@ fn croft_loch_commit_is_a_one_row_split_pill() {
 /// quiet count chip, and the branch glyph muted rather than the accent.
 #[test]
 fn croft_loch_change_rows_lead_with_the_name_and_wear_the_band() {
+    let mut cx = ViewCx::default();
     use crate::theme::tones;
     use crate::widgets::surface::ROW_BAR;
     use ratatui::buffer::Buffer;
     let t = tones(crate::theme::Theme::LOCH).unwrap();
     let mut p = SourceControlPanel::new();
-    p.theme = crate::theme::Theme::LOCH;
+    cx.theme = crate::theme::Theme::LOCH;
     p.set_status(
         dummy_status_with_branch("main"),
         vec![
@@ -956,11 +964,11 @@ fn croft_loch_change_rows_lead_with_the_name_and_wear_the_band() {
             },
         ],
     );
-    p.focused = true;
+    cx.focused = true;
     assert!(p.focus_list());
     let area = Rect::new(0, 0, 40, 30);
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+    p.draw(&cx, area, &mut buf);
     let rows: Vec<String> = (0..area.height)
         .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect())
         .collect();
@@ -997,10 +1005,11 @@ fn croft_loch_change_rows_lead_with_the_name_and_wear_the_band() {
 /// terminal's default background across the side bar.
 #[test]
 fn croft_loch_repository_rows_keep_the_chrome() {
+    let mut cx = ViewCx::default();
     use ratatui::buffer::Buffer;
     let t = crate::theme::tones(crate::theme::Theme::LOCH).unwrap();
     let mut p = SourceControlPanel::new();
-    p.theme = crate::theme::Theme::LOCH;
+    cx.theme = crate::theme::Theme::LOCH;
     p.status = dummy_status_with_branch("trunk");
     p.repositories = ["gitb", "gitc"]
         .iter()
@@ -1017,7 +1026,7 @@ fn croft_loch_repository_rows_keep_the_chrome() {
     let mut buf = Buffer::empty(area);
     // The side bar paints its chrome under every view first.
     buf.set_style(area, Style::default().bg(t.chrome()));
-    (&mut p).render(area, &mut buf);
+    p.draw(&cx, area, &mut buf);
     let (rect, _) = p.repo_row_areas[1].clone();
     for x in rect.left()..rect.right() {
         assert_eq!(buf[(x, rect.y)].bg, t.chrome(), "({x},{})", rect.y);
@@ -1054,7 +1063,7 @@ fn section_header_shows_green_plus_additions_and_red_minus_deletions() {
         height: 40,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+    p.draw(&ViewCx::default(), area, &mut buf);
     let dump = buffer_to_string(&buf);
     assert!(
         dump.contains("+17"),
@@ -1103,7 +1112,7 @@ fn render_in_non_repo_hides_commit_input_and_button_and_list() {
         height: 30,
     };
     let mut buf = Buffer::empty(area);
-    (&mut p).render(area, &mut buf);
+    p.draw(&ViewCx::default(), area, &mut buf);
     assert_eq!(
         p.last_input_area,
         Rect::default(),
@@ -1133,7 +1142,7 @@ fn empty_state_renders_no_repository_detected_title_and_description() {
         height: 30,
     };
     let mut buf = Buffer::empty(area);
-    (&mut p).render(area, &mut buf);
+    p.draw(&ViewCx::default(), area, &mut buf);
     let dump = buffer_to_string(&buf);
     assert!(
         dump.contains("No repository detected"),
@@ -1177,7 +1186,7 @@ fn empty_state_offers_subfolder_repos_instead_of_initialize() {
         height: 30,
     };
     let mut buf = Buffer::empty(area);
-    (&mut p).render(area, &mut buf);
+    p.draw(&ViewCx::default(), area, &mut buf);
     let dump = buffer_to_string(&buf);
     assert!(
         dump.contains("Repositories found in subfolders"),
@@ -1214,7 +1223,7 @@ fn empty_state_lists_one_open_button_per_subfolder_repo() {
         height: 40,
     };
     let mut buf = Buffer::empty(area);
-    (&mut p).render(area, &mut buf);
+    p.draw(&ViewCx::default(), area, &mut buf);
     let dump = buffer_to_string(&buf);
     assert!(
         dump.contains("Open api/") && dump.contains("Open web/"),
@@ -1255,7 +1264,7 @@ fn empty_state_without_subfolder_repos_still_offers_initialize() {
         height: 30,
     };
     let mut buf = Buffer::empty(area);
-    (&mut p).render(area, &mut buf);
+    p.draw(&ViewCx::default(), area, &mut buf);
     assert!(p.last_init_repo_button_area.width > 0);
     assert!(
         p.nested_repo_button_areas.is_empty(),
@@ -1280,7 +1289,7 @@ fn a_repo_workspace_never_shows_subfolder_open_buttons() {
         height: 30,
     };
     let mut buf = Buffer::empty(area);
-    (&mut p).render(area, &mut buf);
+    p.draw(&ViewCx::default(), area, &mut buf);
     assert!(p.nested_repo_button_areas.is_empty());
     assert!(!buffer_to_string(&buf).contains("Open sub/"));
 }
@@ -1297,7 +1306,7 @@ fn empty_state_records_button_rect_for_hit_testing() {
         height: 30,
     };
     let mut buf = Buffer::empty(area);
-    (&mut p).render(area, &mut buf);
+    p.draw(&ViewCx::default(), area, &mut buf);
     assert!(
         p.last_init_repo_button_area.width > 0 && p.last_init_repo_button_area.height > 0,
         "Initialize Repository button rect must be tracked"
@@ -1320,7 +1329,7 @@ fn empty_state_init_button_paints_a_visible_label_at_narrow_widths() {
         height: 40,
     };
     let mut buf = Buffer::empty(area);
-    (&mut p).render(area, &mut buf);
+    p.draw(&ViewCx::default(), area, &mut buf);
     let btn = p.last_init_repo_button_area;
     assert!(
         btn.width > 0 && btn.height > 0,
@@ -1344,15 +1353,16 @@ fn empty_state_init_button_paints_a_visible_label_at_narrow_widths() {
 /// three-row rect still answers the click and lifts the face on hover.
 #[test]
 fn croft_loch_initialize_button_is_a_one_row_pill_on_the_card() {
+    let mut cx = ViewCx::default();
     use crate::git::GitStatus;
     let t = crate::theme::tones(crate::theme::Theme::LOCH).unwrap();
     let teal = crate::gradient::rgb_color(crate::gradient::PRIMARY_BTN_BG);
     let mut p = SourceControlPanel::new();
-    p.theme = crate::theme::Theme::LOCH;
+    cx.theme = crate::theme::Theme::LOCH;
     p.status = GitStatus::default();
     let area = Rect::new(0, 0, 40, 40);
     let mut buf = Buffer::empty(area);
-    (&mut p).render(area, &mut buf);
+    p.draw(&cx, area, &mut buf);
     let b = p.last_init_repo_button_area;
     assert_eq!(b.height, 3, "the three-row target");
     let face_y = b.y + 1;
@@ -1374,9 +1384,9 @@ fn croft_loch_initialize_button_is_a_one_row_pill_on_the_card() {
         p.click_init_repo_button(b.x, b.y),
         "the top row still clicks"
     );
-    p.hover_pointer = Some((b.x + 2, b.bottom() - 1));
+    cx.pointer = Some((b.x + 2, b.bottom() - 1));
     let mut buf = Buffer::empty(area);
-    (&mut p).render(area, &mut buf);
+    p.draw(&cx, area, &mut buf);
     assert_ne!(buf[(b.x + 1, face_y)].bg, teal, "the face lifts");
     assert_eq!(buf[(b.x + 1, b.y)].bg, t.raised(), "only the face");
 }
@@ -1401,7 +1411,7 @@ fn empty_state_description_wraps_to_card_width_no_mid_word_truncation() {
         height: 40,
     };
     let mut buf = Buffer::empty(area);
-    (&mut p).render(area, &mut buf);
+    p.draw(&ViewCx::default(), area, &mut buf);
     let dump = buffer_to_string(&buf);
     assert!(
         !dump.contains("Open a folder under G\n"),
@@ -1430,7 +1440,7 @@ fn empty_state_illustration_does_not_use_arrow_up_codicon() {
         height: 30,
     };
     let mut buf = Buffer::empty(area);
-    (&mut p).render(area, &mut buf);
+    p.draw(&ViewCx::default(), area, &mut buf);
     let dump = buffer_to_string(&buf);
     assert!(
         !dump.contains('\u{eaa1}'),
@@ -1481,7 +1491,7 @@ fn change_rows_use_a_subtle_row_tint_not_darker_than_panel_bg() {
         height: 30,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+    p.draw(&ViewCx::default(), area, &mut buf);
     let bad = ratatui::style::Color::Rgb(0x16, 0x1b, 0x25);
     for y in 0..area.height {
         for x in 0..area.width {
@@ -1521,7 +1531,7 @@ fn clicking_a_change_entry_highlights_it_with_a_visible_row_bg() {
         height: 30,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+    p.draw(&ViewCx::default(), area, &mut buf);
     // Pretend the user clicked the second change row.
     let target_y = (0..area.height)
         .find(|y| {
@@ -1535,7 +1545,7 @@ fn clicking_a_change_entry_highlights_it_with_a_visible_row_bg() {
     p.select_change_at(target_y);
     // Re-render with the new selection.
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+    p.draw(&ViewCx::default(), area, &mut buf);
     // The selected row must carry a non-Reset bg distinct from the
     // unselected rows so the user can tell which entry is active.
     let mut selected_has_bg = false;
@@ -1584,7 +1594,7 @@ fn rendering_at_narrow_widths_does_not_panic() {
                 continue;
             }
             let mut buf = Buffer::empty(area);
-            ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+            p.draw(&ViewCx::default(), area, &mut buf);
         }
     }
 }
@@ -1616,7 +1626,7 @@ fn repositories_overview_renders_rows_and_maps_clicks() {
         height: 20,
     };
     let mut buf = Buffer::empty(area);
-    (&mut p).render(area, &mut buf);
+    p.draw(&ViewCx::default(), area, &mut buf);
     let dump = buffer_to_string(&buf);
     assert!(dump.contains("REPOSITORIES"), "{dump}");
     assert!(dump.contains("gitb") && dump.contains("gitc"), "{dump}");
@@ -1779,7 +1789,7 @@ fn render_in_repo_paints_input_and_button() {
         height: 16,
     };
     let mut buf = Buffer::empty(area);
-    (&mut p).render(area, &mut buf);
+    p.draw(&ViewCx::default(), area, &mut buf);
     assert!(
         p.last_input_area.height > 0,
         "input area must paint when in_repo"
@@ -1792,13 +1802,14 @@ fn render_in_repo_paints_input_and_button() {
 
 #[test]
 fn cursor_screen_pos_is_none_when_not_focused() {
+    let mut cx = ViewCx::default();
     let mut p = SourceControlPanel::new();
     p.status = GitStatus {
         in_repo: true,
         branch: Some("main".into()),
         ..Default::default()
     };
-    p.focused = false;
+    cx.focused = false;
     let area = Rect {
         x: 0,
         y: 0,
@@ -1806,9 +1817,9 @@ fn cursor_screen_pos_is_none_when_not_focused() {
         height: 16,
     };
     let mut buf = Buffer::empty(area);
-    (&mut p).render(area, &mut buf);
+    p.draw(&cx, area, &mut buf);
     assert_eq!(
-        p.cursor_screen_pos(),
+        p.cursor_screen_pos(cx.focused),
         None,
         "caret must hide when the panel is not focused"
     );
@@ -1816,9 +1827,10 @@ fn cursor_screen_pos_is_none_when_not_focused() {
 
 #[test]
 fn cursor_screen_pos_is_none_when_no_repo() {
+    let mut cx = ViewCx::default();
     let mut p = SourceControlPanel::new();
     p.status = GitStatus::default();
-    p.focused = true;
+    cx.focused = true;
     let area = Rect {
         x: 0,
         y: 0,
@@ -1826,9 +1838,9 @@ fn cursor_screen_pos_is_none_when_no_repo() {
         height: 30,
     };
     let mut buf = Buffer::empty(area);
-    (&mut p).render(area, &mut buf);
+    p.draw(&cx, area, &mut buf);
     assert_eq!(
-        p.cursor_screen_pos(),
+        p.cursor_screen_pos(cx.focused),
         None,
         "caret must hide when the panel is in the no-repo empty state (no input box painted)"
     );
@@ -1836,13 +1848,14 @@ fn cursor_screen_pos_is_none_when_no_repo() {
 
 #[test]
 fn cursor_screen_pos_lands_at_first_text_cell_when_message_is_empty() {
+    let mut cx = ViewCx::default();
     let mut p = SourceControlPanel::new();
     p.status = GitStatus {
         in_repo: true,
         branch: Some("main".into()),
         ..Default::default()
     };
-    p.focused = true;
+    cx.focused = true;
     let area = Rect {
         x: 0,
         y: 0,
@@ -1850,11 +1863,11 @@ fn cursor_screen_pos_lands_at_first_text_cell_when_message_is_empty() {
         height: 16,
     };
     let mut buf = Buffer::empty(area);
-    (&mut p).render(area, &mut buf);
+    p.draw(&cx, area, &mut buf);
     let r = p.last_input_area;
     assert!(r.width >= 3 && r.height == 3, "input must be laid out");
     let (cx, cy) = p
-        .cursor_screen_pos()
+        .cursor_screen_pos(cx.focused)
         .expect("focused, in repo → caret must report a cell");
     assert_eq!(
         (cx, cy),
@@ -1865,13 +1878,14 @@ fn cursor_screen_pos_lands_at_first_text_cell_when_message_is_empty() {
 
 #[test]
 fn cursor_screen_pos_advances_one_cell_per_inserted_char() {
+    let mut cx = ViewCx::default();
     let mut p = SourceControlPanel::new();
     p.status = GitStatus {
         in_repo: true,
         branch: Some("main".into()),
         ..Default::default()
     };
-    p.focused = true;
+    cx.focused = true;
     let area = Rect {
         x: 0,
         y: 0,
@@ -1879,10 +1893,12 @@ fn cursor_screen_pos_advances_one_cell_per_inserted_char() {
         height: 16,
     };
     let mut buf = Buffer::empty(area);
-    (&mut p).render(area, &mut buf);
+    p.draw(&cx, area, &mut buf);
     p.insert_str("fix");
     let r = p.last_input_area;
-    let (cx, cy) = p.cursor_screen_pos().expect("caret must report a cell");
+    let (cx, cy) = p
+        .cursor_screen_pos(cx.focused)
+        .expect("caret must report a cell");
     assert_eq!(
         (cx, cy),
         (r.x + 2 + 3, r.y + 1),
@@ -1892,15 +1908,16 @@ fn cursor_screen_pos_advances_one_cell_per_inserted_char() {
 
 #[test]
 fn cursor_screen_pos_is_none_before_first_render() {
+    let mut cx = ViewCx::default();
     let mut p = SourceControlPanel::new();
     p.status = GitStatus {
         in_repo: true,
         branch: Some("main".into()),
         ..Default::default()
     };
-    p.focused = true;
+    cx.focused = true;
     assert_eq!(
-        p.cursor_screen_pos(),
+        p.cursor_screen_pos(cx.focused),
         None,
         "caret must hide before the first render (last_input_area is still default)"
     );
@@ -1924,7 +1941,7 @@ fn selected_unstaged_row_paints_discard_and_stage_icons_before_the_badge() {
         height: 20,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+    p.draw(&ViewCx::default(), area, &mut buf);
     // First render learns the row coordinate; click-select it.
     let row_y = (area.y..area.y + area.height)
         .find(|y| {
@@ -1937,7 +1954,7 @@ fn selected_unstaged_row_paints_discard_and_stage_icons_before_the_badge() {
         .expect("ch.py row must render");
     p.select_change_at(row_y);
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+    p.draw(&ViewCx::default(), area, &mut buf);
     let actions = p
         .last_row_actions
         .expect("selected unstaged row must record action hit rects");
@@ -1982,7 +1999,7 @@ fn unselected_rows_paint_no_action_icons() {
         height: 20,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+    p.draw(&ViewCx::default(), area, &mut buf);
     assert!(
         p.last_row_actions.is_none(),
         "no selection ⇒ no action icons"
@@ -2012,7 +2029,7 @@ fn selected_staged_row_exposes_only_an_unstage_action() {
         height: 20,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+    p.draw(&ViewCx::default(), area, &mut buf);
     let row_y = (area.y..area.y + area.height)
         .find(|y| {
             let mut row = String::new();
@@ -2024,7 +2041,7 @@ fn selected_staged_row_exposes_only_an_unstage_action() {
         .expect("s.py row must render");
     p.select_change_at(row_y);
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+    p.draw(&ViewCx::default(), area, &mut buf);
     let actions = p
         .last_row_actions
         .expect("a selected staged row exposes the unstage action");
@@ -2153,7 +2170,7 @@ fn action_icons_are_suppressed_at_narrow_widths_so_the_path_stays_legible() {
         height: 60,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+    p.draw(&ViewCx::default(), area, &mut buf);
     assert!(
         p.last_row_actions.is_none(),
         "narrow rows must skip the action icons rather than overlap the path"
@@ -2218,7 +2235,7 @@ fn clicking_a_row_resets_multi_selection_to_just_that_row() {
         height: 20,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+    p.draw(&ViewCx::default(), area, &mut buf);
     let row_y = (area.y..area.y + area.height)
         .find(|y| {
             let mut row = String::new();
@@ -2249,6 +2266,7 @@ fn change(path: &str, kind: ChangeKind) -> ChangeEntry {
 /// first row reports the end so the App hands back the message box.
 #[test]
 fn arrows_walk_the_change_list_in_drawn_order_and_keep_it_in_view() {
+    let mut cx = ViewCx::default();
     let mut p = SourceControlPanel::new();
     p.set_status(
         dummy_status_with_branch("main"),
@@ -2258,12 +2276,15 @@ fn arrows_walk_the_change_list_in_drawn_order_and_keep_it_in_view() {
             change("added.txt", ChangeKind::StagedAdded),
         ],
     );
-    p.focused = true;
+    cx.focused = true;
     p.last_input_area = Rect::new(0, 0, 20, 3);
     p.last_list_area = Rect::new(0, 10, 20, 2);
-    assert!(p.cursor_screen_pos().is_some());
+    assert!(p.cursor_screen_pos(cx.focused).is_some());
     assert!(p.focus_list());
-    assert!(p.cursor_screen_pos().is_none(), "the list hides the caret");
+    assert!(
+        p.cursor_screen_pos(cx.focused).is_none(),
+        "the list hides the caret"
+    );
     assert_eq!(p.selected_change, Some(2), "the staged row is drawn first");
     let mut walked = Vec::new();
     for _ in 0..3 {
@@ -2371,7 +2392,7 @@ fn multi_selected_rows_paint_a_visible_row_bg_even_when_not_primary() {
         height: 20,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+    p.draw(&ViewCx::default(), area, &mut buf);
     // Both rows must carry SOME bg distinct from panel bg.
     let row_b_y = (area.y..area.y + area.height)
         .find(|y| {
@@ -2408,7 +2429,7 @@ fn split_commit_button_records_a_separate_caret_rect_at_default_widths() {
         height: 20,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+    p.draw(&ViewCx::default(), area, &mut buf);
     assert!(
         p.last_button_area.width > 0,
         "main commit button must paint"
@@ -2476,11 +2497,11 @@ fn changes_count_returns_entry_total() {
     assert_eq!(p.changes_count(), 2);
 }
 
-fn render_rows(p: &mut SourceControlPanel) -> Vec<String> {
-    render_rows_in(p, 30)
+fn render_rows(p: &mut SourceControlPanel, cx: &ViewCx) -> Vec<String> {
+    render_rows_in(p, cx, 30)
 }
 
-fn render_rows_in(p: &mut SourceControlPanel, height: u16) -> Vec<String> {
+fn render_rows_in(p: &mut SourceControlPanel, cx: &ViewCx, height: u16) -> Vec<String> {
     use ratatui::buffer::Buffer;
     let area = Rect {
         x: 0,
@@ -2489,7 +2510,7 @@ fn render_rows_in(p: &mut SourceControlPanel, height: u16) -> Vec<String> {
         height,
     };
     let mut buf = Buffer::empty(area);
-    ratatui::widgets::Widget::render(p, area, &mut buf);
+    p.draw(cx, area, &mut buf);
     (0..area.height)
         .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect())
         .collect()
@@ -2509,42 +2530,46 @@ fn pasted_line_breaks_are_kept_as_newlines() {
 /// on their own row, and the caret sits on its line.
 #[test]
 fn the_message_box_shows_each_line_on_its_own_row() {
+    let mut cx = ViewCx::default();
     let mut p = SourceControlPanel::new();
     p.set_status(dummy_status_with_branch("main"), Vec::new());
-    p.focused = true;
+    cx.focused = true;
     p.insert_str("subject\n\nbody");
-    let rows = render_rows(&mut p);
+    let rows = render_rows(&mut p, &cx);
     let input = p.last_input_area;
     assert_eq!(input.height, 5, "three lines plus the border");
     let row = |n: u16| rows[(input.y + 1 + n) as usize].clone();
     assert!(row(0).contains("subject"), "{rows:#?}");
     assert!(!row(1).contains("body") && !row(1).contains("subject"));
     assert!(row(2).contains("body"), "{rows:#?}");
-    assert_eq!(p.cursor_screen_pos(), Some((input.x + 2 + 4, input.y + 3)));
+    assert_eq!(
+        p.cursor_screen_pos(cx.focused),
+        Some((input.x + 2 + 4, input.y + 3))
+    );
 }
 
 /// Past the row cap the box scrolls to keep the caret's line in view.
 #[test]
 fn a_long_message_scrolls_to_the_caret_line() {
+    let mut cx = ViewCx::default();
     let mut p = SourceControlPanel::new();
     p.set_status(dummy_status_with_branch("main"), Vec::new());
-    p.focused = true;
+    cx.focused = true;
     let text: Vec<String> = (1..=12).map(|n| format!("line{n}")).collect();
     p.insert_str(&text.join("\n"));
-    let rows = render_rows(&mut p);
+    let rows = render_rows(&mut p, &cx);
     let input = p.last_input_area;
     assert_eq!(input.height, 2 + MESSAGE_MAX_ROWS as u16);
     let last = rows[(input.y + input.height - 2) as usize].clone();
     assert!(last.contains("line12"), "{rows:#?}");
     assert!(!rows.iter().any(|r| r.contains("line1 ")), "{rows:#?}");
-    let (_, caret_y) = p.cursor_screen_pos().unwrap();
+    let (_, caret_y) = p.cursor_screen_pos(cx.focused).unwrap();
     assert_eq!(caret_y, input.y + input.height - 2);
 }
 
 fn long_message_panel(lines: usize) -> SourceControlPanel {
     let mut p = SourceControlPanel::new();
     p.set_status(dummy_status_with_branch("main"), Vec::new());
-    p.focused = true;
     let text: Vec<String> = (1..=lines).map(|n| format!("line{n}")).collect();
     p.insert_str(&text.join("\n"));
     p
@@ -2554,8 +2579,12 @@ fn long_message_panel(lines: usize) -> SourceControlPanel {
 /// the Commit button off the bottom.
 #[test]
 fn a_long_message_leaves_room_for_the_commit_button() {
+    let cx = ViewCx {
+        focused: true,
+        ..ViewCx::default()
+    };
     let mut p = long_message_panel(5);
-    let rows = render_rows_in(&mut p, 16);
+    let rows = render_rows_in(&mut p, &cx, 16);
     let button = p.last_button_area;
     assert_eq!(button.height, 3, "{rows:#?}");
     assert!(button.y + button.height <= 16, "{button:?}");
@@ -2565,15 +2594,19 @@ fn a_long_message_leaves_room_for_the_commit_button() {
     );
     let input = p.last_input_area;
     assert!(input.y + input.height < button.y, "{input:?} {button:?}");
-    let (_, caret_y) = p.cursor_screen_pos().unwrap();
+    let (_, caret_y) = p.cursor_screen_pos(cx.focused).unwrap();
     assert!(rows[caret_y as usize].contains("line5"), "{rows:#?}");
 }
 
 /// ...and leaves rows for the change list, so files can still be staged.
 #[test]
 fn a_long_message_leaves_room_for_the_change_list() {
+    let cx = ViewCx {
+        focused: true,
+        ..ViewCx::default()
+    };
     let mut p = long_message_panel(6);
-    let rows = render_rows_in(&mut p, 20);
+    let rows = render_rows_in(&mut p, &cx, 20);
     assert!(
         p.last_list_area.height >= 2,
         "{:?} {rows:#?}",
@@ -2610,7 +2643,7 @@ fn a_one_line_message_keeps_the_three_row_box() {
     let mut p = SourceControlPanel::new();
     p.set_status(dummy_status_with_branch("main"), Vec::new());
     p.insert_str("just a subject");
-    render_rows(&mut p);
+    render_rows(&mut p, &ViewCx::default());
     assert_eq!(p.last_input_area.height, 3);
 }
 
@@ -2635,7 +2668,7 @@ fn the_keyboard_reaches_only_the_repository_rows_drawn() {
         .collect();
     let area = Rect::new(0, 0, 34, 6);
     let mut buf = Buffer::empty(area);
-    (&mut p).render(area, &mut buf);
+    p.draw(&ViewCx::default(), area, &mut buf);
     let drawn = p.repo_row_areas.len();
     assert!(drawn > 0 && drawn < 4, "{drawn} of 4 rows drawn");
     p.focus_repositories();

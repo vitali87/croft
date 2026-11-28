@@ -7,6 +7,7 @@ impl SearchPanel {
     /// `self.replace`, honouring the active `SearchOpts`. Returns the total
     /// number of matches replaced across all files. The caller is responsible
     /// for re-running the query afterwards so the (now stale) hit list updates.
+    #[cfg(test)]
     pub fn replace_all_on_disk(&self) -> usize {
         let needle = as_typed(&self.query);
         if needle.is_empty() {

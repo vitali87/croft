@@ -8,9 +8,9 @@ impl SearchPanel {
     /// Screen position of the focused field's text caret, in absolute terminal
     /// coordinates, for the app to drive the host's blinking hardware caret
     /// (mirroring `SourceControlPanel::cursor_screen_pos`). `None` when the
-    /// panel isn't focused or hasn't been laid out yet.
-    pub fn cursor_screen_pos(&self) -> Option<(u16, u16)> {
-        if !self.focused {
+    /// panel isn't `focused` (has the keyboard) or hasn't been laid out yet.
+    pub fn cursor_screen_pos(&self, focused: bool) -> Option<(u16, u16)> {
+        if !focused {
             return None;
         }
         self.caret_cell
@@ -113,30 +113,9 @@ impl SearchPanel {
         self.carets[SearchField::Query.index()] = None;
     }
 
+    #[cfg(test)]
     pub fn clear_selection(&mut self) {
         self.selection = None;
-    }
-
-    pub fn delete_selection(&mut self) -> bool {
-        let Some((a, b)) = self.selection_range() else {
-            return false;
-        };
-        if a == b {
-            self.selection = None;
-            return false;
-        }
-        self.query.replace_range(a..b, "");
-        self.selection = None;
-        let at = crate::widgets::line_edit::char_of(&self.query, a);
-        self.store_caret(SearchField::Query, at);
-        true
-    }
-
-    pub fn selection_text(&self) -> String {
-        match self.selection_range() {
-            Some((a, b)) if a < b => self.query[a..b].to_string(),
-            _ => String::new(),
-        }
     }
 
     /// Mutable handle to the text of whichever field is focused. The Query
@@ -326,11 +305,6 @@ impl SearchPanel {
         if !self.details_open && matches!(self.field, SearchField::Include | SearchField::Exclude) {
             self.focus_field(SearchField::Query);
         }
-    }
-
-    /// Compile the current include/exclude inputs into a `PathFilter`.
-    pub fn path_filter(&self) -> PathFilter {
-        PathFilter::new(&self.include, &self.effective_exclude())
     }
 
     /// The exclude box plus, while `use_exclude_settings` is on, the

@@ -1783,7 +1783,7 @@ fn a_rebase_names_the_branch_being_rebased() {
         panel.set_status(st, Vec::new());
         let area = ratatui::layout::Rect::new(0, 0, 60, 12);
         let mut buf = ratatui::buffer::Buffer::empty(area);
-        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        panel.draw(&crate::widgets::view_cx::ViewCx::default(), area, &mut buf);
         let panel_text: String = (0..area.height)
             .flat_map(|y| (0..area.width).map(move |x| (x, y)))
             .map(|xy| buf[xy].symbol())
@@ -3346,11 +3346,11 @@ fn tab_steps_through_source_control_message_list_and_commits() {
     // One stop has the keys at a time: the message box shows no caret
     // while COMMITS has them.
     draw(&mut app, 120, 40);
-    assert_eq!(app.source_control.cursor_screen_pos(), None);
+    assert_eq!(app.source_control.cursor_screen_pos(true), None);
     press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
     assert_eq!(at(&app), "message");
     draw(&mut app, 120, 40);
-    assert!(app.source_control.cursor_screen_pos().is_some());
+    assert!(app.source_control.cursor_screen_pos(true).is_some());
     press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT);
     assert_eq!(at(&app), "commits");
     press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT);
@@ -4297,7 +4297,7 @@ fn focused_source_control_input_drives_a_visible_caret_at_the_message_cursor() {
     );
     let (cx, cy) = app
         .source_control
-        .cursor_screen_pos()
+        .cursor_screen_pos(true)
         .expect("focused SC panel must expose a caret cell");
     let r = app.source_control.last_input_area;
     assert!(

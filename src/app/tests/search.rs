@@ -2,6 +2,12 @@
 
 use super::*;
 
+/// Whether Search has the keyboard: the side bar has focus and shows
+/// Search, which is what the side bar draws the view's focus from.
+fn search_has_keys(app: &App) -> bool {
+    app.focus == Pane::Tree && app.sidebar_view == SidebarView::Search
+}
+
 #[test]
 fn opening_a_search_hit_moves_focus_to_the_editor() {
     let tmp = tempfile::tempdir().unwrap();
@@ -21,7 +27,7 @@ fn opening_a_search_hit_moves_focus_to_the_editor() {
         matches!(app.focus, Pane::Editor),
         "opening a search result must hand keyboard focus to the editor so typing no longer leaks into the search box"
     );
-    assert!(!app.search.focused);
+    assert!(!search_has_keys(&app));
 }
 
 #[test]
@@ -383,7 +389,8 @@ fn search_panel_paints_a_scrollbar_when_hits_exceed_visible_rows() {
         height: 30,
     };
     let mut buf = ratatui::buffer::Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut app.search, area, &mut buf);
+    app.search
+        .draw(&crate::widgets::view_cx::ViewCx::default(), area, &mut buf);
     assert!(
         app.search.last_scrollbar.width > 0 && app.search.last_scrollbar.height > 0,
         "scrollbar rect must be tracked when results overflow the viewport"
@@ -421,7 +428,7 @@ fn search_view_focuses_search_input_not_terminal_or_tree() {
     ))
     .unwrap();
     assert!(app.focus == Pane::Tree);
-    assert!(app.search.focused);
+    assert!(search_has_keys(&app));
     assert!(!app.tree.focused);
     assert!(!app.terminal().focused);
 }
@@ -432,7 +439,7 @@ fn cycling_focus_away_from_search_clears_search_focus_flag() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.set_sidebar_view(SidebarView::Search);
     app.cycle_focus();
-    assert!(!app.search.focused);
+    assert!(!search_has_keys(&app));
 }
 
 #[test]
