@@ -508,14 +508,18 @@ def widens(old, new, old_module=None, new_module=None, moved=False):
 def follows_move(old_module, new_module):
     """Whether an item that sat in `old_module` and now sits in
     `new_module` went with a module the commits declare moved: it was under
-    the old path and is under the new one. A file renamed inside the module
-    left behind did not move with it, so its reach is read where it is."""
-    if old_module is None or new_module is None:
+    the old path and now sits where the move puts it, or in a file renamed
+    beside that place. An item that stayed, one in a file renamed inside the
+    module left behind, and one already at the new path before all keep
+    their reach where they are."""
+    if old_module is None or new_module is None or old_module == new_module:
         return False
     for old in sorted(MOVED, key=len, reverse=True):
         if old_module[: len(old)] == old:
             new = MOVED[old]
-            return new_module[: len(new)] == new
+            put = new + old_module[len(old) :]
+            beside = len(new_module) == len(put) and new_module[:-1] == put[:-1]
+            return new_module[: len(new)] == new and (new_module == put or beside)
     return False
 
 
