@@ -139,6 +139,15 @@ src/
 ├── review_ops.rs         the write side of review (#366): reply, resolve, submit a review, as `gh` jobs off the frame loop
 ├── review_threads.rs     GitHub review threads as the editor's comment boxes, behind "Review: Load PR Comments for This File"; distinguishes a thread's current `line` from `original_line`
 ├── scrubber.rs           moving through a branch's history, the cursor behind "Source Control: Scrub History"; the working tree is a `Position::Working` in the cursor, so leaving restores the live buffer exactly
+├── search.rs             the workspace search engine behind the Search view, the search editor, the log view and the find bars: `SearchHit`, `SearchOpts` and the parts below; nothing here draws (the view is `widgets/search.rs`)
+├── search/               the search engine's parts, beside search.rs; each file's `//!` doc says what it holds
+│   ├── highlight.rs      splitting a hit's line around its matches, for highlighting
+│   ├── matcher.rs        the query's matcher and its toggles, the pattern the Find bar shares, an invalid query's error
+│   ├── path_filter.rs    the files to include / exclude globs, and the test a path must pass
+│   ├── replace.rs        replacement text with $1, ${name} and Preserve Case; replacing in a line, a text or a file
+│   ├── tests.rs          the search engine's own tests
+│   ├── walk.rs           walking the workspace and streaming each file's hits; searching an unsaved buffer
+│   ├── worker.rs         the background search worker, its requests and events, and the typing pause; each search run is numbered and its events carry the number, so the view keeps only the run it shows, and a run stopped part-way ends `Cancelled`, never `Done` (#2608); each scan is a `search-scan` job the worker watches while it waits, so a run whose scan crashed ends `Crashed` (#2611)
 ├── session.rs            the files behind local persistent sessions: per-workspace socket paths (mux, legacy dtach, collab relay, hook, pair records), the start-time sidecar, the liveness probe (a probe that fails because the machine is out of file descriptors or memory counts as alive, so nothing respawns over a live server) and the owner-only socket bind; shared by the session host, collab relay, web view and agent hooks, so it sits below all of them
 ├── session_cli.rs        local session persistence: `croft attach` / `croft ls` run croft under the session host so terminals/LSP/DAP survive closing the window; legacy dtach sessions keep reattaching, and `ls` lists only session sockets, never the relay, hook or pane-host sockets beside them
 ├── session_host.rs       the multiplayer session mux: a hidden `croft session-host` subcommand owning the inner croft's PTY and broadcasting it verbatim to N unix-socket clients, with write control and a presence roster: what every part shares (the `Host` and `Client` structs, the swap handoff's descriptors, a client's outbox, the inner channel); each feature lives in a file in `session_host/` below
@@ -494,19 +503,14 @@ src/
     ├── run_debug.rs          Run and Debug sidebar widget: the Run button empty state, and when a session is live the call stack, expandable variables, WATCH, a debug console and a `❯` REPL prompt; the App builds the rows and maps clicks back to frames and variables
     ├── testing.rs            Testing sidebar widget: the test suite tree with pass/fail/skip glyphs, the Activity summary line, and the failing-test count feeding the beaker activity badge
     ├── scrollbar.rs     shared vertical- and horizontal-scrollbar geometry
-    ├── search.rs        sidebar search panel (query/replace/include/exclude inputs) + .gitignore-aware walker, glob filtering, and replace: the `SearchPanel` type, its constructor and the types its parts share (`SearchHit`, `SearchOpts`, `SearchField`, `SearchToggle`); each feature lives in a file in `search/` below
+    ├── search.rs        the Search view (query/replace/include/exclude inputs, results and Replace All): the `SearchPanel` type, its constructor and the types its parts share (`SearchField`, `SearchToggle`, `SearchProgress`); the engine it drives is `src/search.rs`; each feature lives in a file in `search/` below
     ├── search/          the search panel's feature files, beside search.rs; each file's `//!` doc says what it holds
     │   ├── fields.rs        the input fields: caret, selection, typing, focus, the Replace and details rows
-    │   ├── highlight.rs     splitting a hit's line around its matches, for highlighting
     │   ├── hit_test.rs      what a click or the pointer lands on: toggles, buttons, fields, result rows
-    │   ├── matcher.rs       the query's matcher and its toggles, the pattern the Find bar shares, an invalid query's error
-    │   ├── path_filter.rs   the files to include / exclude globs, and the test a path must pass
     │   ├── render.rs        drawing the panel and each input field
-    │   ├── replace.rs       replacement text, replacing in a line, a text or a file, and Replace All
+    │   ├── replace.rs       Replace All on disk, over the files the hits came from
     │   ├── results.rs       the results list: hits in order, counts, selection, scrolling, the mode toggles
-    │   ├── tests.rs         the search panel's own tests
-    │   ├── walk.rs          walking the workspace and streaming each file's hits; searching an unsaved buffer
-    │   ├── worker.rs        the background search worker, its requests and events, and the typing pause; each search run is numbered and its events carry the number, so the panel keeps only the run it shows, and a run stopped part-way ends `Cancelled`, never `Done` (#2608); each scan is a `search-scan` job the worker watches while it waits, so a run whose scan crashed ends `Crashed` (#2611)
+    │   ├── tests.rs         the Search view's own tests
     ├── shortcuts.rs     F1 shortcuts modal: every binding grouped by pane, scrollable
     ├── branch_picker.rs Checkout / Create Branch quick-pick overlay: type to filter the repo's branches, Enter to switch or create-and-switch (also drives the Branch submenu's merge / rebase / delete / create-from via `branch_purpose`); pure widget fed by `git::list_branches`
     ├── input_prompt.rs  single-line text modal for SCM ops that need a typed value (clone URL, branch rename, remote name/URL, tag name), tagged by `InputPurpose`; `InputPrompt::confirm` is the same box with no field, a Y/N question (trash, uninstall, remove, consent) that nothing typed can answer

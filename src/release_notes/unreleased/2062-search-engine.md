@@ -1,0 +1,1 @@
+refactor: the workspace search engine (the walk, the matcher, include and exclude globs, highlighting, the background worker and Replace) moves out of the Search view into its own module, `src/search.rs`, with its own tests; the search editor, the log view, the find bars and the editor import it from there (#2062). Nothing changes in use.
