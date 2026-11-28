@@ -21,6 +21,15 @@ on:
 permissions:
   contents: read
 
+# A push to a pull request makes the run on its previous head redundant: only
+# the run on the current head decides whether it can merge, and the runners are
+# shared, so each replaced commit's run used to wait its turn and hold a runner
+# the current heads were waiting for (#2870). Pushes to main group by commit, so
+# none of them is cancelled. macos.yml does the same.
+concurrency:
+  group: sonarcloud-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
 jobs:
   sonarcloud:
     name: SonarQube Cloud analysis
