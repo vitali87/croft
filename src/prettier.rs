@@ -163,7 +163,7 @@ fn run(bin: &Path, file: &Path, text: &str, limit: Duration) -> Result<String, S
     let ran = Bounded {
         stdout: Keep::All { cap: OUTPUT_CAP },
         stderr: Keep::Tail(ERROR_TAIL),
-        detached: true,
+        apart: crate::proc::Apart::Session,
         limit,
         retry_busy: false,
     }

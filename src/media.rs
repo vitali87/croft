@@ -396,7 +396,7 @@ fn poster_frame(path: &Path, scratch: &Path) -> Option<std::path::PathBuf> {
     let ok = crate::proc::Bounded {
         stdout: crate::proc::Keep::Nothing,
         stderr: crate::proc::Keep::Nothing,
-        detached: false,
+        apart: crate::proc::Apart::No,
         limit: POSTER_LIMIT,
         retry_busy: false,
     }

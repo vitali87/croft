@@ -17,7 +17,7 @@ mod bounded;
 #[cfg(test)]
 pub(crate) mod record;
 
-pub(crate) use bounded::{Bounded, Keep, Kept, RunError};
+pub(crate) use bounded::{Apart, Bounded, Keep, Kept, RunError};
 
 /// The program croft starts for `name`: `name` itself, or in a test the
 /// stand-in this thread put in its place.

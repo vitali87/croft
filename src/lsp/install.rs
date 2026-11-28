@@ -1535,7 +1535,7 @@ fn detached_shell_node_dir() -> Option<PathBuf> {
 /// file that hangs would otherwise keep it, and what it waits on, running
 /// for as long as croft does.
 fn node_dir_from_probe(mut probe: Command, timeout: std::time::Duration) -> Option<PathBuf> {
-    let out = crate::dap::install::run_probe(&mut probe, timeout, true)?;
+    let out = crate::dap::install::run_probe(&mut probe, timeout, crate::proc::Apart::Session)?;
     let node = Path::new(parse_node_probe(&out)?);
     if !node.is_file() {
         return None;

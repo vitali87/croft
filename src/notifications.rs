@@ -457,7 +457,7 @@ fn run_bounded(
     let ran = crate::proc::Bounded {
         stdout: Keep::Nothing,
         stderr: Keep::Tail(ERROR_TAIL),
-        detached: false,
+        apart: crate::proc::Apart::No,
         limit: timeout,
         retry_busy: false,
     }

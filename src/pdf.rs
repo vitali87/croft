@@ -401,7 +401,7 @@ fn run_bounded_stdout(
         stdout: crate::proc::Keep::All { cap },
         // Null, never inherited: the child must not touch croft's TTY.
         stderr: crate::proc::Keep::Nothing,
-        detached: false,
+        apart: crate::proc::Apart::No,
         limit: budget,
         retry_busy: false,
     }
