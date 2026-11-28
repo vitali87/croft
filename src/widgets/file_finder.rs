@@ -1,4 +1,4 @@
-use crate::file_index::{FileEntry, build_file_index};
+use crate::file_index::FileEntry;
 use crate::widgets::picker_colours;
 use crate::widgets::picker_query;
 use ratatui::{
@@ -1400,6 +1400,7 @@ fn split_dir_file(rel: &str, filename_start: usize) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file_index::{build_file_index, build_multi_file_index};
 
     fn loch_finder(names: &[&str], query: &str) -> (FileFinder, Buffer) {
         let entries: Vec<FileEntry> = names
