@@ -3,7 +3,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Widget},
 };
 
 #[derive(Clone, Copy)]
@@ -1452,6 +1452,12 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
 
 #[derive(Default)]
 pub struct ShortcutsModal {
+    /// Words typed after `/` (or Ctrl+F): an entry stays when every word
+    /// occurs in its keys, description or group title, case-insensitively.
+    pub filter: String,
+    /// True while the filter takes typed characters; false once Enter
+    /// committed it (or before it was opened), when the scroll keys work.
+    pub editing: bool,
     pub scroll: u16,
     pub last_inner_height: u16,
     pub last_content_height: u16,
@@ -1459,6 +1465,38 @@ pub struct ShortcutsModal {
 }
 
 impl ShortcutsModal {
+    /// Whether an entry of `group` passes the filter.
+    fn entry_matches(&self, group: &ShortcutGroup, entry: &ShortcutEntry) -> bool {
+        let words: Vec<String> = self
+            .filter
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect();
+        if words.is_empty() {
+            return true;
+        }
+        let hay = format!("{} {} {}", group.title, entry.keys, entry.description).to_lowercase();
+        words.iter().all(|w| hay.contains(w))
+    }
+
+    /// How many entries pass the filter.
+    pub fn match_count(&self) -> usize {
+        SHORTCUT_GROUPS
+            .iter()
+            .map(|g| {
+                g.entries
+                    .iter()
+                    .filter(|e| self.entry_matches(g, e))
+                    .count()
+            })
+            .sum()
+    }
+
+    pub fn set_filter(&mut self, filter: String) {
+        self.filter = filter;
+        self.scroll = 0;
+    }
+
     pub fn lines(&self, theme: crate::theme::Theme) -> Vec<Line<'static>> {
         let mut out: Vec<Line<'static>> = Vec::new();
         // A `surfaces` theme sets the sheet in its type ramp: group titles
@@ -1481,19 +1519,93 @@ impl ShortcutsModal {
                 Style::default().fg(theme.ui(Color::Rgb(0xd0, 0xd0, 0xd0))),
             ),
         };
-        for (i, group) in SHORTCUT_GROUPS.iter().enumerate() {
-            if i > 0 {
+        let mut shown = 0;
+        for group in SHORTCUT_GROUPS.iter() {
+            let entries: Vec<&ShortcutEntry> = group
+                .entries
+                .iter()
+                .filter(|e| self.entry_matches(group, e))
+                .collect();
+            if entries.is_empty() {
+                continue;
+            }
+            if shown > 0 {
                 out.push(Line::from(""));
             }
+            shown += 1;
             out.push(Line::from(Span::styled(group.title, title)));
             out.push(Line::from(Span::styled(
                 "─".repeat(group.title.chars().count()),
                 rule,
             )));
-            for entry in group.entries {
+            for entry in entries {
                 out.push(Line::from(vec![
                     Span::styled(format!("  {:<32} ", entry.keys), keys),
                     Span::styled(entry.description, what),
+                ]));
+            }
+        }
+        if shown == 0 {
+            out.push(Line::from(Span::styled("  No shortcuts match", what)));
+        }
+        out
+    }
+
+    /// The rows as drawn at `width` cells: like [`lines`](Self::lines), but a
+    /// description too long for its row wraps inside its own column, under
+    /// the description's first character, not back to the left edge.
+    pub fn wrapped_lines(&self, theme: crate::theme::Theme, width: u16) -> Vec<Line<'static>> {
+        let width = usize::from(width);
+        let mut out = Vec::new();
+        for line in self.lines(theme) {
+            // An entry row is [keys span, description span]; titles, rules and
+            // blanks have one span or none and need no wrapping.
+            let [keys, desc] = line.spans.as_slice() else {
+                // A title, rule or blank: wrapped only when it is wider than
+                // the modal, in its own style.
+                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                if text.chars().count() <= width {
+                    out.push(line);
+                } else {
+                    let style = line.spans.first().map(|s| s.style).unwrap_or_default();
+                    for row in wrap_words(text.trim_start(), width.max(1)) {
+                        out.push(Line::from(Span::styled(row, style)));
+                    }
+                }
+                continue;
+            };
+            let indent = keys.content.chars().count();
+            let room = width.saturating_sub(indent);
+            if room < MIN_DESCRIPTION_COLUMN {
+                // Too narrow for two columns: the keys on a row of their own
+                // and the description wrapped at full width under them, so
+                // no description is ever cut off.
+                let keys_text = keys.content.trim_end();
+                for row in wrap_words(keys_text.trim_start(), width.saturating_sub(2).max(1)) {
+                    out.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(row, keys.style),
+                    ]));
+                }
+                for row in wrap_words(&desc.content, width.saturating_sub(4).max(1)) {
+                    out.push(Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled(row, desc.style),
+                    ]));
+                }
+                continue;
+            }
+            let rows = wrap_words(&desc.content, room);
+            let mut rows = rows.into_iter();
+            let first = rows.next().unwrap_or_default();
+            out.push(Line::from(vec![
+                keys.clone(),
+                Span::styled(first, desc.style),
+            ]));
+            for row in rows {
+                out.push(Line::from(vec![
+                    Span::raw(" ".repeat(indent)),
+                    Span::styled(row, desc.style),
                 ]));
             }
         }
@@ -1546,6 +1658,62 @@ impl ShortcutsModal {
     }
 }
 
+/// The narrowest description column worth drawing beside the keys; below it
+/// an entry stacks its description under its keys at full width.
+const MIN_DESCRIPTION_COLUMN: usize = 20;
+
+/// Greedy word wrap to `room` display cells. A word longer than a row is
+/// split at the row edge.
+fn wrap_words(text: &str, room: usize) -> Vec<String> {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    let mut rows: Vec<String> = Vec::new();
+    let mut row = String::new();
+    let mut row_w = 0;
+    for word in text.split(' ').filter(|w| !w.is_empty()) {
+        let mut word = word;
+        loop {
+            let w = word.width();
+            let sep = usize::from(row_w > 0);
+            if row_w + sep + w <= room {
+                if sep == 1 {
+                    row.push(' ');
+                }
+                row.push_str(word);
+                row_w += sep + w;
+                break;
+            }
+            if row_w > 0 {
+                rows.push(std::mem::take(&mut row));
+                row_w = 0;
+                continue;
+            }
+            // A word wider than the whole row: cut it at the edge.
+            let mut cut = 0;
+            let mut cells = 0;
+            for (i, c) in word.char_indices() {
+                let cw = c.width().unwrap_or(0);
+                if cells + cw > room {
+                    break;
+                }
+                cells += cw;
+                cut = i + c.len_utf8();
+            }
+            if cut == 0 {
+                cut = word.chars().next().map_or(word.len(), char::len_utf8);
+            }
+            rows.push(word[..cut].to_string());
+            word = &word[cut..];
+            if word.is_empty() {
+                break;
+            }
+        }
+    }
+    if !row.is_empty() || rows.is_empty() {
+        rows.push(row);
+    }
+    rows
+}
+
 pub fn render_shortcuts_modal(
     modal: &mut ShortcutsModal,
     area: Rect,
@@ -1567,8 +1735,22 @@ pub fn render_shortcuts_modal(
     modal.last_rect = rect;
 
     Widget::render(Clear, rect, buf);
+    let title_text = if modal.editing {
+        format!(
+            " Shortcuts — filter: {}\u{258f}  (Enter keeps, Esc clears) ",
+            modal.filter
+        )
+    } else if !modal.filter.is_empty() {
+        format!(
+            " Shortcuts — filter: {} ({} found) — / edits, Esc clears ",
+            modal.filter,
+            modal.match_count()
+        )
+    } else {
+        " Shortcuts — / to search, Esc/q to close, ↑/↓ PgUp/PgDn Home/End to scroll ".to_string()
+    };
     let title = Span::styled(
-        " Shortcuts — Esc/q to close, ↑/↓ PgUp/PgDn Home/End to scroll ",
+        title_text,
         Style::default()
             .fg(theme.ui(Color::Rgb(0xff, 0xff, 0xff)))
             .add_modifier(Modifier::BOLD),
@@ -1591,11 +1773,12 @@ pub fn render_shortcuts_modal(
         buf.set_span(rect.x + 1, rect.y, &title, title.width() as u16);
     }
 
-    let paragraph = Paragraph::new(modal.lines(theme)).wrap(Wrap { trim: false });
-    // Count the rows AFTER wrapping, not the logical-line count: a description
-    // that wraps onto a second visual row adds a row the scroll ceiling must
-    // account for, otherwise the bottom of the list is unreachable.
-    modal.last_content_height = paragraph.line_count(inner.width) as u16;
+    // Wrapped here, not by the paragraph, so a long description stays in its
+    // own column. The scroll ceiling counts these drawn rows, otherwise the
+    // bottom of the list is unreachable.
+    let rows = modal.wrapped_lines(theme, inner.width);
+    modal.last_content_height = rows.len() as u16;
+    let paragraph = Paragraph::new(rows);
     modal.last_inner_height = inner.height;
     let max_scroll = modal.last_content_height.saturating_sub(inner.height);
     if modal.scroll > max_scroll {
@@ -1607,6 +1790,99 @@ pub fn render_shortcuts_modal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_description_wraps_inside_its_own_column() {
+        let theme = crate::theme::Theme::default();
+        let modal = ShortcutsModal::default();
+        let rows = modal.wrapped_lines(theme, 60);
+        let flat = |l: &Line| {
+            l.spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        };
+        // The description column of the entry above (wider key names push it
+        // right, so it is not one constant).
+        let mut indent = 0;
+        let mut wrapped = 0;
+        for (i, row) in rows.iter().enumerate() {
+            let text = flat(row);
+            assert!(text.chars().count() <= 60, "row {i} fits: {text:?}");
+            // A continuation row is blank in the keys column.
+            if row.spans.len() == 2 && !row.spans[0].content.trim().is_empty() {
+                indent = row.spans[0].content.chars().count();
+            } else if row.spans.len() == 2
+                && row.spans[0].content.trim().is_empty()
+                && row.spans[0].content.chars().count() > 4
+                && i > 0
+            {
+                wrapped += 1;
+                assert_eq!(row.spans[0].content.chars().count(), indent, "{text:?}");
+            }
+        }
+        assert!(wrapped > 0, "some description is long enough to wrap");
+        // Nothing is lost: every description's words survive in order.
+        for group in SHORTCUT_GROUPS {
+            for e in group.entries {
+                let joined = rows.iter().map(flat).collect::<Vec<_>>().join("\n");
+                let first = e.description.split(' ').next().unwrap();
+                assert!(joined.contains(first), "{}", e.description);
+            }
+        }
+    }
+
+    #[test]
+    fn a_narrow_modal_stacks_each_description_under_its_keys_without_cutting_any() {
+        let theme = crate::theme::Theme::default();
+        let modal = ShortcutsModal::default();
+        let flat = |l: &Line| {
+            l.spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        };
+        for width in [20u16, 30, 38, 46] {
+            let rows: Vec<String> = modal.wrapped_lines(theme, width).iter().map(flat).collect();
+            for r in &rows {
+                assert!(r.chars().count() <= usize::from(width), "w{width}: {r:?}");
+            }
+            // Every description survives whole: its words appear in order
+            // across the rows that follow its keys.
+            let words: String = rows
+                .join(" ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            for group in SHORTCUT_GROUPS {
+                for e in group.entries {
+                    let want = e
+                        .description
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    // Wrapping may split a very long word, so compare per word.
+                    for w in e
+                        .description
+                        .split_whitespace()
+                        .filter(|w| w.chars().count() < 12)
+                    {
+                        assert!(words.contains(w), "w{width}: {w:?} of {want:?} is cut");
+                    }
+                }
+            }
+        }
+        // At 46 cells most entries stack: keys row, then the description row.
+        let rows = modal.wrapped_lines(theme, 46);
+        assert!(rows.iter().any(|r| flat(r).starts_with("    ")));
+    }
+
+    #[test]
+    fn wrap_words_breaks_on_spaces_and_cuts_a_word_wider_than_the_row() {
+        assert_eq!(wrap_words("aa bb cc", 5), ["aa bb", "cc"]);
+        assert_eq!(wrap_words("abcdefgh", 3), ["abc", "def", "gh"]);
+        assert_eq!(wrap_words("", 5), [""]);
+    }
 
     #[test]
     fn shortcut_groups_cover_every_pane_the_user_can_focus() {
@@ -1666,6 +1942,7 @@ mod tests {
             last_inner_height: 10,
             last_content_height: 25,
             last_rect: Rect::default(),
+            ..Default::default()
         };
         modal.scroll_down(100);
         assert_eq!(
@@ -1681,6 +1958,7 @@ mod tests {
             last_inner_height: 10,
             last_content_height: 25,
             last_rect: Rect::default(),
+            ..Default::default()
         };
         modal.scroll_up(100);
         assert_eq!(modal.scroll, 0);
@@ -1710,6 +1988,7 @@ mod tests {
             last_inner_height: 8,
             last_content_height: 30,
             last_rect: Rect::default(),
+            ..Default::default()
         };
         modal.scroll_to_bottom();
         assert_eq!(modal.scroll, 22);
@@ -1756,5 +2035,47 @@ mod tests {
             "after scroll_to_bottom the final entry '{}' must be visible; wrapped rows are not counted in the scroll ceiling so the bottom of the list is unreachable\n--- rendered ---\n{text}",
             last_entry.description
         );
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+
+    fn flat(m: &ShortcutsModal, w: u16) -> String {
+        m.wrapped_lines(crate::theme::Theme::default(), w)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Every word must occur (keys, description or group title, any case);
+    /// groups with no match disappear; no match says so.
+    #[test]
+    fn the_filter_keeps_matching_entries_and_drops_empty_groups() {
+        let mut m = ShortcutsModal::default();
+        let all = m.match_count();
+        assert!(all > 20);
+        m.set_filter("TERMINAL".into());
+        let some = m.match_count();
+        assert!(0 < some && some < all);
+        let text = flat(&m, 100);
+        assert!(text.to_lowercase().contains("terminal"));
+        let groups = text
+            .lines()
+            .filter(|l| l.chars().all(|c| c == '─') && !l.is_empty())
+            .count();
+        assert!(groups < SHORTCUT_GROUPS.len(), "empty groups are dropped");
+        m.set_filter("terminal zzzzqqq".into());
+        assert_eq!(m.match_count(), 0);
+        assert!(flat(&m, 100).contains("No shortcuts match"));
+        m.set_filter(String::new());
+        assert_eq!(m.match_count(), all);
     }
 }
