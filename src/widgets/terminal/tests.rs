@@ -949,6 +949,52 @@ fn an_exit_in_the_pane_hosts_greeting_keeps_its_code() {
     assert_eq!(link.backend.try_exit(true), Some(Some(7)));
 }
 
+/// #2553: a signal that lands while croft waits for a pane host's greeting
+/// is not the host's answer. A socket read with a timeout is never
+/// restarted, whatever the handler asks, so it failed with "Interrupted
+/// system call" and a restore gave the pane a fresh shell. It reads again.
+#[test]
+fn a_signal_while_waiting_for_the_pane_hosts_greeting_does_not_end_the_attach() {
+    use crate::session_host::{Control, encode_control_frame};
+    use std::io::{Read, Write};
+    extern "C" fn on_usr1(_: libc::c_int) {}
+    // SAFETY: sigaction(2) on a zeroed struct; the handler does nothing.
+    // SA_RESTART, as croft's own handlers ask: the timed read still fails.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = on_usr1 as *const () as libc::sighandler_t;
+        action.sa_flags = libc::SA_RESTART;
+        libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut());
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("pane.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let (thread_tx, thread_rx) = std::sync::mpsc::channel();
+    let attach_socket = socket.clone();
+    let attacher = std::thread::spawn(move || {
+        // SAFETY: pthread_self has no preconditions.
+        thread_tx.send(unsafe { libc::pthread_self() }).unwrap();
+        PaneLink::attach(&attach_socket, 80, 24).map(|link| link.shell_pid)
+    });
+    let attacher_thread = thread_rx.recv().unwrap();
+    let (mut conn, _) = listener.accept().unwrap();
+    let mut hello = [0u8; 512];
+    let _ = conn.read(&mut hello);
+    // Croft has said hello and waits for the greeting: interrupt the wait.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    // SAFETY: the attacher thread is alive until it is joined below.
+    unsafe { libc::pthread_kill(attacher_thread, libc::SIGUSR1) };
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    // An attach that gave up has closed its end: the result says why.
+    let _ = conn.write_all(&encode_control_frame(&Control::PaneInfo { pid: 4242 }));
+    let pid = attacher.join().unwrap();
+    assert_eq!(
+        pid.map_err(|e| format!("{e:#}")),
+        Ok(Some(4242)),
+        "the attach ended on the signal"
+    );
+}
+
 /// #912: a shell that exits while its pane lives is reaped then, not
 /// left a zombie until the pane is dropped, and its exit code goes
 /// under its output.
