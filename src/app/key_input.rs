@@ -173,9 +173,9 @@ impl App {
                 self.run_code_lens_at_cursor();
                 true
             }
-            // Cmd+K Shift+N: the user's menu (menu.json). Must precede any
-            // plain N arm, which matches either case.
-            KeyCode::Char(c) if shifted && plain && !cmd_held && c.eq_ignore_ascii_case(&'n') => {
+            // Cmd+K Shift+J: the user's menu (menu.json). Must precede the
+            // plain J arm (unfold all), which matches either case.
+            KeyCode::Char(c) if shifted && plain && !cmd_held && c.eq_ignore_ascii_case(&'j') => {
                 self.open_user_menu();
                 true
             }

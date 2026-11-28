@@ -3,7 +3,7 @@
 //! instead of a search in the Command Palette.
 //!
 //! The same list is shown two ways: as a drop-down (`User Menu: Open`,
-//! `Cmd+K Shift+N`) and as a starred block at the top of the Command Palette.
+//! `Cmd+K Shift+J`) and as a starred block at the top of the Command Palette.
 //! Only built-in commands are accepted, named by the ids `keybindings.json`
 //! uses; tasks and shell commands are deliberately not part of it.
 //!
@@ -173,7 +173,7 @@ fn parse_rows(
 /// The starter file, also the menu until the file exists.
 pub const TEMPLATE: &str = r##"// croft user menu: the commands you use every day.
 //
-// Open it with "User Menu: Open" (Cmd+K Shift+N); the same commands also head
+// Open it with "User Menu: Open" (Cmd+K Shift+J); the same commands also head
 // the Command Palette, marked with a star. A row is one of:
 //   { "command": "format_document" }                    a command, by its id
 //   { "command": "toggle_bookmark", "label": "Mark" }   ... under your own label

@@ -2498,7 +2498,7 @@ commands! {
     OpenUserMenu {
         id: "open_user_menu",
         title: "User Menu: Open",
-        hint: "Cmd+K Shift+N",
+        hint: "Cmd+K Shift+J",
     }
     OpenUserMenuJson {
         id: "open_user_menu_json",
