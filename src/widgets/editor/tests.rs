@@ -11417,6 +11417,19 @@ fn open_pdf_tab_keeps_last_good_page_through_a_mid_write_sweep() {
         report.conflicts.is_empty(),
         "a clean tab is never a conflict"
     );
+    settle_pdf_jobs(&mut tabs);
+    assert_eq!(
+        tabs.take_landed_reloads().failed,
+        vec![path.clone()],
+        "the failed rebuild is said once it lands (#2827)"
+    );
+    // A sweep with nothing new on disk tries again, quietly.
+    tabs.reload_externally_changed_tabs(&|_| false);
+    settle_pdf_jobs(&mut tabs);
+    assert!(
+        tabs.take_landed_reloads().is_empty(),
+        "the same failed version is said only once"
+    );
     let tab = tabs.iter_tabs().next().unwrap();
     assert_eq!(
         tab.image
@@ -11429,8 +11442,9 @@ fn open_pdf_tab_keeps_last_good_page_through_a_mid_write_sweep() {
     // The write completes; the next sweep picks it up.
     std::fs::write(&path, one_page_pdf).unwrap();
     bump_mtime(&path, 4);
-    let report = tabs.reload_externally_changed_tabs(&|_| false);
-    assert_eq!(report.reloaded, vec![path.clone()]);
+    tabs.reload_externally_changed_tabs(&|_| false);
+    settle_pdf_jobs(&mut tabs);
+    assert_eq!(tabs.take_landed_reloads().reloaded, vec![path.clone()]);
     let tab = tabs.iter_tabs().next().unwrap();
     assert!(tab.image.is_some(), "completed write renders again");
 }
@@ -11535,14 +11549,112 @@ fn pdf_reload_keeps_the_current_page() {
         .unwrap()
         .set_modified(newer)
         .unwrap();
+    let shown = tabs
+        .iter_tabs()
+        .next()
+        .unwrap()
+        .image
+        .as_ref()
+        .unwrap()
+        .generation;
     let report = tabs.reload_externally_changed_tabs(&|_| false);
-    assert_eq!(report.reloaded, vec![path.clone()]);
+    // The rebuild renders on a job (#2827): the sweep returns at once, with
+    // the page on screen as it was, and the reload is said when it lands.
+    assert!(
+        report.reloaded.is_empty(),
+        "the sweep must not wait for the render"
+    );
+    assert_eq!(
+        tabs.iter_tabs()
+            .next()
+            .unwrap()
+            .image
+            .as_ref()
+            .unwrap()
+            .generation,
+        shown,
+        "the page on screen stays until the rebuild lands"
+    );
+    settle_pdf_jobs(&mut tabs);
+    assert_eq!(tabs.take_landed_reloads().reloaded, vec![path.clone()]);
+    assert_ne!(
+        tabs.iter_tabs()
+            .next()
+            .unwrap()
+            .image
+            .as_ref()
+            .unwrap()
+            .generation,
+        shown,
+        "the rebuild is shown once it lands"
+    );
     assert_eq!(
         tabs.pdf_page(),
         Some(2),
         "an external rebuild must not move the reader back to page 1; status: {:?}",
         tabs.iter_tabs().next().unwrap().status
     );
+}
+
+/// A PDF rebuilt again while its last rebuild still renders waits for it
+/// (#2827): one reload renders at a time, and the sweep after it lands
+/// renders the newer file, instead of a renderer per write piling up. A
+/// rebuild that fails after the file has moved on is not said: the newer
+/// one renders next.
+#[test]
+fn a_pdf_rebuilt_again_mid_reload_waits_for_the_reload_rendering() {
+    if crate::pdf::detect_backend().is_none() {
+        eprintln!("skipping: no PDF rasteriser installed");
+        return;
+    }
+    let one_page_pdf = concat!(
+        "%PDF-1.4\n",
+        "1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n",
+        "2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n",
+        "3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]/Contents 4 0 R>>endobj\n",
+        "4 0 obj<</Length 27>>stream\n0 0 1 rg 10 10 100 100 re f\nendstream endobj\n",
+        "trailer<</Root 1 0 R/Size 5>>\n%%EOF\n",
+    );
+    let rewrite = |path: &Path, secs: u64| {
+        std::fs::write(path, one_page_pdf).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(secs))
+            .unwrap();
+        Editor::disk_stamp_of(path)
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("deck.pdf");
+    std::fs::write(&path, one_page_pdf).unwrap();
+    let mut tabs = EditorTabs::new();
+    tabs.open_pinned(&path).unwrap();
+    settle_pdf_jobs(&mut tabs);
+    let first = rewrite(&path, 2);
+    *crate::pdf::FAIL_RASTERIZE_ONCE_FOR_TEST.lock().unwrap() = Some((path.clone(), 1));
+    tabs.reload_externally_changed_tabs(&|_| false);
+    assert!(tabs.pdf_jobs.reloading());
+    let second = rewrite(&path, 4);
+    assert_ne!(first, second);
+    tabs.reload_externally_changed_tabs(&|_| false);
+    assert_eq!(
+        tabs.disk_stamp, first,
+        "the second rebuild waits: the reload rendering is still the first"
+    );
+    settle_pdf_jobs(&mut tabs);
+    assert!(
+        tabs.take_landed_reloads().is_empty(),
+        "a rebuild that failed after the file moved on is not said"
+    );
+    tabs.reload_externally_changed_tabs(&|_| false);
+    assert!(
+        tabs.pdf_jobs.reloading(),
+        "the sweep after it lands renders the newer file"
+    );
+    assert_eq!(tabs.disk_stamp, second);
+    settle_pdf_jobs(&mut tabs);
+    assert_eq!(tabs.take_landed_reloads().reloaded, vec![path.clone()]);
 }
 
 /// The transient arm of the rebuild race (#72): the reader is on page 2,
@@ -11595,10 +11707,13 @@ fn a_transient_page_render_failure_during_reload_keeps_the_readers_place() {
     bump_mtime(&path, 2);
     *crate::pdf::FAIL_RASTERIZE_ONCE_FOR_TEST.lock().unwrap() = Some((path.clone(), 2));
     let report = tabs.reload_externally_changed_tabs(&|_| false);
+    assert!(report.reloaded.is_empty());
+    settle_pdf_jobs(&mut tabs);
+    let landed = tabs.take_landed_reloads();
     assert!(
-        report.reloaded.is_empty(),
+        landed.reloaded.is_empty() && landed.failed == vec![path.clone()],
         "a reload that cannot restore the reader's page is a failed \
-             reload, not a successful one that lost their place"
+             reload, not a successful one that lost their place: {landed:?}"
     );
     assert_eq!(
         tabs.pdf_page(),
@@ -11620,8 +11735,9 @@ fn a_transient_page_render_failure_during_reload_keeps_the_readers_place() {
     // The failure was transient: the next sweep reloads and the reader
     // is still on their page.
     bump_mtime(&path, 4);
-    let report = tabs.reload_externally_changed_tabs(&|_| false);
-    assert_eq!(report.reloaded, vec![path.clone()]);
+    tabs.reload_externally_changed_tabs(&|_| false);
+    settle_pdf_jobs(&mut tabs);
+    assert_eq!(tabs.take_landed_reloads().reloaded, vec![path.clone()]);
     assert_eq!(
         tabs.pdf_page(),
         Some(2),

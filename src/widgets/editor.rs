@@ -48,6 +48,7 @@ use brackets::*;
 use comments::*;
 pub use diff_view::diff_hit_test;
 use diff_view::*;
+pub use disk::ExternalReloadReport;
 pub use disk::LineEnding;
 pub use disk::SCRATCH_SAVE_REFUSAL;
 pub use disk::SaveCleanup;

@@ -556,7 +556,7 @@ fn last_settle() -> String {
     }
 }
 
-/// Test-only: the next `rasterize_page` call for exactly this (path, page)
+/// Test-only: the next `rasterize_page_while_wanted` call for exactly this (path, page)
 /// fails once, simulating a transient rasteriser failure (a spawn refused
 /// under load, an OOM-killed child). Keyed on the full path so parallel
 /// tests rendering the same page number of their own tempdir files never
@@ -569,19 +569,11 @@ pub static FAIL_RASTERIZE_ONCE_FOR_TEST: std::sync::Mutex<Option<(PathBuf, u32)>
 /// the encoded PNG. The caller is responsible for cleaning up no temp
 /// files — every backend writes to a per-call temp path that we delete
 /// before returning.
-pub fn rasterize_page(pdf: &Path, page: u32, backend: PdfBackend) -> std::io::Result<Vec<u8>> {
-    rasterize_page_while_wanted(
-        pdf,
-        page,
-        backend,
-        &std::sync::atomic::AtomicBool::new(false),
-    )
-}
-
-/// [`rasterize_page`], stopping the renderer once `unwanted` is set: a page
-/// the reader has left, or a tab now showing another file, does not keep
-/// its renderer running to the end of its budget. The `sips` path renders
-/// in one call and runs to its end.
+///
+/// The renderer is stopped once `unwanted` is set: a page the reader has
+/// left, or a tab now showing another file, does not keep it running to the
+/// end of its budget. The `sips` path renders in one call and runs to its
+/// end.
 pub fn rasterize_page_while_wanted(
     pdf: &Path,
     page: u32,

@@ -1,0 +1,1 @@
+fix: a PDF rebuilt on disk (pdflatex finishing, say) no longer freezes croft while it renders again: the page on screen stays until the new one is ready, the status line says it reloaded once it has, and a rebuild that will not render yet keeps the last good page and your place, says so once, and is tried again (#2827).

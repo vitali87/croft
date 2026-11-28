@@ -945,6 +945,42 @@ impl Editor {
         }
     }
 
+    /// A PDF rebuild that landed (#2827): the tab is in step with disk, and
+    /// the sweep's report says it reloaded.
+    pub(super) fn pdf_reload_landed(&mut self) {
+        self.disk_report = None;
+        self.pdf_jobs.failed_found = None;
+        self.pdf_jobs.reload_outcome = Some(ExternalChange::Reloaded);
+    }
+
+    /// A PDF rebuild that did not render (#2827): the last good page and the
+    /// reader's place stay (#72), and the version it read is not taken, so
+    /// the sweep tries it again, quietly, as it does any failed reload
+    /// (#900). The failure is reported once per version on disk, and not at
+    /// all when the file has been written again since: a half-written
+    /// rebuild caught mid-write is not news, and the next sweep renders the
+    /// newer one.
+    pub(super) fn pdf_reload_failed(
+        &mut self,
+        before: Option<(SystemTime, u64)>,
+        found: Option<(SystemTime, u64)>,
+    ) {
+        self.disk_stamp = before;
+        self.disk_report = Some(DiskReport {
+            synced: before,
+            found,
+            deleted: false,
+        });
+        let written_since = self
+            .path
+            .as_deref()
+            .is_some_and(|path| Self::disk_stamp_of(path) != found);
+        if !written_since && self.pdf_jobs.failed_found != Some(found) {
+            self.pdf_jobs.failed_found = Some(found);
+            self.pdf_jobs.reload_outcome = Some(ExternalChange::ReloadFailed);
+        }
+    }
+
     /// Reload from disk *only if* there are no unsaved local edits. Returns
     /// `Some(Ok(()))` if a reload happened, `Some(Err(_))` if reload failed,
     /// `None` if reload was skipped because the buffer is dirty (caller
@@ -1137,6 +1173,12 @@ impl Editor {
     /// A failed reload or a deletion is reported once, then the sweep stays
     /// quiet until disk changes again (#900).
     pub fn reload_or_flag_conflict(&mut self) -> ExternalChange {
+        // A PDF rebuild still rendering is this tab's reload under way: one
+        // renders at a time, and the sweep looks again once it has landed
+        // (#2827).
+        if self.pdf_jobs.reloading() {
+            return ExternalChange::Unchanged;
+        }
         if !self.disk_changed_externally() {
             self.disk_report = None;
             return ExternalChange::Unchanged;
@@ -1162,6 +1204,8 @@ impl Editor {
             // working again with nothing on disk moving, as when a
             // permission is put back.
             return match self.reload_from_disk() {
+                // A PDF renders on a job; it reports when it lands (#2827).
+                Ok(()) if self.pdf_jobs.reloading() => ExternalChange::Unchanged,
                 Ok(()) => {
                     self.disk_report = None;
                     ExternalChange::Reloaded
@@ -1196,6 +1240,8 @@ impl Editor {
             };
         }
         match self.reload_from_disk() {
+            // A PDF renders on a job; it reports when it lands (#2827).
+            Ok(()) if self.pdf_jobs.reloading() => ExternalChange::Unchanged,
             Ok(()) => ExternalChange::Reloaded,
             Err(_) => {
                 // Keyed on the stamp as the failed open left it, which is

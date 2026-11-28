@@ -235,6 +235,24 @@ impl EditorTabs {
         report
     }
 
+    /// The PDF rebuilds that landed since the last ask (#2827), as the
+    /// sweep would have reported them had they rendered there.
+    pub fn take_landed_reloads(&mut self) -> ExternalReloadReport {
+        let mut report = ExternalReloadReport::default();
+        for ed in &mut self.editors {
+            let (Some(outcome), Some(path)) = (ed.pdf_jobs.reload_outcome.take(), ed.path.clone())
+            else {
+                continue;
+            };
+            match outcome {
+                ExternalChange::Reloaded => report.reloaded.push(path),
+                ExternalChange::ReloadFailed => report.failed.push(path),
+                _ => {}
+            }
+        }
+        report
+    }
+
     /// Discard unsaved edits and reload the given paths from disk — the
     /// "Reload" resolution of an external-change conflict. Returns the paths
     /// actually reverted (a tab must still be open on each).

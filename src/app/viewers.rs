@@ -669,6 +669,18 @@ impl App {
             self.status = self.editor.status.clone();
             changed = true;
         }
+        // A rebuild on disk that landed is said as the sweep says a reload
+        // (#2827).
+        let mut landed = self.editor.take_landed_reloads();
+        for group in self.editor_layout.inactive_groups_mut() {
+            let more = group.take_landed_reloads();
+            landed.reloaded.extend(more.reloaded);
+            landed.failed.extend(more.failed);
+        }
+        if !landed.is_empty() {
+            self.announce_external_changes(landed);
+            changed = true;
+        }
         let links_in = self
             .editor
             .image

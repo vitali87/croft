@@ -440,6 +440,16 @@ impl App {
         if report.is_empty() {
             return settled;
         }
+        self.announce_external_changes(report)
+    }
+
+    /// Say what a sweep found: a conflict asks, a deletion or a failed
+    /// reload is said in the status line, a reload says what was reloaded.
+    /// Also for a PDF rebuild that lands on a job after its sweep (#2827).
+    pub(super) fn announce_external_changes(
+        &mut self,
+        report: crate::widgets::editor::ExternalReloadReport,
+    ) -> bool {
         // The active file changed on disk under a clean buffer: its coverage
         // marks describe the old text now, so they dim like an edit's (#263).
         if let Some(active) = self.editor.path.as_ref()

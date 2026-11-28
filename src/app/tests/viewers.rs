@@ -2289,6 +2289,40 @@ fn a_pdf_whose_first_page_fails_says_why_once_it_lands() {
     );
 }
 
+/// A PDF rebuilt on disk reloads without the sweep waiting for the render,
+/// and the status says so once it lands (#2827).
+#[test]
+fn a_pdf_rebuilt_on_disk_reloads_without_waiting_and_says_so() {
+    require_pdf_backend();
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("doc.pdf");
+    write_three_page_pdf(&path);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&path).unwrap();
+    settle_pdf(&mut app);
+    write_three_page_pdf(&path);
+    let newer = std::time::SystemTime::now() + std::time::Duration::from_secs(2);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(newer)
+        .unwrap();
+    app.status.clear();
+    app.reload_open_file_after_external_change();
+    assert!(
+        app.editor.pdf_jobs.reloading(),
+        "the rebuild renders on a job, not in the sweep"
+    );
+    assert!(!app.status.contains("Reloaded"), "{}", app.status);
+    settle_pdf(&mut app);
+    assert!(
+        app.status.contains("Reloaded") && app.status.contains("doc.pdf"),
+        "the reload is said once it lands: {}",
+        app.status
+    );
+}
+
 /// End pressed right after the open, before the page count is in, goes to
 /// the last page once it is: the count is read on a job (#2824).
 #[test]
