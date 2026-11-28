@@ -2236,6 +2236,18 @@ impl App {
         self.lsp.last_seen.clear();
         self.lsp.diagnostics.clear();
         self.lsp.progress.clear();
+        // The questions the old servers asked go with them: an answer goes
+        // back to the server that asked, and it is shut down (#2880).
+        // Dropping one answers "no action", as closing its picker does.
+        self.lsp.questions.clear();
+        if self
+            .list_picker
+            .as_ref()
+            .is_some_and(|p| p.purpose == crate::widgets::list_picker::ListPurpose::ServerQuestion)
+        {
+            self.close_list_picker();
+        }
+        self.lsp.question = None;
         // A new manager numbers semantic replies from 0 again (see the
         // build resume, which hits the same thing).
         self.lsp.semantic_generation_seen.clear();
