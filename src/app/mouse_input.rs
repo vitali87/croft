@@ -345,7 +345,7 @@ impl App {
             return;
         }
         self.hover.mark_fired();
-        if self.completion_popup.is_some() {
+        if self.completion.popup.is_some() {
             return;
         }
         if self.editor.has_non_text_view() {

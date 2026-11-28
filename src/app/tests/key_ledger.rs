@@ -1002,7 +1002,7 @@ fn fields(app: &App, root: &Path, read: &[String; 5], hide_ids: bool) -> Fields 
             ("hover", on(app.hover_popup.is_some())),
             (
                 "completion",
-                app.completion_popup.as_ref().map(|c| {
+                app.completion.popup.as_ref().map(|c| {
                     let row = c.items.get(c.selected).map_or("", |r| &r.label);
                     format!("{} > {}", quote(&c.prefix), quote(row))
                 }),

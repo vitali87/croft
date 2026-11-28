@@ -740,7 +740,7 @@ fn a_completion_accept_tracks_the_caret_and_is_one_generated_undo_step() {
     app.editor.lines = vec![String::from("ab)")];
     app.editor.cursor_row = 0;
     app.editor.cursor_col = 2;
-    app.completion_origin = Some((0, 3));
+    app.completion.origin = Some((0, 3));
     let item = crate::lsp::CompletionItem {
         label: String::from("abcdef"),
         text_edit: Some(TextSpanEdit {
@@ -759,7 +759,7 @@ fn a_completion_accept_tracks_the_caret_and_is_one_generated_undo_step() {
     app.editor.lines = vec![String::from("x = fo; y"), String::from("z")];
     app.editor.provenance = crate::provenance::Provenance::new();
     app.editor.cursor_col = 6;
-    app.completion_origin = Some((0, 6));
+    app.completion.origin = Some((0, 6));
     let before = app.editor.lines.clone();
     let item = crate::lsp::CompletionItem {
         label: String::from("foobar"),
@@ -812,8 +812,8 @@ fn a_late_completion_reply_opens_only_while_the_caret_is_in_its_word() {
     let ask_at = |app: &mut App, id, col| {
         app.editor.cursor_row = 0;
         app.editor.cursor_col = col;
-        app.completion_request_id = Some(id);
-        app.completion_origin = Some((0, col));
+        app.completion.request_id = Some(id);
+        app.completion.origin = Some((0, col));
     };
     let press = |app: &mut App, code| app.handle_key(key(code, KeyModifiers::NONE)).unwrap();
 
@@ -822,7 +822,7 @@ fn a_late_completion_reply_opens_only_while_the_caret_is_in_its_word() {
     press(&mut app, KeyCode::Enter);
     draw(&mut app, 100, 30);
     assert!(!app.apply_completion_result(reply(1)));
-    assert!(app.completion_popup.is_none(), "no popup on the next line");
+    assert!(app.completion.popup.is_none(), "no popup on the next line");
     press(&mut app, KeyCode::Enter);
     assert_eq!(
         app.editor.lines,
@@ -837,7 +837,7 @@ fn a_late_completion_reply_opens_only_while_the_caret_is_in_its_word() {
     draw(&mut app, 100, 30);
     assert!(app.apply_completion_result(reply(2)));
     assert_eq!(
-        app.completion_popup.take().map(|p| p.prefix),
+        app.completion.popup.take().map(|p| p.prefix),
         Some(String::from("loa"))
     );
 
@@ -851,7 +851,7 @@ fn a_late_completion_reply_opens_only_while_the_caret_is_in_its_word() {
     press(&mut app, KeyCode::Char(' '));
     draw(&mut app, 100, 30);
     assert!(!app.apply_completion_result(reply(4)));
-    assert!(app.completion_popup.is_none());
+    assert!(app.completion.popup.is_none());
 
     // A reply for another buffer never opens in this one.
     ask_at(&mut app, 5, 9);
@@ -859,7 +859,7 @@ fn a_late_completion_reply_opens_only_while_the_caret_is_in_its_word() {
         path: tmp.path().join("other.txt"),
         ..reply(5)
     }));
-    assert!(app.completion_popup.is_none());
+    assert!(app.completion.popup.is_none());
 }
 
 /// TypeScript on a possibly-undefined object: vtsls's member items replace
@@ -877,8 +877,8 @@ fn optional_members_survive_the_first_typed_letter() {
     app.focus_pane(Pane::Editor);
     app.editor.cursor_row = 0;
     app.editor.cursor_col = 6;
-    app.completion_request_id = Some(1);
-    app.completion_origin = Some((0, 6));
+    app.completion.request_id = Some(1);
+    app.completion.origin = Some((0, 6));
     draw(&mut app, 100, 30);
     let member = |name: &str| crate::lsp::CompletionItem {
         label: name.to_string(),
@@ -897,7 +897,7 @@ fn optional_members_survive_the_first_typed_letter() {
         path: path.clone(),
         items: vec![member("email"), member("name")],
     }));
-    let popup = app.completion_popup.as_ref().expect("the popup opens");
+    let popup = app.completion.popup.as_ref().expect("the popup opens");
     assert_eq!(
         popup.selected_item().map(|i| i.label.as_str()),
         Some("name"),
@@ -908,7 +908,8 @@ fn optional_members_survive_the_first_typed_letter() {
     app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE))
         .unwrap();
     let popup = app
-        .completion_popup
+        .completion
+        .popup
         .as_ref()
         .expect("still open after `na`");
     assert_eq!(popup.visible_indices().len(), 1);
@@ -916,7 +917,7 @@ fn optional_members_survive_the_first_typed_letter() {
         .unwrap();
     app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
         .unwrap();
-    let popup = app.completion_popup.as_ref().expect("still open after `.`");
+    let popup = app.completion.popup.as_ref().expect("still open after `.`");
     assert_eq!(popup.visible_indices().len(), 2);
     // Enter takes the server's edit: the `.` becomes `?.`.
     app.handle_key(key(KeyCode::Char('n'), KeyModifiers::NONE))
@@ -970,23 +971,24 @@ fn incomplete_reply(
 fn typing_into_an_incomplete_list_asks_the_server_again() {
     let (_tmp, path, mut app, tx) = completion_reply_app();
     app.trigger_completion();
-    let first = app.completion_request_id.expect("the ask went out");
+    let first = app.completion.request_id.expect("the ask went out");
     draw(&mut app, 100, 30);
     tx.send(incomplete_reply(first, &path, &["load"])).unwrap();
     assert!(app.drain_lsp_completion());
-    assert!(app.completion_popup.is_some());
+    assert!(app.completion.popup.is_some());
     app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
         .unwrap();
     sync_then_reask(&mut app);
     let again = app
-        .completion_request_id
+        .completion
+        .request_id
         .expect("an incomplete list keeps a request in flight");
     assert_ne!(again, first, "typing into an incomplete list re-asks");
     draw(&mut app, 100, 30);
     tx.send(incomplete_reply(again, &path, &["loxodrome"]))
         .unwrap();
     assert!(app.drain_lsp_completion());
-    let popup = app.completion_popup.as_ref().expect("the new list opens");
+    let popup = app.completion.popup.as_ref().expect("the new list opens");
     assert_eq!(popup.prefix, "lox");
     let labels: Vec<&str> = popup
         .visible_indices()
@@ -1002,7 +1004,7 @@ fn typing_into_an_incomplete_list_asks_the_server_again() {
 fn an_incomplete_list_keeps_its_matches_until_the_new_reply_lands() {
     let (_tmp, path, mut app, tx) = completion_reply_app();
     app.trigger_completion();
-    let first = app.completion_request_id.unwrap();
+    let first = app.completion.request_id.unwrap();
     draw(&mut app, 100, 30);
     tx.send(incomplete_reply(first, &path, &["load", "local"]))
         .unwrap();
@@ -1010,7 +1012,8 @@ fn an_incomplete_list_keeps_its_matches_until_the_new_reply_lands() {
     app.handle_key(key(KeyCode::Char('c'), KeyModifiers::NONE))
         .unwrap();
     let popup = app
-        .completion_popup
+        .completion
+        .popup
         .as_ref()
         .expect("`local` still matches");
     assert_eq!(popup.visible_indices().len(), 1);
@@ -1018,7 +1021,7 @@ fn an_incomplete_list_keeps_its_matches_until_the_new_reply_lands() {
     // The first ask answering late is dropped by id.
     tx.send(incomplete_reply(first, &path, &["stale"])).unwrap();
     assert!(!app.drain_lsp_completion());
-    let again = app.completion_request_id.unwrap();
+    let again = app.completion.request_id.unwrap();
     assert_ne!(again, first);
 }
 
@@ -1028,7 +1031,7 @@ fn an_incomplete_list_keeps_its_matches_until_the_new_reply_lands() {
 fn typing_into_a_complete_list_only_filters_it() {
     let (_tmp, path, mut app, tx) = completion_reply_app();
     app.trigger_completion();
-    let first = app.completion_request_id.unwrap();
+    let first = app.completion.request_id.unwrap();
     draw(&mut app, 100, 30);
     tx.send(completion_reply(first, &path, &["load", "local"]))
         .unwrap();
@@ -1036,12 +1039,12 @@ fn typing_into_a_complete_list_only_filters_it() {
     app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE))
         .unwrap();
     sync_then_reask(&mut app);
-    assert_eq!(app.completion_request_id, Some(first), "no re-ask");
-    assert!(app.completion_popup.is_some());
+    assert_eq!(app.completion.request_id, Some(first), "no re-ask");
+    assert!(app.completion.popup.is_some());
     app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
         .unwrap();
-    assert!(app.completion_popup.is_none(), "nothing matches `loax`");
-    assert_eq!(app.completion_request_id, None);
+    assert!(app.completion.popup.is_none(), "nothing matches `loax`");
+    assert_eq!(app.completion.request_id, None);
 }
 
 /// #1529 negative: leaving the word (a space) ends an incomplete list's
@@ -1050,15 +1053,15 @@ fn typing_into_a_complete_list_only_filters_it() {
 fn leaving_the_word_ends_an_incomplete_list() {
     let (_tmp, path, mut app, tx) = completion_reply_app();
     app.trigger_completion();
-    let first = app.completion_request_id.unwrap();
+    let first = app.completion.request_id.unwrap();
     draw(&mut app, 100, 30);
     tx.send(incomplete_reply(first, &path, &["load"])).unwrap();
     app.drain_lsp_completion();
     app.handle_key(key(KeyCode::Char(' '), KeyModifiers::NONE))
         .unwrap();
     sync_then_reask(&mut app);
-    assert!(app.completion_popup.is_none());
-    assert_eq!(app.completion_request_id, None);
+    assert!(app.completion.popup.is_none());
+    assert_eq!(app.completion.request_id, None);
 }
 
 /// One event-loop tick's LSP steps: the edit's `didChange`, then the re-ask
@@ -1075,27 +1078,27 @@ fn sync_then_reask(app: &mut App) {
 fn an_emptied_incomplete_list_still_re_asks_on_the_next_keystroke() {
     let (_tmp, path, mut app, tx) = completion_reply_app();
     app.trigger_completion();
-    let first = app.completion_request_id.unwrap();
+    let first = app.completion.request_id.unwrap();
     draw(&mut app, 100, 30);
     tx.send(incomplete_reply(first, &path, &["load", "local"]))
         .unwrap();
     app.drain_lsp_completion();
     app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
         .unwrap();
-    assert!(app.completion_popup.is_none(), "nothing matches `lox`");
+    assert!(app.completion.popup.is_none(), "nothing matches `lox`");
     sync_then_reask(&mut app);
-    let second = app.completion_request_id.expect("re-asked for `lox`");
+    let second = app.completion.request_id.expect("re-asked for `lox`");
     assert_ne!(second, first);
     app.handle_key(key(KeyCode::Char('o'), KeyModifiers::NONE))
         .unwrap();
     sync_then_reask(&mut app);
-    let third = app.completion_request_id.expect("re-asked for `loxo`");
+    let third = app.completion.request_id.expect("re-asked for `loxo`");
     assert_ne!(third, second, "a keystroke with no popup still re-asks");
     draw(&mut app, 100, 30);
     tx.send(incomplete_reply(third, &path, &["loxodrome"]))
         .unwrap();
     assert!(app.drain_lsp_completion());
-    let popup = app.completion_popup.as_ref().expect("the new list opens");
+    let popup = app.completion.popup.as_ref().expect("the new list opens");
     assert_eq!(popup.prefix, "loxo");
 }
 
@@ -1105,7 +1108,7 @@ fn an_emptied_incomplete_list_still_re_asks_on_the_next_keystroke() {
 fn an_incomplete_re_ask_waits_until_the_edit_is_synced() {
     let (_tmp, path, mut app, tx) = completion_reply_app();
     app.trigger_completion();
-    let first = app.completion_request_id.unwrap();
+    let first = app.completion.request_id.unwrap();
     draw(&mut app, 100, 30);
     tx.send(incomplete_reply(first, &path, &["load"])).unwrap();
     app.drain_lsp_completion();
@@ -1114,16 +1117,16 @@ fn an_incomplete_re_ask_waits_until_the_edit_is_synced() {
     app.handle_key(key(KeyCode::Char('o'), KeyModifiers::NONE))
         .unwrap();
     assert_eq!(
-        app.completion_request_id,
+        app.completion.request_id,
         Some(first),
         "no request goes out from the key handler"
     );
     app.send_due_completion_reask();
-    let again = app.completion_request_id.unwrap();
+    let again = app.completion.request_id.unwrap();
     assert_ne!(again, first, "one re-ask covers both keystrokes");
     app.send_due_completion_reask();
     assert_eq!(
-        app.completion_request_id,
+        app.completion.request_id,
         Some(again),
         "nothing more is due"
     );
@@ -1141,7 +1144,7 @@ fn typing_completion_app(text: &str, triggers: &str) -> (tempfile::TempDir, App)
 
 /// What a typed key left due to ask, if anything (#929).
 fn due_ask(app: &App) -> Option<CompletionTrigger> {
-    app.completion_ask_due.as_ref().map(|(trigger, _)| *trigger)
+    app.completion.ask_due.as_ref().map(|(trigger, _)| *trigger)
 }
 
 /// #929: the first letter of a word asks for completions, as VS Code's
@@ -1154,10 +1157,10 @@ fn a_word_begun_in_code_opens_completion_as_it_is_typed() {
     let path = app.editor.path.clone().unwrap();
     type_keys(&mut app, "p");
     assert_eq!(due_ask(&app), Some(CompletionTrigger::Invoked));
-    assert_eq!(app.completion_request_id, None, "asked after the sync");
+    assert_eq!(app.completion.request_id, None, "asked after the sync");
     type_keys(&mut app, "ri");
     app.send_due_completion_ask();
-    let id = app.completion_request_id.expect("one ask for the word");
+    let id = app.completion.request_id.expect("one ask for the word");
     app.apply_completion_result(completion_reply(id, &path, &["print", "property"]));
     assert_eq!(popup_labels(&app), ["print"]);
     type_keys(&mut app, "n");
@@ -1166,7 +1169,7 @@ fn a_word_begun_in_code_opens_completion_as_it_is_typed() {
         .unwrap();
     type_keys(&mut app, "t");
     assert_eq!(
-        (due_ask(&app), app.completion_popup.is_none()),
+        (due_ask(&app), app.completion.popup.is_none()),
         (None, true)
     );
 }
@@ -1203,15 +1206,15 @@ fn the_server_s_trigger_characters_open_completion() {
     let (_tmp, mut app) = typing_completion_app("import os", ".");
     let path = app.editor.path.clone().unwrap();
     app.trigger_completion();
-    let id = app.completion_request_id.unwrap();
+    let id = app.completion.request_id.unwrap();
     app.apply_completion_result(completion_reply(id, &path, &["os"]));
     type_keys(&mut app, ".");
     assert_eq!(due_ask(&app), Some(CompletionTrigger::Character('.')));
     app.send_due_completion_ask();
-    let id = app.completion_request_id.expect("the trigger asked");
+    let id = app.completion.request_id.expect("the trigger asked");
     type_keys(&mut app, "zz");
     app.apply_completion_result(completion_reply(id, &path, &["path"]));
-    assert!(app.completion_popup.is_none());
+    assert!(app.completion.popup.is_none());
     assert!(
         !app.status.contains("No completions match"),
         "{}",
@@ -1221,7 +1224,7 @@ fn the_server_s_trigger_characters_open_completion() {
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     app.send_due_completion_ask();
-    assert_eq!(app.completion_request_id, None, "the caret left the line");
+    assert_eq!(app.completion.request_id, None, "the caret left the line");
 
     let (_tmp, mut app) = typing_completion_app("x = os", "/");
     type_keys(&mut app, ".");
@@ -1270,7 +1273,7 @@ fn word_completion_app(files: &[(&str, &str)]) -> (tempfile::TempDir, App) {
 }
 
 fn popup_labels(app: &App) -> Vec<String> {
-    app.completion_popup.as_ref().map_or_else(Vec::new, |p| {
+    app.completion.popup.as_ref().map_or_else(Vec::new, |p| {
         p.visible_indices()
             .into_iter()
             .map(|i| p.items[i].label.clone())
@@ -1348,7 +1351,7 @@ fn word_suggestions_draw_on_the_open_documents_the_setting_names() {
     ]);
     let mut offered = |mode| {
         app.word_suggestions = mode;
-        app.completion_popup = None;
+        app.completion.popup = None;
         app.trigger_completion();
         popup_labels(&app)
     };
@@ -1394,7 +1397,7 @@ fn with_word_suggestions_off_ctrl_space_offers_nothing() {
     let (_tmp, mut app) = word_completion_app(&[("notes.txt", "configuration loader\nconfigu")]);
     app.word_suggestions = crate::word_suggest::WordSuggestions::Off;
     app.trigger_completion();
-    assert!(app.completion_popup.is_none());
+    assert!(app.completion.popup.is_none());
     assert_ne!(app.status, "No suggestions");
 }
 
@@ -1402,7 +1405,7 @@ fn with_word_suggestions_off_ctrl_space_offers_nothing() {
 fn ctrl_space_with_no_word_to_offer_says_so() {
     let (_tmp, mut app) = word_completion_app(&[("notes.txt", "alpha\nzz")]);
     app.trigger_completion();
-    assert!(app.completion_popup.is_none());
+    assert!(app.completion.popup.is_none());
     assert_eq!(app.status, "No suggestions");
 }
 
@@ -1413,7 +1416,7 @@ fn a_typed_full_stop_does_not_open_the_word_list() {
     let (_tmp, mut app) = word_completion_app(&[("notes.txt", "configuration\nconfig")]);
     app.handle_key(key(KeyCode::Char('.'), KeyModifiers::NONE))
         .unwrap();
-    assert!(app.completion_popup.is_none());
+    assert!(app.completion.popup.is_none());
     assert_eq!(app.editor.lines[1], "config.");
 }
 
@@ -1426,10 +1429,10 @@ fn a_server_s_own_items_are_not_mixed_with_words() {
     lsp.set_document_servers_for_test(&path, &["srv"]);
     app.trigger_completion();
     assert!(
-        app.completion_popup.is_none(),
+        app.completion.popup.is_none(),
         "a file a server has waits for the server's answer"
     );
-    let id = app.completion_request_id.expect("the server was asked");
+    let id = app.completion.request_id.expect("the server was asked");
     tx.send(completion_reply(id, &path, &["load_from_server"]))
         .unwrap();
     assert!(app.drain_lsp_completion());
@@ -1444,7 +1447,7 @@ fn a_server_with_nothing_to_offer_leaves_the_words() {
     let tx = lsp.completion_reply_sender_for_test();
     lsp.set_document_servers_for_test(&path, &["srv"]);
     app.trigger_completion();
-    let id = app.completion_request_id.unwrap();
+    let id = app.completion.request_id.unwrap();
     tx.send(completion_reply(id, &path, &[])).unwrap();
     assert!(app.drain_lsp_completion());
     assert_eq!(popup_labels(&app), ["load_words"]);
@@ -1462,10 +1465,10 @@ fn a_late_server_list_replaces_the_words_and_an_empty_one_keeps_them() {
     assert_eq!(popup_labels(&app), ["load_a", "load_b"]);
     app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
         .unwrap();
-    let id = app.completion_request_id.unwrap();
+    let id = app.completion.request_id.unwrap();
     tx.send(completion_reply(id, &path, &[])).unwrap();
     app.drain_lsp_completion();
-    assert_eq!(app.completion_popup.as_ref().unwrap().selected, 1);
+    assert_eq!(app.completion.popup.as_ref().unwrap().selected, 1);
     tx.send(completion_reply(id, &path, &["load_server"]))
         .unwrap();
     assert!(app.drain_lsp_completion());
@@ -1480,14 +1483,14 @@ fn a_late_server_list_replaces_the_words_and_an_empty_one_keeps_them() {
 fn a_completion_reply_landing_after_enter_leaves_the_next_enter_to_break_the_line() {
     let (_tmp, path, mut app, tx) = completion_reply_app();
     app.trigger_completion();
-    let id = app.completion_request_id.expect("the ask went out");
+    let id = app.completion.request_id.expect("the ask went out");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     draw(&mut app, 100, 30);
     tx.send(completion_reply(id, &path, &["load"])).unwrap();
     app.drain_lsp_completion();
     assert!(
-        app.completion_popup.is_none(),
+        app.completion.popup.is_none(),
         "a reply for the word left behind opened on the next line"
     );
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
@@ -1506,12 +1509,12 @@ fn a_completion_reply_landing_after_enter_leaves_the_next_enter_to_break_the_lin
 fn a_completion_reply_with_the_caret_where_it_was_asked_still_opens() {
     let (_tmp, path, mut app, tx) = completion_reply_app();
     app.trigger_completion();
-    let id = app.completion_request_id.expect("the ask went out");
+    let id = app.completion.request_id.expect("the ask went out");
     draw(&mut app, 100, 30);
     tx.send(completion_reply(id, &path, &["load"])).unwrap();
     assert!(app.drain_lsp_completion());
     assert_eq!(
-        app.completion_popup.as_ref().map(|p| p.prefix.as_str()),
+        app.completion.popup.as_ref().map(|p| p.prefix.as_str()),
         Some("lo")
     );
 }
@@ -1523,7 +1526,7 @@ fn a_completion_reply_with_the_caret_where_it_was_asked_still_opens() {
 fn a_completion_reply_still_opens_after_non_ascii_word_chars_typed_since() {
     let (_tmp, path, mut app, tx) = completion_reply_app();
     app.trigger_completion();
-    let id = app.completion_request_id.expect("the ask went out");
+    let id = app.completion.request_id.expect("the ask went out");
     for c in ['ö', '_'] {
         app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
             .unwrap();
@@ -1533,7 +1536,7 @@ fn a_completion_reply_still_opens_after_non_ascii_word_chars_typed_since() {
         .unwrap();
     assert!(app.drain_lsp_completion());
     assert_eq!(
-        app.completion_popup.as_ref().map(|p| p.prefix.as_str()),
+        app.completion.popup.as_ref().map(|p| p.prefix.as_str()),
         Some("loö_")
     );
 }
@@ -1546,16 +1549,17 @@ fn a_completion_reply_still_opens_after_non_ascii_word_chars_typed_since() {
 fn a_stale_completion_reply_does_not_cancel_the_pending_one() {
     let (_tmp, path, mut app, tx) = completion_reply_app();
     app.trigger_completion();
-    let stale = app.completion_request_id.expect("the first ask went out");
+    let stale = app.completion.request_id.expect("the first ask went out");
     app.trigger_completion();
-    let fresh = app.completion_request_id.expect("the second ask went out");
+    let fresh = app.completion.request_id.expect("the second ask went out");
     assert_ne!(stale, fresh);
     draw(&mut app, 100, 30);
     tx.send(completion_reply(stale, &path, &["lost"])).unwrap();
     tx.send(completion_reply(fresh, &path, &["load"])).unwrap();
     assert!(app.drain_lsp_completion());
     let popup = app
-        .completion_popup
+        .completion
+        .popup
         .as_ref()
         .expect("the fresh reply opens");
     assert_eq!(popup.request_id, fresh);
@@ -1692,17 +1696,17 @@ fn an_accepted_completion_resolves_its_auto_import() {
     let accept = || {
         let (tmp, path, mut app, tx) = completion_reply_app();
         app.trigger_completion();
-        let request_id = app.completion_request_id.unwrap();
+        let request_id = app.completion.request_id.unwrap();
         draw(&mut app, 100, 30);
         tx.send(completion_reply(request_id, &path, &["load"]))
             .unwrap();
         app.drain_lsp_completion();
-        let popup = app.completion_popup.as_mut().expect("the list opens");
+        let popup = app.completion.popup.as_mut().expect("the list opens");
         popup.items[0].resolve = Some(std::sync::Arc::default());
         app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
         assert_eq!(app.editor.lines, ["import load"]);
-        let pending = app.completion_resolve.as_ref().expect("a resolve went out");
+        let pending = app.completion.resolve.as_ref().expect("a resolve went out");
         let mut reply = completion_reply(pending.request_id, &path, &["load"]);
         reply.items[0].additional_edits = vec![crate::widgets::editor::TextSpanEdit {
             start: (0, 0),
@@ -1750,17 +1754,17 @@ fn a_completion_accepted_in_a_vim_change_undoes_with_it() {
         app.vim.enabled = true;
         type_char(&mut app, 'A');
         app.trigger_completion();
-        let request_id = app.completion_request_id.unwrap();
+        let request_id = app.completion.request_id.unwrap();
         draw(&mut app, 100, 30);
         tx.send(completion_reply(request_id, &path, &["load"]))
             .unwrap();
         app.drain_lsp_completion();
-        let popup = app.completion_popup.as_mut().expect("the list opens");
+        let popup = app.completion.popup.as_mut().expect("the list opens");
         popup.items[0].resolve = Some(std::sync::Arc::default());
         app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
         type_char(&mut app, ';');
-        let pending = app.completion_resolve.as_ref().expect("a resolve went out");
+        let pending = app.completion.resolve.as_ref().expect("a resolve went out");
         let mut reply = completion_reply(pending.request_id, &path, &["load"]);
         reply.items[0].additional_edits = vec![crate::widgets::editor::TextSpanEdit {
             start: (0, 0),
@@ -1821,12 +1825,12 @@ fn a_completion_accepted_in_a_vim_change_undoes_with_it() {
 fn a_resolved_import_moves_a_live_snippet_and_undoes_with_it() {
     let (_tmp, path, mut app, tx) = completion_reply_app();
     app.trigger_completion();
-    let request_id = app.completion_request_id.unwrap();
+    let request_id = app.completion.request_id.unwrap();
     draw(&mut app, 100, 30);
     tx.send(completion_reply(request_id, &path, &["load"]))
         .unwrap();
     app.drain_lsp_completion();
-    let popup = app.completion_popup.as_mut().expect("the list opens");
+    let popup = app.completion.popup.as_mut().expect("the list opens");
     let item = &mut popup.items[0];
     item.resolve = Some(std::sync::Arc::default());
     item.is_snippet = true;
@@ -1839,7 +1843,7 @@ fn a_resolved_import_moves_a_live_snippet_and_undoes_with_it() {
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     assert_eq!(app.editor.lines, ["import load(a, b)"]);
-    let pending = app.completion_resolve.as_ref().expect("a resolve went out");
+    let pending = app.completion.resolve.as_ref().expect("a resolve went out");
     let mut reply = completion_reply(pending.request_id, &path, &["load"]);
     let import = "from shelf import load";
     reply.items[0].additional_edits = vec![crate::widgets::editor::TextSpanEdit {
@@ -2427,7 +2431,7 @@ fn accepting_a_snippet_completion_expands_it_with_tab_stops() {
         body: "console.log($1)".into(),
         scope: vec![],
     });
-    app.completion_popup = Some(crate::widgets::completion_popup::CompletionPopup::new(
+    app.completion.popup = Some(crate::widgets::completion_popup::CompletionPopup::new(
         vec![item],
         "log".into(),
         (0, 0),
@@ -5594,9 +5598,9 @@ fn accepting_a_reasked_completion_does_not_swallow_what_follows_the_word() {
     // The session began at `f(P|`; the last re-ask went out at `f(PRE|`.
     app.editor.cursor_row = 0;
     app.editor.cursor_col = 5;
-    app.completion_origin = Some((0, 3));
-    app.completion_ask_pos = Some((0, 5));
-    app.completion_request_id = Some(7);
+    app.completion.origin = Some((0, 3));
+    app.completion.ask_pos = Some((0, 5));
+    app.completion.request_id = Some(7);
     let item = crate::lsp::CompletionItem {
         label: String::from("PRESS"),
         text_edit: Some(TextSpanEdit {
@@ -5636,10 +5640,10 @@ fn an_older_reply_shown_during_a_reask_still_shifts_from_its_own_request() {
     // and a re-ask for the word as it is now is still in flight.
     app.editor.cursor_row = 0;
     app.editor.cursor_col = 4;
-    app.completion_origin = Some((0, 3));
-    app.completion_ask_pos = Some((0, 4));
-    app.completion_request_id = Some(3);
-    app.completion_items_pos = Some((0, 4));
+    app.completion.origin = Some((0, 3));
+    app.completion.ask_pos = Some((0, 4));
+    app.completion.request_id = Some(3);
+    app.completion.items_pos = Some((0, 4));
     let item = crate::lsp::CompletionItem {
         label: String::from("PRESS"),
         text_edit: Some(TextSpanEdit {
@@ -5682,9 +5686,9 @@ fn a_reask_reply_that_installs_no_popup_keeps_the_shown_items_request_point() {
     // The shown reply was for `f(PR|`.
     app.editor.cursor_row = 0;
     app.editor.cursor_col = 4;
-    app.completion_origin = Some((0, 3));
-    app.completion_ask_pos = Some((0, 4));
-    app.completion_request_id = Some(3);
+    app.completion.origin = Some((0, 3));
+    app.completion.ask_pos = Some((0, 4));
+    app.completion.request_id = Some(3);
     let item = crate::lsp::CompletionItem {
         label: String::from("PRESS"),
         text_edit: Some(TextSpanEdit {
@@ -5704,8 +5708,8 @@ fn a_reask_reply_that_installs_no_popup_keeps_the_shown_items_request_point() {
     // A Backspace, and the re-ask it sent from `f(P|`.
     app.editor.lines[0] = String::from("f(P) {");
     app.editor.cursor_col = 3;
-    app.completion_ask_pos = Some((0, 3));
-    app.completion_request_id = Some(4);
+    app.completion.ask_pos = Some((0, 3));
+    app.completion.request_id = Some(4);
     // Its reply lands while the caret is out of view: no new popup.
     app.editor.scroll = 5;
     let newer = crate::lsp::CompletionItem {
@@ -5719,7 +5723,7 @@ fn a_reask_reply_that_installs_no_popup_keeps_the_shown_items_request_point() {
         items: vec![newer],
     }));
     app.editor.scroll = 0;
-    assert!(app.completion_popup.is_some(), "the older items stay open");
+    assert!(app.completion.popup.is_some(), "the older items stay open");
     app.handle_completion_popup_key(key(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(app.editor.lines[0], "f(PRESS) {", "the `)` stays");
 }

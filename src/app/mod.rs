@@ -2673,52 +2673,11 @@ pub struct App {
     /// Dropping one answers the server "no action".
     lsp_questions: std::collections::VecDeque<LspQuestion>,
     lsp_question: Option<LspQuestion>,
-    /// Active completion popup, when a completion request has been issued
-    /// and the user hasn't dismissed the result. Populated by drain_lsp_completion
-    /// once the worker sends a CompletionResult back.
-    pub completion_popup: Option<crate::widgets::completion_popup::CompletionPopup>,
-    /// Most recent completion request id; later responses with a stale
-    /// id are dropped so a slow earlier response cannot clobber a fresh
-    /// one (e.g. user already moved past the original trigger).
-    completion_request_id: Option<u64>,
-    /// Where the caret was (row, char column) when the pending completion was
-    /// requested: the server's edit ranges describe the line then, and the
-    /// accept shifts them by what was typed or deleted since.
-    completion_origin: Option<(usize, usize)>,
-    /// The caret position the latest completion request was sent at. Unlike
-    /// `completion_origin` (the session's anchor, kept across re-asks so the
-    /// reply still opens in the word) it moves with every re-ask, because a
-    /// server's ranges describe the line at that very point.
-    completion_ask_pos: Option<(usize, usize)>,
-    /// The request position of the reply the open popup's items came from:
-    /// what an accepted item's ranges are shifted from.
-    completion_items_pos: Option<(usize, usize)>,
-    /// The pending completion's last reply was marked `isIncomplete` (#1529):
-    /// each word edit re-asks the server, whether or not any of its old items
-    /// are still on screen. Lives only while `completion_request_id` does.
-    completion_incomplete: bool,
-    /// A word edit in an incomplete session is waiting to re-ask the server;
-    /// sent after `sync_lsp` so the request follows the edit's `didChange`.
-    completion_reask_due: bool,
-    /// A typed key that opens completion (#929) in the file it was typed
-    /// in, waiting like the re-ask: a trigger character or a word begun.
-    completion_ask_due: Option<(CompletionTrigger, PathBuf)>,
-    /// The pending completion was asked for, not opened by typing (#929):
-    /// only then does a reply with nothing matching the word say so.
-    completion_explicit: bool,
+    /// Code completion's popup, request, re-asks and resolve
+    /// (see [`completion::CompletionState`]).
+    completion: completion::CompletionState,
     /// `disable_quick_suggestions` unset: a word begun opens completion.
     quick_suggestions: bool,
-    /// The pending completion was asked for (Ctrl+Space), so the words of
-    /// the open documents fill in when no server offers anything (#1566).
-    /// A `.` typed asks the server alone: a word list there would open on
-    /// every full stop of a plain-text note.
-    completion_words: bool,
-    /// Ids for completions answered here rather than by a server (#1566),
-    /// counting down from the top so they never meet the manager's.
-    local_completion_seq: u64,
-    /// The last accepted completion, while its server resolves the
-    /// auto-import it left out of the list (#928).
-    completion_resolve: Option<PendingCompletionResolve>,
     /// `word_based_suggestions`: which open documents word completion
     /// draws on (#1566).
     pub word_suggestions: crate::word_suggest::WordSuggestions,
@@ -4315,7 +4274,7 @@ impl App {
             lsp_progress: std::collections::HashMap::new(),
             lsp_questions: std::collections::VecDeque::new(),
             lsp_question: None,
-            completion_popup: None,
+            completion: completion::CompletionState::new(),
             editor_vim_chord: EditorVimChord::default(),
             cmd_k_leader: None,
             cmd_k_miss_note: None,
@@ -4484,18 +4443,7 @@ impl App {
             file_finder_index: None,
             file_finder_index_job,
             file_finder_index_dirty: false,
-            completion_request_id: None,
-            completion_origin: None,
-            completion_ask_pos: None,
-            completion_items_pos: None,
-            completion_incomplete: false,
-            completion_reask_due: false,
-            completion_ask_due: None,
-            completion_explicit: false,
             quick_suggestions: !loaded_prefs.disable_quick_suggestions,
-            completion_words: false,
-            local_completion_seq: u64::MAX,
-            completion_resolve: None,
             word_suggestions: crate::word_suggest::WordSuggestions::from_pref(
                 &loaded_prefs.word_based_suggestions,
             ),
