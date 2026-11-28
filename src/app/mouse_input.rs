@@ -4,6 +4,47 @@
 use super::*;
 use crate::widgets::source_control::KeyStop;
 
+/// The editor's word hover: the pointer's dwell, the open popup, the
+/// request in flight and the word, document and screen cell it was asked
+/// about, the diagnostic block shown above the reply, and whether the
+/// keyboard asked for it at the caret.
+pub(super) struct HoverState {
+    pub(super) dwell: HoverDwell,
+    pub(super) popup: Option<crate::widgets::hover_popup::HoverPopup>,
+    pub(super) request_id: Option<u64>,
+    pub(super) anchor: Option<(u16, u16)>,
+    pub(super) word: Option<(usize, usize, usize)>,
+    /// Diagnostic block for the point a hover is anchored to, captured
+    /// synchronously when the dwell fires (server diagnostics already live in
+    /// the editor). Stacked above the async LSP hover reply by `compose_hover`
+    /// so a squiggle's message shows even when the server returns no type info.
+    pub(super) diagnostic: Option<String>,
+    /// Set when the keyboard asked for the hover at the caret (#1518), not
+    /// the pointer's rest: its reply is checked against the caret, and says
+    /// there is no hover only over the status line this holds, the one shown
+    /// at the request, so a newer message is not replaced.
+    pub(super) at_caret: Option<String>,
+    /// The tab and edit count the hover was asked about: a reply after
+    /// either changed (a paste over the word keeps its span) is dropped.
+    pub(super) doc: (Option<PathBuf>, u64),
+}
+
+impl HoverState {
+    /// No dwell, popup or request yet.
+    pub(super) fn new() -> Self {
+        Self {
+            dwell: HoverDwell::default(),
+            popup: None,
+            request_id: None,
+            anchor: None,
+            word: None,
+            diagnostic: None,
+            at_caret: None,
+            doc: (None, 0),
+        }
+    }
+}
+
 impl App {
     /// [`Self::ui_tooltip_at`], plus the hints whose text is what sits under
     /// the pointer rather than a control's name: a Search result row shows
@@ -215,11 +256,12 @@ impl App {
     pub(super) fn on_mouse_moved(&mut self, col: u16, row: u16, in_editor: bool) {
         // Crossing onto the hover keeps it, so the wheel can reach it.
         if self
-            .hover_popup
+            .hover
+            .popup
             .as_ref()
             .is_some_and(|p| rect_contains(p.last_area, col, row))
         {
-            self.hover.clear();
+            self.hover.dwell.clear();
             return;
         }
         // Activity-bar hover: brighten the icon under the pointer. Re-emit the
@@ -281,11 +323,11 @@ impl App {
         // tab, so the tooltip keeps showing while the pointer drifts a few
         // cells within the same tab (matches the LSP "same word" rule).
         if let Some(idx) = self.editor.tab_at(col, row) {
-            self.hover.clear();
-            self.hover_popup = None;
-            self.hover_word = None;
-            self.hover_diagnostic = None;
-            self.hover_request_id = None;
+            self.hover.dwell.clear();
+            self.hover.popup = None;
+            self.hover.word = None;
+            self.hover.diagnostic = None;
+            self.hover.request_id = None;
             if self.tab_hover_idx != Some(idx) {
                 self.tab_hover.on_move(std::time::Instant::now(), col, row);
                 self.tab_hover_idx = Some(idx);
@@ -297,25 +339,28 @@ impl App {
         self.tab_tooltip = None;
         self.tab_hover_idx = None;
         if !in_editor {
-            self.hover.clear();
+            self.hover.dwell.clear();
             // A terminal-annotation note survives pointer drift while the
             // pointer stays on its own span (the editor's same-region rule);
             // leaving the span dismisses it. Matching the popup's text to
             // the span's note keeps a stale editor hover from hiding here.
             let over_own_note = self
-                .hover_popup
+                .hover
+                .popup
                 .as_ref()
                 .zip(self.terminal().annotation_at(col, row))
                 .is_some_and(|(popup, (_, note))| popup.lines.join("\n") == note);
             if !over_own_note {
-                self.hover_popup = None;
+                self.hover.popup = None;
             }
-            self.hover_word = None;
-            self.hover_diagnostic = None;
-            self.hover_request_id = None;
+            self.hover.word = None;
+            self.hover.diagnostic = None;
+            self.hover.request_id = None;
             return;
         }
-        self.hover.on_move(std::time::Instant::now(), col, row);
+        self.hover
+            .dwell
+            .on_move(std::time::Instant::now(), col, row);
         // The blame card (#1556) belongs to the annotation of its commit,
         // not to a word: it stays while the pointer moves along that and
         // goes when the pointer leaves it.
@@ -324,34 +369,34 @@ impl App {
                 return;
             }
             self.blame_hover = None;
-            self.hover_popup = None;
+            self.hover.popup = None;
         }
-        if self.hover_popup.is_some() {
+        if self.hover.popup.is_some() {
             let current = self
                 .editor
                 .buffer_pos_at(col, row)
                 .and_then(|(line, c)| self.editor.hover_region_at(line, c));
-            if current != self.hover_word {
-                self.hover_popup = None;
-                self.hover_word = None;
-                self.hover_diagnostic = None;
-                self.hover_request_id = None;
+            if current != self.hover.word {
+                self.hover.popup = None;
+                self.hover.word = None;
+                self.hover.diagnostic = None;
+                self.hover.request_id = None;
             }
         }
     }
 
     pub(super) fn poll_hover(&mut self) {
-        if !self.hover.due(std::time::Instant::now(), HOVER_DELAY) {
+        if !self.hover.dwell.due(std::time::Instant::now(), HOVER_DELAY) {
             return;
         }
-        self.hover.mark_fired();
+        self.hover.dwell.mark_fired();
         if self.completion.popup.is_some() {
             return;
         }
         if self.editor.has_non_text_view() {
             return;
         }
-        let Some((col, row)) = self.hover.cell() else {
+        let Some((col, row)) = self.hover.dwell.cell() else {
             return;
         };
         self.hover_at_cell(col, row);
@@ -376,18 +421,18 @@ impl App {
     /// for the caret, anchored at the caret's cell. Says so when there is
     /// nothing to show, where the pointer's hover stays silent.
     pub(super) fn show_hover_at_caret(&mut self) {
-        self.hover_popup = None;
-        self.hover_diagnostic = None;
-        self.hover_request_id = None;
+        self.hover.popup = None;
+        self.hover.diagnostic = None;
+        self.hover.request_id = None;
         // A pointer that came to rest just before the command would fire its
         // own hover next frame and take this one's place.
-        self.hover.clear();
+        self.hover.dwell.clear();
         let Some(anchor) = self.editor.cursor_screen_pos() else {
             return;
         };
         let (line, c) = self.caret_hover_point();
         self.hover_at(line, c, anchor, true);
-        if self.hover_popup.is_none() && self.hover_request_id.is_none() {
+        if self.hover.popup.is_none() && self.hover.request_id.is_none() {
             self.status = String::from(NO_HOVER_AT_CARET);
         }
     }
@@ -415,18 +460,18 @@ impl App {
         let Some(region) = self.editor.hover_region_at(line, c) else {
             return;
         };
-        self.hover_anchor = Some((col, row));
-        self.hover_word = Some(region);
-        self.hover_at_caret = at_caret.then(|| self.status.clone());
-        self.hover_doc = (self.editor.path.clone(), self.editor.edit_seq);
+        self.hover.anchor = Some((col, row));
+        self.hover.word = Some(region);
+        self.hover.at_caret = at_caret.then(|| self.status.clone());
+        self.hover.doc = (self.editor.path.clone(), self.editor.edit_seq);
         // Debug hover-to-evaluate: while paused, hovering a variable shows its
         // current value (from the loaded locals/globals) instead of the LSP
         // type hover. Takes priority because the live value is what the user
         // wants mid-debug.
         if let Some(text) = self.debug_hover_value(line, c) {
-            self.hover_request_id = None;
-            self.hover_diagnostic = None;
-            self.hover_popup = Some(crate::widgets::hover_popup::HoverPopup::new(
+            self.hover.request_id = None;
+            self.hover.diagnostic = None;
+            self.hover.popup = Some(crate::widgets::hover_popup::HoverPopup::new(
                 text,
                 (col, row),
             ));
@@ -435,7 +480,7 @@ impl App {
         // Server diagnostics are already in the editor, so capture the
         // message synchronously; the squiggle's message must show even if the
         // server has no type info (or no LSP is attached at all).
-        self.hover_diagnostic =
+        self.hover.diagnostic =
             format_diagnostics(&self.editor.diagnostics_at(line, c, self.workspace_root()));
         // Only a real word is worth a `textDocument/hover` round-trip; over
         // punctuation there is no symbol to describe, so show the diagnostic
@@ -447,11 +492,11 @@ impl App {
         match (word, self.editor.path.clone(), self.lsp.as_mut()) {
             (true, Some(path), Some(lsp)) => {
                 let id = lsp.request_hover(path, uline, uchar);
-                self.hover_request_id = Some(id);
+                self.hover.request_id = Some(id);
             }
             _ => {
-                self.hover_request_id = None;
-                self.hover_popup = compose_hover(self.hover_diagnostic.as_deref(), None)
+                self.hover.request_id = None;
+                self.hover.popup = compose_hover(self.hover.diagnostic.as_deref(), None)
                     .map(|text| crate::widgets::hover_popup::HoverPopup::new(text, (col, row)));
             }
         }
@@ -491,35 +536,36 @@ impl App {
         };
         let mut changed = false;
         while let Some(result) = lsp.drain_hover() {
-            if Some(result.request_id) != self.hover_request_id {
+            if Some(result.request_id) != self.hover.request_id {
                 continue;
             }
-            if self.hover_doc.0 != self.editor.path || self.hover_doc.1 != self.editor.edit_seq {
+            if self.hover.doc.0 != self.editor.path || self.hover.doc.1 != self.editor.edit_seq {
                 continue;
             }
             // A keyboard hover belongs to the caret (#1518), a dwell's to the
             // pointer; either may have moved off the word since the request.
-            let current = if self.hover_at_caret.is_some() {
+            let current = if self.hover.at_caret.is_some() {
                 let (line, ch) = self.caret_hover_point();
                 self.editor.hover_region_at(line, ch)
             } else {
                 self.hover
+                    .dwell
                     .cell()
                     .and_then(|(c, r)| self.editor.buffer_pos_at(c, r))
                     .and_then(|(line, ch)| self.editor.hover_region_at(line, ch))
             };
-            if current != self.hover_word {
+            if current != self.hover.word {
                 continue;
             }
             // Diagnostic on top, type info below (VS Code PR #166560). Either
             // side may be empty; an all-empty compose hides the popup.
-            let anchor = self.hover_anchor.unwrap_or((0, 0));
+            let anchor = self.hover.anchor.unwrap_or((0, 0));
             // The server's part is about a symbol in this file's language,
             // which a `surfaces` card lays out as path, signature and docs.
             let lang = self.editor.language();
             let symbol = result.text.is_some();
-            self.hover_popup =
-                compose_hover(self.hover_diagnostic.as_deref(), result.text.as_deref()).map(
+            self.hover.popup =
+                compose_hover(self.hover.diagnostic.as_deref(), result.text.as_deref()).map(
                     |text| {
                         let popup = crate::widgets::hover_popup::HoverPopup::new(text, anchor);
                         if symbol {
@@ -529,7 +575,7 @@ impl App {
                         }
                     },
                 );
-            if self.hover_popup.is_none() && self.hover_at_caret.as_ref() == Some(&self.status) {
+            if self.hover.popup.is_none() && self.hover.at_caret.as_ref() == Some(&self.status) {
                 self.status = String::from(NO_HOVER_AT_CARET);
             }
             changed = true;
@@ -547,8 +593,8 @@ impl App {
     /// having two copies is how the swallow branch came to skip it entirely.
     pub(super) fn dismiss_click_overlays(&mut self, m: MouseEvent) {
         if !matches!(m.kind, MouseEventKind::Up(_)) {
-            self.hover_popup = None;
-            self.hover_diagnostic = None;
+            self.hover.popup = None;
+            self.hover.diagnostic = None;
         }
         self.tab_tooltip = None;
         self.tab_hover.clear();
@@ -556,7 +602,7 @@ impl App {
         self.ui_tooltip = None;
         self.ui_hover.clear();
         self.ui_tooltip_label = None;
-        self.hover.clear();
+        self.hover.dwell.clear();
     }
 
     pub(super) fn handle_mouse(&mut self, m: MouseEvent) {
@@ -1460,7 +1506,7 @@ impl App {
 
         // The wheel over a hover scrolls its text rather than dismissing it
         // (#1254): a long docstring's Returns/Raises sit below the box.
-        if let Some(popup) = self.hover_popup.as_mut()
+        if let Some(popup) = self.hover.popup.as_mut()
             && rect_contains(popup.last_area, m.column, m.row)
         {
             match m.kind {
@@ -1502,8 +1548,8 @@ impl App {
         // that is what lets a press-and-hold (touch) read the hover after
         // lifting the finger. Every other event dismisses it.
         if !matches!(m.kind, MouseEventKind::Up(_)) {
-            self.hover_popup = None;
-            self.hover_diagnostic = None;
+            self.hover.popup = None;
+            self.hover.diagnostic = None;
         }
         // Any click dismisses the tab tooltip (selecting/closing a tab,
         // or clicking elsewhere) so it can't linger over the new state.
@@ -1532,12 +1578,13 @@ impl App {
             {
                 // clear() before on_move(): a repeat tap on the same cell
                 // must restart the timer (on_move alone keys off cell change).
-                self.hover.clear();
+                self.hover.dwell.clear();
                 self.hover
+                    .dwell
                     .on_move(std::time::Instant::now(), m.column, m.row);
             }
             MouseEventKind::Up(_) => {}
-            _ => self.hover.clear(),
+            _ => self.hover.dwell.clear(),
         }
 
         // Termux: a tap in any editable area raises the on-screen keyboard,
@@ -1555,7 +1602,7 @@ impl App {
             self.osk = Some(osk);
             // The raise reflows the whole frame, so a dwell armed at the
             // pre-raise coordinates would resolve the wrong buffer cell.
-            self.hover.clear();
+            self.hover.dwell.clear();
         }
 
         match m.kind {
@@ -3394,7 +3441,7 @@ impl App {
                     if self.terminal().selection().is_some() {
                         self.terminal_mut().clear_selection();
                     }
-                    self.hover_popup = Some(crate::widgets::hover_popup::HoverPopup::new(
+                    self.hover.popup = Some(crate::widgets::hover_popup::HoverPopup::new(
                         secret,
                         (m.column, m.row),
                     ));
@@ -3415,7 +3462,7 @@ impl App {
                     if self.terminal().selection().is_some() {
                         self.terminal_mut().clear_selection();
                     }
-                    self.hover_popup = Some(crate::widgets::hover_popup::HoverPopup::new(
+                    self.hover.popup = Some(crate::widgets::hover_popup::HoverPopup::new(
                         note,
                         (m.column, m.row),
                     ));

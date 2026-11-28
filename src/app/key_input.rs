@@ -844,9 +844,9 @@ impl App {
             // key does what it would anyway.
             Some(ShortcutCapture::Recording { .. }) | None => {}
         }
-        self.hover_popup = None;
-        self.hover_diagnostic = None;
-        self.hover_request_id = None;
+        self.hover.popup = None;
+        self.hover.diagnostic = None;
+        self.hover.request_id = None;
         // `Cmd+K` leader: if armed, this keystroke is the second half of a
         // `Cmd+K`-prefixed chord, as in VS Code. A key that only goes down,
         // a modifier on its way to `Shift+X` (the kitty protocol reports

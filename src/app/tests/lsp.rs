@@ -189,7 +189,8 @@ fn hovering_a_diagnostic_on_punctuation_shows_its_message_synchronously() {
     // text_x = x(0) + gutter(2) + 1 = 3, so cell col 4 is char 1 (the `.`).
     app.hover_at_cell(4, 0);
     let popup = app
-        .hover_popup
+        .hover
+        .popup
         .as_ref()
         .expect("hovering a squiggle must surface a popup even without an LSP reply");
     assert_eq!(
@@ -268,19 +269,20 @@ fn show_hover_asks_about_the_caret_and_opens_the_popup_there() {
         .expect("the caret is on screen");
     app.run_command(crate::widgets::command_palette::Command::ShowHover);
     let id = app
-        .hover_request_id
+        .hover
+        .request_id
         .expect("a word at the caret asks the server");
-    assert_eq!(app.hover_word, Some((0, 8, 15)), "about `compute`");
+    assert_eq!(app.hover.word, Some((0, 8, 15)), "about `compute`");
     // The worker's own empty answer first, so the pushed one is the last.
     await_hover_reply(&mut app);
     answer_hover(&app, id, "fn compute(x: i32) -> i32");
     assert!(app.drain_lsp_hover());
-    let popup = app.hover_popup.as_ref().expect("the reply opens the popup");
+    let popup = app.hover.popup.as_ref().expect("the reply opens the popup");
     assert_eq!(popup.lines, vec![String::from("fn compute(x: i32) -> i32")]);
     assert_eq!(popup.anchor, caret);
     app.handle_key(key(KeyCode::Right, KeyModifiers::NONE))
         .unwrap();
-    assert!(app.hover_popup.is_none(), "the next key closes it");
+    assert!(app.hover.popup.is_none(), "the next key closes it");
 }
 
 #[test]
@@ -289,15 +291,15 @@ fn show_hover_in_a_file_no_server_has_shows_a_problem_or_says_there_is_none() {
     // command waited forever: no popup for the problem, no status (#1518).
     let (mut app, _tmp) = caret_hover_app(10);
     app.run_command(crate::widgets::command_palette::Command::ShowHover);
-    assert!(app.hover_request_id.is_some(), "a word still asks");
+    assert!(app.hover.request_id.is_some(), "a word still asks");
     await_hover_reply(&mut app);
-    assert!(app.hover_popup.is_none());
+    assert!(app.hover.popup.is_none());
     assert_eq!(app.status, "No hover information at the caret");
 
     diagnose_compute(&mut app);
     app.run_command(crate::widgets::command_palette::Command::ShowHover);
     await_hover_reply(&mut app);
-    let popup = app.hover_popup.as_ref().expect("the problem shows");
+    let popup = app.hover.popup.as_ref().expect("the problem shows");
     assert_eq!(popup.lines, vec![String::from(COMPUTE_PROBLEM)]);
 }
 
@@ -309,11 +311,11 @@ fn a_pointer_hover_in_a_file_no_server_has_shows_the_problem_on_a_word() {
     diagnose_compute(&mut app);
     // text_x = gutter(2) + 1, so cell col 12 is char 9, inside `compute`.
     let past = std::time::Instant::now() - HOVER_DELAY * 2;
-    app.hover.on_move(past, 12, 0);
+    app.hover.dwell.on_move(past, 12, 0);
     app.poll_hover();
-    assert!(app.hover_request_id.is_some());
+    assert!(app.hover.request_id.is_some());
     await_hover_reply(&mut app);
-    let popup = app.hover_popup.as_ref().expect("the problem shows");
+    let popup = app.hover.popup.as_ref().expect("the problem shows");
     assert_eq!(popup.lines, vec![String::from(COMPUTE_PROBLEM)]);
 }
 
@@ -323,14 +325,14 @@ fn show_hover_is_not_taken_over_by_a_pointer_dwell_already_running() {
     // fire next frame and put its own hover in place of the caret's.
     let (mut app, _tmp) = caret_hover_app(10);
     let past = std::time::Instant::now() - HOVER_DELAY * 2;
-    app.hover.on_move(past, 3, 0);
+    app.hover.dwell.on_move(past, 3, 0);
     app.run_command(crate::widgets::command_palette::Command::ShowHover);
-    let id = app.hover_request_id;
-    let anchor = app.hover_anchor;
+    let id = app.hover.request_id;
+    let anchor = app.hover.anchor;
     app.poll_hover();
-    assert_eq!(app.hover_request_id, id, "still the caret's request");
-    assert_eq!(app.hover_anchor, anchor);
-    assert_eq!(app.hover_word, Some((0, 8, 15)), "still about `compute`");
+    assert_eq!(app.hover.request_id, id, "still the caret's request");
+    assert_eq!(app.hover.anchor, anchor);
+    assert_eq!(app.hover.word, Some((0, 8, 15)), "still about `compute`");
 }
 
 #[test]
@@ -340,7 +342,7 @@ fn a_hover_reply_after_a_paste_over_the_word_is_dropped() {
     // reply describes text that is gone.
     let (mut app, _tmp) = caret_hover_app(10);
     app.run_command(crate::widgets::command_palette::Command::ShowHover);
-    let id = app.hover_request_id.expect("a request");
+    let id = app.hover.request_id.expect("a request");
     await_hover_reply(&mut app);
     app.editor.selection = Some(crate::widgets::editor::EditorSelection {
         anchor: (0, 8),
@@ -348,10 +350,10 @@ fn a_hover_reply_after_a_paste_over_the_word_is_dropped() {
     });
     app.handle_paste("average");
     assert_eq!(app.editor.lines[0], "let n = average(1);");
-    assert_eq!(app.hover_request_id, Some(id), "still pending");
+    assert_eq!(app.hover.request_id, Some(id), "still pending");
     answer_hover(&app, id, "fn compute(x: i32) -> i32");
     assert!(!app.drain_lsp_hover(), "the stale reply is dropped");
-    assert!(app.hover_popup.is_none());
+    assert!(app.hover.popup.is_none());
 }
 
 #[test]
@@ -368,13 +370,13 @@ fn show_hover_reads_the_word_the_caret_ends_and_says_when_there_is_none() {
     // As in VS Code: just past `compute` (on its `(`) is still on it.
     let (mut app, _tmp) = caret_hover_app(15);
     app.run_command(crate::widgets::command_palette::Command::ShowHover);
-    assert!(app.hover_request_id.is_some());
-    assert_eq!(app.hover_word, Some((0, 8, 15)));
+    assert!(app.hover.request_id.is_some());
+    assert_eq!(app.hover.word, Some((0, 8, 15)));
     // On `=`, after a space: nothing to describe, and the command says so.
     app.editor.cursor_col = 6;
     app.run_command(crate::widgets::command_palette::Command::ShowHover);
-    assert_eq!(app.hover_request_id, None);
-    assert!(app.hover_popup.is_none());
+    assert_eq!(app.hover.request_id, None);
+    assert!(app.hover.popup.is_none());
     assert_eq!(app.status, "No hover information at the caret");
 }
 
@@ -390,7 +392,7 @@ fn ctrl_k_ctrl_i_in_the_editor_shows_the_hover_and_ctrl_k_i_still_broadcasts() {
     };
     assert!(app.handle_cmd_k_chord(key(KeyCode::Char('i'), cmd)));
     assert!(
-        app.hover_request_id.is_some(),
+        app.hover.request_id.is_some(),
         "the chord asks for the hover"
     );
     assert!(!app.pending_broadcast_enable);
@@ -417,7 +419,7 @@ fn the_swallowed_prefix_click_dismisses_the_hover_and_tab_tooltip() {
     let (mut app, _tmp) = tree_app_with_keymap(
         r#"[{"key": "ctrl+double_click", "command": "quick_open", "when": "editor"}]"#,
     );
-    app.hover_popup = Some(crate::widgets::hover_popup::HoverPopup::new(
+    app.hover.popup = Some(crate::widgets::hover_popup::HoverPopup::new(
         String::from("stale hover"),
         (1, 1),
     ));
@@ -444,7 +446,7 @@ fn the_swallowed_prefix_click_dismisses_the_hover_and_tab_tooltip() {
          did, this exercises the matched branch and not the swallow"
     );
     assert!(
-        app.hover_popup.is_none(),
+        app.hover.popup.is_none(),
         "a swallowed prefix click must dismiss the hover it painted over, \
          exactly as the matched branch does: it re-focuses the pane underneath"
     );
@@ -457,19 +459,20 @@ fn tap_in_the_editor_arms_the_hover_dwell_and_release_keeps_it_armed() {
     let (mut app, _tmp, col, row) = app_with_open_file_and_editor_cell();
     app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
     assert_eq!(
-        app.hover.cell(),
+        app.hover.dwell.cell(),
         Some((col, row)),
         "a tap is the touch equivalent of the pointer arriving: it must arm \
          the dwell at the tapped cell (a touchscreen never emits Moved events)"
     );
     assert!(
         app.hover
+            .dwell
             .due(std::time::Instant::now() + HOVER_DELAY, HOVER_DELAY),
         "the tap-armed dwell must come due HOVER_DELAY after the press"
     );
     app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), col, row));
     assert_eq!(
-        app.hover.cell(),
+        app.hover.dwell.cell(),
         Some((col, row)),
         "lifting the finger must not cancel the pending dwell, or a quick \
          tap could never fire"
@@ -483,14 +486,14 @@ fn drag_and_scroll_cancel_a_tap_armed_hover_dwell() {
     app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
     app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), col + 3, row));
     assert_eq!(
-        app.hover.cell(),
+        app.hover.dwell.cell(),
         None,
         "a drag is a selection, not a rest: it must cancel the pending dwell"
     );
     app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
     app.handle_mouse(mouse(MouseEventKind::ScrollDown, col, row));
     assert_eq!(
-        app.hover.cell(),
+        app.hover.dwell.cell(),
         None,
         "scrolling moves the text under the tapped cell; the dwell must cancel"
     );
@@ -502,18 +505,18 @@ fn press_and_hold_hover_popup_survives_the_finger_release() {
     let (mut app, _tmp, col, row) = app_with_open_file_and_editor_cell();
     app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
     // The dwell fired while the finger was still down (press-and-hold).
-    app.hover_popup = Some(crate::widgets::hover_popup::HoverPopup::new(
+    app.hover.popup = Some(crate::widgets::hover_popup::HoverPopup::new(
         String::from("int"),
         (col, row),
     ));
     app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), col, row));
     assert!(
-        app.hover_popup.is_some(),
+        app.hover.popup.is_some(),
         "releasing the press must not dismiss the popup it just summoned"
     );
     app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
     assert!(
-        app.hover_popup.is_none(),
+        app.hover.popup.is_none(),
         "the next tap is a new gesture and dismisses the previous popup"
     );
 }
@@ -5146,7 +5149,7 @@ fn app_with_long_hover() -> (
         .map(|i| format!("doc line {i}"))
         .collect::<Vec<_>>()
         .join("\n");
-    app.hover_popup = Some(crate::widgets::hover_popup::HoverPopup::new(
+    app.hover.popup = Some(crate::widgets::hover_popup::HoverPopup::new(
         doc,
         (col, row),
     ));
@@ -5158,30 +5161,31 @@ fn app_with_long_hover() -> (
 fn the_wheel_over_a_hover_popup_scrolls_it_instead_of_closing_it() {
     use crossterm::event::MouseEventKind;
     let (mut app, _tmp, mut term) = app_with_long_hover();
-    let area = app.hover_popup.as_ref().unwrap().last_area;
+    let area = app.hover.popup.as_ref().unwrap().last_area;
     assert!(area.height > 2, "the popup painted");
     let (x, y) = (area.x + 3, area.y + 2);
     app.handle_mouse(mouse(MouseEventKind::ScrollDown, x, y));
     let popup = app
-        .hover_popup
+        .hover
+        .popup
         .as_ref()
         .expect("the wheel keeps the popup open");
     assert!(popup.scroll > 0, "and scrolls it");
     let after_down = popup.scroll;
     app.handle_mouse(mouse(MouseEventKind::ScrollUp, x, y));
-    assert!(app.hover_popup.as_ref().unwrap().scroll < after_down);
+    assert!(app.hover.popup.as_ref().unwrap().scroll < after_down);
     term.draw(|frame| app.render(frame)).unwrap();
-    assert!(app.hover_popup.is_some());
+    assert!(app.hover.popup.is_some());
 }
 
 #[test]
 fn moving_the_pointer_onto_the_hover_popup_keeps_it_open() {
     use crossterm::event::MouseEventKind;
     let (mut app, _tmp, _term) = app_with_long_hover();
-    let area = app.hover_popup.as_ref().unwrap().last_area;
+    let area = app.hover.popup.as_ref().unwrap().last_area;
     app.handle_mouse(mouse(MouseEventKind::Moved, area.x + 3, area.y + 2));
     assert!(
-        app.hover_popup.is_some(),
+        app.hover.popup.is_some(),
         "the pointer has to cross onto the popup to scroll it"
     );
 }
@@ -5190,7 +5194,7 @@ fn moving_the_pointer_onto_the_hover_popup_keeps_it_open() {
 fn the_wheel_away_from_the_hover_popup_still_closes_it() {
     use crossterm::event::MouseEventKind;
     let (mut app, _tmp, _term) = app_with_long_hover();
-    let area = app.hover_popup.as_ref().unwrap().last_area;
+    let area = app.hover.popup.as_ref().unwrap().last_area;
     let x = if area.x > 2 {
         area.x - 2
     } else {
@@ -5198,7 +5202,7 @@ fn the_wheel_away_from_the_hover_popup_still_closes_it() {
     };
     app.handle_mouse(mouse(MouseEventKind::ScrollDown, x, area.y + 1));
     assert!(
-        app.hover_popup.is_none(),
+        app.hover.popup.is_none(),
         "scrolling the editor dismisses the hover"
     );
 }

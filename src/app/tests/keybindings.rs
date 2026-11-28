@@ -115,7 +115,7 @@ fn a_bound_gesture_dismisses_the_hover_and_tab_tooltip() {
     let (mut app, _tmp) = tree_app_with_keymap(
         r#"[{"key": "ctrl+click", "command": "quick_open", "when": "editor"}]"#,
     );
-    app.hover_popup = Some(crate::widgets::hover_popup::HoverPopup::new(
+    app.hover.popup = Some(crate::widgets::hover_popup::HoverPopup::new(
         String::from("stale hover"),
         (1, 1),
     ));
@@ -134,7 +134,7 @@ fn a_bound_gesture_dismisses_the_hover_and_tab_tooltip() {
 
     assert!(app.file_finder.is_some(), "the binding fired");
     assert!(
-        app.hover_popup.is_none(),
+        app.hover.popup.is_none(),
         "a fired binding must dismiss the hover it painted over"
     );
     assert!(app.tab_tooltip.is_none(), "and the tab tooltip with it");

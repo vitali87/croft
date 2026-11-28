@@ -683,7 +683,7 @@ impl App {
     /// The pointer rested on the inline blame naming `hash` (#1556): fetch
     /// the commit's card off the UI thread, for [`Self::drain_blame_hover`].
     pub(super) fn hover_blame_card(&mut self, col: u16, row: u16, hash: String) {
-        let shown = self.hover_popup.is_some();
+        let shown = self.hover.popup.is_some();
         if shown && self.blame_hover.as_ref().is_some_and(|(h, _)| *h == hash) {
             return;
         }
@@ -698,9 +698,9 @@ impl App {
             let _ = tx.send(crate::git::commit_card(&dir, &job));
         });
         // A word's hover still in flight must not land over the card.
-        self.hover_request_id = None;
-        self.hover_word = None;
-        self.hover_anchor = Some((col, row));
+        self.hover.request_id = None;
+        self.hover.word = None;
+        self.hover.anchor = Some((col, row));
         self.blame_hover = Some((hash, rx));
     }
 
@@ -718,6 +718,7 @@ impl App {
         };
         let under = self
             .hover
+            .dwell
             .cell()
             .and_then(|(c, r)| self.editor.blame_commit_at(c, r));
         if under != Some(hash.as_str()) {
@@ -725,9 +726,9 @@ impl App {
             return false;
         }
         let card = card.unwrap_or_else(|e| format!("Could not read the commit: {e}"));
-        self.hover_popup = Some(crate::widgets::hover_popup::HoverPopup::new(
+        self.hover.popup = Some(crate::widgets::hover_popup::HoverPopup::new(
             format!("{card}\n\nClick to open its changes (Git: Open Commit for Line)"),
-            self.hover_anchor.unwrap_or((0, 0)),
+            self.hover.anchor.unwrap_or((0, 0)),
         ));
         true
     }

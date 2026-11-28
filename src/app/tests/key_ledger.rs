@@ -999,7 +999,7 @@ fn fields(app: &App, root: &Path, read: &[String; 5], hide_ids: bool) -> Fields 
                     .as_ref()
                     .map(|(refs, i)| format!("{i}/{}", refs.len())),
             ),
-            ("hover", on(app.hover_popup.is_some())),
+            ("hover", on(app.hover.popup.is_some())),
             (
                 "completion",
                 app.completion.popup.as_ref().map(|c| {

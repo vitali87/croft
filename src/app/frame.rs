@@ -2300,7 +2300,7 @@ impl App {
                 frame.render_widget(&*popup, area);
             }
         }
-        if let Some(popup) = self.hover_popup.as_mut() {
+        if let Some(popup) = self.hover.popup.as_mut() {
             popup.theme = self.theme;
             let area = popup.area_for(frame.area());
             popup.last_area = area;
