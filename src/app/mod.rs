@@ -3107,9 +3107,17 @@ pub struct App {
     pub welcome_tour_button: Rect,
     /// The `gh` executable GitHub features run; tests point it at a stand-in.
     gh_program: PathBuf,
+    /// How long one code scanning `gh` call may take (#2786); tests shorten it.
+    gh_limit: std::time::Duration,
+    /// Code scanning's asks of GitHub in flight (#2786): the analyses to
+    /// offer, the alert behind a result, a dismissal, an analysis to open.
+    code_scan_asks: Vec<crate::jobs::Job<code_scanning::CodeScanAnswer>>,
     /// The SARIF result a code scanning dismissal is for (#577): its log's
     /// path and its run and result indices, marked suppressed on success.
-    dismiss_target: Option<(PathBuf, usize, usize)>,
+    dismiss_target: Option<code_scanning::DismissTarget>,
+    /// The workspace folder the code scanning analysis picker was filled
+    /// from, which the analysis picked is fetched from (#2786).
+    code_scan_picker_root: Option<PathBuf>,
     /// The SARIF location a Locate prompt is open for (#577): its URI and
     /// the 1-based line and column to land on.
     sarif_locate_pending: Option<(String, i64, i64)>,
@@ -5038,7 +5046,10 @@ impl App {
             tour_done: loaded_prefs.tour_done,
             welcome_tour_button: Rect::default(),
             gh_program: PathBuf::from("gh"),
+            gh_limit: code_scanning::CODE_SCAN_GH_LIMIT,
+            code_scan_asks: Vec::new(),
             dismiss_target: None,
+            code_scan_picker_root: None,
             sarif_locate_pending: None,
             sarif_download: None,
             sarif_fetch: fetch_sarif_source,

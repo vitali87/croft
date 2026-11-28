@@ -1778,38 +1778,6 @@ impl App {
             crate::pr_review::log_args(run, job),
         );
     }
-
-    /// Run `gh` with `args` in the active workspace root. Its stdout, or
-    /// the first line of what it said went wrong: GitHub's own message when
-    /// the API sent one, else gh's; or that gh is missing or signed out.
-    pub(super) fn run_gh(&self, args: &[String]) -> Result<String, String> {
-        let root = self.active_workspace_root();
-        let mut cmd = std::process::Command::new(&self.gh_program);
-        cmd.args(args).current_dir(&root);
-        let out = crate::proc::output_retrying_busy(&mut cmd)
-            .map_err(|e| crate::gh::spawn_error(&e, Some(root.as_path())))?;
-        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-        if out.status.success() {
-            return Ok(stdout);
-        }
-        if crate::gh::signed_out(out.status) {
-            return Err(String::from(crate::gh::SIGNED_OUT));
-        }
-        let api_message = serde_json::from_str::<serde_json::Value>(&stdout)
-            .ok()
-            .and_then(|v| v.get("message")?.as_str().map(str::to_string));
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let first = |s: &str| s.trim().lines().next().map(str::to_string);
-        Err(api_message
-            .or_else(|| {
-                let s = stderr.trim();
-                serde_json::from_str::<serde_json::Value>(s)
-                    .ok()
-                    .and_then(|v| v.get("message")?.as_str().map(str::to_string))
-                    .or_else(|| first(s))
-            })
-            .unwrap_or_else(|| String::from("gh failed")))
-    }
 }
 
 /// Run `cmd` for at most `budget`, collecting stdout; None when it could not
