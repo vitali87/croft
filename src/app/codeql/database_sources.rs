@@ -138,7 +138,7 @@ impl App {
         // Downloads and extraction run on a worker (#1155): a database is
         // commonly hundreds of megabytes, and inline the whole UI froze until
         // it was on disk.
-        if let Some((what, _)) = &self.codeql_db_job {
+        if let Some((what, _)) = &self.codeql_jobs.db_job {
             self.status = format!("Still adding the CodeQL database {what}");
             return;
         }
@@ -178,12 +178,12 @@ impl App {
             let _ = tx.send(job());
         });
         self.status = format!("Adding the CodeQL database {what}\u{2026}");
-        self.codeql_db_job = Some((what, rx));
+        self.codeql_jobs.db_job = Some((what, rx));
     }
 
     /// Register a database that finished downloading or extracting (#1155).
     pub fn drain_codeql_db_job(&mut self) -> bool {
-        let Some((what, rx)) = self.codeql_db_job.as_ref() else {
+        let Some((what, rx)) = self.codeql_jobs.db_job.as_ref() else {
             return false;
         };
         let outcome = match rx.try_recv() {
@@ -193,7 +193,7 @@ impl App {
                 "Adding the CodeQL database {what} stopped unexpectedly"
             )),
         };
-        self.codeql_db_job = None;
+        self.codeql_jobs.db_job = None;
         match outcome {
             Ok(dir) => self.register_codeql_database(&dir),
             Err(why) => self.status = why,

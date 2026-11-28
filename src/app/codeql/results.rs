@@ -181,7 +181,7 @@ impl App {
             .clone()
             .filter(|p| self.editor.sheet.is_some() && cq::locations_path(p).is_file());
         let on_table = active.is_some();
-        let Some(table) = active.or_else(|| self.codeql_results_walk.clone()) else {
+        let Some(table) = active.or_else(|| self.codeql_jobs.results_walk.clone()) else {
             self.status = String::from("Open a CodeQL results table first");
             return;
         };
@@ -195,7 +195,7 @@ impl App {
                 .find(|t| t.path.as_deref() == Some(table.as_path()) && t.sheet.is_some())
         };
         let Some(sheet) = tab.and_then(|t| t.sheet.as_mut()) else {
-            self.codeql_results_walk = None;
+            self.codeql_jobs.results_walk = None;
             self.status = String::from("Open a CodeQL results table first");
             return;
         };
@@ -214,7 +214,7 @@ impl App {
         data.cur_col = step(data.cur_col, cols, data.col_widths.len().max(1));
         let (cells, col) = (data.rows[data.cur_row].clone(), data.cur_col);
         let row = data.cur_row + 1;
-        self.codeql_results_walk = Some(table.clone());
+        self.codeql_jobs.results_walk = Some(table.clone());
         let saved: Vec<cq::RowLocs> = std::fs::read_to_string(cq::locations_path(&table))
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
@@ -410,12 +410,12 @@ impl App {
             self.status = format!("The database {name} ran on is gone", name = entry.database);
             return;
         };
-        if self.codeql_doc_job.is_some() {
+        if self.codeql_jobs.doc_job.is_some() {
             self.status = String::from("A CodeQL view is already being made");
             return;
         }
         let out = entry.output.with_file_name("alerts.csv");
-        let program = self.codeql_program.clone();
+        let program = self.codeql_jobs.program.clone();
         let query = entry.query.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -427,7 +427,7 @@ impl App {
             let _ = tx.send(made);
         });
         self.status = format!("Writing the alerts of {name} as CSV\u{2026}");
-        self.codeql_doc_job = Some((
+        self.codeql_jobs.doc_job = Some((
             rx,
             format!("Alerts of {name} (CSV)"),
             format!("Could not write the alerts of {name} as CSV"),
@@ -461,12 +461,12 @@ impl App {
             self.status = format!("The database no longer keeps the results of {name}");
             return;
         };
-        if self.codeql_doc_job.is_some() {
+        if self.codeql_jobs.doc_job.is_some() {
             self.status = String::from("A CodeQL view is already being made");
             return;
         }
         let out = entry.output.with_file_name("raw-results.csv");
-        let program = self.codeql_program.clone();
+        let program = self.codeql_jobs.program.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let made = Self::codeql_decode_sets(&program, &bqrs, &out, &|args| {
@@ -476,7 +476,7 @@ impl App {
             let _ = tx.send(made);
         });
         self.status = format!("Decoding the results of {name}\u{2026}");
-        self.codeql_doc_job = Some((
+        self.codeql_jobs.doc_job = Some((
             rx,
             format!("Results of {name} (CSV)"),
             format!("Could not decode the results of {name}"),

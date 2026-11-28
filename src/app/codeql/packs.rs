@@ -62,23 +62,23 @@ impl App {
         done: String,
         failed: String,
     ) {
-        if self.codeql_pack_job.is_some() {
+        if self.codeql_jobs.pack_job.is_some() {
             self.status = String::from("A CodeQL pack install or download is already running");
             return;
         }
-        let program = self.codeql_program.clone();
+        let program = self.codeql_jobs.program.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(Self::codeql_command(&program, &args));
         });
         self.status = running;
-        self.codeql_pack_job = Some((rx, done, failed));
+        self.codeql_jobs.pack_job = Some((rx, done, failed));
     }
 
     /// Collect a finished pack install or download (#578) onto the status
     /// line.
     pub fn drain_codeql_pack_job(&mut self) -> bool {
-        let Some((rx, _, _)) = self.codeql_pack_job.as_ref() else {
+        let Some((rx, _, _)) = self.codeql_jobs.pack_job.as_ref() else {
             return false;
         };
         let outcome = match rx.try_recv() {
@@ -88,7 +88,7 @@ impl App {
                 Err(String::from("the pack command stopped unexpectedly"))
             }
         };
-        let Some((_, done, failed)) = self.codeql_pack_job.take() else {
+        let Some((_, done, failed)) = self.codeql_jobs.pack_job.take() else {
             return false;
         };
         self.status = match outcome {
@@ -168,7 +168,7 @@ impl App {
     /// Each run keeps its own history entry. Refused while a query is
     /// running, so two pack runs never interleave.
     pub(in crate::app) fn run_codeql_pack(&mut self, pack: usize) {
-        if self.codeql_run.is_some() {
+        if self.codeql_jobs.run.is_some() {
             self.status = String::from("A CodeQL query is already running");
             return;
         }

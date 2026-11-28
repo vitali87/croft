@@ -62,24 +62,24 @@ impl App {
             }
             return;
         }
-        if self.codeql_log_summary.is_some() {
+        if self.codeql_jobs.log_summary.is_some() {
             self.status = String::from("An evaluator log summary is already being made");
             return;
         }
-        let program = self.codeql_program.clone();
+        let program = self.codeql_jobs.program.clone();
         let args = crate::codeql_query::log_summary_args(&log, &summary);
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(Self::codeql_command(&program, &args));
         });
         self.status = String::from("Summarising the evaluator log\u{2026}");
-        self.codeql_log_summary = Some((rx, summary));
+        self.codeql_jobs.log_summary = Some((rx, summary));
     }
 
     /// Open a finished evaluator log summary (#578), or say why the CLI
     /// could not make it.
     pub fn drain_codeql_log_summary(&mut self) -> bool {
-        let Some((rx, _)) = self.codeql_log_summary.as_ref() else {
+        let Some((rx, _)) = self.codeql_jobs.log_summary.as_ref() else {
             return false;
         };
         let outcome = match rx.try_recv() {
@@ -89,7 +89,7 @@ impl App {
                 Err(String::from("the summary stopped unexpectedly"))
             }
         };
-        let Some((_, summary)) = self.codeql_log_summary.take() else {
+        let Some((_, summary)) = self.codeql_jobs.log_summary.take() else {
             return false;
         };
         match outcome.and_then(|()| {
@@ -131,7 +131,7 @@ impl App {
         let Some(log) = self.codeql_history_log(index) else {
             return;
         };
-        if self.codeql_log_viewer.is_some() {
+        if self.codeql_jobs.log_viewer.is_some() {
             self.status = String::from("The evaluator log viewer is already being prepared");
             return;
         }
@@ -141,19 +141,19 @@ impl App {
             .get(index)
             .map(|e| e.query_name())
             .unwrap_or_default();
-        let program = self.codeql_program.clone();
+        let program = self.codeql_jobs.program.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(Self::codeql_log_predicates(&program, &log));
         });
         self.status = String::from("Reading the evaluator log\u{2026}");
-        self.codeql_log_viewer = Some((rx, query));
+        self.codeql_jobs.log_viewer = Some((rx, query));
     }
 
     /// Show a prepared evaluator log tree (#578) in a tab with every
     /// predicate folded, or say why it could not be made.
     pub fn drain_codeql_log_viewer(&mut self) -> bool {
-        let Some((rx, _)) = self.codeql_log_viewer.as_ref() else {
+        let Some((rx, _)) = self.codeql_jobs.log_viewer.as_ref() else {
             return false;
         };
         let outcome = match rx.try_recv() {
@@ -163,7 +163,7 @@ impl App {
                 Err(String::from("the viewer stopped unexpectedly"))
             }
         };
-        let Some((_, query)) = self.codeql_log_viewer.take() else {
+        let Some((_, query)) = self.codeql_jobs.log_viewer.take() else {
             return false;
         };
         let label = format!("Evaluator Log ({query})");
@@ -215,14 +215,14 @@ impl App {
         let Some(old_log) = self.codeql_history_log(partner) else {
             return;
         };
-        if self.codeql_perf_compare.is_some() {
+        if self.codeql_jobs.perf_compare.is_some() {
             self.status = String::from("A performance comparison is already being prepared");
             return;
         }
         let query = entry.query_name();
         let old_label = format!("earlier ({})", history.entries[partner].database);
         let new_label = format!("later ({})", entry.database);
-        let program = self.codeql_program.clone();
+        let program = self.codeql_jobs.program.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let table = Self::codeql_log_predicates(&program, &old_log).and_then(|old| {
@@ -235,13 +235,13 @@ impl App {
             let _ = tx.send(table);
         });
         self.status = String::from("Comparing the evaluator logs\u{2026}");
-        self.codeql_perf_compare = Some((rx, format!("Performance ({query})")));
+        self.codeql_jobs.perf_compare = Some((rx, format!("Performance ({query})")));
     }
 
     /// Show a prepared performance comparison (#578) in a tab, or say why
     /// it could not be made.
     pub fn drain_codeql_perf_compare(&mut self) -> bool {
-        let Some((rx, _)) = self.codeql_perf_compare.as_ref() else {
+        let Some((rx, _)) = self.codeql_jobs.perf_compare.as_ref() else {
             return false;
         };
         let outcome = match rx.try_recv() {
@@ -251,7 +251,7 @@ impl App {
                 Err(String::from("the comparison stopped unexpectedly"))
             }
         };
-        let Some((_, label)) = self.codeql_perf_compare.take() else {
+        let Some((_, label)) = self.codeql_jobs.perf_compare.take() else {
             return false;
         };
         match outcome.and_then(|text| {

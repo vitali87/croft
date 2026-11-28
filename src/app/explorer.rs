@@ -761,8 +761,8 @@ impl App {
         }
         // A CodeQL database's folder size landed; drop one for a database
         // removed while it was being summed.
-        while let Ok((path, size)) = self.codeql_size_rx.try_recv() {
-            self.codeql_size_pending.remove(&path);
+        while let Ok((path, size)) = self.codeql_jobs.size_rx.try_recv() {
+            self.codeql_jobs.size_pending.remove(&path);
             if let Some(size) = size
                 && self.codeql.databases.iter().any(|db| db.path == path)
             {

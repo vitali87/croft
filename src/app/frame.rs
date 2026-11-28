@@ -786,8 +786,8 @@ impl App {
                     self.testing.draw(&side_cx, usable_area, frame.buffer_mut())
                 }
                 SidebarView::CodeQL => {
-                    let running = self.codeql_run.as_ref().map(|(_, since)| {
-                        (self.codeql_run_name.clone(), since.elapsed().as_secs())
+                    let running = self.codeql_jobs.run.as_ref().map(|(_, since)| {
+                        (self.codeql_jobs.run_name.clone(), since.elapsed().as_secs())
                     });
                     self.codeql.set_running(running);
                     self.codeql.draw(&side_cx, usable_area, frame.buffer_mut())
@@ -1727,12 +1727,12 @@ impl App {
         // A running CodeQL query (#578): what runs and for how long, and a
         // click on it cancels the run.
         let mut codeql_chip: Option<(u16, u16)> = None;
-        if let Some((_, since)) = &self.codeql_run {
+        if let Some((_, since)) = &self.codeql_jobs.run {
             let secs = since.elapsed().as_secs();
             let pill = status_pill(
                 &format!(
                     "\u{27f3} CodeQL {} {}:{:02} \u{2715}",
-                    self.codeql_run_name,
+                    self.codeql_jobs.run_name,
                     secs / 60,
                     secs % 60
                 ),

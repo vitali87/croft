@@ -22,7 +22,7 @@ impl App {
             return;
         };
         if !run.progress.as_ref().is_some_and(|p| p.is_done()) {
-            self.codeql_variant_polled = None;
+            self.codeql_jobs.variant_polled = None;
         }
         let path = croft_cache_dir()
             .join("codeql")
@@ -60,13 +60,13 @@ impl App {
     /// CodeQL never calls GitHub for it. Returns true when progress landed.
     pub fn poll_codeql_variant_runs(&mut self) -> bool {
         use crate::codeql_submit as cs;
-        if let Some(rx) = self.codeql_variant_poll.as_ref() {
+        if let Some(rx) = self.codeql_jobs.variant_poll.as_ref() {
             let polled = match rx.try_recv() {
                 Ok(p) => p,
                 Err(std::sync::mpsc::TryRecvError::Empty) => return false,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => Vec::new(),
             };
-            self.codeql_variant_poll = None;
+            self.codeql_jobs.variant_poll = None;
             let path = Self::codeql_variant_runs_path();
             for (mut run, outcome) in polled {
                 let Ok(progress) = outcome else { continue };
@@ -90,7 +90,8 @@ impl App {
         if self.codeql.variant_runs.is_empty()
             || !self.is_extension_enabled("codeql")
             || self
-                .codeql_variant_polled
+                .codeql_jobs
+                .variant_polled
                 .is_some_and(|t| t.elapsed() < CODEQL_VARIANT_POLL)
         {
             return false;
@@ -104,7 +105,7 @@ impl App {
             .filter(|r| !r.progress.as_ref().is_some_and(|p| p.is_done()))
             .filter(|r| now.saturating_sub(r.submitted_at) < CODEQL_VARIANT_FOLLOW.as_secs())
             .collect();
-        self.codeql_variant_polled = Some(std::time::Instant::now());
+        self.codeql_jobs.variant_polled = Some(std::time::Instant::now());
         if unfinished.is_empty() {
             return false;
         }
@@ -127,7 +128,7 @@ impl App {
                 .collect();
             let _ = tx.send(polled);
         });
-        self.codeql_variant_poll = Some(rx);
+        self.codeql_jobs.variant_poll = Some(rx);
         false
     }
 
@@ -194,7 +195,7 @@ impl App {
     /// [`Self::drain_codeql_variant_results`] opens what it made.
     pub(in crate::app) fn open_codeql_variant_results(&mut self, index: Option<usize>) {
         use crate::codeql_submit as cs;
-        if self.codeql_variant_results.is_some() {
+        if self.codeql_jobs.variant_results.is_some() {
             self.status = String::from("Variant analysis results are already being fetched");
             return;
         }
@@ -219,7 +220,7 @@ impl App {
             .join("variant-results")
             .join(format!("{}-{}", run.controller.replace('/', "-"), run.id));
         let gh = self.gh_program.to_string_lossy().into_owned();
-        let program = self.codeql_program.clone();
+        let program = self.codeql_jobs.program.clone();
         let root = self.active_workspace_root().to_path_buf();
         let (tx, rx) = std::sync::mpsc::channel();
         let count = repos.len();
@@ -228,7 +229,7 @@ impl App {
                 &gh, &program, &root, &run, &repos, &dir,
             ));
         });
-        self.codeql_variant_results = Some(rx);
+        self.codeql_jobs.variant_results = Some(rx);
         self.status = format!(
             "Fetching the results of {count} repositor{}\u{2026}",
             if count == 1 { "y" } else { "ies" }
@@ -334,7 +335,7 @@ impl App {
     /// Open the results a finished fetch made: the SARIF log in the viewer
     /// (else the CSV), saying what else there is and what failed.
     pub fn drain_codeql_variant_results(&mut self) -> bool {
-        let Some(rx) = self.codeql_variant_results.as_ref() else {
+        let Some(rx) = self.codeql_jobs.variant_results.as_ref() else {
             return false;
         };
         let outcome = match rx.try_recv() {
@@ -344,7 +345,7 @@ impl App {
                 Err(String::from("the fetch stopped without answering"))
             }
         };
-        self.codeql_variant_results = None;
+        self.codeql_jobs.variant_results = None;
         let files = match outcome {
             Ok(files) => files,
             Err(why) => {
@@ -421,7 +422,7 @@ impl App {
         value: &str,
     ) {
         use crate::codeql_submit as cs;
-        if self.codeql_variant_export.is_some() {
+        if self.codeql_jobs.variant_export.is_some() {
             self.status = String::from("Variant analysis results are already being exported");
             return;
         }
@@ -447,7 +448,7 @@ impl App {
         };
         let repos = cs::repos_with_results(&run);
         let gh = self.gh_program.to_string_lossy().into_owned();
-        let program = self.codeql_program.clone();
+        let program = self.codeql_jobs.program.clone();
         let root = self.active_workspace_root().to_path_buf();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -519,14 +520,14 @@ impl App {
             })();
             let _ = tx.send(outcome);
         });
-        self.codeql_variant_export = Some(rx);
+        self.codeql_jobs.variant_export = Some(rx);
         self.status = String::from("Exporting the variant analysis results\u{2026}");
     }
 
     /// Report a finished export: open a folder export's summary, or name
     /// the gist.
     pub fn drain_codeql_variant_export(&mut self) -> bool {
-        let Some(rx) = self.codeql_variant_export.as_ref() else {
+        let Some(rx) = self.codeql_jobs.variant_export.as_ref() else {
             return false;
         };
         let outcome = match rx.try_recv() {
@@ -536,7 +537,7 @@ impl App {
                 Err(String::from("the export stopped without answering"))
             }
         };
-        self.codeql_variant_export = None;
+        self.codeql_jobs.variant_export = None;
         let done = match outcome {
             Ok(done) => done,
             Err(why) => {
@@ -578,7 +579,7 @@ impl App {
     /// reports the run.
     pub(in crate::app) fn run_codeql_variant_analysis(&mut self) {
         use crate::codeql_submit as cs;
-        if self.codeql_variant_submit.is_some() {
+        if self.codeql_jobs.variant_submit.is_some() {
             self.status = String::from("A variant analysis is already being submitted");
             return;
         }
@@ -638,7 +639,7 @@ impl App {
             .join("codeql")
             .join("variant")
             .join(format!("{submitted_at}-{stem}"));
-        let program = self.codeql_program.clone();
+        let program = self.codeql_jobs.program.clone();
         let gh = self.gh_program.to_string_lossy().into_owned();
         let root = self.active_workspace_root().to_path_buf();
         let describe = targets.describe();
@@ -674,7 +675,7 @@ impl App {
             let _ = std::fs::remove_dir_all(&work);
             let _ = tx.send(outcome);
         });
-        self.codeql_variant_submit = Some(rx);
+        self.codeql_jobs.variant_submit = Some(rx);
         self.status = format!(
             "Submitting {} as a variant analysis against {describe}\u{2026}",
             query.file_name().unwrap_or_default().to_string_lossy()
@@ -684,7 +685,7 @@ impl App {
     /// Report a finished variant analysis submission, and remember the run.
     /// Returns true when one finished.
     pub fn drain_codeql_variant_submit(&mut self) -> bool {
-        let Some(rx) = self.codeql_variant_submit.as_ref() else {
+        let Some(rx) = self.codeql_jobs.variant_submit.as_ref() else {
             return false;
         };
         let outcome = match rx.try_recv() {
@@ -694,7 +695,7 @@ impl App {
                 Err(String::from("the submission stopped without answering"))
             }
         };
-        self.codeql_variant_submit = None;
+        self.codeql_jobs.variant_submit = None;
         self.status = match outcome {
             Ok(run) => {
                 let name = run
@@ -716,7 +717,7 @@ impl App {
                 {
                     Ok(()) => {
                         // Follow it from now on, starting with the next tick.
-                        self.codeql_variant_polled = None;
+                        self.codeql_jobs.variant_polled = None;
                         self.refresh_codeql_variant_runs();
                         format!("Variant analysis {id} of {name} submitted{skipped}: {url}")
                     }

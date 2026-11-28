@@ -69,8 +69,8 @@ impl App {
         let in_va = self.codeql.selected_section() == Some(Section::VariantAnalysis);
         let in_db = self.codeql.selected_section() == Some(Section::Databases);
         match key.code {
-            KeyCode::Esc if !self.codeql_run_queue.is_empty() => self.cancel_codeql_queue(),
-            KeyCode::Esc if self.codeql_run.is_some() => self.cancel_codeql_run(),
+            KeyCode::Esc if !self.codeql_jobs.run_queue.is_empty() => self.cancel_codeql_queue(),
+            KeyCode::Esc if self.codeql_jobs.run.is_some() => self.cancel_codeql_run(),
             KeyCode::Esc => self.set_sidebar_view(SidebarView::Explorer),
             KeyCode::Up => self.codeql.move_selection(false),
             KeyCode::Down => self.codeql.move_selection(true),

@@ -62,11 +62,11 @@ impl App {
         database: Option<&Path>,
     ) {
         use crate::codeql_query::{self as cq, History, HistoryEntry, Output, RunStatus};
-        if self.codeql_run.is_some() {
+        if self.codeql_jobs.run.is_some() {
             self.status = String::from("A CodeQL query is already running");
             return;
         }
-        if let Some((_, job, _, _)) = self.codeql_upgrade.as_ref() {
+        if let Some((_, job, _, _)) = self.codeql_jobs.upgrade.as_ref() {
             self.status = format!("Wait for the CodeQL database {} to finish", job.noun());
             return;
         }
@@ -149,11 +149,11 @@ impl App {
         let packs: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
         // The workspace's model packs (#578), which customize the run.
         let models = crate::codeql_model::model_pack_args(self.workspace_root());
-        let program = self.codeql_program.clone();
+        let program = self.codeql_jobs.program.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         // A fresh flag per run, so a late cancel never stops the next one.
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        self.codeql_cancel = cancel.clone();
+        self.codeql_jobs.cancel = cancel.clone();
         std::thread::spawn(move || {
             let run = |args: Vec<String>| Self::codeql_command_until(&program, &args, &cancel);
             let outcome = std::fs::create_dir_all(&dir)
@@ -198,8 +198,8 @@ impl App {
                 Err(e) => RunStatus::Failed(e),
             });
         });
-        self.codeql_run = Some((rx, std::time::Instant::now()));
-        self.codeql_run_name = name.clone();
+        self.codeql_jobs.run = Some((rx, std::time::Instant::now()));
+        self.codeql_jobs.run_name = name.clone();
         self.status = format!("Running {name} on {}\u{2026}", db.name);
     }
 
@@ -342,14 +342,15 @@ impl App {
     /// CodeQL: Cancel Running Query (#578): stop the query in flight, and
     /// the queries a pack or multi-database run has queued after it.
     pub(in crate::app) fn cancel_codeql_run(&mut self) {
-        if self.codeql_run.is_none() {
+        if self.codeql_jobs.run.is_none() {
             self.status = String::from("No CodeQL query is running");
             return;
         }
-        self.codeql_cancel
+        self.codeql_jobs
+            .cancel
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let queued = self.codeql_run_queue.len();
-        self.codeql_run_queue.clear();
+        let queued = self.codeql_jobs.run_queue.len();
+        self.codeql_jobs.run_queue.clear();
         self.status = match queued {
             0 => String::from("Cancelling the running CodeQL query\u{2026}"),
             n => format!("Cancelling the running CodeQL query and {n} queued\u{2026}"),
@@ -387,7 +388,7 @@ impl App {
     /// next query.
     pub fn drain_codeql_run(&mut self) -> bool {
         use crate::codeql_query::RunStatus;
-        let Some((rx, since)) = self.codeql_run.as_ref() else {
+        let Some((rx, since)) = self.codeql_jobs.run.as_ref() else {
             return false;
         };
         let status = match rx.try_recv() {
@@ -398,11 +399,11 @@ impl App {
             }
         };
         let seconds = since.elapsed().as_secs();
-        self.codeql_run = None;
+        self.codeql_jobs.run = None;
         let failed = matches!(status, RunStatus::Failed(_));
         self.record_codeql_run(status, seconds);
-        if self.codeql_batch.0 > 0 {
-            self.codeql_batch.1 += usize::from(failed);
+        if self.codeql_jobs.batch.0 > 0 {
+            self.codeql_jobs.batch.1 += usize::from(failed);
             self.start_next_queued_codeql();
         }
         true

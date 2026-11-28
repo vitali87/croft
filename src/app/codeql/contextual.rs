@@ -82,7 +82,7 @@ impl App {
     /// the cursor, from the current database, opened as a document.
     pub(in crate::app) fn view_codeql_cfg(&mut self) {
         use crate::codeql_ast as ast;
-        if self.codeql_doc_job.is_some() {
+        if self.codeql_jobs.doc_job.is_some() {
             self.status = String::from("A CodeQL view is already being made");
             return;
         }
@@ -96,7 +96,7 @@ impl App {
             .unwrap_or_default();
         let title = format!("{name}:{line}:{column} in {}", db.name);
         let dir = Self::codeql_contextual_dir("cfg");
-        let program = self.codeql_program.clone();
+        let program = self.codeql_jobs.program.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let read = || -> Result<PathBuf, String> {
@@ -130,7 +130,7 @@ impl App {
             let _ = tx.send(read());
         });
         self.status = format!("Reading the control flow graph at {name}:{line}\u{2026}");
-        self.codeql_doc_job = Some((
+        self.codeql_jobs.doc_job = Some((
             rx,
             String::from("Control flow graph"),
             String::from("Could not read the control flow graph"),
@@ -139,7 +139,7 @@ impl App {
 
     /// Open a finished CodeQL document (#578), or say why there is none.
     pub fn drain_codeql_doc(&mut self) -> bool {
-        let Some((rx, ..)) = self.codeql_doc_job.as_ref() else {
+        let Some((rx, ..)) = self.codeql_jobs.doc_job.as_ref() else {
             return false;
         };
         let outcome = match rx.try_recv() {
@@ -149,7 +149,7 @@ impl App {
                 Err(String::from("it stopped unexpectedly"))
             }
         };
-        let Some((_, done, failed)) = self.codeql_doc_job.take() else {
+        let Some((_, done, failed)) = self.codeql_jobs.doc_job.take() else {
             return false;
         };
         self.status = match outcome {
@@ -167,7 +167,7 @@ impl App {
     /// thread; [`Self::drain_codeql_ast`] shows it in the AST Viewer.
     pub(in crate::app) fn view_codeql_ast(&mut self) {
         use crate::codeql_ast as ast;
-        if self.codeql_ast_job.is_some() {
+        if self.codeql_jobs.ast_job.is_some() {
             self.status = String::from("An AST is already being read");
             return;
         }
@@ -175,7 +175,7 @@ impl App {
             return;
         };
         let dir = Self::codeql_contextual_dir("ast");
-        let program = self.codeql_program.clone();
+        let program = self.codeql_jobs.program.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         let (db_path, csv) = (db.path.clone(), ast::selected_file_csv(&archive));
         let shown = archive.clone();
@@ -203,7 +203,7 @@ impl App {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         self.status = format!("Reading the AST of {name} from {}\u{2026}", db.name);
-        self.codeql_ast_job = Some((
+        self.codeql_jobs.ast_job = Some((
             rx,
             ast::AstView {
                 file,
@@ -217,7 +217,7 @@ impl App {
     /// Show a finished AST read in the AST Viewer (#578), or say why there
     /// is none.
     pub fn drain_codeql_ast(&mut self) -> bool {
-        let Some((rx, _)) = self.codeql_ast_job.as_ref() else {
+        let Some((rx, _)) = self.codeql_jobs.ast_job.as_ref() else {
             return false;
         };
         let outcome = match rx.try_recv() {
@@ -227,7 +227,7 @@ impl App {
                 Err(String::from("the AST read stopped unexpectedly"))
             }
         };
-        let Some((_, mut view)) = self.codeql_ast_job.take() else {
+        let Some((_, mut view)) = self.codeql_jobs.ast_job.take() else {
             return false;
         };
         match outcome {

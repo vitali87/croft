@@ -1691,13 +1691,9 @@ pub struct App {
     /// the file it describes. Starting another drops it, so an older list can
     /// never replace a newer one (#2575).
     timeline_fetch: Option<crate::jobs::Job<(PathBuf, Vec<crate::git::FileHistoryEntry>)>>,
-    /// Background folder-size scans for the CodeQL database card (#578): a
-    /// large database is many files, so the walk stays off the input path.
-    codeql_size_rx: std::sync::mpsc::Receiver<(PathBuf, Option<u64>)>,
-    codeql_size_tx: std::sync::mpsc::Sender<(PathBuf, Option<u64>)>,
-    /// Databases whose size scan is in flight, so a refresh does not start
-    /// a second walk of the same folder.
-    codeql_size_pending: std::collections::HashSet<PathBuf>,
+    /// CodeQL's CLI, its running jobs and queue, and what they last reported
+    /// (see [`codeql::CodeqlJobs`]); the view is [`Self::codeql`].
+    codeql_jobs: codeql::CodeqlJobs,
     /// The file the TIMELINE has been fetched (or is being fetched) for, so the
     /// fetch fires exactly once per active-file change.
     timeline_fetched: Option<PathBuf>,
@@ -2051,105 +2047,6 @@ pub struct App {
     /// main loop; rebuilds the Extensions panel once if the verified cache
     /// changed. `None` once consumed (or on a disarmed build, immediately).
     ext_index_refresh: Option<std::sync::mpsc::Receiver<bool>>,
-    /// The `codeql` executable; tests point it at a stand-in (#578).
-    codeql_program: PathBuf,
-    /// The query run in flight: its outcome arrives here, and when it
-    /// started (#578).
-    codeql_run: Option<(
-        std::sync::mpsc::Receiver<crate::codeql_query::RunStatus>,
-        std::time::Instant,
-    )>,
-    /// Raised to stop the query run in flight: its `codeql` is killed and
-    /// the run recorded as cancelled (#578).
-    codeql_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// The file name of the query in flight, for its status-bar chip.
-    codeql_run_name: String,
-    /// Queries "Run Queries in Pack" has yet to start, in order (#578).
-    codeql_run_queue: std::collections::VecDeque<crate::codeql_query::QueuedRun>,
-    /// "Run Query on Multiple Databases" being set up (#578): the query,
-    /// its text, and the databases checked so far.
-    codeql_multi_db: Option<(PathBuf, String, Vec<PathBuf>)>,
-    /// How many queries the pack run holds and how many have failed so
-    /// far, for the status line; the total is 0 when no pack run is on.
-    codeql_batch: (usize, usize),
-    /// The database upgrade or cache cleanup in flight (#578).
-    codeql_upgrade: Option<CodeqlUpgrade>,
-    /// The `codeql version` call behind "CodeQL: Copy Version Information"
-    /// (#578): its bare version number, or why it could not be read.
-    codeql_version: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
-    /// The evaluator log summary being generated (#578): where the outcome
-    /// arrives, and the summary file to open once it lands.
-    codeql_log_summary: Option<(std::sync::mpsc::Receiver<Result<(), String>>, PathBuf)>,
-    /// The evaluator log viewer being prepared (#578): where the rendered
-    /// tree (or why there is none) arrives, and the tab label to show it in.
-    codeql_log_viewer: Option<CodeqlLogViewerJob>,
-    /// The Model Editor's endpoints being read (#578): the endpoints or why
-    /// not, and the database and language they are for.
-    codeql_model_job: Option<CodeqlModelJob>,
-    /// The performance comparison being prepared (#578): where the rendered
-    /// table (or why there is none) arrives, and the tab label to show it in.
-    codeql_perf_compare: Option<(std::sync::mpsc::Receiver<Result<String, String>>, String)>,
-    /// The query help being rendered (#578): where the outcome arrives,
-    /// the Markdown file to preview once it lands, and the query's name.
-    codeql_query_help: Option<CodeqlQueryHelp>,
-    /// The pack install or download in flight (#578): where its outcome
-    /// arrives, and the status lines for success and failure.
-    codeql_pack_job: Option<CodeqlPackJob>,
-    /// A database being downloaded or extracted (#1155): what is being
-    /// added, for the status line, and where its folder arrives.
-    codeql_db_job: Option<(String, std::sync::mpsc::Receiver<Result<PathBuf, String>>)>,
-    /// A CodeQL document being made (#578: View CFG, the alert and result
-    /// views): the file it writes or why not, and the status lines for
-    /// each.
-    codeql_doc_job: Option<CodeqlDocJob>,
-    /// The CodeQL results table last walked (#578), so the walk goes on
-    /// once the code it opened has the focus.
-    codeql_results_walk: Option<PathBuf>,
-    /// The AST being read for the AST Viewer (#578): the tree or why not,
-    /// and the view it fills in.
-    codeql_ast_job: Option<(
-        std::sync::mpsc::Receiver<Result<crate::codeql_ast::AstTree, String>>,
-        crate::codeql_ast::AstView,
-    )>,
-    /// `codeql_cli_path` from settings (#578), kept to notice a reload
-    /// changing it.
-    codeql_cli_setting: Option<String>,
-    /// Where [`Self::codeql_program`] came from (#578).
-    codeql_cli_source: crate::codeql_cli::Source,
-    /// The newest CLI release "CodeQL: Check for CLI Updates" found, which
-    /// "CodeQL: Download CLI" then installs (#578).
-    codeql_cli_latest: Option<String>,
-    /// The CLI download in flight (#578).
-    codeql_cli_download: Option<std::sync::mpsc::Receiver<crate::codeql_cli::JobUpdate>>,
-    /// The CLI update check in flight (#578): the latest release and the
-    /// version in use, if it could be read.
-    codeql_cli_check: Option<std::sync::mpsc::Receiver<CodeqlCliCheck>>,
-    /// The network calls behind those two, replaced in tests.
-    codeql_cli_net: crate::codeql_cli::Net,
-    /// The GitHub Code Search in flight: the list its repositories go
-    /// into, and its outcome (#578).
-    codeql_code_search: Option<CodeqlCodeSearch>,
-    /// The variant analysis being bundled and submitted (#578).
-    codeql_variant_submit:
-        Option<std::sync::mpsc::Receiver<Result<crate::codeql_submit::Submitted, String>>>,
-    /// The read of unfinished variant analyses' progress in flight, and
-    /// when the last one started (#578).
-    codeql_variant_poll: Option<std::sync::mpsc::Receiver<Vec<CodeqlRunPoll>>>,
-    codeql_variant_polled: Option<std::time::Instant>,
-    /// The fetch of a variant analysis's results in flight (#578).
-    codeql_variant_results: Option<std::sync::mpsc::Receiver<VariantResults>>,
-    /// The export of a variant analysis's results in flight (#578): where
-    /// it went (a folder's summary file or a gist's URL), how many
-    /// repositories it holds, and those whose results failed.
-    codeql_variant_export: Option<std::sync::mpsc::Receiver<Result<VariantExport, String>>>,
-    /// The walk for the workspace's queries in flight (#840): opening the
-    /// CodeQL view starts it off the UI thread and the packs land here. It is
-    /// tagged with the root it walks, so a root the workspace has left since
-    /// never lists its queries.
-    codeql_queries_job: Option<(
-        PathBuf,
-        std::sync::mpsc::Receiver<Vec<crate::codeql_query::QueryPack>>,
-    )>,
     /// True when the in-flight refresh was triggered by the user (the ⟳ button),
     /// so its completion reports a status line; the silent startup refresh
     /// doesn't, to avoid clobbering more useful startup messages.
@@ -4221,7 +4118,6 @@ impl App {
         } else {
             crate::mcp::catalog::installed_ids(&crate::lsp::manifest::user_extensions_dir())
         };
-        let (codeql_size_tx, codeql_size_rx) = std::sync::mpsc::channel();
         let (history_done_tx, history_done_rx) = std::sync::mpsc::channel();
         let (project_hint_tx, project_hint_rx) = std::sync::mpsc::channel();
         let (test_jump_tx, test_jump_rx) = std::sync::mpsc::channel();
@@ -4366,9 +4262,7 @@ impl App {
             settings_chain: merged_settings.chain,
             settings_provenance: merged_settings.provenance,
             timeline_fetch: None,
-            codeql_size_rx,
-            codeql_size_tx,
-            codeql_size_pending: std::collections::HashSet::new(),
+            codeql_jobs: codeql::CodeqlJobs::new(loaded_prefs.codeql_cli_path.clone()),
             history_done_rx,
             history_done_tx,
             project_check: None,
@@ -4519,38 +4413,6 @@ impl App {
             secondary_outline: Default::default(),
             welcome,
             ext_index_refresh,
-            codeql_program: PathBuf::from("codeql"),
-            codeql_run: None,
-            codeql_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            codeql_run_name: String::new(),
-            codeql_run_queue: std::collections::VecDeque::new(),
-            codeql_batch: (0, 0),
-            codeql_multi_db: None,
-            codeql_upgrade: None,
-            codeql_version: None,
-            codeql_log_summary: None,
-            codeql_log_viewer: None,
-            codeql_model_job: None,
-            codeql_perf_compare: None,
-            codeql_query_help: None,
-            codeql_pack_job: None,
-            codeql_db_job: None,
-            codeql_ast_job: None,
-            codeql_doc_job: None,
-            codeql_results_walk: None,
-            codeql_cli_setting: loaded_prefs.codeql_cli_path.clone(),
-            codeql_cli_source: crate::codeql_cli::Source::Fallback,
-            codeql_cli_latest: None,
-            codeql_cli_download: None,
-            codeql_cli_check: None,
-            codeql_cli_net: crate::codeql_cli::Net::default(),
-            codeql_code_search: None,
-            codeql_variant_submit: None,
-            codeql_variant_poll: None,
-            codeql_variant_polled: None,
-            codeql_variant_results: None,
-            codeql_variant_export: None,
-            codeql_queries_job: None,
             ext_index_manual_refresh: false,
             search_query_tx,
             search_results_rx,
@@ -5133,7 +4995,7 @@ impl App {
         // `codeql` rather than whatever the machine has installed.
         if cfg!(test) {
             app.test_worker
-                .set_codeql_program(app.codeql_program.clone());
+                .set_codeql_program(app.codeql_jobs.program.clone());
         } else {
             app.resolve_codeql_cli();
         }
