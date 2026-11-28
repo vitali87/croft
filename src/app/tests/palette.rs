@@ -3033,3 +3033,29 @@ fn the_connect_dialog_keeps_its_own_caret() {
         "the pictures put the dialog's caret back after drawing"
     );
 }
+
+/// The user's menu commands head the palette while the query is empty, in
+/// menu order, and are not pinned once a query narrows the list.
+#[test]
+fn the_palette_lists_the_user_menu_commands_first_until_a_query_is_typed() {
+    use crate::widgets::command_palette::{Command, PaletteItem};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_command_palette();
+    let palette = app.command_palette.as_mut().unwrap();
+    palette.set_pinned(vec![Command::UnfoldAll, Command::FoldAll]);
+    let first: Vec<_> = palette.results.iter().take(2).cloned().collect();
+    assert_eq!(
+        first,
+        vec![
+            PaletteItem::Builtin(Command::UnfoldAll),
+            PaletteItem::Builtin(Command::FoldAll)
+        ]
+    );
+    assert!(palette.is_pinned(&first[0]));
+    palette.set_query("fold");
+    assert!(
+        !palette.is_pinned(&first[0]),
+        "a query ranks by match, not pin"
+    );
+}

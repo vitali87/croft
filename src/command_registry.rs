@@ -2494,6 +2494,17 @@ commands! {
         title: "Preferences: Open Workspace Settings — Local (JSON)",
         hint: "",
     }
+    /// The user's own short menu (`menu.json`) as a drop-down over the editor.
+    OpenUserMenu {
+        id: "open_user_menu",
+        title: "User Menu: Open",
+        hint: "Cmd+K Shift+J",
+    }
+    OpenUserMenuJson {
+        id: "open_user_menu_json",
+        title: "Preferences: Open User Menu (JSON)",
+        hint: "",
+    }
     OpenKeybindingsJson {
         id: "open_keybindings_json",
         title: "Preferences: Open Keyboard Shortcuts (JSON)",
@@ -3000,7 +3011,7 @@ mod tests {
     /// How many palette commands show no chord on this platform: the ratchet
     /// below holds it there or lower. Kill to End of Line has one on macOS
     /// only, which is the difference between the two.
-    const WITHOUT_A_CHORD: usize = if cfg!(target_os = "macos") { 271 } else { 272 };
+    const WITHOUT_A_CHORD: usize = if cfg!(target_os = "macos") { 272 } else { 273 };
 
     /// Everything has a shortcut (TENETS.md): every row of the table must
     /// state its hint, and the number with none may only fall. A new command

@@ -516,6 +516,8 @@ enum MenuAction {
     /// A row of the Commit button's `▾` dropdown (#871).
     Commit(crate::widgets::source_control::CommitMenuItem),
     Create(CreateKind),
+    /// Run a palette command: a row of the user's menu (`menu.json`).
+    RunCommand(crate::widgets::command_palette::Command),
     /// Move every path in `paths` to the OS trash (recoverable). One entry
     /// for a single right-click, more when a multi-selection is active.
     Delete {

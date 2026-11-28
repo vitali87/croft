@@ -1,0 +1,1 @@
+feature: User Menu: your own short list of commands in `menu.json` (Preferences: Open User Menu (JSON)), opened as a drop-down with Cmd/Ctrl+K Shift+M and shown as a starred block at the top of the Command Palette.
