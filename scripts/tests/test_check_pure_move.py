@@ -366,6 +366,76 @@ class PureMoves(unittest.TestCase):
             self.assertEqual(code, 0, out)
             self.assertIn("1 unchanged, 1 moved", out)
 
+    def test_test_only_means_compiled_only_for_tests(self):
+        """A module counts as test-only when the build compiles it only for
+        tests, under `#[cfg(test)]`, inline or as its own file; a module
+        merely named like one does not, since its items are in the release
+        build."""
+        helper = "fn helper() -> u8 {\n    1\n}\n"
+        indent = "".join("    " + ln + "\n" for ln in helper.strip().split("\n"))
+        guarded = "#[cfg(test)]\nmod tests {\n" + indent + "}\n"
+        named = "mod release_tests {\n" + indent + "}\n"
+        cases = [
+            # an inline cfg(test) module into a file module the parent declares cfg(test)
+            ({"src/main.rs": "mod a;\nmod c;\n", "src/a.rs": guarded, "src/c.rs": "#[cfg(test)]\nmod tests;\n"},
+             {"src/a.rs": "", "src/c/tests.rs": helper}, 0),
+            # a module only named like a test module, in the release build
+            ({"src/main.rs": "mod a;\nmod b;\n", "src/a.rs": named, "src/b.rs": ""},
+             {"src/a.rs": "", "src/b.rs": named}, 1),
+        ]
+        for base, after, want in cases:
+            with self.subTest(after=sorted(after)), tempfile.TemporaryDirectory() as tmp:
+                repo = Repo(Path(tmp), base)
+                repo.commit(after)
+                code, out = repo.check()
+                self.assertEqual(code, want, out)
+
+    def test_only_a_helper_is_ever_a_copy(self):
+        """A helper copied into a second test module is a copy, also from a
+        file the change does not touch; a copied `#[test]` is a second test
+        that runs twice, so it is an addition."""
+        def tests_mod(*items):
+            body = "\n".join("".join("    " + ln + "\n" for ln in it.strip().split("\n")) for it in items)
+            return "#[cfg(test)]\nmod tests {\n" + body + "}\n"
+        helper = "fn lines() -> u8 {\n    1\n}\n"
+        test = "#[test]\nfn adds() {\n    assert_eq!(lines(), 1);\n}\n"
+        other = "#[test]\nfn other() {\n    assert!(true);\n}\n"
+        cases = [
+            # the helper copied from an unchanged file: a copy
+            ({"src/main.rs": "mod a;\nmod b;\n", "src/a.rs": tests_mod(helper, test), "src/b.rs": tests_mod(other)},
+             {"src/b.rs": tests_mod(other, helper)}, 0, "copied   fn src/b.rs::tests::lines"),
+            # a test copied: an addition
+            ({"src/main.rs": "mod a;\nmod b;\n", "src/a.rs": tests_mod(helper, test), "src/b.rs": tests_mod(other, helper)},
+             {"src/b.rs": tests_mod(other, helper, test)}, 1, "ADDED    fn src/b.rs::tests::adds"),
+        ]
+        for base, after, want, says in cases:
+            with self.subTest(says=says), tempfile.TemporaryDirectory() as tmp:
+                repo = Repo(Path(tmp), base)
+                repo.commit(after)
+                code, out = repo.check()
+                self.assertEqual(code, want, out)
+                self.assertIn(says, out)
+
+    def test_declared_module_moves_compose_in_commit_order(self):
+        """`crate::a -> crate::b` and then `crate::b -> crate::c` take what was
+        under `crate::a` at the base to `crate::c`."""
+        item = "pub(super) fn find() -> u8 {\n    1\n}\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp), {"src/main.rs": "mod a;\n", "src/a.rs": "mod walk;\n", "src/a/walk.rs": item})
+            (Path(tmp) / "src/a/walk.rs").unlink()
+            repo.commit(
+                {"src/main.rs": "mod a;\nmod b;\n", "src/a.rs": "", "src/b.rs": "mod walk;\n", "src/b/walk.rs": item},
+                "move\n\npure-move-module: crate::a -> crate::b",
+            )
+            (Path(tmp) / "src/b/walk.rs").unlink()
+            repo.commit(
+                {"src/main.rs": "mod a;\nmod b;\nmod c;\n", "src/b.rs": "", "src/c.rs": "mod walk;\n", "src/c/walk.rs": item},
+                "move again\n\npure-move-module: crate::b -> crate::c",
+            )
+            code, out = repo.check()
+            self.assertEqual(code, 0, out)
+            self.assertIn("moved    fn src/a/walk.rs::find -> src/c/walk.rs::find", out)
+
     def test_module_scopes_read_every_spelling(self):
         app = pm.module_of("src/app/codeql.rs")
         self.assertEqual(app, ("crate", "app", "codeql"))

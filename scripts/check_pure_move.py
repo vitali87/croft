@@ -510,9 +510,9 @@ def relocated(reach):
     read at its new path: what reached all of the old module reaches all of
     the new one. Applied only to items that moved: an item that stays keeps
     its reach. The build checks that nothing left behind needed it."""
-    for old, new in MOVED.items():
+    for old in sorted(MOVED, key=len, reverse=True):
         if reach[: len(old)] == old:
-            return new + reach[len(old) :]
+            return MOVED[old] + reach[len(old) :]
     return reach
 
 
@@ -532,11 +532,105 @@ def vis_module(it):
     return module_of(it.file, it.mods)
 
 
+# The items, by id, that the build compiles only for tests: set by check().
+TEST_ONLY = set()
+# A `#[cfg(test)]` and whatever other attributes or comments follow it.
+CFG_TEST = r"#\[cfg\(test\)\]\s*(?:#\[[^\]]*\]\s*|//[^\n]*\n\s*)*"
+VIS_OPT = r"(?:pub(?:\([^)]*\))?\s+)?"
+
+
 def in_tests(it):
-    """Whether `it` sits in a test module: one named `tests` or `*_tests`,
-    inline or a file of its own, at any depth under src/."""
-    module = module_of(it.file, it.mods)
-    return module is not None and any(m == "tests" or m.endswith("_tests") for m in module)
+    """Whether the build compiles `it` only for tests: its module, or one it
+    sits in, is declared under `#[cfg(test)]`. A module merely named `tests`
+    does not count; nothing outside test code can name a test-only item."""
+    return id(it) in TEST_ONLY
+
+
+def is_test_fn(it):
+    """Whether `it` is a test the harness runs (`#[test]`, `#[tokio::test]`):
+    a copy of one is a second test, never a kept helper."""
+    return it.kind == "fn" and re.search(r"^\s*#\[(?:\w+::)*test\b", it.norm, re.M) is not None
+
+
+def declares_test_mod(text, name, inline):
+    """Whether `text` declares module `name` under `#[cfg(test)]`, inline
+    (`mod name {`) or as a file of its own (`mod name;`)."""
+    end = r"\s*\{" if inline else r"\s*;"
+    return re.search(CFG_TEST + VIS_OPT + r"mod\s+" + re.escape(name) + r"\b" + end, text) is not None
+
+
+def parent_files(path):
+    """The module name of src/ file `path` and the files that can declare
+    it, or None for the crate root: src/a/b.rs is `b`, declared in src/a.rs
+    or src/a/mod.rs; src/a.rs is `a`, declared in src/main.rs or src/lib.rs."""
+    parts = path[len("src/") : -len(".rs")].split("/")
+    if parts in (["main"], ["lib"]):
+        return None
+    if parts[-1] == "mod":
+        parts.pop()
+    name, up = parts[-1], parts[:-1]
+    if not up:
+        return name, ["src/main.rs", "src/lib.rs"]
+    return name, ["src/" + "/".join(up) + ".rs", "src/" + "/".join(up) + "/mod.rs"]
+
+
+def test_only_at(rev, file, mods, cache):
+    """Whether an item of `file`, inside its inline `mods`, is compiled only
+    for tests at `rev`: an inline module it sits in, its file's module or a
+    module above that is declared under `#[cfg(test)]`."""
+    key = (rev, file, mods)
+    if key in cache:
+        return cache[key]
+    answer = False
+    if file.startswith("src/") and file.endswith(".rs"):
+        text = shown_at(rev, file, cache)
+        answer = bool(text) and any(declares_test_mod(text, m, True) for m in mods)
+        path = file
+        while not answer:
+            up = parent_files(path)
+            if up is None:
+                break
+            name, parents = up
+            found = next((p for p in parents if shown_at(rev, p, cache) is not None), None)
+            if found is None:
+                break
+            answer = declares_test_mod(shown_at(rev, found, cache), name, False)
+            path = found
+    cache[key] = answer
+    return answer
+
+
+def twin_elsewhere(base, it, skip, cache):
+    """Whether a file left unchanged holds, at `base`, a test-only item
+    identical to `it`: a helper copied from a test module the change did not
+    touch."""
+    found = subprocess.run(
+        ["git", "grep", "-l", "-F", "-e", it.name, base, "--", "src/*.rs"],
+        capture_output=True,
+        text=True,
+    ).stdout.split()
+    for hit in found:
+        path = hit.split(":", 1)[1]
+        if path in skip:
+            continue
+        try:
+            items, _ = parse(shown_at(base, path, cache), path)
+        except ParseError:
+            continue
+        for o in items:
+            if (o.kind, o.name, o.ctx, o.norm) == (it.kind, it.name, it.ctx, it.norm) and test_only_at(
+                base, o.file, o.mods, cache
+            ):
+                return True
+    return False
+
+
+def shown_at(rev, path, cache):
+    """`path` at `rev`, read once, or None when it is not there."""
+    key = ("show", rev, path)
+    if key not in cache:
+        cache[key] = git("show", f"{rev}:{path}") if exists_at(rev, path) else None
+    return cache[key]
 
 
 def item_widens(o, n):
@@ -746,9 +840,16 @@ def check(base, head, if_declared):
         return 0
     messages = git("log", f"{base}..{head}", "--format=%B")
     declared = bool(PURE_MOVE.search(messages))
+    # Declarations compose in the order their commits were made: `a -> b`
+    # then `b -> c` takes what was under `a` at the base to `c`.
     MOVED.clear()
-    for old, new in MOVED_MODULE.findall(messages):
-        MOVED[tuple(old.split("::"))] = tuple(new.split("::"))
+    in_order = git("log", "--reverse", f"{base}..{head}", "--format=%B")
+    for old, new in MOVED_MODULE.findall(in_order):
+        o, n = tuple(old.split("::")), tuple(new.split("::"))
+        for was, now in list(MOVED.items()):
+            if now[: len(o)] == o:
+                MOVED[was] = n + now[len(o) :]
+        MOVED.setdefault(o, n)
     for old, new in MOVED.items():
         print(f"  module moved: {'::'.join(old)} -> {'::'.join(new)}")
     enforced = declared or not if_declared
@@ -764,14 +865,27 @@ def check(base, head, if_declared):
                     continue
                 items += its
                 glue += gl
+    cache = {}
+    TEST_ONLY.clear()
+    for rev, (items, _) in zip((base, head), sides):
+        for it in items:
+            if test_only_at(rev, it.file, it.mods, cache):
+                TEST_ONLY.add(id(it))
     ed = edition()
     unchanged, widened, moved, changed, removed, added, relaid = compare(
         sides[0][0], sides[1][0], lambda o, n: laid_out_alike(o, n, ed)
     )
     # A test helper both sides of a split still use is copied, not added:
-    # identical to an item of the base, in a test module.
-    base_texts = {(o.kind, o.name, o.ctx, o.norm) for o in sides[0][0]}
-    copied = [n for n in added if in_tests(n) and (n.kind, n.name, n.ctx, n.norm) in base_texts]
+    # test-only, not itself a test, and identical to a test-only item of the
+    # base, in a changed file or an unchanged one.
+    base_texts = {(o.kind, o.name, o.ctx, o.norm) for o in sides[0][0] if in_tests(o)}
+    copied = [
+        n
+        for n in added
+        if in_tests(n)
+        and not is_test_fn(n)
+        and ((n.kind, n.name, n.ctx, n.norm) in base_texts or twin_elsewhere(base, n, changed_files, cache))
+    ]
     added = [n for n in added if n not in copied]
     respelled = [(o, n) for o, n in widened + moved if o.vis != n.vis]
     same = sum(1 for o, n in respelled if same_reach(o, n))
