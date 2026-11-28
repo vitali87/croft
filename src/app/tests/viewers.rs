@@ -2261,6 +2261,34 @@ fn opening_a_pdf_does_not_wait_for_its_first_page() {
     assert_eq!(app.editor.pdf_page(), Some(1));
 }
 
+/// A PDF whose first page fails in the background says so in the status
+/// line, as the open that waited for it did: a `.pdf` names the failure, and
+/// a file only sniffed as a PDF says why it went to the hex viewer (#2829
+/// review). The open had said "Opened …" long before.
+#[test]
+fn a_pdf_whose_first_page_fails_says_why_once_it_lands() {
+    require_pdf_backend();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("half.pdf"), b"%PDF-1.4\nnot really a pdf\n").unwrap();
+    std::fs::write(tmp.path().join("broken"), b"%PDF-1.4\nnot really a pdf\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    open_from_explorer(&mut app, "half.pdf");
+    settle_pdf(&mut app);
+    assert!(
+        app.status.contains("PDF page 1 failed"),
+        "the failure is said: {}",
+        app.status
+    );
+    open_from_explorer(&mut app, "broken");
+    settle_pdf(&mut app);
+    assert!(app.editor.hex.is_some(), "status: {}", app.status);
+    assert!(
+        app.status.contains("in the hex viewer") && app.status.contains("could not render"),
+        "why it went to hex is said: {}",
+        app.status
+    );
+}
+
 /// End pressed right after the open, before the page count is in, goes to
 /// the last page once it is: the count is read on a job (#2824).
 #[test]

@@ -645,6 +645,10 @@ impl App {
     /// page's links acts now. Whether anything on screen changed.
     pub(super) fn poll_pdf_previews(&mut self) -> bool {
         let mut changed = false;
+        // What the tab in front says once its work lands: a page that would
+        // not render, or a file the PDF viewer turned away to the hex viewer.
+        // Its open said "Opened …" long before (#2829 review).
+        let said = self.editor.status.clone();
         for (g, group) in self
             .editor_layout
             .all_groups_mut(&mut self.editor)
@@ -660,6 +664,10 @@ impl App {
                     editor.pdf_jobs.waiting_click = None;
                 }
             }
+        }
+        if self.editor.status != said {
+            self.status = self.editor.status.clone();
+            changed = true;
         }
         let links_in = self
             .editor
