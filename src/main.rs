@@ -115,6 +115,7 @@ mod review_threads;
 mod rewind;
 mod sarif;
 mod scrubber;
+mod search;
 mod search_editor;
 mod session;
 mod session_cli;

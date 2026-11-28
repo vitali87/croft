@@ -1,8 +1,3 @@
-use globset::{Glob, GlobSet, GlobSetBuilder};
-use grep_matcher::{LineMatchKind, LineTerminator, Match, Matcher, NoCaptures, NoError};
-use grep_regex::{RegexMatcher, RegexMatcherBuilder};
-use grep_searcher::{BinaryDetection, MmapChoice, Searcher, SearcherBuilder, Sink, SinkMatch};
-use ignore::{WalkBuilder, WalkState};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -12,67 +7,19 @@ use ratatui::{
 };
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use unicode_width::UnicodeWidthStr;
 
-use crate::glob_list::split_globs;
-
 mod fields;
-mod highlight;
 mod hit_test;
-mod matcher;
-mod path_filter;
 mod render;
 mod replace;
 mod results;
-mod walk;
-mod worker;
-pub use highlight::split_for_highlight;
-pub(crate) use matcher::Pattern;
-use matcher::*;
-pub use path_filter::PathFilter;
-use path_filter::*;
-pub use replace::preserve_case;
-use replace::*;
-pub(crate) use walk::as_typed;
-pub use walk::line_may_match;
-pub use walk::search_workspace_streaming_filtered;
-use walk::*;
-pub use worker::SearchEvent;
-pub use worker::SearchRequest;
-pub use worker::search_worker_loop;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SearchHit {
-    pub path: PathBuf,
-    /// 1-indexed line number, the way humans / editors talk about lines.
-    pub line_no: usize,
-    /// The matched line without its line break, length capped, and with
-    /// any indent before the first match trimmed.
-    pub line_text: String,
-    /// How many times the query matches on this line, counted as Replace All
-    /// replaces them. The header counts these, as VS Code does, not lines
-    /// (#860).
-    pub matches: usize,
-}
-
-/// Mode toggles that drive `search_workspace`. Mirror VS Code's three
-/// search input toggles, in the same left-to-right order:
-///   - `case_sensitive` (Aa)
-///   - `whole_word` (ab with underline)
-///   - `use_regex` (.*)
-///   - `preserve_case` (AB, on the replace row): each replacement takes the
-///     case of the text it replaces (#1612)
-///
-/// All-false matches the original case-insensitive substring behaviour.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct SearchOpts {
-    pub case_sensitive: bool,
-    pub whole_word: bool,
-    pub use_regex: bool,
-    pub preserve_case: bool,
-}
+use crate::search::*;
+pub use crate::search::{
+    PathFilter, SearchEvent, SearchHit, SearchOpts, SearchRequest, line_may_match, preserve_case,
+    search_worker_loop, search_workspace_streaming_filtered, split_for_highlight,
+};
+pub(crate) use crate::search::{Pattern, as_typed};
 
 /// How far the Search panel's run got (#2608).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
