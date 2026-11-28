@@ -1,0 +1,1 @@
+fix: A command croft runs through the remote connection, once that connection has gone, fails at once instead of starting a fresh login that could ask for a password over croft's screen, and gives up on an unreachable host in 10 seconds instead of the system's network timeout (#2793).

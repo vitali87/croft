@@ -3,10 +3,10 @@
 //! Every ssh croft starts builds through [`Ssh`] and is named by what it is
 //! for, so each kind's options and streams are written once:
 //!
-//! - [`Ssh::client`]: a command through the shared connection, with a
-//!   connect timeout and keepalive, as the session's own commands run;
-//!   [`Ssh::bare_client`] is one with neither, as the relay's helpers have
-//!   always run;
+//! - [`Ssh::client`]: a command through the shared connection, never
+//!   logging in afresh, with a keepalive, as the session's own commands run;
+//!   [`Ssh::bare_client`] is one without the keepalive, as the relay's
+//!   helpers run;
 //! - [`Ssh::background`], [`Ssh::no_stdin`] and [`Ssh::quiet`]: what a
 //!   client may touch of croft's streams, for one that runs while the remote
 //!   session owns the terminal;
@@ -32,13 +32,17 @@ use std::process::{Command, Stdio};
 /// One ssh call, built up before it runs.
 pub(crate) struct Ssh(Command);
 
-/// What a client through the connection sets beyond using it: each connect
-/// attempt is bounded, so a reconnect against a host that is asleep or
-/// offline fails fast instead of hanging, and the link is checked every
+/// What every client through the connection sets (#2793): through a live
+/// connection neither does anything, since no login happens. Once the
+/// connection has gone, ssh falls back to a fresh login; `BatchMode` makes
+/// that fail at once rather than ask for a password over croft's screen or
+/// the remote session, and the connect timeout makes an unreachable host
+/// fail in 10 s rather than the system's TCP timeout.
+const THROUGH_OPTIONS: [&str; 4] = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"];
+
+/// The keepalive the session's own commands add: the link is checked every
 /// 10 s, so a dead one is noticed after three misses.
-const CLIENT_OPTIONS: [&str; 6] = [
-    "-o",
-    "ConnectTimeout=10",
+const KEEPALIVE_OPTIONS: [&str; 4] = [
     "-o",
     "ServerAliveInterval=10",
     "-o",
@@ -97,22 +101,24 @@ impl Ssh {
     }
 
     /// Through the shared connection at `socket`, never opening a master of
-    /// its own: `-S socket -o ControlMaster=no`, and nothing more.
+    /// its own (`-S socket -o ControlMaster=no`) and never logging in afresh
+    /// once it has gone ([`THROUGH_OPTIONS`]).
     pub(crate) fn bare_client(socket: &Path) -> Self {
         let mut ssh = Self::new();
         ssh.0
             .arg("-S")
             .arg(socket)
             .arg("-o")
-            .arg("ControlMaster=no");
+            .arg("ControlMaster=no")
+            .args(THROUGH_OPTIONS);
         ssh
     }
 
-    /// Through the shared connection at `socket`, with the connect timeout
-    /// and keepalive ([`CLIENT_OPTIONS`]) the session's commands run with.
+    /// [`Ssh::bare_client`] with the keepalive ([`KEEPALIVE_OPTIONS`]) the
+    /// session's commands run with.
     pub(crate) fn client(socket: &Path) -> Self {
         let mut ssh = Self::bare_client(socket);
-        ssh.0.args(CLIENT_OPTIONS);
+        ssh.0.args(KEEPALIVE_OPTIONS);
         ssh
     }
 
@@ -160,12 +166,16 @@ impl Ssh {
         ssh
     }
 
-    /// The terminal session's own master at `socket`, with the client's
-    /// connect timeout and keepalive ([`CLIENT_OPTIONS`]), so it tears
-    /// itself down promptly once the link goes away.
+    /// The terminal session's own master at `socket`: each connect attempt
+    /// bounded to 10 s, so a reconnect against a host that is asleep or
+    /// offline fails fast instead of hanging, and the client's keepalive
+    /// ([`KEEPALIVE_OPTIONS`]), so it tears itself down promptly once the
+    /// link goes away. It may prompt: the user is at the terminal.
     pub(crate) fn session_master(socket: &Path) -> Self {
         let mut ssh = Self::master(socket);
-        ssh.0.args(CLIENT_OPTIONS);
+        ssh.0
+            .args(["-o", "ConnectTimeout=10"])
+            .args(KEEPALIVE_OPTIONS);
         ssh
     }
 
@@ -210,8 +220,9 @@ impl Ssh {
 /// shell rsync hands the line to.
 pub(crate) fn rsync_transport(socket: &Path) -> String {
     format!(
-        "ssh -S {} -o ControlMaster=no",
+        "ssh -S {} -o ControlMaster=no {}",
         super::shell_quote_for_e_arg(socket),
+        THROUGH_OPTIONS.join(" "),
     )
 }
 
@@ -223,4 +234,45 @@ pub(crate) fn dialog_master_args(socket: &Path, host: &str) -> Vec<std::ffi::OsS
     args.extend(DIALOG_MASTER_OPTIONS.map(Into::into));
     args.push(host.into());
     args
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(ssh: Ssh) -> Vec<String> {
+        ssh.into_command()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// #2793: every call through the shared connection, rsync's included,
+    /// fails at once rather than log in afresh once the connection has
+    /// gone, and gives up on an unreachable host in 10 s.
+    #[test]
+    fn a_client_through_the_connection_never_logs_in_afresh() {
+        let socket = Path::new("/tmp/croft-ssh/ctl");
+        for client in [
+            args(Ssh::client(socket)),
+            args(Ssh::bare_client(socket)),
+            args(Ssh::client(socket).background()),
+        ] {
+            let joined = client.join(" ");
+            assert!(joined.contains("-o BatchMode=yes"), "{joined}");
+            assert!(joined.contains("-o ConnectTimeout=10"), "{joined}");
+        }
+        let rsync = rsync_transport(socket);
+        assert!(rsync.contains("-o BatchMode=yes"), "{rsync}");
+        assert!(rsync.contains("-o ConnectTimeout=10"), "{rsync}");
+    }
+
+    /// The openers are left as they were: the session's own master may
+    /// prompt, the user being at the terminal.
+    #[test]
+    fn the_session_master_may_prompt() {
+        let master = args(Ssh::session_master(Path::new("/tmp/croft-ssh/ctl"))).join(" ");
+        assert!(!master.contains("BatchMode"), "{master}");
+        assert!(master.contains("-o ConnectTimeout=10"), "{master}");
+    }
 }
