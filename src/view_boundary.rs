@@ -50,12 +50,13 @@ fn uses(root: &Path) -> BTreeSet<(String, String)> {
         }
         let text = std::fs::read_to_string(&file).unwrap();
         let mut rest = text.as_str();
-        while let Some(at) = rest.find("crate::widgets") {
-            rest = &rest[at + "crate::widgets".len()..];
-            if rest.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+        while let Some(at) = rest.find("crate::") {
+            let named_crate = !rest[..at].ends_with(|c: char| c.is_alphanumeric() || c == '_');
+            rest = &rest[at + "crate::".len()..];
+            if !named_crate {
                 continue;
             }
-            for path in use_paths(rest) {
+            for path in widget_paths(rest) {
                 found.insert((rel.clone(), cut_after_type(&path)));
             }
         }
@@ -80,19 +81,27 @@ fn rust_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// The paths named by the text right after a `crate::widgets`: one for
-/// `::editor::Editor`, one each for a group (`::{editor::Editor, diff}`),
-/// and the empty path for the module itself (`;`, ` as w`), which no entry
-/// allows, so an alias cannot hide what is named through it.
-fn use_paths(after: &str) -> Vec<String> {
-    match after.strip_prefix("::") {
-        Some(tree) => use_tree(tree).0,
-        None => vec![String::new()],
-    }
+/// The paths under `widgets` named by the use tree right after a `crate::`:
+/// one for `widgets::editor::Editor`, one each for a group, whether it opens
+/// under `widgets` (`widgets::{editor::Editor, diff}`) or at the crate root
+/// (`{git, widgets::diff}`), and the empty path for the module itself
+/// (`widgets;`, `widgets as w`, `{self, widgets}`), which no entry allows, so
+/// an alias cannot hide what is named through it.
+fn widget_paths(after_crate: &str) -> Vec<String> {
+    use_tree(after_crate)
+        .0
+        .into_iter()
+        .filter_map(|p| match p.strip_prefix("widgets") {
+            Some("") => Some(String::new()),
+            Some(sub) => sub.strip_prefix("::").map(str::to_string),
+            None => None,
+        })
+        .collect()
 }
 
 /// The paths of the use tree at the start of `s`, and how many bytes it
-/// takes: a name, a name followed by `::` and a tree, or a `{…}` group.
+/// takes: a name (with its `as` alias, if any), a name followed by `::` and
+/// a tree, or a `{…}` group.
 fn use_tree(s: &str) -> (Vec<String>, usize) {
     let trimmed = s.trim_start();
     let lead = s.len() - trimmed.len();
@@ -134,8 +143,27 @@ fn use_tree(s: &str) -> (Vec<String>, usize) {
             };
             (paths, lead + name_len + 2 + used)
         }
-        None => (vec![name.to_string()], lead + name_len),
+        None => (
+            vec![name.to_string()],
+            lead + name_len + alias_len(&trimmed[name_len..]),
+        ),
     }
+}
+
+/// How many bytes an ` as name` at the start of `s` takes, or 0.
+fn alias_len(s: &str) -> usize {
+    let trimmed = s.trim_start();
+    let Some(after) = trimmed.strip_prefix("as") else {
+        return 0;
+    };
+    let name = after.trim_start();
+    if name.len() == after.len() {
+        return 0;
+    }
+    let name_len = name
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(name.len());
+    s.len() - name.len() + name_len
 }
 
 /// `path` cut after its first segment that starts with a capital (a type, a
@@ -173,19 +201,31 @@ fn outside_the_ui_only_the_listed_parts_come_from_the_views() {
 #[test]
 fn a_grouped_nested_or_aliased_use_is_read_in_full() {
     assert_eq!(
-        use_paths("::editor::Editor::new(x)"),
+        widget_paths("widgets::editor::Editor::new(x)"),
         ["editor::Editor::new"]
     );
     assert_eq!(
-        use_paths("::{editor::{self, Editor}, terminal::VoidListener};"),
+        widget_paths("widgets::{editor::{self, Editor}, terminal::VoidListener};"),
         ["editor", "editor::Editor", "terminal::VoidListener"]
     );
     assert_eq!(
-        use_paths("::{\n    diff::DiffData,\n    testing,\n};"),
+        widget_paths("widgets::{\n    diff::DiffData,\n    testing,\n};"),
         ["diff::DiffData", "testing"]
     );
-    assert_eq!(use_paths(";"), [""]);
-    assert_eq!(use_paths(" as views;"), [""]);
+    assert_eq!(widget_paths("widgets;"), [""]);
+    assert_eq!(widget_paths("widgets as views;"), [""]);
+    // A group at the crate root, and an alias inside a group, hide nothing.
+    assert_eq!(
+        widget_paths("{git, widgets::search::SearchPanel};"),
+        ["search::SearchPanel"]
+    );
+    assert_eq!(
+        widget_paths("widgets::{editor::Editor as E, search::SearchPanel};"),
+        ["editor::Editor", "search::SearchPanel"]
+    );
+    assert_eq!(widget_paths("{self, widgets as w, git::query};"), [""]);
+    assert!(widget_paths("git::query(p)").is_empty());
+    assert!(widget_paths("widgets_extra::X;").is_empty());
     assert_eq!(cut_after_type("editor::Editor::new"), "editor::Editor");
     assert_eq!(
         cut_after_type("terminal::resize_term"),
@@ -205,7 +245,8 @@ fn a_new_use_outside_the_ui_is_caught_and_the_ui_is_not_read() {
     std::fs::create_dir_all(src.join("app")).unwrap();
     std::fs::write(
         src.join("engine.rs"),
-        "use crate::widgets::search::SearchPanel;\n/// See [`crate::widgets::diff`].\n",
+        "use crate::widgets::search::SearchPanel;\n/// See [`crate::widgets::diff`].\n\
+         use crate::{git, widgets::{editor::Editor as E, ports::PortsPanel}};\n",
     )
     .unwrap();
     std::fs::write(
@@ -221,6 +262,8 @@ fn a_new_use_outside_the_ui_is_caught_and_the_ui_is_not_read() {
         found,
         [
             ("src/engine.rs".to_string(), "diff".to_string()),
+            ("src/engine.rs".to_string(), "editor::Editor".to_string()),
+            ("src/engine.rs".to_string(), "ports::PortsPanel".to_string()),
             (
                 "src/engine.rs".to_string(),
                 "search::SearchPanel".to_string()
