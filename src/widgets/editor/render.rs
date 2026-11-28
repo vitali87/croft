@@ -458,7 +458,15 @@ impl Widget for &mut Editor {
                 crate::iterm2_inline::detect_inline_image_protocol(),
                 self.theme,
             );
-            render_image_placeholder(image, self.path.as_deref(), inner, buf, ibg, self.theme);
+            render_image_placeholder(
+                image,
+                self.pdf_jobs.rendering(),
+                self.path.as_deref(),
+                inner,
+                buf,
+                ibg,
+                self.theme,
+            );
             if self.cell_images {
                 let area = Rect {
                     y: inner.y + 1,
