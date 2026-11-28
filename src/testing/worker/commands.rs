@@ -30,7 +30,7 @@ pub(super) fn declares_workspace(root: &Path) -> bool {
 /// dir is prepended to the child PATH so the rustup shim finds its sibling
 /// `rustc` (same fix as the dependencies fetcher).
 pub(super) fn cargo_cmd(root: &Path, args: &[&str]) -> Command {
-    let cargo = crate::widgets::dependencies::cargo_binary();
+    let cargo = crate::dependencies::cargo_binary();
     let mut cmd = Command::new(&cargo);
     cmd.args(workspace_args(root, args))
         .current_dir(root)

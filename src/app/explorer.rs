@@ -823,7 +823,7 @@ impl App {
         let root = self.tree.root.clone();
         if self.deps_fetched.as_ref() != Some(&root) {
             self.deps_fetched = Some(root.clone());
-            self.dep_ecosystems = crate::widgets::dependencies::detect_ecosystems(&root);
+            self.dep_ecosystems = crate::dependencies::detect_ecosystems(&root);
             self.dependencies
                 .set_header(crate::widgets::dependencies::header_label(
                     &self.dep_ecosystems,
@@ -837,7 +837,7 @@ impl App {
             {
                 let job =
                     crate::jobs::Job::spawn("dependencies", crate::jobs::Start::Now, move || {
-                        crate::widgets::dependencies::fetch_dependencies(&root)
+                        crate::dependencies::fetch_dependencies(&root)
                     });
                 match job {
                     Ok(job) => {

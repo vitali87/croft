@@ -349,7 +349,7 @@ fn prune_old_install_logs(dir: &std::path::Path, keep: &std::path::Path) {
 /// `PATH`, where spawning a bare `cargo` fails with "No such file or
 /// directory" even though a terminal launch finds it.
 fn self_install_command(manifest_dir: &str) -> std::process::Command {
-    self_install_command_with(crate::widgets::dependencies::cargo_binary(), manifest_dir)
+    self_install_command_with(crate::dependencies::cargo_binary(), manifest_dir)
 }
 
 /// Split from [`self_install_command`] so tests can inject a deterministic
@@ -608,7 +608,7 @@ mod tests {
         let cmd = self_install_command("/some/repo");
         assert_eq!(
             PathBuf::from(cmd.get_program()),
-            crate::widgets::dependencies::cargo_binary(),
+            crate::dependencies::cargo_binary(),
         );
     }
 

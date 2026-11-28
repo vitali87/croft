@@ -1,0 +1,1 @@
+refactor: the update check, the update watcher, the test runner and the Explorer read the workspace's dependencies and the `cargo` path from `src/dependencies.rs` directly, and the DEPENDENCIES view only draws them (#2062). Nothing changes in use.

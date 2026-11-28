@@ -127,9 +127,10 @@ use crate::paths::croft_cache_dir;
 use crate::theme::BRAND_ORANGE;
 use crate::widgets::terminal::cwd_of_pid;
 
+use crate::dependencies::{Dependency, Ecosystem};
 use crate::search::SearchRequest;
 use crate::widgets::{
-    dependencies::{DependenciesPanel, Dependency, Ecosystem},
+    dependencies::DependenciesPanel,
     editor::{Editor, EditorTabs},
     file_tree::FileTree,
     open_editors::{OpenEditorItem, OpenEditorsPanel},
@@ -4098,7 +4099,7 @@ impl App {
         // Detect the workspace's package ecosystems up front so the DEPENDENCIES
         // section's visibility, ⋯-menu entry, and header are correct before the
         // first sync tick. Re-detected on every re-root (see sync_explorer_panels).
-        let dep_ecosystems = crate::widgets::dependencies::detect_ecosystems(&root);
+        let dep_ecosystems = crate::dependencies::detect_ecosystems(&root);
         dependencies.set_header(crate::widgets::dependencies::header_label(&dep_ecosystems));
         // The active profile (#618) decides which settings, keybindings and
         // snippets files are read below, so it is chosen first. Never under

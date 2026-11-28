@@ -686,12 +686,7 @@ impl StagedInstall {
                     let _ = std::fs::create_dir_all(dir);
                 }
                 let build = || {
-                    stage_command(
-                        crate::widgets::dependencies::cargo_binary(),
-                        &ver,
-                        &stage_root,
-                    )
-                    .output()
+                    stage_command(crate::dependencies::cargo_binary(), &ver, &stage_root).output()
                 };
                 let cache = crate::session_state::dirs_cache_croft().join("prebuilt");
                 let prepare = |version: &str, triple: &str| {
