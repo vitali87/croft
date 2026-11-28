@@ -395,10 +395,7 @@ pub(super) fn try_local_cross_install(
         anyhow::bail!("remote mkdir exited with {mkdir}");
     }
 
-    let ssh_e = format!(
-        "ssh -S {} -o ControlMaster=no",
-        shell_quote_for_e_arg(&ssh.socket_path),
-    );
+    let ssh_e = rsync_transport(&ssh.socket_path);
     let dest = format!("{}:.cargo/bin/croft.new", ssh.host);
     let rsync_status = crate::proc::command("rsync")
         .args(["-az", "--checksum", "-e"])

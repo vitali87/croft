@@ -24,6 +24,7 @@ mod pull;
 mod relay;
 mod session;
 mod source;
+mod ssh;
 pub(crate) use clipboard::MAX_COPY_PAYLOAD_BYTES;
 use clipboard::*;
 pub use config_push::SyncResolution;
@@ -78,6 +79,9 @@ pub use session::running_over_ssh;
 use session::*;
 pub(crate) use source::shell_quote_for_e_arg;
 use source::*;
+pub(crate) use ssh::Ssh;
+pub(crate) use ssh::dialog_master_args;
+pub(crate) use ssh::rsync_transport;
 
 pub struct SshControl {
     host: String,

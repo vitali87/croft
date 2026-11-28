@@ -125,10 +125,7 @@ pub(super) fn sync_via_rsync(ssh: &SshControl) -> Result<()> {
     if !mkdir_status.success() {
         anyhow::bail!("remote mkdir exited with {mkdir_status}");
     }
-    let ssh_e = format!(
-        "ssh -S {} -o ControlMaster=no",
-        shell_quote_for_e_arg(&ssh.socket_path),
-    );
+    let ssh_e = rsync_transport(&ssh.socket_path);
     let mut source_arg: std::ffi::OsString = source.clone().into_os_string();
     source_arg.push("/");
     let dest = format!("{}:.cache/croft/source/", ssh.host);

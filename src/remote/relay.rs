@@ -89,16 +89,13 @@ impl DropPump {
         if inbox_dir.is_empty() || requests_log.is_empty() {
             anyhow::bail!("remote relay setup returned blank paths");
         }
-        let mut tail = crate::proc::command("ssh")
-            .arg("-S")
-            .arg(&ssh.socket_path)
-            .arg("-o")
-            .arg("ControlMaster=no")
+        let mut tail = Ssh::bare_client(&ssh.socket_path)
             .arg(&ssh.host)
             .arg(format!(
                 "exec tail -F -n 0 {} 2>/dev/null",
                 shell_quote(&requests_log)
             ))
+            .into_command()
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .stdin(Stdio::null())
@@ -337,13 +334,10 @@ pub(super) fn write_relay_err(
         dir = shell_quote(&dest_dir),
         err = shell_quote(&err_path),
     );
-    let Ok(mut ssh) = crate::proc::command("ssh")
-        .arg("-S")
-        .arg(socket)
-        .arg("-o")
-        .arg("ControlMaster=no")
+    let Ok(mut ssh) = Ssh::bare_client(socket)
         .arg(host)
         .arg(&cmd)
+        .into_command()
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

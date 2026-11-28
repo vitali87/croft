@@ -19,10 +19,7 @@ pub(super) fn install_remote_croft(ssh: &SshControl, source_stamp: &str) -> Resu
     // Before either: the release binary for this exact version (#261), when
     // this croft IS that release.
     let mut ship = |binary: &Path| -> Result<()> {
-        let ssh_e = format!(
-            "ssh -S {} -o ControlMaster=no",
-            shell_quote_for_e_arg(&ssh.socket_path),
-        );
+        let ssh_e = rsync_transport(&ssh.socket_path);
         let dest = format!("{}:.cargo/bin/croft.new", ssh.host);
         let status = crate::proc::command("rsync")
             .args(["-az", "--checksum", "-e"])

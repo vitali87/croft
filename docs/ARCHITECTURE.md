@@ -129,6 +129,7 @@ src/
 │   ├── relay.rs          the drop relay's pump: reading, claiming and answering a remote croft's requests
 │   ├── session.rs        launching a remote croft session, its outcome, and reconnecting after a drop
 │   ├── source.rs         the source stamp, and syncing the source to the remote by allow-list
+│   ├── ssh.rs            how croft starts ssh: one builder, each kind named once (a client through the connection, in the background, a request to its master, the three ways a connection opens), and rsync's `-e` line
 │   ├── tests.rs          remote.rs's own tests
 ├── remote_bulk.rs       bulk lane for background installs: dedicated BatchMode SSH connection when key auth works (throttled shared mux otherwise) so update bytes never queue ahead of live-session keystrokes
 ├── remote_connect.rs    interactive SSH connect flow (host + password prompt phases) behind the connect dialog

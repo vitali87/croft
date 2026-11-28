@@ -23,23 +23,17 @@ pub struct AdoptedMaster {
 /// Dropping an [`SshControl`] keeps them, for the command-line paths that
 /// run with croft's screen torn down.
 pub fn close_master(a: AdoptedMaster) {
-    let _ = exit_request(&a.socket_path, &a.host)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+    let _ = Ssh::control(&a.socket_path, "exit")
+        .arg(&a.host)
+        .quiet()
+        .into_command()
         .status();
     let _ = std::fs::remove_dir_all(&a.socket_dir);
 }
 
 /// `ssh -S <socket> -O exit <host>`: ask the master behind `socket` to end.
 fn exit_request(socket_path: &Path, host: &str) -> Command {
-    let mut ssh = crate::proc::command("ssh");
-    ssh.arg("-S")
-        .arg(socket_path)
-        .arg("-O")
-        .arg("exit")
-        .arg(host);
-    ssh
+    Ssh::control(socket_path, "exit").arg(host).into_command()
 }
 
 impl SshControl {
@@ -54,23 +48,12 @@ impl SshControl {
     pub(super) fn start(host: &str) -> Result<Self> {
         let socket_dir = ssh_control_dir()?;
         let socket_path = socket_dir.join("ctl");
-        let status = crate::proc::command("ssh")
-            .arg("-M")
-            .arg("-S")
-            .arg(&socket_path)
-            .arg("-f")
-            .arg("-N")
-            .arg("-T")
-            // Bound each connect attempt so a reconnect against a host that is
-            // still asleep/offline fails fast instead of hanging, and let the
-            // master tear itself down promptly once the link goes away.
-            .arg("-o")
-            .arg("ConnectTimeout=10")
-            .arg("-o")
-            .arg("ServerAliveInterval=10")
-            .arg("-o")
-            .arg("ServerAliveCountMax=3")
+        // Each connect attempt is bounded, so a reconnect against a host that
+        // is still asleep/offline fails fast instead of hanging, and the
+        // master tears itself down promptly once the link goes away.
+        let status = Ssh::session_master(&socket_path)
             .arg(host)
+            .into_command()
             .status()
             .context("starting SSH control connection")?;
         if !status.success() {
@@ -129,26 +112,12 @@ pub(super) fn ssh_socket_read(socket_path: &Path, host: &str, script: &str) -> C
 /// onto the alt screen. The interactive session is the one caller that must
 /// keep the terminal, so it passes `false`.
 pub(super) fn ssh_socket_command(socket_path: &Path, background: bool) -> Command {
-    let mut command = crate::proc::command("ssh");
-    command
-        .arg("-S")
-        .arg(socket_path)
-        .arg("-o")
-        .arg("ControlMaster=no")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg("-o")
-        .arg("ServerAliveInterval=10")
-        .arg("-o")
-        .arg("ServerAliveCountMax=3");
+    let client = Ssh::client(socket_path);
     if background {
-        command
-            .arg("-n")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+        client.background().into_command()
+    } else {
+        client.into_command()
     }
-    command
 }
 
 impl Drop for SshControl {
@@ -162,16 +131,11 @@ impl Drop for SshControl {
 /// nested master). Used for the relay inbox bookkeeping (`mkdir`, sentinel
 /// writes). Returns whether it exited zero.
 pub(super) fn ssh_exec(host: &str, socket: &Path, cmd: &str) -> bool {
-    crate::proc::command("ssh")
-        .arg("-S")
-        .arg(socket)
-        .arg("-o")
-        .arg("ControlMaster=no")
+    Ssh::bare_client(socket)
         .arg(host)
         .arg(cmd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .quiet()
+        .into_command()
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
