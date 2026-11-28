@@ -1753,3 +1753,72 @@ fn a_hidden_problems_panel_takes_no_right_click() {
         "the editor's menu opens there: {labels:?}"
     );
 }
+
+/// #2848: PROBLEMS draws a scrollbar once its rows outgrow the panel, and
+/// the bar answers the mouse as every other one does: a press on the track
+/// jumps the list there, and dragging the thumb keeps it under the pointer.
+#[test]
+fn pressing_and_dragging_the_problems_scrollbar_scrolls_the_list() {
+    use crate::lsp::manager::DiagnosticSeverity;
+    use crate::widgets::problems::ProblemHit;
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("many.rs");
+    std::fs::write(&file, "fn a() {}\n".repeat(120)).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let diagnostics = (0..120)
+        .map(|line| crate::lsp::manager::Diagnostic {
+            start_line: line,
+            start_char: 3,
+            end_line: line,
+            end_char: 4,
+            severity: DiagnosticSeverity::Warning,
+            message: format!("warning on line {line}"),
+            tags: Default::default(),
+            code: None,
+            origin: None,
+        })
+        .collect();
+    let mut by_server = std::collections::HashMap::new();
+    by_server.insert(String::from("rustc"), diagnostics);
+    app.lsp_diagnostics.insert(file.clone(), by_server);
+    app.rebuild_problems();
+    app.bottom_panel_tab = BottomPanelTab::Problems;
+
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let bar = app.problems.last_scrollbar;
+    assert!(
+        bar.width > 0 && bar.height > 2,
+        "120 problems in the panel must draw a scrollbar"
+    );
+    let top_line = |app: &App| match app.problems.hit_at(bar.y) {
+        Some(ProblemHit::Diagnostic { line, .. }) => Some(line),
+        _ => None,
+    };
+    assert!(
+        matches!(app.problems.hit_at(bar.y), Some(ProblemHit::Header(_))),
+        "the list starts at the file's header"
+    );
+
+    // A press near the track's foot jumps the list toward its end.
+    let foot = bar.y + bar.height - 1;
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), bar.x, foot));
+    term.draw(|f| app.render(f)).unwrap();
+    let jumped = top_line(&app);
+    assert!(
+        jumped.is_some_and(|l| l > 20),
+        "a press on the scrollbar's foot must jump the list down, but its top row is line {jumped:?}"
+    );
+
+    // Dragging the thumb back to the top follows the pointer up.
+    app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), bar.x, bar.y));
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        matches!(app.problems.hit_at(bar.y), Some(ProblemHit::Header(_))),
+        "dragging the thumb to the track's top must bring the header back"
+    );
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), bar.x, bar.y));
+    assert!(app.scrollbar_drag.is_none(), "the release ends the drag");
+}
