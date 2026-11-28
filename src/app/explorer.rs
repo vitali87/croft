@@ -1235,6 +1235,10 @@ impl App {
         let lane_rows = self.agent_lane_panel_rows();
         self.agent_lane_panel.set_rows(lane_rows);
 
+        // The sections share the Explorer's focus, as VS Code dims them
+        // together when the side bar loses the keyboard.
+        let cx =
+            self.view_cx(self.focus == Pane::Tree && self.sidebar_view == SidebarView::Explorer);
         let folders_visible = self.explorer_views.is_visible(ExplorerView::Folders);
         if !folders_visible {
             // The tree isn't painted, so zero its geometry too — otherwise a
@@ -1244,7 +1248,7 @@ impl App {
         }
         if area.height == 0 || area.width == 0 {
             if folders_visible {
-                frame.render_widget(&mut self.tree, area);
+                self.tree.draw(&cx, area, frame.buffer_mut());
             }
             return;
         }
@@ -1307,10 +1311,6 @@ impl App {
             }
         }
 
-        // The sections share the Explorer's focus, as VS Code dims them
-        // together when the side bar loses the keyboard.
-        let cx =
-            self.view_cx(self.focus == Pane::Tree && self.sidebar_view == SidebarView::Explorer);
         let mut y = area.y;
         for (v, h) in heights {
             if h == 0 {
@@ -1325,7 +1325,7 @@ impl App {
             y = y.saturating_add(h);
             match v {
                 ExplorerView::Folders => {
-                    frame.render_widget(&mut self.tree, rect);
+                    self.tree.draw(&cx, rect, frame.buffer_mut());
                     // Croft Loch: every stacked section ends on a hairline,
                     // so the tree's blank bottom padding row takes the same
                     // seam when a section follows it.

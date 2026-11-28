@@ -2,12 +2,6 @@
 
 use super::*;
 
-/// Whether Search has the keyboard: the side bar has focus and shows
-/// Search, which is what the side bar draws the view's focus from.
-fn search_has_keys(app: &App) -> bool {
-    app.focus == Pane::Tree && app.sidebar_view == SidebarView::Search
-}
-
 #[test]
 fn opening_a_search_hit_moves_focus_to_the_editor() {
     let tmp = tempfile::tempdir().unwrap();
@@ -27,7 +21,7 @@ fn opening_a_search_hit_moves_focus_to_the_editor() {
         matches!(app.focus, Pane::Editor),
         "opening a search result must hand keyboard focus to the editor so typing no longer leaks into the search box"
     );
-    assert!(!search_has_keys(&app));
+    assert!(!side_view_has_keys(&app, SidebarView::Search));
 }
 
 #[test]
@@ -428,8 +422,8 @@ fn search_view_focuses_search_input_not_terminal_or_tree() {
     ))
     .unwrap();
     assert!(app.focus == Pane::Tree);
-    assert!(search_has_keys(&app));
-    assert!(!app.tree.focused);
+    assert!(side_view_has_keys(&app, SidebarView::Search));
+    assert!(!side_view_has_keys(&app, SidebarView::Explorer));
     assert!(!app.terminal().focused);
 }
 
@@ -439,7 +433,7 @@ fn cycling_focus_away_from_search_clears_search_focus_flag() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.set_sidebar_view(SidebarView::Search);
     app.cycle_focus();
-    assert!(!search_has_keys(&app));
+    assert!(!side_view_has_keys(&app, SidebarView::Search));
 }
 
 #[test]

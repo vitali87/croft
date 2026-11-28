@@ -8,10 +8,11 @@ use super::*;
 /// with the file-type icon at the start of the row.
 pub(super) const AGENT_DOT: char = '\u{b7}';
 
-impl Widget for &mut FileTree {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let block_style = if self.focused {
-            Style::default().fg(self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff)))
+impl FileTree {
+    /// Draw the view into `area` with this frame's [`ViewCx`].
+    pub fn draw(&mut self, cx: &ViewCx, area: Rect, buf: &mut Buffer) {
+        let block_style = if cx.focused {
+            Style::default().fg(cx.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff)))
         } else {
             Style::default().fg(Color::DarkGray)
         };
@@ -19,7 +20,7 @@ impl Widget for &mut FileTree {
         // Croft Dark keeps the historical white-on-navy chip.
         let label = format!(" {} ", crate::i18n::tr("EXPLORER"));
         let label_width = unicode_width::UnicodeWidthStr::width(label.as_str());
-        let tones = crate::theme::tones(self.theme);
+        let tones = crate::theme::tones(cx.theme);
         // Croft Loch: the view title is the one label in the side bar that
         // says where focus is, so it is the strong ink while the tree has
         // the keyboard and recedes to muted otherwise. Never bold: weight
@@ -27,9 +28,9 @@ impl Widget for &mut FileTree {
         let title = if let Some(t) = tones {
             Span::styled(
                 label,
-                Style::default().fg(if self.focused { t.strong() } else { t.muted() }),
+                Style::default().fg(if cx.focused { t.strong() } else { t.muted() }),
             )
-        } else if self.focus_gradient {
+        } else if cx.theme.gradient() {
             Span::styled(
                 label,
                 Style::default()
@@ -40,13 +41,13 @@ impl Widget for &mut FileTree {
             Span::styled(
                 label,
                 Style::default()
-                    .fg(self.theme.ui(Color::White))
-                    .bg(self.theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e)))
+                    .fg(cx.theme.ui(Color::White))
+                    .bg(cx.theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e)))
                     .add_modifier(Modifier::BOLD),
             )
         };
         let block =
-            crate::widgets::surface::view_block(self.theme, true, block_style).title(title.clone());
+            crate::widgets::surface::view_block(cx.theme, true, block_style).title(title.clone());
         let inner = block.inner(area);
         block.render(area, buf);
         // Black theme: replace the solid focus border with the orange→green
@@ -56,7 +57,7 @@ impl Widget for &mut FileTree {
         // padding: the title keeps a breath of space on both sides and the
         // lip's accent end sits right beside the name of the focused view.
         if tones.is_some() {
-            if self.focused {
+            if cx.focused {
                 let lip_x = area
                     .x
                     .saturating_add(1)
@@ -69,15 +70,15 @@ impl Widget for &mut FileTree {
                         width: area.right() - lip_x,
                         ..area
                     },
-                    self.theme,
+                    cx.theme,
                 );
             }
         } else if crate::widgets::surface::paint_view_focus(
             buf,
             area,
-            self.theme,
-            self.focused,
-            self.focus_gradient,
+            cx.theme,
+            cx.focused,
+            cx.theme.gradient(),
         ) {
             buf.set_span(area.x + 1, area.y, &title, title.width() as u16);
         }
@@ -110,8 +111,8 @@ impl Widget for &mut FileTree {
                 area.x + area.width - 1,
                 area.y,
                 crate::widgets::header_pill::MORE_LABEL,
-                self.theme,
-                self.hover_pointer,
+                cx.theme,
+                cx.pointer,
             )
         {
             self.header_views_btn = rect;
@@ -158,7 +159,7 @@ impl Widget for &mut FileTree {
             .width
             .saturating_sub(u16::from(scrollbar_metrics.is_some()));
 
-        let pointer = self.hover_pointer;
+        let pointer = cx.pointer;
         // No Explorer filter any more, so no characters are ever highlighted.
         let query = String::new();
         let end = (scroll_pos + visible_height).min(visible.len());
@@ -203,13 +204,13 @@ impl Widget for &mut FileTree {
 
             // Git-ignored and changed rows colour the *name* only — icons
             // keep their color, matching VS Code's git decorations.
-            let name_fg = self.name_fg(&node.path);
+            let name_fg = self.name_fg(cx, &node.path);
             // Croft Loch's quiet layer: chevrons, the rolled-up dot, the
             // root badge and note counts all in the muted ink.
-            let mark_fg = tones.map_or_else(|| self.theme.ui(Color::Gray), |t| t.muted());
+            let mark_fg = tones.map_or_else(|| cx.theme.ui(Color::Gray), |t| t.muted());
 
             if node.is_dir {
-                let chev = crate::widgets::surface::chevron(self.theme, node.expanded);
+                let chev = crate::widgets::surface::chevron(cx.theme, node.expanded);
                 let icon = if node.expanded {
                     icons::FOLDER_OPEN
                 } else {
@@ -221,7 +222,7 @@ impl Widget for &mut FileTree {
                 ));
                 spans.push(Span::styled(
                     format!("{} ", icon.glyph),
-                    Style::default().fg(self.folder_icon_fg(icon.color)),
+                    Style::default().fg(self.folder_icon_fg(cx, icon.color)),
                 ));
                 // Bold marks a folder on a boxed theme. Croft Loch keeps
                 // weight for the workspace root alone, so the tree reads as
@@ -231,7 +232,7 @@ impl Widget for &mut FileTree {
                 } else {
                     Style::default().fg(name_fg).add_modifier(Modifier::BOLD)
                 };
-                push_name_spans(&mut spans, &name, &query, base, self.theme);
+                push_name_spans(&mut spans, &name, &query, base, cx.theme);
                 // A collapsed folder hiding an unreviewed agent write shows a
                 // dimmer copy of the file dot (#345), so the lane's changes
                 // stay findable without expanding every folder. Only while
@@ -265,14 +266,14 @@ impl Widget for &mut FileTree {
                 spans.push(Span::raw("  "));
                 spans.push(Span::styled(
                     format!("{} ", icon.glyph),
-                    Style::default().fg(self.theme.ui(icon.color)),
+                    Style::default().fg(cx.theme.ui(icon.color)),
                 ));
                 push_name_spans(
                     &mut spans,
                     &name,
                     &query,
                     Style::default().fg(name_fg),
-                    self.theme,
+                    cx.theme,
                 );
                 // The agent-lane dot (#345), AFTER the name rather than
                 // before it: a leading marker would shift every name in the
@@ -283,8 +284,8 @@ impl Widget for &mut FileTree {
                     // Croft Loch takes its own palette's yellow rather than
                     // the named colour, which follows the host terminal.
                     let dot = match tones {
-                        Some(_) => crate::gradient::rgb_color(self.theme.ansi()[3]),
-                        None => self.theme.ui(Color::Yellow),
+                        Some(_) => crate::gradient::rgb_color(cx.theme.ansi()[3]),
+                        None => cx.theme.ui(Color::Yellow),
                     };
                     spans.push(Span::styled(
                         format!(" {AGENT_DOT}"),
@@ -306,7 +307,7 @@ impl Widget for &mut FileTree {
                 width: row_width,
                 height: 1,
             };
-            let drop_bg = self.theme.ui(Color::Rgb(0x2c, 0x60, 0x2e));
+            let drop_bg = cx.theme.ui(Color::Rgb(0x2c, 0x60, 0x2e));
             if let Some(t) = tones {
                 // Croft Loch: the one selected-row anatomy, the band with the
                 // accent bar standing in the pane's left padding column so
@@ -325,7 +326,7 @@ impl Widget for &mut FileTree {
                         },
                         t,
                         t.chrome,
-                        self.focused,
+                        cx.focused,
                     );
                 } else if is_marked {
                     let tint = crate::gradient::lerp_rgb(t.chrome, t.accent, 0.12);
@@ -334,7 +335,7 @@ impl Widget for &mut FileTree {
                         Style::default().bg(crate::gradient::rgb_color(tint)),
                     );
                 } else if let Some(bg) =
-                    crate::widgets::hover::row_hover_bg(row_rect, pointer, self.theme)
+                    crate::widgets::hover::row_hover_bg(row_rect, pointer, cx.theme)
                 {
                     buf.set_style(row_rect, Style::default().bg(bg));
                 }
@@ -344,15 +345,15 @@ impl Widget for &mut FileTree {
                 // selection), replacing the legacy bright-blue accent. Croft
                 // Dark keeps the historical blue. The drop target stays
                 // green either way.
-                let (sel_bg, mark_bg) = if self.focus_gradient {
+                let (sel_bg, mark_bg) = if cx.theme.gradient() {
                     (
                         crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG),
-                        self.theme.ui(Color::Rgb(0x18, 0x35, 0x32)),
+                        cx.theme.ui(Color::Rgb(0x18, 0x35, 0x32)),
                     )
                 } else {
                     (
-                        self.theme.ui(Color::Rgb(0x09, 0x4d, 0x77)),
-                        self.theme.ui(Color::Rgb(0x07, 0x33, 0x55)),
+                        cx.theme.ui(Color::Rgb(0x09, 0x4d, 0x77)),
+                        cx.theme.ui(Color::Rgb(0x07, 0x33, 0x55)),
                     )
                 };
                 let line_style = if is_drop_target {
@@ -362,7 +363,7 @@ impl Widget for &mut FileTree {
                 } else if is_marked {
                     Style::default().bg(mark_bg)
                 } else if let Some(bg) =
-                    crate::widgets::hover::row_hover_bg(row_rect, pointer, self.theme)
+                    crate::widgets::hover::row_hover_bg(row_rect, pointer, cx.theme)
                 {
                     Style::default().bg(bg)
                 } else {
@@ -388,7 +389,7 @@ impl Widget for &mut FileTree {
                         inner.x + row_width - 2,
                         y,
                         glyph.to_string(),
-                        Style::default().fg(self.theme.git_decoration_fg(dec)),
+                        Style::default().fg(cx.theme.git_decoration_fg(dec)),
                     );
                 }
                 None => {
@@ -403,7 +404,7 @@ impl Widget for &mut FileTree {
         // Explorer pane is focused and the root row sits at the top of the
         // viewport; hidden otherwise (VS Code's hover/focus reveal). Painted
         // after the rows so the pills win over the root row's text/fill.
-        if self.focused && self.scroll == 0 && !self.nodes.is_empty() {
+        if cx.focused && self.scroll == 0 && !self.nodes.is_empty() {
             use crate::widgets::header_pill;
             const GLYPHS: [char; 4] = [
                 header_pill::NEW_FILE_GLYPH,
@@ -438,8 +439,8 @@ impl Widget for &mut FileTree {
                         width: step,
                         height: 1,
                     };
-                    let hovered = crate::widgets::hover::contains(rect, self.hover_pointer);
-                    header_pill::render(buf, x, y, glyph, self.theme, hovered);
+                    let hovered = crate::widgets::hover::contains(rect, cx.pointer);
+                    header_pill::render(buf, x, y, glyph, cx.theme, hovered);
                     match i {
                         0 => self.header_new_file_btn = rect,
                         1 => self.header_new_folder_btn = rect,
@@ -466,8 +467,8 @@ impl Widget for &mut FileTree {
             let shown = &chain[chain.len() - band..];
             // Croft Loch lifts the band onto the raised tone: the theme's
             // sticky tint is a hair off the chrome and vanished against it.
-            let bg = tones.map_or_else(|| self.theme.sticky_scroll_bg(), |t| t.raised());
-            let mark_fg = tones.map_or_else(|| self.theme.ui(Color::Gray), |t| t.muted());
+            let bg = tones.map_or_else(|| cx.theme.sticky_scroll_bg(), |t| t.raised());
+            let mark_fg = tones.map_or_else(|| cx.theme.ui(Color::Gray), |t| t.muted());
             for (i, &aidx) in shown.iter().enumerate() {
                 let y = inner.y + i as u16;
                 for x in inner.x..inner.x + row_width {
@@ -476,7 +477,7 @@ impl Widget for &mut FileTree {
                 }
                 let node = &self.nodes[aidx];
                 let name = node.label();
-                let name_fg = self.name_fg(&node.path);
+                let name_fg = self.name_fg(cx, &node.path);
                 let name_style = if tones.is_some() && node.depth > 0 {
                     Style::default().fg(name_fg).bg(bg)
                 } else {
@@ -488,13 +489,13 @@ impl Widget for &mut FileTree {
                 let spans = vec![
                     Span::raw("  ".repeat(node.depth)),
                     Span::styled(
-                        format!("{} ", crate::widgets::surface::chevron(self.theme, true)),
+                        format!("{} ", crate::widgets::surface::chevron(cx.theme, true)),
                         Style::default().fg(mark_fg).bg(bg),
                     ),
                     Span::styled(
                         format!("{} ", icons::FOLDER_OPEN.glyph),
                         Style::default()
-                            .fg(self.folder_icon_fg(icons::FOLDER_OPEN.color))
+                            .fg(self.folder_icon_fg(cx, icons::FOLDER_OPEN.color))
                             .bg(bg),
                     ),
                     Span::styled(name, name_style),
@@ -504,7 +505,7 @@ impl Widget for &mut FileTree {
             }
         }
         if let Some(metrics) = scrollbar_metrics {
-            scrollbar::render_vertical_on_chrome(buf, metrics, self.focused, self.theme);
+            scrollbar::render_vertical_on_chrome(buf, metrics, cx.focused, cx.theme);
         }
     }
 }
