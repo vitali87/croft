@@ -257,7 +257,7 @@ impl App {
                 String::from("A pending comment has no thread yet; submit the review first");
             return;
         }
-        let Some(host) = &self.pair_host else {
+        let Some(host) = &self.pair.host else {
             self.status =
                 String::from("Navigator is not active (run croft pair in this workspace)");
             return;
@@ -276,6 +276,7 @@ impl App {
             return;
         };
         let Some((_, row, note_body)) = self
+            .pair
             .navigator_notes
             .get(&file)
             .and_then(|notes| notes.iter().find(|(id, ..)| *id == focus.id))
@@ -292,7 +293,7 @@ impl App {
                 // retry, and appending first would duplicate the reply in
                 // the box on every attempt.
                 host.append_to_note(focus.id, &format!("you: {reply}"));
-                self.pair_turn_origin = Some((file, row));
+                self.pair.turn_origin = Some((file, row));
                 self.status = format!("Replied to {}", host.name());
                 self.editor.comment_focus = None;
             }
@@ -694,11 +695,11 @@ impl App {
                     let exported = settles.notes;
                     if !exported.is_empty() {
                         for id in &exported {
-                            if let Some(host) = &self.pair_host {
+                            if let Some(host) = &self.pair.host {
                                 host.remove_note(*id);
                             }
                         }
-                        for list in self.navigator_notes.values_mut() {
+                        for list in self.pair.navigator_notes.values_mut() {
                             list.retain(|(id, ..)| !exported.contains(id));
                         }
                         if self.editor.path.is_some() {
@@ -764,10 +765,10 @@ impl App {
             self.status = String::from("Note resolved or reopened");
             return;
         }
-        if let Some(host) = &self.pair_host {
+        if let Some(host) = &self.pair.host {
             host.remove_note(id);
         }
-        for notes in self.navigator_notes.values_mut() {
+        for notes in self.pair.navigator_notes.values_mut() {
             notes.retain(|(nid, ..)| *nid != id);
         }
         // Review boxes share this footer and this hit-test, so without
@@ -830,7 +831,7 @@ impl App {
             .path
             .as_ref()
             .and_then(|p| collab_file_key(&self.tree.root, p))
-            .and_then(|file| self.navigator_notes.get(&file))
+            .and_then(|file| self.pair.navigator_notes.get(&file))
             .cloned()
             .unwrap_or_default();
         if let Some((path, threads)) = &self.review.boxes
@@ -1001,7 +1002,7 @@ impl App {
         let prefix = self.review.ai_prefix.clone();
         let mut comments = self.review.pending.clone();
         let mut notes = Vec::new();
-        for (file, list) in &self.navigator_notes {
+        for (file, list) in &self.pair.navigator_notes {
             let Some(rel) = repo_relative(&repo_root, &self.tree.root.join(file)) else {
                 continue;
             };

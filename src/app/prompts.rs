@@ -787,7 +787,7 @@ impl App {
                 // gone or gone busy while the user typed) keeps the box open
                 // with the draft intact for a retry, like a failed comment
                 // reply keeps its draft.
-                let Some(host) = &self.pair_host else {
+                let Some(host) = &self.pair.host else {
                     self.status = String::from("Navigator is not active");
                     return;
                 };
@@ -799,7 +799,7 @@ impl App {
                         self.close_input_prompt();
                         self.status = format!("Asked {name} about {file}:{}", range.0 + 1);
                         // Anchor the turn's prose commentary where it was asked.
-                        self.pair_turn_origin = Some((file, range.0));
+                        self.pair.turn_origin = Some((file, range.0));
                     }
                     Err(e) => self.status = format!("Ask Navigator failed: {e}"),
                 }

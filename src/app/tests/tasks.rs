@@ -1152,17 +1152,17 @@ fn resident_seating_never_replays_a_persisted_task() {
     let socket = tmp.path().join("collab.sock");
     let seen_task = std::rc::Rc::new(std::cell::RefCell::new(Some(String::from("sentinel"))));
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.pair_record_path = tmp.path().join("x.pair.json");
-    app.pair_socket = socket.clone();
-    app.pair_host_lock_path = tmp.path().join("x.pair-host.lock");
+    app.pair.record_path = tmp.path().join("x.pair.json");
+    app.pair.socket = socket.clone();
+    app.pair.host_lock_path = tmp.path().join("x.pair-host.lock");
     app.collab_config = Some((socket, crate::collab::CollabRole::Owner));
     let seen2 = seen_task.clone();
-    app.pair_spawn_override = Some(Box::new(move |cfg| {
+    app.pair.spawn_override = Some(Box::new(move |cfg| {
         *seen2.borrow_mut() = cfg.task.clone();
         anyhow::bail!("stop before a real child");
     }));
     crate::session::write_pair_record(
-        &app.pair_record_path,
+        &app.pair.record_path,
         &crate::session::PairRecord {
             model: None,
             name: "nav".into(),
@@ -1173,7 +1173,7 @@ fn resident_seating_never_replays_a_persisted_task() {
         },
     )
     .unwrap();
-    app.last_pair_check = None;
+    app.pair.last_check = None;
     app.maybe_seat_navigator();
     assert_eq!(
         *seen_task.borrow(),

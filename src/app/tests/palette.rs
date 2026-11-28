@@ -1925,7 +1925,7 @@ fn palette_carries_the_navigator_commands() {
     let file = tmp.path().join("f.txt");
     std::fs::write(&file, "a\nb").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.pair_record_path = tmp.path().join("x.pair.json");
+    app.pair.record_path = tmp.path().join("x.pair.json");
     app.open_file_at_launch(&file);
 
     app.run_command(crate::widgets::command_palette::Command::AskNavigator);
@@ -1933,7 +1933,8 @@ fn palette_carries_the_navigator_commands() {
     app.run_command(crate::widgets::command_palette::Command::YieldToNavigator);
     assert!(app.status.to_lowercase().contains("not active"));
 
-    app.navigator_notes
+    app.pair
+        .navigator_notes
         .insert("f.txt".into(), vec![(1, 0, "n".into())]);
     app.editor.comment_focus = Some(crate::widgets::editor::CommentFocus {
         id: 1,
@@ -1941,15 +1942,15 @@ fn palette_carries_the_navigator_commands() {
         cursor: 0,
     });
     app.run_command(crate::widgets::command_palette::Command::ClearNavigatorNotes);
-    assert!(app.navigator_notes.is_empty());
+    assert!(app.pair.navigator_notes.is_empty());
     assert!(app.editor.comment_focus.is_none());
 
     app.run_command(crate::widgets::command_palette::Command::ToggleNavigator);
     let record =
-        crate::session::read_pair_record(&app.pair_record_path).expect("toggle writes the record");
+        crate::session::read_pair_record(&app.pair.record_path).expect("toggle writes the record");
     assert!(record.enabled);
     app.run_command(crate::widgets::command_palette::Command::ToggleNavigator);
-    let record = crate::session::read_pair_record(&app.pair_record_path).unwrap();
+    let record = crate::session::read_pair_record(&app.pair.record_path).unwrap();
     assert!(!record.enabled);
 }
 

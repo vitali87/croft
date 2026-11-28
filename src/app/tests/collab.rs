@@ -870,15 +870,15 @@ fn solo_guest_never_hosts_the_navigator() {
     let tmp = tempfile::tempdir().unwrap();
     let socket = tmp.path().join("collab.sock");
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.pair_record_path = tmp.path().join("x.pair.json");
-    app.pair_socket = socket.clone();
-    app.pair_host_lock_path = tmp.path().join("x.pair-host.lock");
+    app.pair.record_path = tmp.path().join("x.pair.json");
+    app.pair.socket = socket.clone();
+    app.pair.host_lock_path = tmp.path().join("x.pair-host.lock");
     app.collab_config = Some((socket, crate::collab::CollabRole::Guest));
-    app.pair_spawn_override = Some(Box::new(|_| {
+    app.pair.spawn_override = Some(Box::new(|_| {
         panic!("a solo guest must never spawn the pilot");
     }));
     crate::session::write_pair_record(
-        &app.pair_record_path,
+        &app.pair.record_path,
         &crate::session::PairRecord {
             model: None,
             name: "navigator".into(),
@@ -889,9 +889,9 @@ fn solo_guest_never_hosts_the_navigator() {
         },
     )
     .unwrap();
-    app.last_pair_check = None;
+    app.pair.last_check = None;
     app.maybe_seat_navigator();
-    assert!(app.pair_host.is_none());
+    assert!(app.pair.host.is_none());
 }
 
 /// The AI-stream badge lifecycle: a pilot's StreamState(active) sets

@@ -305,17 +305,17 @@ fn turn_done_status_keeps_the_notes_visible() {
     // answers the pilot's SnapshotRequest so the NOTE can anchor.
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.open_file_at_launch(&file);
-    app.pair_record_path = tmp.path().join("x.pair.json");
-    app.pair_socket = socket.clone();
-    app.pair_host_lock_path = tmp.path().join("x.pair-host.lock");
+    app.pair.record_path = tmp.path().join("x.pair.json");
+    app.pair.socket = socket.clone();
+    app.pair.host_lock_path = tmp.path().join("x.pair-host.lock");
     let (script2, log2, socket2) = (script.clone(), log.clone(), socket.clone());
-    app.pair_spawn_override = Some(Box::new(move |cfg| {
+    app.pair.spawn_override = Some(Box::new(move |cfg| {
         let mut cmd = std::process::Command::new("python3");
         cmd.arg(&script2).arg(&log2).arg("notes");
         crate::pair_host::PairHost::spawn_cmd(&socket2, &cfg.name, cfg.task.as_deref(), cmd)
     }));
     crate::session::write_pair_record(
-        &app.pair_record_path,
+        &app.pair.record_path,
         &crate::session::PairRecord {
             model: None,
             name: "nav".into(),
@@ -326,7 +326,7 @@ fn turn_done_status_keeps_the_notes_visible() {
         },
     )
     .unwrap();
-    app.last_pair_check = None;
+    app.pair.last_check = None;
     assert!(app.maybe_seat_navigator());
     let deadline = Instant::now() + Duration::from_secs(5);
     while app.collab.is_none() {
@@ -359,7 +359,7 @@ fn turn_done_status_keeps_the_notes_visible() {
     // OUTPUT mutually exclusive; the fallback path has its own test, and
     // the OUTPUT channel is process-global so it cannot be asserted empty
     // under the parallel suite).
-    let host = app.pair_host.as_ref().expect("still seated");
+    let host = app.pair.host.as_ref().expect("still seated");
     let snap = host.notes_snapshot("demo.txt");
     assert!(
         snap.iter().any(|(_, _, body)| body.contains("Reviewing.")),
@@ -378,7 +378,7 @@ fn f4_focuses_comment_boxes_typing_edits_the_draft_and_esc_releases() {
     std::fs::write(&file, "a\nb\nc\nd\ne").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.open_file_at_launch(&file);
-    app.navigator_notes.insert(
+    app.pair.navigator_notes.insert(
         "f.txt".into(),
         vec![(1, 1, "first note".into()), (2, 3, "second note".into())],
     );
@@ -425,7 +425,7 @@ fn f4_focuses_comment_boxes_typing_edits_the_draft_and_esc_releases() {
     app.handle_key(key(KeyCode::F(4), KeyModifiers::SHIFT))
         .unwrap();
     assert_eq!(
-        app.navigator_notes.get("f.txt").map(|n| n.len()),
+        app.pair.navigator_notes.get("f.txt").map(|n| n.len()),
         Some(1),
         "the ignored box is gone from the snapshot"
     );
@@ -499,8 +499,9 @@ fn enter_in_a_focused_comment_box_sends_the_reply_turn() {
     app.open_file_at_launch(&file);
     let mut cmd = std::process::Command::new("python3");
     cmd.arg(&script).arg(&log).arg("notes");
-    app.pair_host = Some(crate::pair_host::PairHost::spawn_cmd(&socket, "nav", None, cmd).unwrap());
-    app.navigator_notes
+    app.pair.host = Some(crate::pair_host::PairHost::spawn_cmd(&socket, "nav", None, cmd).unwrap());
+    app.pair
+        .navigator_notes
         .insert("f.txt".into(), vec![(1, 1, "seed note".into())]);
     app.editor.comment_focus = Some(crate::widgets::editor::CommentFocus {
         id: 1,
@@ -1170,7 +1171,8 @@ fn pending_comments_stay_with_their_pull_request() {
 
     // A failed export keeps the navigator notes it carried.
     app.review.pending.clear();
-    app.navigator_notes
+    app.pair
+        .navigator_notes
         .insert(String::from("a.rs"), vec![(1, 1, String::from("n"))]);
     app.drain_review_ops();
     app.review
@@ -1187,7 +1189,7 @@ fn pending_comments_stay_with_their_pull_request() {
         })
         .unwrap();
     app.drain_review_ops();
-    assert_eq!(app.navigator_notes["a.rs"].len(), 1);
+    assert_eq!(app.pair.navigator_notes["a.rs"].len(), 1);
 }
 
 /// A failed reply or thread load while a review is being submitted does not
@@ -1231,7 +1233,7 @@ fn only_the_submissions_own_failure_ends_it() {
 fn comments_export_to_the_pull_request_after_a_preview() {
     let (_tmp, root, f, log, stdin, gh) = review_fixture();
     let mut app = review_app(&root, &f, &gh);
-    app.navigator_notes.insert(
+    app.pair.navigator_notes.insert(
         String::from("a.rs"),
         vec![
             (1, 1, String::from("b is unused")),
@@ -1262,7 +1264,10 @@ fn comments_export_to_the_pull_request_after_a_preview() {
     app.post_exported_comments();
     crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "the post", || {
         app.drain_review_ops();
-        app.navigator_notes.get("a.rs").is_some_and(Vec::is_empty)
+        app.pair
+            .navigator_notes
+            .get("a.rs")
+            .is_some_and(Vec::is_empty)
     });
     let sent: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&stdin).unwrap()).unwrap();

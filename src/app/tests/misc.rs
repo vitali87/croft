@@ -345,12 +345,12 @@ fn an_unopenable_host_lock_is_reported_as_such_and_re_announced_when_the_reason_
     let lock_dir = tmp.path().join("no-such-dir");
     let lock_path = lock_dir.join("host.lock");
     let mut b = App::new(tmp.path().to_path_buf()).unwrap();
-    b.pair_record_path = tmp.path().join("b.pair.json");
-    b.pair_socket = socket.clone();
-    b.pair_host_lock_path = lock_path.clone();
-    b.pair_spawn_override = Some(Box::new(local_test_spawn));
+    b.pair.record_path = tmp.path().join("b.pair.json");
+    b.pair.socket = socket.clone();
+    b.pair.host_lock_path = lock_path.clone();
+    b.pair.spawn_override = Some(Box::new(local_test_spawn));
     crate::session::write_pair_record(
-        &b.pair_record_path,
+        &b.pair.record_path,
         &crate::session::PairRecord {
             model: None,
             name: "nav".into(),
@@ -361,9 +361,9 @@ fn an_unopenable_host_lock_is_reported_as_such_and_re_announced_when_the_reason_
         },
     )
     .unwrap();
-    b.last_pair_check = None;
+    b.pair.last_check = None;
     b.maybe_seat_navigator();
-    assert!(b.pair_host.is_none(), "cannot host without the lock");
+    assert!(b.pair.host.is_none(), "cannot host without the lock");
     assert!(
         b.status.contains("cannot open host lock") && b.status.contains("no-such-dir"),
         "an unopenable lock names the path and the error, got: {}",
@@ -377,7 +377,7 @@ fn an_unopenable_host_lock_is_reported_as_such_and_re_announced_when_the_reason_
 
     // Same reason next tick: quiet.
     b.status = String::from("Saved src/foo.rs");
-    b.last_pair_check = None;
+    b.pair.last_check = None;
     assert!(
         !b.maybe_seat_navigator(),
         "an unchanged refusal stays quiet"
@@ -388,7 +388,7 @@ fn an_unopenable_host_lock_is_reported_as_such_and_re_announced_when_the_reason_
     // reason changed, so it is announced.
     std::fs::create_dir_all(&lock_dir).unwrap();
     let holder = crate::session::try_acquire_pair_host_lock(&lock_path).expect("holder acquires");
-    b.last_pair_check = None;
+    b.pair.last_check = None;
     assert!(
         b.maybe_seat_navigator(),
         "a changed reason dirties the frame"
@@ -403,7 +403,7 @@ fn an_unopenable_host_lock_is_reported_as_such_and_re_announced_when_the_reason_
     // directory vanishes, so the refusal is an open failure again - and
     // that change of reason is announced too.
     std::fs::remove_dir_all(&lock_dir).unwrap();
-    b.last_pair_check = None;
+    b.pair.last_check = None;
     assert!(b.maybe_seat_navigator(), "Busy -> Io is a changed reason");
     assert!(
         b.status.contains("cannot open host lock"),
@@ -414,14 +414,14 @@ fn an_unopenable_host_lock_is_reported_as_such_and_re_announced_when_the_reason_
 
     // The holder exits: this window takes over.
     drop(holder);
-    b.last_pair_check = None;
+    b.pair.last_check = None;
     b.maybe_seat_navigator();
     assert!(
-        b.pair_host.is_some(),
+        b.pair.host.is_some(),
         "B hosts once the lock frees: {}",
         b.status
     );
-    assert!(b.pair_host_lock.is_some());
+    assert!(b.pair.host_lock.is_some());
 }
 
 /// A zero-sized frame (a host window mid-collapse) has no cells at all:
