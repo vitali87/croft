@@ -9,8 +9,7 @@
 //! A program croft waits for runs through [`Bounded`], which states what
 //! is kept of each output, whether it runs apart from croft's terminal and
 //! how long it may take. A key press, click, paste, command or frame is a
-//! [`UiTurn`], which in a test may not wait on one unless its place says why
-//! ([`ui_wait_allowed`]). A program croft looks for, on `PATH` or in a list
+//! [`UiTurn`], which in a test may not wait on one. A program croft looks for, on `PATH` or in a list
 //! of folders, is found through [`find`], by one rule for what can run.
 
 use std::ffi::OsString;
@@ -25,7 +24,7 @@ mod starts;
 mod ui_turn;
 
 pub(crate) use bounded::{Apart, Bounded, Keep, Kept, RunError};
-pub(crate) use ui_turn::{UiTurn, about_to_wait, ui_wait_allowed};
+pub(crate) use ui_turn::{UiTurn, about_to_wait};
 
 /// The program croft starts for `name`: `name` itself, or in a test the
 /// stand-in this thread put in its place.

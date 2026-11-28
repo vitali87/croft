@@ -101,9 +101,10 @@ impl EditorTabs {
             }
             return;
         }
-        if let Some(page) = ed.pdf_page() {
+        if let Some(page) = ed.pdf_target_page() {
             // One page per wheel event, like the focused preview: the
-            // caller's notches are text lines (3 a tick), not pages.
+            // caller's notches are text lines (3 a tick), not pages. From
+            // the page asked for last, which may still be rendering (#2824).
             let target = if notches >= 0 {
                 page.saturating_add(1)
             } else {

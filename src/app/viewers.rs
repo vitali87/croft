@@ -574,17 +574,18 @@ impl App {
 
     /// Wheel paging for the PDF preview. Differs from the key path twice
     /// over: it clamps at the document ends (no scroll wheel wraps a PDF),
-    /// and a same-direction repeat inside the cooldown is dropped - every
-    /// page step is a synchronous rasteriser run on the UI thread, so a
-    /// momentum flick's burst of wheel events must coalesce instead of
-    /// freezing the TUI for one render per event. A reversal is deliberate
+    /// and a same-direction repeat inside the cooldown is dropped - a
+    /// momentum flick's burst of wheel events must coalesce into one page
+    /// step, not race through a page per event. A reversal is deliberate
     /// and always passes.
     pub(super) fn wheel_pdf_page(&mut self, delta: i32) {
         let doc = self.editor.path.clone();
         if pdf_wheel_cooling(self.last_pdf_wheel.as_ref(), delta, &doc) {
             return;
         }
-        let Some(cur) = self.editor.pdf_page() else {
+        // From the page asked for last: the one on screen may still be
+        // rendering the previous step (#2824).
+        let Some(cur) = self.editor.pdf_target_page() else {
             return;
         };
         let target = if delta >= 0 {
@@ -593,11 +594,6 @@ impl App {
             cur.saturating_sub(delta.unsigned_abs()).max(1)
         };
         self.editor.set_pdf_page(target);
-        // Stamped AFTER the rasterise: the flick's remaining events queued
-        // while the render ran, so a stamp taken at entry had already aged
-        // by the render's duration when they were processed — a render
-        // slower than the cooldown let every queued event through, one
-        // blocking render each.
         self.last_pdf_wheel = Some((std::time::Instant::now(), delta.signum(), doc));
     }
 
@@ -606,8 +602,10 @@ impl App {
     }
 
     /// Resolve the PDF link under a click at screen cell (`col`, `row`) on
-    /// the focused PDF preview, extracting the current page's link regions
-    /// on first use (and caching them on the tab until the page changes).
+    /// the focused PDF preview, from the current page's link regions, kept
+    /// on the tab until the page changes. Before the first click on a page
+    /// they are read on a job (#2824), and the click acts when they are in
+    /// ([`Self::poll_pdf_previews`]).
     pub(super) fn pdf_link_target_at(
         &mut self,
         col: u16,
@@ -634,24 +632,73 @@ impl App {
                 (image.pixel_w, image.pixel_h),
             )?
         };
-        let pdf = self.editor.image.as_mut()?.pdf.as_mut()?;
-        if pdf.links.is_none() {
-            // Waits on pdftohtml during the click, up to its 5 s budget,
-            // until extraction moves onto a job (#2824).
-            match crate::proc::ui_wait_allowed(
-                "a PDF link click reads the page's links (#2824)",
-                || crate::pdf::page_links(&pdf.source_path, pdf.current_page),
-            ) {
-                Ok(links) => pdf.links = Some(links),
-                // Not cached: a mid-write extraction failure (pdflatex
-                // rebuilding the file) heals on the next click.
-                Err(e) => {
-                    self.status = format!("PDF links unavailable: {e}");
-                    return None;
+        let pdf = self.editor.image.as_ref()?.pdf.as_ref()?;
+        let Some(links) = pdf.links.as_ref() else {
+            self.editor.read_pdf_links_for(frac);
+            return None;
+        };
+        Some(links.link_at(frac)?.target.clone())
+    }
+
+    /// Settle the PDF previews' work that finished off the UI thread
+    /// (#2824): a page that landed is shown, and a click that waited for its
+    /// page's links acts now. Whether anything on screen changed.
+    pub(super) fn poll_pdf_previews(&mut self) -> bool {
+        let mut changed = false;
+        for (g, group) in self
+            .editor_layout
+            .all_groups_mut(&mut self.editor)
+            .enumerate()
+        {
+            let active = group.active_index();
+            for (i, editor) in group.editors.iter_mut().enumerate() {
+                changed |= editor.poll_pdf_jobs();
+                // A click acts on the preview in front: one left waiting on
+                // a tab or group the user has since left is dropped, so it
+                // never fires on their return.
+                if (g, i) != (0, active) {
+                    editor.pdf_jobs.waiting_click = None;
                 }
             }
         }
-        Some(pdf.links.as_ref()?.link_at(frac)?.target.clone())
+        let links_in = self
+            .editor
+            .image
+            .as_ref()
+            .and_then(|i| i.pdf.as_ref())
+            .is_some_and(|pdf| pdf.links.is_some());
+        let clicked = links_in
+            .then(|| self.editor.pdf_jobs.waiting_click.take())
+            .flatten();
+        if let Some(frac) = clicked {
+            let target = self
+                .editor
+                .image
+                .as_ref()
+                .and_then(|i| i.pdf.as_ref())
+                .and_then(|pdf| pdf.links.as_ref())
+                .and_then(|links| links.link_at(frac))
+                .map(|link| link.target.clone());
+            if let Some(target) = target {
+                self.follow_pdf_link(target);
+            }
+            changed = true;
+        }
+        changed
+    }
+
+    /// Follow a PDF link: an external URL opens in the browser, an internal
+    /// target flips to its page.
+    pub(super) fn follow_pdf_link(&mut self, target: crate::pdf::LinkTarget) {
+        match target {
+            crate::pdf::LinkTarget::Url(url) => {
+                self.status = match open_url(&url) {
+                    Ok(()) => format!("Opened {url}"),
+                    Err(e) => format!("Could not open {url}: {e}"),
+                };
+            }
+            crate::pdf::LinkTarget::Page(page) => self.jump_pdf_page(page),
+        }
     }
 
     pub(super) fn focused_image_side(&self) -> usize {

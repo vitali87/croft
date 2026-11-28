@@ -110,6 +110,38 @@ pub struct PdfState {
     pub links: Option<crate::pdf::PageLinks>,
 }
 
+/// A PDF's work that runs off the UI thread (#2824): poppler can take
+/// seconds on a large or half-written file, and a key press, click or frame
+/// must not wait for it. A page turn asks for a page and the one shown stays
+/// until it lands, the page count is read after the open, and a link click
+/// waits for its page's links.
+#[derive(Default)]
+pub struct PdfJobs {
+    /// The page asked for and its rasterisation. A newer page turn replaces
+    /// it: the latest one asked for is the one shown.
+    render: Option<PageJob<Vec<u8>>>,
+    /// The page count, read after the open.
+    count: Option<crate::jobs::Job<Option<u32>>>,
+    /// End was pressed before the count was in: go to the last page once it
+    /// is.
+    last_page_wanted: bool,
+    /// The page whose links are being read, and the reading.
+    links: Option<PageJob<crate::pdf::PageLinks>>,
+    /// Where on the page a click waits for its page's links, as fractions of
+    /// the page (left, top, right, bottom).
+    pub waiting_click: Option<(f64, f64, f64, f64)>,
+}
+
+/// A page and the job reading something from it.
+type PageJob<T> = (u32, crate::jobs::Job<Result<T, String>>);
+
+impl PdfJobs {
+    /// Whether any of a PDF's work is still running.
+    pub fn busy(&self) -> bool {
+        self.render.is_some() || self.count.is_some() || self.links.is_some()
+    }
+}
+
 /// The background the image/sheet/diff canvases fill with. On iTerm2,
 /// `Reset` inherits the session bg that `SetColors` re-tints per theme, so
 /// the canvas matches the surrounding panes for free. Every other host
@@ -1092,6 +1124,8 @@ impl Editor {
         self.pr_review = None;
         self.fleet = None;
         self.sarif = None;
+        // A page or links landing after the tab moved on are not its.
+        self.pdf_jobs = PdfJobs::default();
     }
 
     /// Turn this tab into a viewer of `path`, whose text side is an empty
@@ -1366,18 +1400,17 @@ impl Editor {
         let backend = crate::pdf::detect_backend()
             .ok_or_else(|| anyhow::anyhow!("Install poppler (pdftoppm) to preview PDFs"))?;
         let meta = std::fs::metadata(path)?;
-        // Waits on pdfinfo during the open, up to its 2 s budget, until the
-        // probe moves onto a job (#2824).
-        let page_count =
-            crate::proc::ui_wait_allowed("a PDF opens knowing its page count (#2824)", || {
-                crate::pdf::detect_page_count(path)
-            });
         // A reload comes up on the reader's page in this single
         // rasterisation — clamped when the count is known, so a genuinely
         // shrunken document lands on its new last page. On failure the
         // whole open fails and the caller's failed-reload path keeps the
-        // last good render AND the place (#72).
-        let page = match self.pdf_restore_page.take() {
+        // last good render AND the place (#72). A reload comes from the file
+        // changing on disk, never from a key press, so it may read the count
+        // first; a first open shows page 1 and reads the count on a job
+        // (#2824).
+        let restore = self.pdf_restore_page.take();
+        let page_count = restore.and_then(|_| crate::pdf::detect_page_count(path));
+        let page = match restore {
             Some(p) => p.clamp(1, page_count.unwrap_or(p).max(1)),
             None => 1,
         };
@@ -1403,6 +1436,15 @@ impl Editor {
                 links: None,
             }),
         });
+        self.pdf_jobs = PdfJobs::default();
+        if page_count.is_none() {
+            let pdf = path.to_path_buf();
+            self.pdf_jobs.count =
+                crate::jobs::Job::spawn("pdf-count", crate::jobs::Start::Now, move || {
+                    crate::pdf::detect_page_count(&pdf)
+                })
+                .ok();
+        }
         self.status = format!("Opened PDF {}", path.display());
         Ok(())
     }
@@ -1938,19 +1980,32 @@ impl Editor {
         let Some(pdf) = self.image.as_ref().and_then(|i| i.pdf.clone()) else {
             return false;
         };
+        // From the page asked for last, so two quick presses move two pages
+        // while the first still renders.
+        let from = self.pdf_target_page().unwrap_or(pdf.current_page);
         let new_page = if let Some(total) = pdf.page_count {
             if total == 0 {
                 return false;
             }
-            let cur = pdf.current_page as i64;
+            let cur = from as i64;
             let next = ((cur - 1 + delta as i64).rem_euclid(total as i64)) + 1;
             next as u32
         } else if delta > 0 {
-            pdf.current_page.saturating_add(delta as u32)
+            from.saturating_add(delta as u32)
         } else {
-            pdf.current_page.saturating_sub((-delta) as u32).max(1)
+            from.saturating_sub((-delta) as u32).max(1)
         };
         self.render_pdf_page(new_page)
+    }
+
+    /// The page an open PDF preview will show: the one asked for while it
+    /// renders, else the one on screen.
+    pub fn pdf_target_page(&self) -> Option<u32> {
+        self.pdf_jobs
+            .render
+            .as_ref()
+            .map(|(page, _)| *page)
+            .or_else(|| self.pdf_page())
     }
 
     /// Jump the active PDF preview to an absolute page, clamped to the
@@ -1965,6 +2020,11 @@ impl Editor {
         // where mdls reports nothing): rendering the sentinel itself would
         // just spray "PDF page 4294967295 failed" into the status bar.
         if page == u32::MAX && pdf.page_count.is_none() {
+            // Still being read: go there once it is in.
+            if self.pdf_jobs.count.is_some() {
+                self.pdf_jobs.last_page_wanted = true;
+                return false;
+            }
             self.status = String::from("PDF page count unknown; cannot jump to the last page");
             return false;
         }
@@ -1972,22 +2032,146 @@ impl Editor {
         self.render_pdf_page(page.clamp(1, last))
     }
 
+    /// Ask for `new_page`, rendered on a job (#2824): the page on screen
+    /// stays until it lands ([`Self::poll_pdf_jobs`]). False: nothing on
+    /// screen changed yet.
     pub(super) fn render_pdf_page(&mut self, new_page: u32) -> bool {
-        let Some(image) = self.image.as_mut() else {
+        let Some(pdf) = self.image.as_ref().and_then(|i| i.pdf.clone()) else {
             return false;
         };
-        let Some(pdf) = image.pdf.clone() else {
-            return false;
-        };
-        if new_page == pdf.current_page {
+        if Some(new_page) == self.pdf_target_page() {
             return false;
         }
-        let bytes = match crate::pdf::rasterize_page(&pdf.source_path, new_page, pdf.backend) {
-            Ok(b) => b,
+        if new_page == pdf.current_page {
+            // Back to the page on screen: whatever was asked for since is
+            // dropped.
+            self.pdf_jobs.render = None;
+            return false;
+        }
+        let (source, backend) = (pdf.source_path.clone(), pdf.backend);
+        match crate::jobs::Job::spawn("pdf-page", crate::jobs::Start::Now, move || {
+            crate::pdf::rasterize_page(&source, new_page, backend).map_err(|e| e.to_string())
+        }) {
+            Ok(job) => self.pdf_jobs.render = Some((new_page, job)),
+            Err(e) => self.status = format!("PDF page {new_page} failed: {e}"),
+        }
+        false
+    }
+
+    /// Read the links of the page on screen on a job, for a click at
+    /// `frac` of the page that waits for them (#2824).
+    pub fn read_pdf_links_for(&mut self, frac: (f64, f64, f64, f64)) {
+        let Some(pdf) = self.image.as_ref().and_then(|i| i.pdf.clone()) else {
+            return;
+        };
+        self.pdf_jobs.waiting_click = Some(frac);
+        if self
+            .pdf_jobs
+            .links
+            .as_ref()
+            .is_some_and(|(page, _)| *page == pdf.current_page)
+        {
+            return;
+        }
+        let (source, page) = (pdf.source_path.clone(), pdf.current_page);
+        match crate::jobs::Job::spawn("pdf-links", crate::jobs::Start::Now, move || {
+            crate::pdf::page_links(&source, page).map_err(|e| e.to_string())
+        }) {
+            Ok(job) => self.pdf_jobs.links = Some((page, job)),
             Err(e) => {
-                self.status = format!("PDF page {new_page} failed: {e}");
-                return false;
+                self.pdf_jobs.waiting_click = None;
+                self.status = format!("PDF links unavailable: {e}");
             }
+        }
+    }
+
+    /// Settle the PDF work that has finished: a page that landed is shown,
+    /// the page count is kept, a page's links are kept for the click that
+    /// waits on them. Whether anything on screen changed.
+    pub fn poll_pdf_jobs(&mut self) -> bool {
+        let mut changed = false;
+        if let Some((page, job)) = &self.pdf_jobs.render {
+            let page = *page;
+            match job.poll() {
+                crate::jobs::Poll::Pending => {}
+                crate::jobs::Poll::Done(Ok(bytes)) => {
+                    self.pdf_jobs.render = None;
+                    changed |= self.show_pdf_page(page, bytes);
+                }
+                crate::jobs::Poll::Done(Err(e)) => {
+                    self.pdf_jobs.render = None;
+                    self.status = format!("PDF page {page} failed: {e}");
+                    changed = true;
+                }
+                crate::jobs::Poll::Died => {
+                    self.pdf_jobs.render = None;
+                    self.status = format!("PDF page {page} failed: it stopped before it finished");
+                    changed = true;
+                }
+            }
+        }
+        if let Some(job) = &self.pdf_jobs.count {
+            match job.poll() {
+                crate::jobs::Poll::Pending => {}
+                answer => {
+                    self.pdf_jobs.count = None;
+                    let count = match answer {
+                        crate::jobs::Poll::Done(count) => count,
+                        _ => None,
+                    };
+                    if let Some(pdf) = self.image.as_mut().and_then(|i| i.pdf.as_mut()) {
+                        pdf.page_count = count;
+                    }
+                    if std::mem::take(&mut self.pdf_jobs.last_page_wanted) && count.is_some() {
+                        self.set_pdf_page(u32::MAX);
+                    }
+                    changed = true;
+                }
+            }
+        }
+        if let Some((page, job)) = &self.pdf_jobs.links {
+            let page = *page;
+            match job.poll() {
+                crate::jobs::Poll::Pending => {}
+                answer => {
+                    self.pdf_jobs.links = None;
+                    let current = self.pdf_page();
+                    match answer {
+                        crate::jobs::Poll::Done(Ok(links)) if current == Some(page) => {
+                            if let Some(pdf) = self.image.as_mut().and_then(|i| i.pdf.as_mut()) {
+                                pdf.links = Some(links);
+                            }
+                        }
+                        // The page turned meanwhile: those links are not its.
+                        crate::jobs::Poll::Done(Ok(_)) => self.pdf_jobs.waiting_click = None,
+                        // Not kept: a mid-write extraction failure (pdflatex
+                        // rebuilding the file) heals on the next click.
+                        crate::jobs::Poll::Done(Err(e)) => {
+                            self.pdf_jobs.waiting_click = None;
+                            self.status = format!("PDF links unavailable: {e}");
+                        }
+                        _ => {
+                            self.pdf_jobs.waiting_click = None;
+                            self.status = String::from(
+                                "PDF links unavailable: it stopped before it finished",
+                            );
+                        }
+                    }
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    /// Show `bytes`, the render of `new_page`, in place of the page on
+    /// screen.
+    fn show_pdf_page(&mut self, new_page: u32, bytes: Vec<u8>) -> bool {
+        // A click waiting on the old page's links is not this page's.
+        self.pdf_jobs.waiting_click = None;
+        self.pdf_jobs.links = None;
+        let Some(image) = self.image.as_mut() else {
+            return false;
         };
         let Some((pixel_w, pixel_h)) = image_dimensions_of(&bytes) else {
             return false;

@@ -76,6 +76,7 @@ const BACKGROUND_PASS_CALLS: &[&str] = &[
     "app.poll_chrome_bake",
     "app.poll_welcome_bake",
     "app.poll_saved_session",
+    "app.poll_pdf_previews",
     "app.settle_bookmarks",
     "crate::startup_trace::mark",
     "app.tick_live_run",

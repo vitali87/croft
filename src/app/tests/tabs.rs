@@ -2560,8 +2560,8 @@ fn status_bar_go_to_line_drops_the_selection_it_leaves_behind() {
 }
 
 /// A wheel burst over a PDF in a background split steps one page, as it does
-/// in the focused group: every step is a synchronous rasterise, and without
-/// the cooldown a flick froze the UI for one render per queued event.
+/// in the focused group: without the cooldown a flick raced through a page
+/// per queued event.
 #[test]
 fn a_wheel_burst_over_a_background_split_pdf_steps_one_page() {
     require_pdf_backend();
@@ -2583,7 +2583,8 @@ fn a_wheel_burst_over_a_background_split_pdf_steps_one_page() {
         .next()
         .unwrap()
         .last_full_area = area;
-    let page = |app: &App| {
+    let page = |app: &mut App| {
+        settle_pdf(app);
         app.editor_layout
             .inactive_groups()
             .next()
@@ -2594,15 +2595,15 @@ fn a_wheel_burst_over_a_background_split_pdf_steps_one_page() {
             .expect("the background group shows the PDF")
             .current_page
     };
-    assert_eq!(page(&app), 1);
+    assert_eq!(page(&mut app), 1);
     // The mouse handlers pass three text lines per wheel tick.
     assert!(app.scroll_inactive_group_at(10, 10, 3));
-    assert_eq!(page(&app), 2, "one tick steps one page, not three");
+    assert_eq!(page(&mut app), 2, "one tick steps one page, not three");
     assert!(app.scroll_inactive_group_at(10, 10, 3));
-    assert_eq!(page(&app), 2, "a same-direction burst steps one page");
+    assert_eq!(page(&mut app), 2, "a same-direction burst steps one page");
     // A reversal is deliberate and always passes.
     assert!(app.scroll_inactive_group_at(10, 10, -3));
-    assert_eq!(page(&app), 1);
+    assert_eq!(page(&mut app), 1);
 }
 
 /// With a submenu open, the wheel over the parent panel drives the parent:

@@ -2740,15 +2740,8 @@ impl App {
                     // text runs they cover), which is what hyperref/beamer
                     // emit. A non-link click just focuses the pane, above.
                     if self.editor.image.as_ref().is_some_and(|i| i.pdf.is_some()) {
-                        match self.pdf_link_target_at(m.column, m.row) {
-                            Some(crate::pdf::LinkTarget::Url(url)) => {
-                                self.status = match open_url(&url) {
-                                    Ok(()) => format!("Opened {url}"),
-                                    Err(e) => format!("Could not open {url}: {e}"),
-                                };
-                            }
-                            Some(crate::pdf::LinkTarget::Page(page)) => self.jump_pdf_page(page),
-                            None => {}
+                        if let Some(target) = self.pdf_link_target_at(m.column, m.row) {
+                            self.follow_pdf_link(target);
                         }
                         return;
                     }

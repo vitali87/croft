@@ -972,8 +972,9 @@ impl Editor {
         // must not snap the reader back to page 1. `open_pdf` consumes the
         // request and comes up on that page directly — restoring it with a
         // second render after the open left a window where that render's
-        // transient failure lost the reader's place (#72).
-        self.pdf_restore_page = self.pdf_page().filter(|&p| p > 1);
+        // transient failure lost the reader's place (#72). The page asked
+        // for, which may still be rendering on a job (#2824).
+        self.pdf_restore_page = self.pdf_target_page().filter(|&p| p > 1);
         // A SARIF viewer keeps the reader's place, and the logs added to
         // it, across a rewrite of its log (#577).
         let old_sarif = self.sarif.take();

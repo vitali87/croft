@@ -11363,6 +11363,68 @@ fn open_pdf_tab_keeps_last_good_page_through_a_mid_write_sweep() {
     assert!(tab.image.is_some(), "completed write renders again");
 }
 
+/// Let a PDF tab's work that runs off the UI thread land (#2824).
+fn settle_pdf_jobs(ed: &mut Editor) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while ed.pdf_jobs.busy() {
+        ed.poll_pdf_jobs();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the PDF work must land; status: {}",
+            ed.status
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// A page that lands after its tab moved on to another file is dropped
+/// (#2824): it must never replace the picture now on screen.
+#[test]
+fn a_pdf_page_landing_after_the_tab_moved_on_is_dropped() {
+    if crate::pdf::detect_backend().is_none() {
+        eprintln!("skipping: no PDF rasteriser installed");
+        return;
+    }
+    let two_page_pdf = concat!(
+        "%PDF-1.4\n",
+        "1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n",
+        "2 0 obj<</Type/Pages/Kids[3 0 R 5 0 R]/Count 2>>endobj\n",
+        "3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]/Contents 4 0 R>>endobj\n",
+        "4 0 obj<</Length 27>>stream\n0 0 1 rg 10 10 100 100 re f\nendstream endobj\n",
+        "5 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]/Contents 6 0 R>>endobj\n",
+        "6 0 obj<</Length 27>>stream\n1 0 0 rg 10 10 100 100 re f\nendstream endobj\n",
+        "trailer<</Root 1 0 R/Size 7>>\n%%EOF\n",
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let pdf = dir.path().join("deck.pdf");
+    std::fs::write(&pdf, two_page_pdf).unwrap();
+    let png = dir.path().join("shot.png");
+    let mut bytes = Vec::new();
+    image::RgbaImage::from_pixel(4, 4, image::Rgba([1, 2, 3, 255]))
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    std::fs::write(&png, &bytes).unwrap();
+    let mut e = Editor::new();
+    e.open(&pdf).unwrap();
+    settle_pdf_jobs(&mut e);
+    e.change_pdf_page(1);
+    assert!(e.pdf_jobs.busy(), "page 2 renders on a job");
+    e.open(&png).unwrap();
+    let shown = e.image.as_ref().unwrap().bytes.clone();
+    // Whatever is still running lands now (none is, once the view is
+    // cleared).
+    settle_pdf_jobs(&mut e);
+    assert!(
+        e.image
+            .as_ref()
+            .is_some_and(|i| i.pdf.is_none() && i.bytes == shown),
+        "the picture now on screen must stay"
+    );
+}
+
 /// Reading page 2 of a deck while pdflatex rebuilds the file: the
 /// FS-sync reload must come back on page 2, not snap the reader to
 /// page 1 and lose their place.
@@ -11387,7 +11449,8 @@ fn pdf_reload_keeps_the_current_page() {
     std::fs::write(&path, two_page_pdf).unwrap();
     let mut tabs = EditorTabs::new();
     tabs.open_pinned(&path).unwrap();
-    assert!(tabs.change_pdf_page(1), "two pages, so page 2 renders");
+    tabs.change_pdf_page(1);
+    settle_pdf_jobs(&mut tabs);
     assert_eq!(tabs.pdf_page(), Some(2));
     // pdflatex rewrites the file (same content is enough; only the
     // disk stamp needs to move).
@@ -11444,7 +11507,8 @@ fn a_transient_page_render_failure_during_reload_keeps_the_readers_place() {
     std::fs::write(&path, two_page_pdf).unwrap();
     let mut tabs = EditorTabs::new();
     tabs.open_pinned(&path).unwrap();
-    assert!(tabs.change_pdf_page(1), "two pages, so page 2 renders");
+    tabs.change_pdf_page(1);
+    settle_pdf_jobs(&mut tabs);
     let good_bytes = tabs
         .iter_tabs()
         .next()
