@@ -2571,11 +2571,12 @@ fn the_bookmark_picker_lists_every_tabs_marks_and_jumps_to_one() {
     assert_eq!(app.editor.cursor_row, 1);
 }
 
-/// View Bookmarks lists open files only: a preview tab that moved on from a
-/// file still holds that file's marks, but the file is no longer open, so
-/// neither it nor its text on disk shows up.
+/// View All Bookmarks also lists the marks of a file no tab shows any more: a
+/// preview tab that moved on from the file still holds them, and a closed
+/// tab hands them to the App. Their text comes from disk, and Enter opens
+/// the file at the line.
 #[test]
-fn the_bookmark_picker_leaves_out_a_file_no_tab_shows() {
+fn the_bookmark_picker_lists_a_file_no_tab_shows_and_opens_it() {
     use crate::widgets::command_palette::Command;
     let tmp = tempfile::tempdir().unwrap();
     let a = tmp.path().join("a.txt");
@@ -2594,16 +2595,90 @@ fn the_bookmark_picker_leaves_out_a_file_no_tab_shows() {
             .any(|e| e.path.as_deref() == Some(a.as_path())),
         "the preview slot moved on to b.txt"
     );
-    assert!(
-        app.editor
-            .editors
-            .iter()
-            .any(|e| e.bookmarks.contains_key(&a)),
-        "a tab still holds a.txt's mark"
-    );
     app.run_command(Command::ViewBookmarks);
-    assert!(app.list_picker.is_none(), "a.txt is not open");
+    assert!(
+        app.list_picker.is_none(),
+        "View Bookmarks lists open files only"
+    );
     assert!(app.status.contains("No bookmarks"), "was {:?}", app.status);
+    app.run_command(Command::ViewAllBookmarks);
+    assert!(app.list_picker.is_some(), "a.txt's mark is listed");
+    assert_eq!(app.pending_bookmarks.len(), 1);
+    assert_eq!(app.pending_bookmarks[0].path, a);
+    assert_eq!(app.pending_bookmarks[0].line, 2);
+    let target = app.pending_bookmarks[0].clone();
+    app.list_picker = None;
+    app.jump_to_bookmark(target);
+    assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
+    assert_eq!(app.editor.cursor_row, 1);
+}
+
+/// Closing the tab keeps the marks too: View All Bookmarks still lists them,
+/// while View Bookmarks stays on the open files.
+#[test]
+fn the_bookmark_picker_lists_the_marks_of_a_closed_tab() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "alpha\nbeta\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    app.editor.cursor_row = 0;
+    app.editor.toggle_bookmark();
+    let tab = app.editor.active_index();
+    assert!(app.editor.close_tab(tab));
+    app.run_command(Command::ViewBookmarks);
+    assert!(app.list_picker.is_none(), "the file is closed");
+    app.run_command(Command::ViewAllBookmarks);
+    assert_eq!(app.pending_bookmarks.len(), 1, "{:?}", app.status);
+    assert_eq!(app.pending_bookmarks[0].path, a);
+    assert_eq!(app.pending_bookmarks[0].line, 1);
+}
+
+/// A closed file is listed the way the editor would open it: a UTF-16 file
+/// with a byte-order mark reads as text, and one past the editor's size cap
+/// (which it would refuse to open) is left out without being read.
+#[test]
+fn the_bookmark_picker_reads_closed_files_as_the_editor_does() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let big = tmp.path().join("big.log");
+    let mut utf16 = vec![0xFF, 0xFE];
+    for u in "alpha\nb\u{e9}ta\n".encode_utf16() {
+        utf16.extend(u.to_le_bytes());
+    }
+    std::fs::write(&a, utf16).unwrap();
+    let f = std::fs::File::create(&big).unwrap();
+    f.set_len(50 * 1024 * 1024 + 1).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.closed_bookmarks
+        .insert(a.clone(), [2].into_iter().collect());
+    app.closed_bookmarks
+        .insert(big.clone(), [1].into_iter().collect());
+    app.run_command(Command::ViewAllBookmarks);
+    let picker = app.list_picker.as_ref().expect("a.txt's mark is listed");
+    let labels: Vec<&str> = picker.rows.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(labels, ["a.txt:2  b\u{e9}ta"]);
+}
+
+/// Cmd+K Shift+B opens View All Bookmarks whichever case the terminal
+/// reports the letter in (CSI-u sends `b` with SHIFT).
+#[test]
+fn cmd_k_shift_b_opens_all_bookmarks_in_either_case() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "alpha\n").unwrap();
+    for c in ['B', 'b'] {
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.closed_bookmarks
+            .insert(a.clone(), [1].into_iter().collect());
+        app.handle_key(key(KeyCode::Char('k'), KeyModifiers::CONTROL))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::SHIFT))
+            .unwrap();
+        assert!(app.list_picker.is_some(), "{c:?} opens the bookmark list");
+    }
 }
 
 /// The marks of a tab in another editor group are listed too, and Enter on

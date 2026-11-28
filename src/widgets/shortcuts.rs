@@ -732,6 +732,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "",
             },
             ShortcutEntry {
+                keys: "Cmd/Ctrl+K Shift+B",
+                description: "Bookmarks: list every bookmark, closed files too",
+                handler: "",
+            },
+            ShortcutEntry {
                 keys: "Cmd/Ctrl+K Cmd/Ctrl+F",
                 description: "Format the selection through the language server",
                 handler: "",

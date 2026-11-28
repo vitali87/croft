@@ -402,6 +402,14 @@ impl EditorTabs {
         true
     }
 
+    /// Put `e` in tab `idx`, in place of the editor it held: a diff, a git
+    /// view or a text buffer shown over a file's own tab. The file's
+    /// bookmarks go to the App as a closing tab's do.
+    fn replace_tab(&mut self, idx: usize, e: Editor) {
+        let old = std::mem::replace(&mut self.editors[idx], e);
+        self.release_bookmarks(&old);
+    }
+
     /// Keep a closing tab's bookmarks for the App, which holds a file's
     /// marks once no tab does.
     pub(super) fn release_bookmarks(&mut self, closed: &Editor) {
@@ -1073,7 +1081,7 @@ impl EditorTabs {
         // Reuse the blank-initial slot if the editor pane was empty;
         // otherwise insert a new tab next to the active one.
         if self.is_blank_initial() {
-            self.editors[self.active] = e;
+            self.replace_tab(self.active, e);
             return Ok(());
         }
         let pos = self.active + 1;
@@ -1171,7 +1179,7 @@ impl EditorTabs {
         e.path = Some(right.to_path_buf());
         e.diff = Some(data);
         if self.is_blank_initial() {
-            self.editors[self.active] = e;
+            self.replace_tab(self.active, e);
             return Ok(());
         }
         // If a tab is already showing this path (as a plain file or a
@@ -1185,7 +1193,7 @@ impl EditorTabs {
             .or_else(|| self.find_tab_with_path(right))
             && !self.editors[idx].dirty
         {
-            self.editors[idx] = e;
+            self.replace_tab(idx, e);
             self.select(idx);
             return Ok(());
         }
@@ -1212,7 +1220,7 @@ impl EditorTabs {
         e.path = Some(path.to_path_buf());
         e.diff = Some(data);
         if self.is_blank_initial() {
-            self.editors[self.active] = e;
+            self.replace_tab(self.active, e);
             return Ok(());
         }
         // Same dirty guard as `open_head_diff_with_text`: a deleted-on-disk
@@ -1220,7 +1228,7 @@ impl EditorTabs {
         if let Some(idx) = self.find_tab_with_path(path)
             && !self.editors[idx].dirty
         {
-            self.editors[idx] = e;
+            self.replace_tab(idx, e);
             self.select(idx);
             return Ok(());
         }
@@ -1250,11 +1258,11 @@ impl EditorTabs {
         e.path = Some(label.to_path_buf());
         e.diff = Some(data);
         if self.is_blank_initial() {
-            self.editors[self.active] = e;
+            self.replace_tab(self.active, e);
             return Ok(());
         }
         if let Some(idx) = self.find_tab_with_path(label) {
-            self.editors[idx] = e;
+            self.replace_tab(idx, e);
             self.select(idx);
             return Ok(());
         }
@@ -1280,7 +1288,7 @@ impl EditorTabs {
         e.path = Some(label);
         e.fleet = Some(view);
         if self.is_blank_initial() {
-            self.editors[self.active] = e;
+            self.replace_tab(self.active, e);
             return;
         }
         let pos = self.active + 1;
@@ -1304,7 +1312,7 @@ impl EditorTabs {
         e.path = Some(label);
         e.pr_review = Some(view);
         if self.is_blank_initial() {
-            self.editors[self.active] = e;
+            self.replace_tab(self.active, e);
             return;
         }
         let pos = self.active + 1;
@@ -1328,11 +1336,11 @@ impl EditorTabs {
             e.lines.push(String::new());
         }
         if self.is_blank_initial() {
-            self.editors[self.active] = e;
+            self.replace_tab(self.active, e);
             return Ok(());
         }
         if let Some(idx) = self.find_tab_with_path(label) {
-            self.editors[idx] = e;
+            self.replace_tab(idx, e);
             self.select(idx);
             return Ok(());
         }
