@@ -3417,6 +3417,10 @@ pub struct App {
     /// alive but hidden until Cmd+K ⇧T restores the newest or the tick reaps
     /// entries older than [`UNDO_CLOSE_GRACE`]. Newest last.
     pub closed_terminals: Vec<ClosedTerminal>,
+    /// Panes being ended on background jobs ([`App::end_terminal`]): their
+    /// shell's hang-up grace and the wait for their reader never stop the
+    /// UI. The tick clears the finished ones; quitting waits for them all.
+    ending_terminals: Vec<crate::jobs::Job<()>>,
     /// Recently closed editor tabs (VS Code "Reopen Closed Editor"): the
     /// path plus enough view state (pin, cursor, scroll) to restore the tab
     /// as it was. Newest last; Cmd+K ⇧W pops. Bounded at
@@ -4871,6 +4875,7 @@ impl App {
             notifier: crate::notifications::Notifier::new(&loaded_prefs.notifications),
             host_accents: compile_host_accents(&loaded_prefs.host_accents),
             closed_terminals: Vec::new(),
+            ending_terminals: Vec::new(),
             closed_tabs: Vec::new(),
             file_finder: None,
             quick_open_range: None,
@@ -6375,6 +6380,9 @@ pub fn run(
     result?;
     if app.drop_to_local {
         crate::widgets::editor::delete_own_gunzip_copies();
+        // `exit` skips dropping the app: finish ending the panes already
+        // closed, or a shell that ignores hang-up outlives croft (#2831).
+        app.wait_for_ending_terminals();
         std::process::exit(crate::remote::DROP_TO_LOCAL_EXIT_CODE);
     }
     // A background self-update landed: serialize the session and replace
@@ -6411,6 +6419,10 @@ pub fn run(
             .arg(&session_path);
         // The relaunched croft reopens each archive from the saved session.
         crate::widgets::editor::delete_own_gunzip_copies();
+        // Replacing the process skips dropping the app too. Only the panes
+        // already closed are waited for: the live ones stay, and a hosted
+        // pane is found again by the relaunched croft (#2831).
+        app.wait_for_ending_terminals();
         let err = CommandExt::exec(&mut cmd);
         eprintln!("croft self-relaunch failed: {err}");
         return Ok(());

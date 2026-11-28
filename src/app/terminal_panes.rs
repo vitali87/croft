@@ -307,8 +307,12 @@ impl App {
         self.close_terminal_copy_mode();
         self.close_terminal_find();
         self.close_terminal_quick_select();
-        self.closed_terminals.clear();
-        self.terminals = terms;
+        for parked in std::mem::take(&mut self.closed_terminals) {
+            self.end_terminal(parked.term);
+        }
+        for outgoing in std::mem::replace(&mut self.terminals, terms) {
+            self.end_terminal(outgoing);
+        }
         self.active_terminal = active.min(self.terminals.len() - 1);
         self.sync_focus_flags();
         self.status = format!("Restored terminal session ({} panes)", self.terminals.len());
@@ -1033,9 +1037,11 @@ impl App {
             self.status = format!("Could not start a new shell: {e}");
             return;
         }
-        if self.close_terminal_at(idx) {
+        if self.close_terminal_at(idx)
+            && let Some(parked) = self.closed_terminals.pop()
+        {
             // Not parked for undo-close: there is no shell to bring back.
-            self.closed_terminals.pop();
+            self.end_terminal(parked.term);
         }
         self.terminal_status(if last {
             String::from("Started a new shell")
@@ -1076,11 +1082,54 @@ impl App {
         self.terminal_status(msg);
     }
 
-    /// Drop parked closed panes whose grace window lapsed (their Drop kills
-    /// the child). Called from the drain tick.
+    /// End parked closed panes whose grace window lapsed, and let go of
+    /// the ones whose ending has finished. Called from the drain tick.
     pub(super) fn reap_closed_terminals(&mut self) {
-        self.closed_terminals
-            .retain(|p| p.closed_at.elapsed() <= UNDO_CLOSE_GRACE);
+        let expired: Vec<ClosedTerminal> = self
+            .closed_terminals
+            .extract_if(.., |p| p.closed_at.elapsed() > UNDO_CLOSE_GRACE)
+            .collect();
+        for parked in expired {
+            self.end_terminal(parked.term);
+        }
+        self.ending_terminals
+            .retain(|job| matches!(job.poll(), crate::jobs::Poll::Pending));
+    }
+
+    /// End `term` on a background job: kill and reap its shell and wait for
+    /// its reader, which takes 50 ms for a shell that leaves on hang-up and
+    /// over 200 ms for one that ignores it, so the UI never waits for it.
+    /// With no thread to spare it ends here, as every pane once did.
+    pub(super) fn end_terminal(&mut self, term: PtyTerminal) {
+        // A failed spawn drops the closure, and the pane with it, here.
+        if let Ok(job) =
+            crate::jobs::Job::spawn("pane-end", crate::jobs::Start::Now, move || drop(term))
+        {
+            self.ending_terminals.push(job);
+        }
+    }
+
+    /// End every pane at once and wait until all have ended: at quit, one
+    /// hang-up grace for the lot instead of one per pane, and no shell left
+    /// running after croft.
+    pub(super) fn end_all_terminals(&mut self) {
+        for parked in std::mem::take(&mut self.closed_terminals) {
+            self.end_terminal(parked.term);
+        }
+        for term in std::mem::take(&mut self.terminals) {
+            self.end_terminal(term);
+        }
+        self.wait_for_ending_terminals();
+    }
+
+    /// Wait for the panes already ending on jobs, and leave the live ones
+    /// alone: for a way out of croft that skips dropping the app (an exit,
+    /// or replacing the process), which would cut those jobs off and leave a
+    /// shell that ignores hang-up running after croft.
+    pub(super) fn wait_for_ending_terminals(&mut self) {
+        for job in self.ending_terminals.drain(..) {
+            let _ = job.wait();
+        }
     }
 
     /// Swap the per-host accent rules (config.json reload, and tests).
@@ -1821,9 +1870,11 @@ impl App {
             if let Some(c) = code.filter(|&c| c != 0) {
                 exited.push_str(&format!(" with code {c}"));
             }
-            if self.close_terminal_at(idx) {
+            if self.close_terminal_at(idx)
+                && let Some(parked) = self.closed_terminals.pop()
+            {
                 // Not parked for undo-close: there is no shell to bring back.
-                self.closed_terminals.pop();
+                self.end_terminal(parked.term);
                 self.terminal_status(exited);
             } else {
                 self.status = format!("{exited}; press a key in it to start a new shell");
@@ -2333,4 +2384,13 @@ pub(super) fn pasted_lines(payload: &[u8]) -> Vec<Vec<u8>> {
         lines.pop();
     }
     lines
+}
+
+impl Drop for App {
+    /// The panes end together, each on its own job, and croft waits for
+    /// them: dropped one after another, quitting with eight panes stopped
+    /// for eight hang-up graces in a row.
+    fn drop(&mut self) {
+        self.end_all_terminals();
+    }
 }
