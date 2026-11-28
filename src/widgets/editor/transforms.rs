@@ -193,7 +193,7 @@ impl Editor {
         self.undoable_edit(EditKind::BumpNumber, |this| {
             // Never coalesce: a run of bumps must undo one at a time, the way
             // holding Ctrl-A in vim does.
-            this.last_edit_kind = None;
+            this.end_caret_action();
 
             // Where every caret lands, worked out on the text before the edits.
             // Literals are ASCII, so a bump's growth in bytes is its growth in

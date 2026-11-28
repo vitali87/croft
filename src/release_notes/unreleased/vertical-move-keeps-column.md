@@ -1,0 +1,1 @@
+feat(editor): Up/Down (and Page Up/Down) carry the caret's column over lines too short to hold it, as Vim does: past an empty line the caret comes back out on the column it went in on, wrapped or not. Any other move forgets the column.

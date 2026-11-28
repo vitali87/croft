@@ -78,7 +78,7 @@ impl Editor {
         };
         self.cursor_row = target_line;
         self.cursor_col = floor_grapheme_col(&self.lines[target_line], target_col);
-        self.last_edit_kind = None;
+        self.end_caret_action();
         // A click is a deliberate reposition; any multi-cursor session ends.
         self.carets.clear();
     }

@@ -225,6 +225,7 @@ impl Editor {
     pub(super) fn push_undo_step(&mut self, kind: EditKind, group: Option<u64>) {
         // The pre-edit text, for bookmarks to be diffed against afterwards.
         self.seed_bookmark_shadow();
+        self.vertical_goal = None;
         // Where the edit about to happen begins — the linked-editing
         // mirror reads this to locate the keystroke (#254).
         self.last_edit_origin = (self.cursor_row, self.cursor_col);
@@ -319,7 +320,7 @@ impl Editor {
         self.linked_ranges.clear();
         self.linked_rows.clear();
         self.merge_edit_row = self.cursor_row;
-        self.last_edit_kind = None;
+        self.end_caret_action();
         // A restore changes the buffer content, so bump the change counter (the
         // app resyncs the LSP / git gutter off `edit_seq`) and drop the wrap /
         // hscroll geometry caches keyed to the old text. `dirty` is taken from
@@ -336,7 +337,7 @@ impl Editor {
     /// Open a new undo step for the next edit (so a typing run doesn't
     /// merge with whatever comes after a movement / mouse / focus change).
     pub fn break_undo_coalescing(&mut self) {
-        self.last_edit_kind = None;
+        self.end_caret_action();
     }
 
     /// Make every edit until [`Self::end_undo_group`] one undo step (#934):
@@ -344,14 +345,14 @@ impl Editor {
     /// text, come back with one undo. The first edit opens a fresh step.
     pub fn begin_undo_group(&mut self) {
         self.undo_group = Some(None);
-        self.last_edit_kind = None;
+        self.end_caret_action();
     }
 
     /// Close the group [`Self::begin_undo_group`] opened, if any. The next
     /// edit opens its own step.
     pub fn end_undo_group(&mut self) {
         self.undo_group = None;
-        self.last_edit_kind = None;
+        self.end_caret_action();
     }
 
     /// Whether a group [`Self::begin_undo_group`] opened is still open: a
