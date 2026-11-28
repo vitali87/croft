@@ -34,6 +34,7 @@ mod dap;
 mod deep_link;
 mod default_formatter;
 mod devcontainer;
+mod diff;
 mod docx;
 mod editorconfig;
 mod emmet;
