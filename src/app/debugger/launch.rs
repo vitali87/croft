@@ -114,7 +114,7 @@ impl App {
     /// F5: start debugging the active file, or resume if already paused.
     pub fn debug_start_or_continue(&mut self) {
         use crate::dap::session::SessionPhase;
-        if let Some(session) = self.debug_sessions.focused_mut() {
+        if let Some(session) = self.debug.sessions.focused_mut() {
             if session.phase == SessionPhase::Stopped {
                 session.continue_execution();
                 self.editor.stop_line = None;
@@ -137,9 +137,10 @@ impl App {
     pub(in crate::app) fn start_selected_debug_now(&mut self) {
         if let Some(name) = self.selected_debug_compound.clone() {
             let root = self.active_workspace_root();
-            self.debug_compounds = crate::dap::configs::discover_compounds(&root);
+            self.debug.compounds = crate::dap::configs::discover_compounds(&root);
             if let Some(compound) = self
-                .debug_compounds
+                .debug
+                .compounds
                 .iter()
                 .find(|c| c.name == name)
                 .cloned()
@@ -156,8 +157,8 @@ impl App {
         }
         if let Some(name) = self.selected_debug_config.clone() {
             let root = self.active_workspace_root();
-            self.debug_configs = crate::dap::configs::discover_configs(&root);
-            if let Some(cfg) = self.debug_configs.iter().find(|c| c.name == name).cloned() {
+            self.debug.configs = crate::dap::configs::discover_configs(&root);
+            if let Some(cfg) = self.debug.configs.iter().find(|c| c.name == name).cloned() {
                 self.launch_debug_config(&cfg);
                 return;
             }
@@ -195,14 +196,14 @@ impl App {
                 return;
             }
         }
-        if !self.debug_sessions.is_empty() {
+        if !self.debug.sessions.is_empty() {
             self.debug_stop();
         }
         self.supersede_waiting_launches();
-        self.debug_build = None;
+        self.debug.build = None;
         self.pending_cargo_launches.clear();
         // A new run: the previous run's cleanup is not this one's.
-        self.debug_post_tasks.clear();
+        self.debug.post_tasks.clear();
         // A compound member from another workspace folder resolves, and
         // finds its preLaunchTask, there (#1425).
         let root = cfg
@@ -556,8 +557,8 @@ impl App {
     ) {
         session.set_function_breakpoints(self.function_breakpoints.clone());
         match slot {
-            LaunchSlot::Replace => self.debug_sessions.replace_with(name, session),
-            LaunchSlot::Add => self.debug_sessions.push(name, session),
+            LaunchSlot::Replace => self.debug.sessions.replace_with(name, session),
+            LaunchSlot::Add => self.debug.sessions.push(name, session),
         }
     }
 }

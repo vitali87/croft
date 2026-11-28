@@ -2644,9 +2644,9 @@ pub struct App {
     /// The latest event screen reader mode reads out whatever has focus
     /// (#1547), numbered so a repeat is still read.
     a11y_event: Option<(u64, String)>,
-    /// Why the focused debug session last stopped, until the stop's
-    /// location is known and the pause can be announced (#1547).
-    debug_pause_reason: Option<String>,
+    /// Run and Debug's sessions, configs, console and what a stop last
+    /// reported (see [`debugger::DebugState`]); the view is [`Self::run_debug`].
+    debug: debugger::DebugState,
     /// Terminal command suggestions (#614): on or off, and the one painted
     /// this frame as (pane index, the text Right arrow would type).
     term_suggest_enabled: bool,
@@ -3086,16 +3086,6 @@ pub struct App {
     sarif_download: Option<std::sync::mpsc::Receiver<SarifDownload>>,
     /// Fetches a URL's body; a field so tests can stand in for the network.
     sarif_fetch: fn(&str) -> Result<Vec<u8>, String>,
-    /// A breakpoint croft set itself at the assertion the last run failed
-    /// on (#373), as `(file, 1-based line)`. It is NOT one of the user's
-    /// breakpoints: it is added to the launch set, rendered hollow-red like
-    /// any unverified one, and removed when the session ends — a debugger
-    /// that silently left breakpoints behind would be worse than one that
-    /// set none.
-    debug_temp_breakpoint: Option<(PathBuf, usize)>,
-    /// Human-readable note about that breakpoint, folded into whichever
-    /// launch message the user actually ends up seeing.
-    debug_temp_note: Option<String>,
     /// Per-agent ledger of files changed while an agent was working (#345),
     /// and the review baselines that decide which of them still need a
     /// look.
@@ -3397,24 +3387,6 @@ pub struct App {
     /// Lists running CPython 3.14+ processes; selecting one spawns
     /// `pdb -p <pid>` in a PTY.
     pub process_picker: Option<crate::widgets::process_picker::ProcessPicker>,
-    /// Active debug session: a debugpy DAP launch. None when not debugging.
-    /// Polled each frame by [`App::poll_dap`], which mirrors the paused location
-    /// into `editor.stop_line`.
-    /// The debug sessions in flight, one FOCUSED (#310). Was a bare
-    /// `Option`, which made "the session" the only thing a call site could
-    /// mean; a compound needs several, so every site now says whether it
-    /// means the focused one or all of them.
-    pub debug_sessions: crate::dap::session::DebugSessions,
-    /// launch.json configurations discovered for the picker (#250); refreshed
-    /// on every picker open so edits are picked up without a restart.
-    debug_configs: Vec<crate::dap::configs::DebugConfig>,
-    /// The configuration **Debug: Add Configuration…** is building (#250),
-    /// between its steps.
-    debug_config_draft: Option<crate::dap::configs::ConfigDraft>,
-    /// Compounds declared beside those configurations. Listed in the picker so
-    /// a workspace's compounds are visible; launching one needs the
-    /// multi-session model tracked in #310.
-    debug_compounds: Vec<crate::dap::configs::Compound>,
     /// Name of the launch.json configuration F5 starts. `None` = the
     /// zero-config "Debug active file" behavior.
     selected_debug_config: Option<String>,
@@ -3422,18 +3394,6 @@ pub struct App {
     /// compound. Exclusive with `selected_debug_config`: a compound and a
     /// configuration may share a name, so one string cannot say which (#567).
     selected_debug_compound: Option<String>,
-    /// The launched compound asked for `stopAll: true` (#567): the first
-    /// member to end stops the rest. Set on every compound launch, so a
-    /// single-config launch (one session, no siblings) never reads a stale
-    /// value in a way that matters.
-    debug_stop_all: bool,
-    /// The `postDebugTask`s of the configurations launched into the current
-    /// run (#250), run once each when the run ends: the user stops it, or
-    /// the last session terminates. A new launch starts a fresh list.
-    debug_post_tasks: Vec<String>,
-    /// The running compound's name, kept past launch so the report rebuilt
-    /// when one member ends can still say which compound is live (#567).
-    debug_compound: Option<String>,
     /// A config launch parked behind its `preLaunchTask`: the task runs in
     /// its pane, and the FinishedCommand sweep launches (exit 0) or aborts
     /// (non-zero) when the matching command completes. Replaced by a newer
@@ -3441,18 +3401,6 @@ pub struct App {
     pending_debug_launch: Option<PendingDebugLaunch>,
     /// The `${input:…}` values a launch or task is asking for (#1424).
     input_run: Option<InputRun>,
-    /// Debuggers being prepared off the UI thread, and the launches that
-    /// wait for them (#2803).
-    debug_setups: Vec<debugger::DebugSetup>,
-    /// What prepares a debugger on this machine; a test puts a stand-in here.
-    debug_tooling: std::sync::Arc<dyn crate::dap::install::DebugTooling>,
-    /// F5's C/C++ build running off the UI thread (#1359): the source it
-    /// debugs and where the build's result arrives. `poll_debug_build`
-    /// launches lldb-dap on the program once it is built.
-    debug_build: Option<(
-        PathBuf,
-        std::sync::mpsc::Receiver<Result<crate::cpp_build::Built, crate::cpp_build::Failed>>,
-    )>,
     /// An attach launch waiting for the user to pick its process (#250):
     /// the resolved config and where it launches once `processId` is known.
     pending_attach: Option<(crate::dap::configs::ResolvedConfig, LaunchSlot)>,
@@ -3466,9 +3414,6 @@ pub struct App {
     /// error), and its config launches into its slot when it lands. One per
     /// compound member that builds; Stop Debugging drops them all.
     pending_cargo_launches: Vec<PendingCargoLaunch>,
-    /// Variable `variablesReference`s the user has expanded in the Variables
-    /// panel. Persisted across polls so re-fetched variables stay open.
-    pub debug_expanded: std::collections::HashSet<i64>,
     /// Debugger watch expressions (#112), in display order. Session-scoped.
     pub watch_exprs: Vec<String>,
     /// Latest evaluate result per expression: `(value, success)`.
@@ -3482,25 +3427,6 @@ pub struct App {
     /// clobbered the baseline with the stop's own values — the changed
     /// highlight never fired (#112).
     watch_baseline_pending: bool,
-    /// The latest Copy Value waiting on the adapter's `clipboard` evaluate
-    /// (#1546): the expression asked for and the row's shown value, copied
-    /// instead if the evaluate fails. A response for any other expression
-    /// answers an earlier Copy Value the user has since replaced, and is
-    /// dropped.
-    debug_copy_pending: Option<(String, String)>,
-    /// Debug console log: program stdout/stderr (DAP output events) plus REPL
-    /// echoes and results. Capped; the tail is shown in the Run & Debug panel.
-    /// Each line is escape-free text with the colour spans its SGR sequences
-    /// set (#1501), so search and copy see `FAILED`, not `[31mFAILED[0m`.
-    pub debug_console: Vec<crate::ansi_text::AnsiLine>,
-    /// How many lines have left the front of `debug_console`, to the cap or
-    /// to a new run's clear, so a stream's open line keeps its place by
-    /// counting from the first line the console ever held (#932).
-    debug_console_dropped: usize,
-    /// True once the current/just-ended debug session stopped at least once
-    /// (breakpoint / step / exception). Drives the "exited without hitting a
-    /// breakpoint" end message. Reset when a new session starts.
-    debug_ever_stopped: bool,
     /// zoxide-backed Explorer jump popup (Cmd+Z). None when closed. Opens
     /// only from the Explorer pane, so it never collides with the editor's
     /// Cmd+Z undo.
@@ -4595,7 +4521,7 @@ impl App {
             announcer: crate::a11y::Announcer::default(),
             announce_pos: None,
             a11y_event: None,
-            debug_pause_reason: None,
+            debug: debugger::DebugState::new(),
             term_suggest_enabled: true,
             term_suggestion: None,
             shortcut_capture: None,
@@ -4745,32 +4671,17 @@ impl App {
             mcp_started: None,
             mcp_busy_label: None,
             process_picker: None,
-            debug_sessions: Default::default(),
-            debug_configs: Vec::new(),
-            debug_config_draft: None,
-            debug_compounds: Vec::new(),
             selected_debug_config: None,
             selected_debug_compound: None,
-            debug_stop_all: false,
-            debug_post_tasks: Vec::new(),
-            debug_compound: None,
             pending_debug_launch: None,
             input_run: None,
-            debug_setups: Vec::new(),
-            debug_tooling: std::sync::Arc::new(crate::dap::install::MachineTooling),
-            debug_build: None,
             pending_attach: None,
             pending_test_debug: None,
             pending_cargo_launches: Vec::new(),
-            debug_expanded: std::collections::HashSet::new(),
             watch_exprs: Vec::new(),
             watch_vals: std::collections::HashMap::new(),
             watch_prev: std::collections::HashMap::new(),
             watch_baseline_pending: false,
-            debug_copy_pending: None,
-            debug_console: Vec::new(),
-            debug_console_dropped: 0,
-            debug_ever_stopped: false,
             zoxide_jump: None,
             zoxide_add_folder: false,
             branch_picker: None,
@@ -4922,8 +4833,6 @@ impl App {
             sarif_locate_pending: None,
             sarif_download: None,
             sarif_fetch: fetch_sarif_source,
-            debug_temp_breakpoint: None,
-            debug_temp_note: None,
             agent_ledger: crate::agent_lane::AgentLedger::new(),
             agent_ledger_store: (!cfg!(test)).then(agent_ledger_store_path),
             agent_ledger_saved: (0, std::time::Instant::now()),
@@ -6118,7 +6027,7 @@ pub fn run(
     // nothing sent `disconnect` here, and the debuggee outlived croft.
     // The teardowns run while the terminal is restored and are joined
     // below, before any exit path.
-    if !app.debug_sessions.is_empty() {
+    if !app.debug.sessions.is_empty() {
         app.debug_stop();
     }
 

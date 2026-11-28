@@ -51,22 +51,22 @@ impl App {
         tooling: Tooling,
         then: impl FnOnce() -> ParkedLaunch,
     ) -> Option<Ready> {
-        let preparing = self.debug_setups.iter().any(|s| s.tooling == tooling);
-        if !preparing && let Some(ready) = self.debug_tooling.ready(tooling) {
+        let preparing = self.debug.setups.iter().any(|s| s.tooling == tooling);
+        if !preparing && let Some(ready) = self.debug.tooling.ready(tooling) {
             return Some(ready);
         }
         let then = then();
         if !then.joins() {
             self.forget_parked_setup_launches();
         }
-        if let Some(setup) = self.debug_setups.iter_mut().find(|s| s.tooling == tooling) {
+        if let Some(setup) = self.debug.setups.iter_mut().find(|s| s.tooling == tooling) {
             setup.waiting.push(then);
         } else {
-            let tools = std::sync::Arc::clone(&self.debug_tooling);
+            let tools = std::sync::Arc::clone(&self.debug.tooling);
             match crate::jobs::Job::spawn("debug-setup", crate::jobs::Start::Now, move || {
                 tools.prepare(tooling)
             }) {
-                Ok(job) => self.debug_setups.push(DebugSetup {
+                Ok(job) => self.debug.setups.push(DebugSetup {
                     tooling,
                     job,
                     waiting: vec![then],
@@ -112,7 +112,7 @@ impl App {
     /// supersedes them, as it does one parked behind its task (#567). The
     /// jobs go on; what they prepare is there for the next launch.
     pub(in crate::app) fn forget_parked_setup_launches(&mut self) {
-        for setup in &mut self.debug_setups {
+        for setup in &mut self.debug.setups {
             setup.waiting.clear();
             setup.set_end_deferred = false;
         }
@@ -129,13 +129,14 @@ impl App {
 
     /// How many launches wait for a debugger.
     pub(in crate::app) fn parked_setup_launches(&self) -> usize {
-        self.debug_setups.iter().map(|s| s.waiting.len()).sum()
+        self.debug.setups.iter().map(|s| s.waiting.len()).sum()
     }
 
     /// How many compound members wait for a debugger to join the running
     /// set: while any do, a member ending does not end the set.
     pub(in crate::app) fn members_waiting_for_setup(&self) -> usize {
-        self.debug_setups
+        self.debug
+            .setups
             .iter()
             .flat_map(|s| &s.waiting)
             .filter(|launch| launch.joins())
@@ -146,7 +147,7 @@ impl App {
     /// set ends, and its `postDebugTask`s run, once they have run too, or
     /// here if their debugger cannot be set up.
     pub(in crate::app) fn defer_set_end_to_setup(&mut self) {
-        for setup in &mut self.debug_setups {
+        for setup in &mut self.debug.setups {
             if setup.waiting.iter().any(ParkedLaunch::joins) {
                 setup.set_end_deferred = true;
             }
@@ -159,8 +160,8 @@ impl App {
     pub(in crate::app) fn poll_debug_setups(&mut self) -> bool {
         let mut settled = Vec::new();
         let mut i = 0;
-        while i < self.debug_setups.len() {
-            let answer = match self.debug_setups[i].job.poll() {
+        while i < self.debug.setups.len() {
+            let answer = match self.debug.setups[i].job.poll() {
                 crate::jobs::Poll::Pending => {
                     i += 1;
                     continue;
@@ -170,7 +171,7 @@ impl App {
                     "Debugger setup failed: it stopped before it finished",
                 )),
             };
-            let setup = self.debug_setups.remove(i);
+            let setup = self.debug.setups.remove(i);
             settled.push((setup.waiting, setup.set_end_deferred, answer));
         }
         let changed = !settled.is_empty();
@@ -189,7 +190,7 @@ impl App {
                     // The set's end waited for these; nothing else runs or
                     // waits, so it has ended now.
                     if deferred
-                        && self.debug_sessions.is_empty()
+                        && self.debug.sessions.is_empty()
                         && self.members_waiting_for_setup() == 0
                     {
                         self.run_post_debug_tasks();

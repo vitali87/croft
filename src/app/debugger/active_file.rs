@@ -80,9 +80,9 @@ impl App {
         // fire later and replace this one (#567), nor one waiting for its
         // debugger to be set up (#2803).
         self.supersede_waiting_launches();
-        self.debug_build = None;
+        self.debug.build = None;
         // Zero-config "Debug active file" declares no postDebugTask.
-        self.debug_post_tasks.clear();
+        self.debug.post_tasks.clear();
         let Some(path) = self.editor.path.clone() else {
             self.debug_error(String::from("Open a file to debug"));
             return;

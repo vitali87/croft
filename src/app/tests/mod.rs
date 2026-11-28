@@ -2411,7 +2411,7 @@ fn app_with_breakpoints() -> (tempfile::TempDir, App, PathBuf, PathBuf) {
 /// Poll until the set shrinks below `from` members or two seconds pass.
 fn poll_until_shrinks(app: &mut App, from: usize) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while app.debug_sessions.len() >= from && std::time::Instant::now() < deadline {
+    while app.debug.sessions.len() >= from && std::time::Instant::now() < deadline {
         app.poll_dap();
         std::thread::sleep(std::time::Duration::from_millis(20));
     }

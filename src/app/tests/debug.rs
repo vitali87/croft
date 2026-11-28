@@ -556,7 +556,7 @@ fn debug_toolbar_app(
     } else {
         SessionPhase::Running
     };
-    app.debug_sessions.push("app.py", session);
+    app.debug.sessions.push("app.py", session);
     app.set_sidebar_view(SidebarView::RunDebug);
     app.refresh_debug_panel();
     let term = draw_terminal(&mut app, 120, 32);
@@ -1078,7 +1078,7 @@ fn f5_refuses_a_project_venv_too_old_for_debugpy() {
     let mut app = App::new(root.clone()).unwrap();
     app.editor.open(&file).unwrap();
     app.debug_start_or_continue();
-    let started = !app.debug_sessions.is_empty();
+    let started = !app.debug.sessions.is_empty();
     if started {
         app.debug_stop();
     }
@@ -1360,7 +1360,7 @@ fn debug_end_message_flags_a_program_that_exited_without_hitting_a_breakpoint() 
 fn debug_console_is_retained_after_the_session_ends() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.debug_console = vec![
+    app.debug.console = vec![
         crate::ansi_text::AnsiLine::plain("hello from program"),
         crate::ansi_text::AnsiLine::plain("all done"),
     ];
@@ -1592,7 +1592,7 @@ fn a_member_that_fails_to_start_is_not_counted_as_started() {
     app.list_picker.as_mut().unwrap().selected = row;
     app.confirm_list_picker();
 
-    let live = app.debug_sessions.names();
+    let live = app.debug.sessions.names();
     assert!(
         !live.contains(&"Broken".to_string()),
         "the unresolvable member never joins the set: {live:?}"
@@ -1685,9 +1685,9 @@ fn a_compound_member_skipped_for_its_own_task_is_named_in_the_feedback() {
     // set, so `contains("Client")` above is not passing on a line that merely
     // lists every configuration in the file.
     assert!(
-        !app.debug_sessions.names().contains(&"Client".to_string()),
+        !app.debug.sessions.names().contains(&"Client".to_string()),
         "the skipped member is not running: {:?}",
-        app.debug_sessions.names()
+        app.debug.sessions.names()
     );
 }
 
@@ -1791,7 +1791,7 @@ fn a_single_member_compound_launches_rather_than_citing_the_multi_session_limit(
     // pin the invariant that was actually broken: the count came from the
     // number of members attempted rather than from the sessions that exist,
     // and said "2 session(s), showing ?" over an empty set.
-    let live = app.debug_sessions.names();
+    let live = app.debug.sessions.names();
     if live.is_empty() {
         assert!(
             app.status.contains("started no sessions"),
@@ -1806,7 +1806,7 @@ fn a_single_member_compound_launches_rather_than_citing_the_multi_session_limit(
             app.status
         );
         assert_eq!(
-            app.debug_sessions.focused_name(),
+            app.debug.sessions.focused_name(),
             Some("Server"),
             "the FIRST member takes focus"
         );
@@ -1864,7 +1864,7 @@ fn a_single_member_compound_launches_rather_than_citing_the_multi_session_limit(
         "nothing parked behind a task that does not exist"
     );
     assert!(
-        fresh.debug_sessions.is_empty(),
+        fresh.debug.sessions.is_empty(),
         "and nothing launched — starting the member anyway would debug stale \
          artifacts, which is what running the task exists to prevent"
     );
@@ -1938,7 +1938,7 @@ fn a_compounds_own_pre_launch_task_runs_before_its_member_starts() {
         app.status
     );
     assert!(
-        app.debug_sessions.is_empty(),
+        app.debug.sessions.is_empty(),
         "nothing has been debugged yet — that is the whole point of the wait"
     );
 
@@ -1982,7 +1982,7 @@ fn a_compounds_own_pre_launch_task_runs_before_its_member_starts() {
         fresh.status
     );
     assert!(
-        fresh.pending_debug_launch.is_none() && fresh.debug_sessions.is_empty(),
+        fresh.pending_debug_launch.is_none() && fresh.debug.sessions.is_empty(),
         "and nothing ran"
     );
 
@@ -2003,7 +2003,7 @@ fn a_compounds_own_pre_launch_task_runs_before_its_member_starts() {
         "and the remedy names EVERY member, not just the first: {}",
         pair.status
     );
-    assert!(pair.debug_sessions.is_empty(), "and still nothing ran");
+    assert!(pair.debug.sessions.is_empty(), "and still nothing ran");
 }
 
 /// #1412: a preLaunchTask written the way VS Code labels auto-detected
@@ -2157,7 +2157,7 @@ fn a_finished_compound_task_starts_its_member_and_chains_the_members_own_task() 
         "a non-zero task aborts the launch and says so: {}",
         app.status
     );
-    assert!(app.debug_sessions.is_empty(), "and nothing was debugged");
+    assert!(app.debug.sessions.is_empty(), "and nothing was debugged");
 }
 
 /// #1541: a workspace whose launch config waits on a `watch` task, as the
@@ -2661,7 +2661,7 @@ fn a_reordering_presentation_leaves_every_row_naming_its_own_entry() {
 /// does not misdirect the rows that remain (#318).
 ///
 /// The second half is the subtle one: row ids are `compound:{i}` where `i`
-/// indexes `debug_compounds`. Filtering AFTER `enumerate` keeps those ids
+/// indexes `debug.compounds`. Filtering AFTER `enumerate` keeps those ids
 /// naming the same compound; filtering before would make every row after a
 /// hidden one launch its neighbour.
 #[test]
@@ -2971,7 +2971,7 @@ fn esc_on_an_input_starts_nothing_and_an_unknown_input_is_named() {
     app.handle_list_picker_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     assert!(app.list_picker.is_none() && app.input_prompt.is_none());
     assert!(
-        app.pending_debug_launch.is_none() && app.debug_sessions.is_empty(),
+        app.pending_debug_launch.is_none() && app.debug.sessions.is_empty(),
         "nothing started"
     );
     assert!(
@@ -2989,7 +2989,7 @@ fn esc_on_an_input_starts_nothing_and_an_unknown_input_is_named() {
         "{}",
         app.status
     );
-    assert!(app.pending_debug_launch.is_none() && app.debug_sessions.is_empty());
+    assert!(app.pending_debug_launch.is_none() && app.debug.sessions.is_empty());
 
     launch_named_1424(&mut app, "Secret");
     let prompt = app.input_prompt.as_ref().expect("asks for the token");
@@ -3214,35 +3214,37 @@ fn poll_until(app: &mut App, done: impl Fn(&App) -> bool) {
 fn the_raised_exceptions_toggle_follows_the_adapters_filters() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.debug_sessions.push(
+    app.debug.sessions.push(
         "Node",
         stub_emitting(&[
             r#"{"seq":1,"type":"response","request_seq":1,"success":true,"command":"initialize","body":{"exceptionBreakpointFilters":[{"filter":"all","label":"Caught Exceptions"},{"filter":"uncaught","label":"Uncaught Exceptions"}]}}"#,
         ]),
     );
     poll_until(&mut app, |a| {
-        a.debug_sessions
+        a.debug
+            .sessions
             .focused()
             .is_some_and(|s| !s.capabilities.is_null())
     });
     app.debug_toggle_raised_exceptions();
     assert_eq!(app.status, "Breaking on raised exceptions (and uncaught)");
     assert_eq!(
-        app.debug_sessions.focused().unwrap().exception_filters,
+        app.debug.sessions.focused().unwrap().exception_filters,
         vec![String::from("uncaught"), String::from("all")]
     );
     app.debug_toggle_raised_exceptions();
     assert_eq!(app.status, "Breaking on uncaught exceptions only");
 
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.debug_sessions.push(
+    app.debug.sessions.push(
         "Go",
         stub_emitting(&[
             r#"{"seq":1,"type":"response","request_seq":1,"success":true,"command":"initialize","body":{"supportsConditionalBreakpoints":true}}"#,
         ]),
     );
     poll_until(&mut app, |a| {
-        a.debug_sessions
+        a.debug
+            .sessions
             .focused()
             .is_some_and(|s| !s.capabilities.is_null())
     });
@@ -3252,7 +3254,7 @@ fn the_raised_exceptions_toggle_follows_the_adapters_filters() {
         "This debugger has no filter for raised exceptions; exception breakpoints are unchanged"
     );
     assert_eq!(
-        app.debug_sessions.focused().unwrap().exception_filters,
+        app.debug.sessions.focused().unwrap().exception_filters,
         vec![String::from("uncaught")]
     );
 }
@@ -3264,7 +3266,7 @@ fn the_raised_exceptions_toggle_follows_the_adapters_filters() {
 fn the_raised_exceptions_toggle_before_initialize_uses_the_adapters_ids() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.debug_sessions.push(
+    app.debug.sessions.push(
         "LLDB",
         stub_emitting(&[
             r#"{"seq":1,"type":"response","request_seq":1,"success":true,"command":"initialize","body":{"exceptionBreakpointFilters":[{"filter":"cpp_catch","label":"C++ Catch"},{"filter":"cpp_throw","label":"C++ Throw"},{"filter":"objc_catch","label":"Objective-C Catch"},{"filter":"objc_throw","label":"Objective-C Throw"}]}}"#,
@@ -3273,12 +3275,13 @@ fn the_raised_exceptions_toggle_before_initialize_uses_the_adapters_ids() {
     app.debug_toggle_raised_exceptions();
     assert!(app.status.starts_with("Breaking on raised exceptions"));
     poll_until(&mut app, |a| {
-        a.debug_sessions
+        a.debug
+            .sessions
             .focused()
             .is_some_and(|s| !s.capabilities.is_null())
     });
     assert_eq!(
-        app.debug_sessions.focused().unwrap().exception_filters,
+        app.debug.sessions.focused().unwrap().exception_filters,
         vec![String::from("cpp_throw"), String::from("objc_throw")]
     );
 }
@@ -3291,7 +3294,7 @@ fn an_expensive_scope_shows_collapsed_and_opens_on_click() {
     use crate::widgets::run_debug::DebugRowKind;
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.debug_sessions.push(
+    app.debug.sessions.push(
         "Node",
         stub_emitting(&[
             r#"{"seq":1,"type":"event","event":"stopped","body":{"reason":"breakpoint","threadId":1}}"#,
@@ -3299,7 +3302,8 @@ fn an_expensive_scope_shows_collapsed_and_opens_on_click() {
         ]),
     );
     poll_until(&mut app, |a| {
-        a.debug_sessions
+        a.debug
+            .sessions
             .focused()
             .is_some_and(|s| s.scopes.len() == 2)
     });
@@ -3336,7 +3340,8 @@ fn an_expensive_scope_shows_collapsed_and_opens_on_click() {
         ]
     );
     assert!(
-        app.debug_sessions
+        app.debug
+            .sessions
             .focused()
             .unwrap()
             .open_expensive_scopes
@@ -3362,7 +3367,7 @@ fn expensive_scopes_sharing_a_name_open_separately() {
     use crate::widgets::run_debug::DebugRowKind;
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.debug_sessions.push(
+    app.debug.sessions.push(
         "Node",
         stub_emitting(&[
             r#"{"seq":1,"type":"event","event":"stopped","body":{"reason":"breakpoint","threadId":1}}"#,
@@ -3370,7 +3375,8 @@ fn expensive_scopes_sharing_a_name_open_separately() {
         ]),
     );
     poll_until(&mut app, |a| {
-        a.debug_sessions
+        a.debug
+            .sessions
             .focused()
             .is_some_and(|s| s.scopes.len() == 2)
     });
@@ -3490,7 +3496,8 @@ fn app_paused_with_a_payload(dir: &Path, clipboard: bool) -> Option<App> {
         return None;
     }
     let mut app = App::new(dir.to_path_buf()).unwrap();
-    app.debug_sessions
+    app.debug
+        .sessions
         .push("P", copy_value_adapter(dir, clipboard));
     crate::test_budget::await_spawned(
         std::time::Duration::from_millis(500),
@@ -3746,28 +3753,30 @@ fn rows_without_an_expression_offer_less_or_nothing() {
 fn a_background_members_output_reaches_the_console_with_its_name() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.debug_sessions.push(
+    app.debug.sessions.push(
         "A",
         stub_emitting(&[
             r#"{"seq":1,"type":"event","event":"output","body":{"category":"stdout","output":"hello from A\n"}}"#,
         ]),
     );
-    app.debug_sessions.push("B", stub_member(false));
-    app.debug_sessions.focus(1);
+    app.debug.sessions.push("B", stub_member(false));
+    app.debug.sessions.focus(1);
     poll_until(&mut app, |a| {
-        a.debug_console
+        a.debug
+            .console
             .iter()
             .any(|l| l.text.contains("hello from A"))
     });
     assert!(
-        app.debug_console
+        app.debug
+            .console
             .iter()
             .any(|l| l.text == "[A] hello from A"),
         "console: {:?}",
-        app.debug_console
+        app.debug.console
     );
     assert_eq!(
-        app.debug_sessions.focused_name(),
+        app.debug.sessions.focused_name(),
         Some("B"),
         "output alone does not steal focus"
     );
@@ -3781,16 +3790,16 @@ fn a_background_members_output_reaches_the_console_with_its_name() {
 fn a_background_stop_moves_the_view_to_the_stopped_member() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.debug_sessions.push(
+    app.debug.sessions.push(
         "A",
         stub_emitting(&[
             r#"{"seq":1,"type":"event","event":"stopped","body":{"reason":"breakpoint","threadId":1}}"#,
         ]),
     );
-    app.debug_sessions.push("B", stub_member(false));
-    app.debug_sessions.focus(1);
-    poll_until(&mut app, |a| a.debug_sessions.focused_name() == Some("A"));
-    assert_eq!(app.debug_sessions.focused_name(), Some("A"));
+    app.debug.sessions.push("B", stub_member(false));
+    app.debug.sessions.focus(1);
+    poll_until(&mut app, |a| a.debug.sessions.focused_name() == Some("A"));
+    assert_eq!(app.debug.sessions.focused_name(), Some("A"));
     assert!(app.status.contains("A stopped"), "status: {}", app.status);
     assert_eq!(
         app.run_debug.feedback.as_deref(),
@@ -3809,14 +3818,15 @@ const STOPPED_EVENT: &str =
 fn a_stop_shows_the_member_that_stopped_even_when_names_repeat() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.debug_sessions.push("A", stub_member(false));
-    app.debug_sessions
+    app.debug.sessions.push("A", stub_member(false));
+    app.debug
+        .sessions
         .push("A", stub_emitting(&[STOPPED_EVENT]));
-    app.debug_sessions.push("B", stub_member(false));
-    app.debug_sessions.focus(2);
-    poll_until(&mut app, |a| a.debug_sessions.focused_index() != 2);
+    app.debug.sessions.push("B", stub_member(false));
+    app.debug.sessions.focus(2);
+    poll_until(&mut app, |a| a.debug.sessions.focused_index() != 2);
     assert_eq!(
-        app.debug_sessions.focused_index(),
+        app.debug.sessions.focused_index(),
         1,
         "the second A stopped"
     );
@@ -3829,19 +3839,20 @@ fn a_stop_shows_the_member_that_stopped_even_when_names_repeat() {
 fn a_stop_lands_on_the_right_member_when_an_earlier_one_ends_alongside() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.debug_sessions.push(
+    app.debug.sessions.push(
         "Gone",
         stub_emitting(&[r#"{"seq":1,"type":"event","event":"terminated"}"#]),
     );
-    app.debug_sessions
+    app.debug
+        .sessions
         .push("Stops", stub_emitting(&[STOPPED_EVENT]));
-    app.debug_sessions.push("Watched", stub_member(false));
-    app.debug_sessions.focus(2);
+    app.debug.sessions.push("Watched", stub_member(false));
+    app.debug.sessions.focus(2);
     poll_until(&mut app, |a| {
-        a.debug_sessions.len() == 2 && a.debug_sessions.focused_name() == Some("Stops")
+        a.debug.sessions.len() == 2 && a.debug.sessions.focused_name() == Some("Stops")
     });
-    assert_eq!(app.debug_sessions.names(), vec!["Stops", "Watched"]);
-    assert_eq!(app.debug_sessions.focused_name(), Some("Stops"));
+    assert_eq!(app.debug.sessions.names(), vec!["Stops", "Watched"]);
+    assert_eq!(app.debug.sessions.focused_name(), Some("Stops"));
     app.debug_stop();
 }
 
@@ -3850,20 +3861,20 @@ fn a_stop_lands_on_the_right_member_when_an_earlier_one_ends_alongside() {
 fn switch_debug_session_cycles_the_members() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.debug_sessions.push("A", stub_member(false));
+    app.debug.sessions.push("A", stub_member(false));
     app.switch_debug_session();
     assert_eq!(app.status, "Only one debug session is running");
-    app.debug_sessions.push("B", stub_member(false));
-    assert_eq!(app.debug_sessions.focused_name(), Some("B"));
+    app.debug.sessions.push("B", stub_member(false));
+    assert_eq!(app.debug.sessions.focused_name(), Some("B"));
     app.switch_debug_session();
-    assert_eq!(app.debug_sessions.focused_name(), Some("A"));
+    assert_eq!(app.debug.sessions.focused_name(), Some("A"));
     assert!(
         app.status.starts_with("Debugging A"),
         "status: {}",
         app.status
     );
     app.switch_debug_session();
-    assert_eq!(app.debug_sessions.focused_name(), Some("B"));
+    assert_eq!(app.debug.sessions.focused_name(), Some("B"));
     assert!(is_switch_debug_session_key(key(
         KeyCode::Char('g'),
         KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT,
@@ -3882,10 +3893,11 @@ fn a_switched_to_member_replays_its_queued_stop() {
     use crate::dap::session::DapEvent;
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.debug_sessions.push("A", stub_member(false));
-    app.debug_sessions.push("B", stub_member(false));
+    app.debug.sessions.push("A", stub_member(false));
+    app.debug.sessions.push("B", stub_member(false));
     let (_, a) = app
-        .debug_sessions
+        .debug
+        .sessions
         .iter_named_mut_indexed()
         .find(|(i, _)| *i == 0)
         .unwrap();
@@ -3922,7 +3934,7 @@ fn the_debug_console_is_mirrored_to_an_output_channel() {
     let event = format!(
         r#"{{"seq":1,"type":"event","event":"output","body":{{"category":"stdout","output":"{printed}\n"}}}}"#
     );
-    app.debug_sessions.push("P", stub_emitting(&[&event]));
+    app.debug.sessions.push("P", stub_emitting(&[&event]));
     let mirrored = |text: &str| {
         crate::output::snapshot(crate::output::CHANNEL_DEBUG_CONSOLE)
             .unwrap_or_default()
@@ -3939,7 +3951,8 @@ fn the_debug_console_is_mirrored_to_an_output_channel() {
     );
 
     let (_, p) = app
-        .debug_sessions
+        .debug
+        .sessions
         .iter_named_mut_indexed()
         .find(|(i, _)| *i == 0)
         .unwrap();
@@ -3969,7 +3982,8 @@ fn the_debug_console_mirror_skips_telemetry_and_copies_each_line_once() {
     let printed = format!(
         r#"{{"seq":2,"type":"event","event":"output","body":{{"category":"stdout","output":"{tag} printed\n"}}}}"#
     );
-    app.debug_sessions
+    app.debug
+        .sessions
         .push("P", stub_emitting(&[&telemetry, &printed]));
     let count = |text: &str| {
         crate::output::snapshot(crate::output::CHANNEL_DEBUG_CONSOLE)
@@ -3991,7 +4005,7 @@ fn the_debug_console_mirror_skips_telemetry_and_copies_each_line_once() {
         app.poll_dap();
     }
     let channel = crate::output::snapshot(crate::output::CHANNEL_DEBUG_CONSOLE).unwrap_or_default();
-    let in_panel = app.debug_console.iter().filter(|l| l.text == line).count();
+    let in_panel = app.debug.console.iter().filter(|l| l.text == line).count();
     app.debug_stop();
     assert_eq!(count(&line), 1, "once");
     assert!(
@@ -4094,14 +4108,16 @@ fn an_exception_answer_after_continue_does_not_say_paused() {
     }
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.debug_sessions
+    app.debug
+        .sessions
         .push("P", exception_stop_adapter(tmp.path(), false));
     crate::test_budget::await_spawned(
         std::time::Duration::from_millis(500),
         "the exception stop",
         || {
             app.poll_dap();
-            app.debug_sessions
+            app.debug
+                .sessions
                 .focused()
                 .is_some_and(|s| s.phase == SessionPhase::Stopped)
         },
@@ -4112,7 +4128,7 @@ fn an_exception_answer_after_continue_does_not_say_paused() {
         "the late answer and the marker after it",
         || {
             app.poll_dap();
-            app.debug_console.iter().any(|l| l.text == "MARKER")
+            app.debug.console.iter().any(|l| l.text == "MARKER")
         },
     );
     let status = app.status.clone();
@@ -4166,7 +4182,7 @@ fn step_into_target_steps_into_the_picked_call() {
     .expect("sh spawns");
     session.phase = crate::dap::session::SessionPhase::Stopped;
     session.stopped_thread = Some(1);
-    app.debug_sessions.push("app.py", session);
+    app.debug.sessions.push("app.py", session);
     let sent = |needle: &str| {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
@@ -4220,7 +4236,7 @@ fn one_or_no_step_in_target_needs_no_picker() {
     .expect("sh spawns");
     session.phase = crate::dap::session::SessionPhase::Stopped;
     session.stopped_thread = Some(1);
-    app.debug_sessions.push("app.py", session);
+    app.debug.sessions.push("app.py", session);
     app.offer_step_in_targets(vec![(9, String::from("only()"))]);
     assert!(app.list_picker.is_none());
     app.offer_step_in_targets(Vec::new());
@@ -4245,7 +4261,7 @@ fn continue_with_no_session_starts_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     assert!(run_palette_row_titled(&mut app, "Debug: Continue"));
-    assert!(app.debug_sessions.is_empty());
+    assert!(app.debug.sessions.is_empty());
     assert_eq!(app.status, "No debug session to continue");
 }
 
@@ -4262,7 +4278,8 @@ fn an_exception_answer_while_stopped_names_the_exception() {
     }
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.debug_sessions
+    app.debug
+        .sessions
         .push("P", exception_stop_adapter(tmp.path(), true));
     crate::test_budget::await_spawned(
         std::time::Duration::from_millis(500),
@@ -4398,7 +4415,7 @@ fn a_go_connect_to_server_attach_reaches_the_headless_delve() {
         "{}",
         app.status
     );
-    assert!(app.debug_sessions.is_empty());
+    assert!(app.debug.sessions.is_empty());
 
     let (port, server) = crate::dap::session::tests::headless_delve(2);
     let rc = resolved_attach(&format!(
@@ -4409,7 +4426,7 @@ fn a_go_connect_to_server_attach_reaches_the_headless_delve() {
     let got = server.join().unwrap();
     assert_eq!(got[1]["command"], "attach");
     assert_eq!(got[1]["arguments"]["mode"], "remote");
-    assert!(!app.debug_sessions.is_empty(), "{}", app.status);
+    assert!(!app.debug.sessions.is_empty(), "{}", app.status);
 }
 
 /// #1417: Python: Remote Attach (`attach` + `connect`) to a `debugpy
@@ -4434,7 +4451,7 @@ fn a_python_remote_attach_talks_to_the_listening_port() {
     let cfg = crate::dap::configs::discover_configs(tmp.path()).remove(0);
     app.launch_debug_config(&cfg);
     assert!(
-        !app.debug_sessions.is_empty() && !app.run_debug.feedback_is_error,
+        !app.debug.sessions.is_empty() && !app.run_debug.feedback_is_error,
         "{}",
         app.status
     );
@@ -4481,7 +4498,7 @@ fn an_lldb_attach_needs_a_pid_a_program_or_attach_commands() {
     );
     app.launch_resolved_config(rc);
     if lldb_dap_path().is_none() {
-        assert!(app.debug_sessions.is_empty());
+        assert!(app.debug.sessions.is_empty());
         return;
     }
     assert!(
@@ -4491,7 +4508,7 @@ fn an_lldb_attach_needs_a_pid_a_program_or_attach_commands() {
         "{}",
         app.status
     );
-    assert!(app.debug_sessions.is_empty());
+    assert!(app.debug.sessions.is_empty());
 
     for config in [
         r#"{ "name": "By name", "type": "lldb", "request": "attach", "program": "/no/such/app", "waitFor": true }"#,
@@ -4500,7 +4517,7 @@ fn an_lldb_attach_needs_a_pid_a_program_or_attach_commands() {
         let rc = resolved_attach(&format!(r#"{{ "configurations": [ {config} ] }}"#));
         app.launch_resolved_config(rc);
         assert!(!app.status.contains("needs a numeric"), "{}", app.status);
-        assert!(!app.debug_sessions.is_empty(), "{config} starts a session");
+        assert!(!app.debug.sessions.is_empty(), "{config} starts a session");
         app.debug_stop();
     }
 }
@@ -4535,7 +4552,7 @@ fn a_pick_process_attach_opens_the_process_picker() {
         "croft does not offer itself"
     );
     assert!(
-        app.debug_sessions.is_empty(),
+        app.debug.sessions.is_empty(),
         "nothing launched before the pick"
     );
 
@@ -4579,8 +4596,8 @@ fn pick_process_on_a_non_lldb_config_is_refused() {
 #[test]
 fn the_internal_stop_before_a_relaunch_runs_no_post_debug_task() {
     let (_tmp, mut app) = app_with_cleanup_task();
-    app.debug_sessions.push("A", stub_member(false));
-    app.debug_post_tasks = vec![String::from("cleanup")];
+    app.debug.sessions.push("A", stub_member(false));
+    app.debug.post_tasks = vec![String::from("cleanup")];
     app.debug_stop();
     assert_eq!(last_task_label(&app), None);
 }
@@ -4590,16 +4607,16 @@ fn stop_all_true_stops_the_set_when_a_background_member_ends() {
     // #567 item 4: `stopAll: true` was refused; it is honoured now.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.debug_sessions.push("A", stub_member(true));
-    app.debug_sessions.push("B", stub_member(false));
-    app.debug_sessions.focus(1);
-    app.debug_stop_all = true;
+    app.debug.sessions.push("A", stub_member(true));
+    app.debug.sessions.push("B", stub_member(false));
+    app.debug.sessions.focus(1);
+    app.debug.stop_all = true;
 
     poll_until_shrinks(&mut app, 2);
     assert!(
-        app.debug_sessions.is_empty(),
+        app.debug.sessions.is_empty(),
         "A ending takes B with it: {:?}",
-        app.debug_sessions.names()
+        app.debug.sessions.names()
     );
     assert!(
         app.status.contains("stopAll"),
@@ -4613,12 +4630,12 @@ fn stop_all_false_leaves_the_siblings_running() {
     // The control: without stopAll only the member that ended goes.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.debug_sessions.push("A", stub_member(true));
-    app.debug_sessions.push("B", stub_member(false));
-    app.debug_sessions.focus(1);
+    app.debug.sessions.push("A", stub_member(true));
+    app.debug.sessions.push("B", stub_member(false));
+    app.debug.sessions.focus(1);
 
     poll_until_shrinks(&mut app, 2);
-    assert_eq!(app.debug_sessions.names(), vec!["B"]);
+    assert_eq!(app.debug.sessions.names(), vec!["B"]);
     app.debug_stop();
 }
 
@@ -4630,10 +4647,10 @@ fn stop_all_false_leaves_the_siblings_running() {
 fn a_session_ending_on_its_own_says_so_on_the_status_line() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.debug_sessions.push("out.py", stub_member(true));
+    app.debug.sessions.push("out.py", stub_member(true));
     app.status = String::from("Debugging out.py — F5 continue · F10 step over · Shift+F5 stop");
     poll_until_shrinks(&mut app, 1);
-    assert!(app.debug_sessions.is_empty(), "the stub terminated");
+    assert!(app.debug.sessions.is_empty(), "the stub terminated");
     assert_eq!(
         app.run_debug.feedback.as_deref(),
         Some("Debug session ended")
@@ -4766,7 +4783,7 @@ fn a_breakpoint_pause_is_read_out_with_its_file_line_and_text() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.screen_reader = true;
-    app.debug_sessions.push("P", loop_stop_adapter(tmp.path()));
+    app.debug.sessions.push("P", loop_stop_adapter(tmp.path()));
     let said = await_a11y_event(&mut app, None);
     app.debug_stop();
     assert!(
@@ -4785,7 +4802,7 @@ fn every_stop_is_read_even_on_the_same_line() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.screen_reader = true;
-    app.debug_sessions.push("P", loop_stop_adapter(tmp.path()));
+    app.debug.sessions.push("P", loop_stop_adapter(tmp.path()));
     await_a11y_event(&mut app, None);
     let first = app.a11y_event.as_ref().map(|(n, _)| *n);
 
@@ -4830,7 +4847,7 @@ fn a_sourceless_stop_is_not_read_with_the_last_stops_location() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.screen_reader = true;
-    app.debug_sessions.push("P", stop_adapter(tmp.path(), true));
+    app.debug.sessions.push("P", stop_adapter(tmp.path(), true));
     await_a11y_event(&mut app, None);
     let first = app.a11y_event.as_ref().map(|(n, _)| *n);
 
@@ -4851,7 +4868,7 @@ fn a_pause_with_screen_reader_mode_off_is_not_kept() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.screen_reader = false;
-    app.debug_sessions.push("P", loop_stop_adapter(tmp.path()));
+    app.debug.sessions.push("P", loop_stop_adapter(tmp.path()));
     crate::test_budget::await_spawned(std::time::Duration::from_millis(500), "the stop", || {
         app.poll_dap();
         app.editor.stop_line.is_some()
@@ -4927,10 +4944,10 @@ fn a_run_that_never_hit_its_breakpoint_says_so_on_the_status_line() {
         .entry(tmp.path().join("out.py"))
         .or_default()
         .insert(1);
-    app.debug_sessions.push("out.py", stub_member(true));
+    app.debug.sessions.push("out.py", stub_member(true));
     app.status = String::from("Debugging out.py — F5 continue · F10 step over · Shift+F5 stop");
     poll_until_shrinks(&mut app, 1);
-    assert!(app.debug_sessions.is_empty(), "the stub terminated");
+    assert!(app.debug.sessions.is_empty(), "the stub terminated");
     assert_eq!(app.status, "Program exited without hitting a breakpoint");
 }
 
@@ -4940,9 +4957,9 @@ fn a_run_that_never_hit_its_breakpoint_says_so_on_the_status_line() {
 fn a_status_set_after_the_debug_session_ended_is_kept() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.debug_sessions.push("out.py", stub_member(true));
+    app.debug.sessions.push("out.py", stub_member(true));
     poll_until_shrinks(&mut app, 1);
-    assert!(app.debug_sessions.is_empty(), "the stub terminated");
+    assert!(app.debug.sessions.is_empty(), "the stub terminated");
     app.status = String::from("Saved out.py");
     for _ in 0..5 {
         app.poll_dap();
@@ -4957,16 +4974,16 @@ fn a_status_set_after_the_debug_session_ended_is_kept() {
 fn stop_all_keeps_its_explanation_when_the_focused_member_ends() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.debug_sessions.push("A", stub_member(true));
-    app.debug_sessions.push("B", stub_member(false));
-    app.debug_sessions.focus(0);
-    app.debug_stop_all = true;
+    app.debug.sessions.push("A", stub_member(true));
+    app.debug.sessions.push("B", stub_member(false));
+    app.debug.sessions.focus(0);
+    app.debug.stop_all = true;
 
     poll_until_shrinks(&mut app, 2);
     assert!(
-        app.debug_sessions.is_empty(),
+        app.debug.sessions.is_empty(),
         "{:?}",
-        app.debug_sessions.names()
+        app.debug.sessions.names()
     );
     assert_eq!(
         app.status,
@@ -4988,9 +5005,9 @@ fn a_refused_compound_does_not_hand_its_stop_all_to_the_running_set() {
     )
     .unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.debug_sessions.push("A", stub_member(true));
-    app.debug_sessions.push("B", stub_member(false));
-    app.debug_sessions.focus(1);
+    app.debug.sessions.push("A", stub_member(true));
+    app.debug.sessions.push("B", stub_member(false));
+    app.debug.sessions.focus(1);
     let compound = crate::dap::configs::discover_compounds(tmp.path())
         .into_iter()
         .find(|c| c.name == "Bad")
@@ -4998,14 +5015,14 @@ fn a_refused_compound_does_not_hand_its_stop_all_to_the_running_set() {
     assert!(compound.stop_all);
     app.launch_compound(&compound);
     assert_eq!(
-        app.debug_sessions.len(),
+        app.debug.sessions.len(),
         2,
         "the refusal leaves the set running"
     );
 
     poll_until_shrinks(&mut app, 2);
     assert_eq!(
-        app.debug_sessions.names(),
+        app.debug.sessions.names(),
         vec!["B"],
         "A ending must not take B: the running set never asked for stopAll"
     );
@@ -5018,14 +5035,14 @@ fn a_background_member_ending_rebuilds_the_report_from_the_live_set() {
     // session. Both now say what ended, what is shown, and what still runs.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.debug_sessions.push("A", stub_member(true));
-    app.debug_sessions.push("B", stub_member(false));
-    app.debug_sessions.focus(1);
-    app.debug_compound = Some(String::from("Stack"));
+    app.debug.sessions.push("A", stub_member(true));
+    app.debug.sessions.push("B", stub_member(false));
+    app.debug.sessions.focus(1);
+    app.debug.compound = Some(String::from("Stack"));
     app.run_debug.feedback = Some(String::from("Debugging compound Stack: A, B"));
 
     poll_until_shrinks(&mut app, 2);
-    assert_eq!(app.debug_sessions.names(), vec!["B"]);
+    assert_eq!(app.debug.sessions.names(), vec!["B"]);
     assert_eq!(
         app.run_debug.feedback.as_deref(),
         Some("Debugging compound Stack: B (A ended)")
@@ -5036,20 +5053,20 @@ fn a_background_member_ending_rebuilds_the_report_from_the_live_set() {
         app.status
     );
     app.debug_stop();
-    assert_eq!(app.debug_compound, None, "a full stop forgets the compound");
+    assert_eq!(app.debug.compound, None, "a full stop forgets the compound");
 }
 
 #[test]
 fn the_focused_member_ending_names_the_session_now_shown() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.debug_sessions.push("A", stub_member(true));
-    app.debug_sessions.push("B", stub_member(false));
-    app.debug_sessions.focus(0);
-    app.debug_compound = Some(String::from("Stack"));
+    app.debug.sessions.push("A", stub_member(true));
+    app.debug.sessions.push("B", stub_member(false));
+    app.debug.sessions.focus(0);
+    app.debug.compound = Some(String::from("Stack"));
 
     poll_until_shrinks(&mut app, 2);
-    assert_eq!(app.debug_sessions.names(), vec!["B"]);
+    assert_eq!(app.debug.sessions.names(), vec!["B"]);
     assert!(
         app.status.starts_with("A ended — showing B; running: B"),
         "{}",
@@ -5107,12 +5124,12 @@ fn every_new_debug_session_carries_the_function_breakpoints() {
     app.adopt_debug_session("orders.py", stub_member(false), LaunchSlot::Replace);
     let want = vec![String::from("apply_discount")];
     assert_eq!(
-        app.debug_sessions.focused().unwrap().function_breakpoints,
+        app.debug.sessions.focused().unwrap().function_breakpoints,
         want
     );
     app.adopt_debug_session("worker", stub_member(false), LaunchSlot::Add);
-    assert_eq!(app.debug_sessions.len(), 2, "a compound member is added");
-    for session in app.debug_sessions.iter_mut() {
+    assert_eq!(app.debug.sessions.len(), 2, "a compound member is added");
+    for session in app.debug.sessions.iter_mut() {
         assert_eq!(session.function_breakpoints, want);
     }
 }
@@ -5141,18 +5158,19 @@ const TERMINATED_EVENT: &str = r#"{"seq":2,"type":"event","event":"terminated"}"
 fn a_member_that_exits_and_terminates_in_one_poll_is_removed_once() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.debug_sessions
+    app.debug
+        .sessions
         .push("A", stub_emitting(&[EXITED_EVENT, TERMINATED_EVENT]));
-    app.debug_sessions.push("B", stub_member(false));
-    app.debug_sessions.push("C", stub_member(false));
-    app.debug_sessions.focus(2);
+    app.debug.sessions.push("B", stub_member(false));
+    app.debug.sessions.push("C", stub_member(false));
+    app.debug.sessions.focus(2);
     // Both messages are written before the first poll reads them.
     std::thread::sleep(std::time::Duration::from_millis(300));
     poll_until(&mut app, |a| {
-        !a.debug_sessions.names().contains(&String::from("A"))
+        !a.debug.sessions.names().contains(&String::from("A"))
     });
     assert_eq!(
-        app.debug_sessions.names(),
+        app.debug.sessions.names(),
         vec![String::from("B"), String::from("C")]
     );
     app.debug_stop();
@@ -5165,17 +5183,19 @@ fn a_member_that_exits_and_terminates_in_one_poll_is_removed_once() {
 fn a_focused_member_that_ends_as_another_stops_is_still_removed() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.debug_sessions
+    app.debug
+        .sessions
         .push("S", stub_emitting(&[STOPPED_EVENT]));
-    app.debug_sessions
+    app.debug
+        .sessions
         .push("F", stub_emitting(&[TERMINATED_EVENT]));
-    app.debug_sessions.focus(1);
+    app.debug.sessions.focus(1);
     std::thread::sleep(std::time::Duration::from_millis(300));
     poll_until(&mut app, |a| {
-        a.debug_sessions.names() == vec![String::from("S")]
+        a.debug.sessions.names() == vec![String::from("S")]
     });
     assert_eq!(
-        app.debug_sessions.names(),
+        app.debug.sessions.names(),
         vec![String::from("S")],
         "F ended and must go"
     );
@@ -5257,13 +5277,13 @@ fn a_refused_debug_launch_says_why() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let refused = r#"{"seq":1,"type":"response","request_seq":2,"success":false,"command":"launch","message":"Failed to launch","body":{"error":{"id":3000,"format":"Failed to launch /w: Go version go1.24.7 is too old for this version of Delve"}}}"#;
-    app.debug_sessions.push("go", stub_emitting(&[refused]));
+    app.debug.sessions.push("go", stub_emitting(&[refused]));
     crate::test_budget::await_spawned(
         std::time::Duration::from_secs(10),
         "the refusal to end the session",
         || {
             app.poll_dap();
-            app.debug_sessions.is_empty()
+            app.debug.sessions.is_empty()
         },
     );
     assert!(
@@ -5289,7 +5309,8 @@ fn debug_until_local(app: &mut App, local: &str, secs: u64) -> Option<String> {
         app.drain_terminal_bells();
         app.poll_dap();
         if let Some(v) = app
-            .debug_sessions
+            .debug
+            .sessions
             .focused()
             .and_then(|s| s.lookup_local(local))
         {
@@ -5335,7 +5356,8 @@ fn a_launch_json_python_config_passes_args_and_env_file() {
     pick_debug_row(&mut app, "Py");
     let greeting = debug_until_local(&mut app, "greeting", 90);
     let who = app
-        .debug_sessions
+        .debug
+        .sessions
         .focused()
         .and_then(|s| s.lookup_local("who"))
         .map(|v| v.value.clone());
@@ -5476,9 +5498,9 @@ fn f5_names_a_project_python_older_than_3_14() {
     let mut app = App::new(root.clone()).unwrap();
     app.editor.open(&file).unwrap();
     app.debug_start_or_continue();
-    let started = !app.debug_sessions.is_empty();
+    let started = !app.debug.sessions.is_empty();
     let status = app.status.clone();
-    let console = app.debug_console.clone();
+    let console = app.debug.console.clone();
     app.debug_stop();
     let want = format!("Debugging main.py under Python {version} (.venv); attach needs 3.14+");
     assert!(started, "{status}");
@@ -5585,7 +5607,8 @@ fn a_launch_json_rust_config_builds_first_and_passes_args_and_env() {
     );
     let k = debug_until_local(&mut app, "k", 240);
     let n = app
-        .debug_sessions
+        .debug
+        .sessions
         .focused()
         .and_then(|s| s.lookup_local("n"))
         .map(|v| v.value.clone());
@@ -5734,7 +5757,7 @@ fn debug_console_after(outputs: &[&str], done: impl Fn(&App) -> bool) -> App {
         })
         .collect();
     let refs: Vec<&str> = events.iter().map(String::as_str).collect();
-    app.debug_sessions.push("P", stub_emitting(&refs));
+    app.debug.sessions.push("P", stub_emitting(&refs));
     crate::test_budget::await_spawned(
         std::time::Duration::from_millis(500),
         "the program's output to reach the Debug Console",
@@ -5748,10 +5771,11 @@ fn debug_console_after(outputs: &[&str], done: impl Fn(&App) -> bool) -> App {
 }
 
 fn console_line<'a>(app: &'a App, text: &str) -> &'a crate::ansi_text::AnsiLine {
-    app.debug_console
+    app.debug
+        .console
         .iter()
         .find(|l| l.text == text)
-        .unwrap_or_else(|| panic!("no {text:?} in {:?}", app.debug_console))
+        .unwrap_or_else(|| panic!("no {text:?} in {:?}", app.debug.console))
 }
 
 /// The colour at byte `at` of a console line.
@@ -5773,7 +5797,7 @@ fn the_debug_console_shows_colour_codes_as_colours() {
         &[&format!(
             r"\u001b[31mFAILED\u001b[0m tests/test_a.py::\u001b[1mtest_x\u001b[0m - {tag}\n"
         )],
-        |a| a.debug_console.iter().any(|l| l.text.contains(&tag)),
+        |a| a.debug.console.iter().any(|l| l.text.contains(&tag)),
     );
     let line = console_line(&app, &printed);
     use crate::ansi_text::AnsiColor;
@@ -5805,7 +5829,7 @@ fn debug_console_colour_carries_across_lines_and_cut_events() {
     let tag = format!("carry-{}", std::process::id());
     let app = debug_console_after(
         &[r"\u001b[3", &format!(r"2m{tag} ok\nstill\u001b[0m plain\n")],
-        |a| a.debug_console.iter().any(|l| l.text.contains("plain")),
+        |a| a.debug.console.iter().any(|l| l.text.contains("plain")),
     );
     use crate::ansi_text::AnsiColor;
     let first = console_line(&app, &format!("{tag} ok"));
@@ -5818,11 +5842,12 @@ fn debug_console_colour_carries_across_lines_and_cut_events() {
     );
     assert_eq!(console_fg(second, 6), None, "until the reset");
     assert!(
-        !app.debug_console
+        !app.debug
+            .console
             .iter()
             .any(|l| l.text.contains('\u{1b}') || l.text.contains("[3")),
         "{:?}",
-        app.debug_console
+        app.debug.console
     );
 }
 
@@ -5834,16 +5859,17 @@ fn debug_console_plain_output_and_croft_lines_stay_plain() {
     let tag = format!("plain-{}", std::process::id());
     let mut app = debug_console_after(
         &[&format!(r"[31m is just text {tag}\n\u001b[35mleft on\n")],
-        |a| a.debug_console.iter().any(|l| l.text.ends_with("left on")),
+        |a| a.debug.console.iter().any(|l| l.text.ends_with("left on")),
     );
     let plain = console_line(&app, &format!("[31m is just text {tag}"));
     assert_eq!(
         plain.spans.iter().map(|s| s.style).collect::<Vec<_>>(),
         vec![crate::ansi_text::AnsiStyle::default()]
     );
-    app.debug_sessions.push("Q", stub_emitting(&[]));
+    app.debug.sessions.push("Q", stub_emitting(&[]));
     let (_, q) = app
-        .debug_sessions
+        .debug
+        .sessions
         .iter_named_mut_indexed()
         .find(|(i, _)| *i == 0)
         .unwrap();
@@ -5871,28 +5897,29 @@ fn debug_console_sessions_keep_their_own_colour_and_cut_escape() {
     let a_event = format!(
         r#"{{"seq":1,"type":"event","event":"output","body":{{"category":"stdout","output":"\u001b[31mred from A {tag}\n\u001b[3"}}}}"#
     );
-    app.debug_sessions.push("A", stub_emitting(&[&a_event]));
+    app.debug.sessions.push("A", stub_emitting(&[&a_event]));
     let a_line = format!("red from A {tag}");
     crate::test_budget::await_spawned(
         std::time::Duration::from_millis(500),
         "session A's output to reach the Debug Console",
         || {
             app.poll_dap();
-            app.debug_console.iter().any(|l| l.text == a_line)
+            app.debug.console.iter().any(|l| l.text == a_line)
         },
     );
     // A is now in the background with red on and `ESC[3` held back.
     let b_event = format!(
         r#"{{"seq":1,"type":"event","event":"output","body":{{"category":"stdout","output":"hello from B {tag}\n"}}}}"#
     );
-    app.debug_sessions.push("B", stub_emitting(&[&b_event]));
+    app.debug.sessions.push("B", stub_emitting(&[&b_event]));
     let b_line = format!("hello from B {tag}");
     crate::test_budget::await_spawned(
         std::time::Duration::from_millis(500),
         "session B's output to reach the Debug Console",
         || {
             app.poll_dap();
-            app.debug_console
+            app.debug
+                .console
                 .iter()
                 .any(|l| l.text.contains(&format!("from B {tag}")))
         },
@@ -5910,7 +5937,7 @@ fn debug_console_sessions_keep_their_own_colour_and_cut_escape() {
 
 /// The Debug Console lines from the first one containing `tag` on.
 fn console_from<'a>(app: &'a App, tag: &str) -> Vec<&'a str> {
-    let lines: Vec<&str> = app.debug_console.iter().map(|l| l.text.as_str()).collect();
+    let lines: Vec<&str> = app.debug.console.iter().map(|l| l.text.as_str()).collect();
     let start = lines
         .iter()
         .position(|l| l.contains(tag))
@@ -5941,7 +5968,7 @@ fn debug_console_joins_a_line_cut_across_events_and_keeps_blank_lines() {
             "print: i =",
             r" 0\n",
         ],
-        |a| a.debug_console.iter().any(|l| l.text == "print: i = 0"),
+        |a| a.debug.console.iter().any(|l| l.text == "print: i = 0"),
     );
     let loaded = format!("Loading {tag}... ok");
     assert_eq!(
@@ -5966,7 +5993,8 @@ fn debug_console_redraws_a_progress_line_in_place() {
             &format!("waiting {tag}"),
         ],
         |a| {
-            a.debug_console
+            a.debug
+                .console
                 .iter()
                 .any(|l| l.text.starts_with("waiting"))
         },
@@ -6001,15 +6029,15 @@ fn debug_console_keeps_categories_apart_in_a_background_member() {
         event(3, "stdout", r" ok\n"),
     ];
     let refs: Vec<&str> = events.iter().map(String::as_str).collect();
-    app.debug_sessions.push("A", stub_emitting(&refs));
-    app.debug_sessions.push("B", stub_emitting(&[]));
+    app.debug.sessions.push("A", stub_emitting(&refs));
+    app.debug.sessions.push("B", stub_emitting(&[]));
     let loaded = format!("[A] Loading {tag}... ok");
     crate::test_budget::await_spawned(
         std::time::Duration::from_millis(500),
         "the background member's line to be finished",
         || {
             app.poll_dap();
-            app.debug_console.iter().any(|l| l.text == loaded)
+            app.debug.console.iter().any(|l| l.text == loaded)
         },
     );
     app.debug_stop();
@@ -6027,8 +6055,8 @@ fn debug_console_shows_every_line_of_a_repl_result() {
     use crate::dap::session::DapEvent;
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.debug_sessions.push("P", stub_emitting(&[]));
-    let (_, p) = app.debug_sessions.iter_named_mut_indexed().next().unwrap();
+    app.debug.sessions.push("P", stub_emitting(&[]));
+    let (_, p) = app.debug.sessions.iter_named_mut_indexed().next().unwrap();
     p.backlog.push(DapEvent::Evaluated {
         context: String::from("repl"),
         expression: String::from("inventory['missing']"),
@@ -6073,7 +6101,7 @@ fn a_node_launch_with_nothing_to_run_names_what_it_needs() {
         "{}",
         app.status
     );
-    assert!(app.debug_sessions.is_empty());
+    assert!(app.debug.sessions.is_empty());
 }
 
 /// #1410: a browser croft launches has a screen to open on only locally
@@ -6281,7 +6309,7 @@ fn a_failed_debug_build_says_why_and_keeps_its_output() {
         app.editor.path = None;
         app.start_debug_session();
         assert!(
-            app.debug_build.is_none(),
+            app.debug.build.is_none(),
             "a new F5 drops the running build"
         );
         assert_eq!(app.status, "Open a file to debug");
@@ -6289,7 +6317,7 @@ fn a_failed_debug_build_says_why_and_keeps_its_output() {
         // Stop while the build runs: it never launches.
         app.begin_debug_build(&main);
         app.debug_stop_by_user();
-        assert!(app.debug_build.is_none(), "Stop drops the running build");
+        assert!(app.debug.build.is_none(), "Stop drops the running build");
         assert!(!app.poll_debug_build());
     });
 }
@@ -6670,7 +6698,7 @@ fn app_with_held_tooling(
         prepared: std::sync::atomic::AtomicUsize::new(0),
         looks_ready_early: std::sync::atomic::AtomicBool::new(false),
     });
-    app.debug_tooling = tooling.clone();
+    app.debug.tooling = tooling.clone();
     (tmp, app, tooling, tx)
 }
 
@@ -6698,7 +6726,7 @@ fn a_python_debug_launch_waits_for_its_debugger_off_the_ui_thread() {
     );
     app.start_debug_session();
     assert_eq!(app.status, "Setting up the Python debugger…");
-    assert!(app.debug_sessions.is_empty());
+    assert!(app.debug.sessions.is_empty());
     app.start_debug_session();
     assert_eq!(app.status, "Setting up the Python debugger…");
     release.send(()).unwrap();
@@ -6875,7 +6903,7 @@ fn debug_test_drops_a_launch_waiting_for_its_debugger() {
     );
     release.send(()).unwrap();
     settle_debug_setup(&mut app);
-    assert!(app.debug_sessions.is_empty(), "nothing older started");
+    assert!(app.debug.sessions.is_empty(), "nothing older started");
 }
 
 /// #2803 review: a launch waiting for its debugger was asked for in the
@@ -6922,8 +6950,8 @@ fn compound_with_members_waiting_for_setup(
         .expect("the compound parses");
     app.launch_compound(&compound);
     assert_eq!(app.parked_setup_launches(), 2, "{}", app.status);
-    app.debug_sessions.push("A", stub_member(true));
-    app.debug_sessions.focus(0);
+    app.debug.sessions.push("A", stub_member(true));
+    app.debug.sessions.focus(0);
     poll_until_shrinks(&mut app, 1);
     (tmp, app, release)
 }
@@ -6940,7 +6968,7 @@ fn stop_all_stops_members_still_waiting_for_their_debugger() {
     );
     release.send(()).unwrap();
     settle_debug_setup(&mut app);
-    assert!(app.debug_sessions.is_empty(), "no member started after");
+    assert!(app.debug.sessions.is_empty(), "no member started after");
 }
 
 /// #2803 review: without `stopAll`, a member ending while the rest wait for

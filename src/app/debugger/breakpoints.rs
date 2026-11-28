@@ -51,7 +51,7 @@ impl App {
             // global editor state, handed to every session at launch, so a
             // breakpoint set mid-run in a shared file must bind in all of
             // them or it binds in the server and not the client.
-            for session in self.debug_sessions.iter_mut() {
+            for session in self.debug.sessions.iter_mut() {
                 session.update_breakpoints(&path, &specs);
             }
         }
@@ -131,7 +131,7 @@ impl App {
             .map(|l| self.editor.source_breakpoints(&path, l))
             .unwrap_or_default();
         // Every session (#310); see `debug_toggle_breakpoint_line`.
-        for session in self.debug_sessions.iter_mut() {
+        for session in self.debug.sessions.iter_mut() {
             session.update_breakpoints(&path, &specs);
         }
     }
@@ -204,7 +204,7 @@ impl App {
             .get(&path)
             .map(|l| self.editor.source_breakpoints(&path, l))
             .unwrap_or_default();
-        for session in self.debug_sessions.iter_mut() {
+        for session in self.debug.sessions.iter_mut() {
             session.update_breakpoints(&path, &specs);
         }
     }
@@ -237,7 +237,7 @@ impl App {
     pub(in crate::app) fn push_function_breakpoints(&mut self) {
         let names = self.function_breakpoints.clone();
         let mut refused = false;
-        for session in self.debug_sessions.iter_mut() {
+        for session in self.debug.sessions.iter_mut() {
             if session.supports("supportsFunctionBreakpoints") {
                 session.set_function_breakpoints(names.clone());
             } else {
@@ -252,7 +252,7 @@ impl App {
     /// Debug: Break When Value Changes (#611): prompt for a variable of the
     /// paused frame.
     pub fn debug_break_on_value_change(&mut self) {
-        match self.debug_sessions.focused() {
+        match self.debug.sessions.focused() {
             Some(s) if s.stopped_thread.is_none() => {
                 self.status = String::from("Break When Value Changes needs the debugger paused");
             }
@@ -269,7 +269,7 @@ impl App {
     }
 
     pub(in crate::app) fn commit_data_breakpoint(&mut self, name: &str) {
-        let Some(session) = self.debug_sessions.focused_mut() else {
+        let Some(session) = self.debug.sessions.focused_mut() else {
             return;
         };
         // The variable's container: the scope (or expanded variable) that
@@ -291,7 +291,7 @@ impl App {
 
     /// Debug: Remove All Data Breakpoints (#611).
     pub fn debug_clear_data_breakpoints(&mut self) {
-        for session in self.debug_sessions.iter_mut() {
+        for session in self.debug.sessions.iter_mut() {
             session.clear_data_breakpoints();
         }
         self.status = String::from("Data breakpoints removed");
@@ -364,7 +364,7 @@ impl App {
             .map(|l| self.editor.source_breakpoints(&path, l))
             .unwrap_or_default();
         // Every session (#310); see `debug_toggle_breakpoint_line`.
-        for session in self.debug_sessions.iter_mut() {
+        for session in self.debug.sessions.iter_mut() {
             session.update_breakpoints(&path, &specs);
         }
     }
@@ -373,7 +373,7 @@ impl App {
     /// filter id this adapter uses for it (#1426). `uncaught` stays on so
     /// unhandled exceptions still pause. No-op without a session.
     pub fn debug_toggle_raised_exceptions(&mut self) {
-        let Some(session) = self.debug_sessions.focused_mut() else {
+        let Some(session) = self.debug.sessions.focused_mut() else {
             self.status = String::from("Start debugging first to set exception breakpoints");
             return;
         };
@@ -394,7 +394,7 @@ impl App {
 
     /// Send `path`'s current breakpoints to every debug session.
     pub(in crate::app) fn resend_breakpoints(&mut self, path: &Path) {
-        if self.debug_sessions.is_empty() {
+        if self.debug.sessions.is_empty() {
             return;
         }
         let specs = self
@@ -403,7 +403,7 @@ impl App {
             .get(path)
             .map(|lines| self.editor.source_breakpoints(path, lines))
             .unwrap_or_default();
-        for session in self.debug_sessions.iter_mut() {
+        for session in self.debug.sessions.iter_mut() {
             session.update_breakpoints(path, &specs);
         }
     }

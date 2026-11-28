@@ -227,7 +227,7 @@ fn a_test_binary_that_finishes_after_a_workspace_change_is_discarded() {
         "the drain consumed the result"
     );
     assert!(
-        app.debug_sessions.is_empty(),
+        app.debug.sessions.is_empty(),
         "no debugger may launch for a foreign workspace's binary"
     );
     assert!(

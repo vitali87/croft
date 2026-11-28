@@ -1011,7 +1011,7 @@ impl App {
                 }
             }
             ListPurpose::DebugConfigType => {
-                self.debug_config_draft = Some(crate::dap::configs::ConfigDraft::new(
+                self.debug.config_draft = Some(crate::dap::configs::ConfigDraft::new(
                     &row.id,
                     crate::dap::configs::RequestKind::Launch,
                 ));
@@ -1044,7 +1044,7 @@ impl App {
                 }
             }
             ListPurpose::DebugConfigRequest => {
-                if let Some(draft) = self.debug_config_draft.as_mut() {
+                if let Some(draft) = self.debug.config_draft.as_mut() {
                     draft.request = if row.id == "attach" {
                         crate::dap::configs::RequestKind::Attach
                     } else {
@@ -1064,7 +1064,7 @@ impl App {
                     let found = idx
                         .parse::<usize>()
                         .ok()
-                        .and_then(|i| self.debug_compounds.get(i));
+                        .and_then(|i| self.debug.compounds.get(i));
                     if let Some(compound) = found.cloned() {
                         self.selected_debug_config = None;
                         self.selected_debug_compound = Some(compound.name.clone());
@@ -1082,7 +1082,7 @@ impl App {
                     .id
                     .parse::<usize>()
                     .ok()
-                    .and_then(|i| self.debug_configs.get(i))
+                    .and_then(|i| self.debug.configs.get(i))
                     .cloned()
                 {
                     self.selected_debug_config = Some(cfg.name.clone());

@@ -29,7 +29,7 @@ impl App {
     /// the session down when the debuggee exits.
     pub fn poll_dap(&mut self) -> bool {
         use crate::dap::session::{DapEvent, SessionPhase};
-        if self.debug_sessions.is_empty() {
+        if self.debug.sessions.is_empty() {
             return false;
         }
         let mut changed_background = false;
@@ -48,17 +48,17 @@ impl App {
         // is focused (#567): dropping its `stopped` left a breakpoint hit that
         // nothing showed, so the member looked hung.
         const BACKLOG_CAP: usize = 256;
-        let focused = self.debug_sessions.focused_index();
+        let focused = self.debug.sessions.focused_index();
         // A session focused since the last poll first replays what it did
         // while in the background.
-        let mut events = self.debug_sessions.take_focused_backlog();
+        let mut events = self.debug.sessions.take_focused_backlog();
         let mut background_ended: Vec<usize> = Vec::new();
         // (session index, category, text) of each background output event.
         let mut background_output: Vec<(usize, String, String)> = Vec::new();
         // By index, not name: a compound can list one configuration twice,
         // so two members can share a name.
         let mut background_stopped: Option<usize> = None;
-        for (index, named) in self.debug_sessions.iter_named_mut_indexed() {
+        for (index, named) in self.debug.sessions.iter_named_mut_indexed() {
             let drained = named.session.poll();
             if index == focused {
                 events.extend(drained);
@@ -104,11 +104,11 @@ impl App {
         let background_stopped =
             background_stopped.and_then(|i| index_after_removals(i, &background_ended));
         for index in background_ended.into_iter().rev() {
-            if let Some(mut gone) = self.debug_sessions.remove(index) {
+            if let Some(mut gone) = self.debug.sessions.remove(index) {
                 mirror_open_console_lines(
                     &mut gone.console,
-                    &self.debug_console,
-                    self.debug_console_dropped,
+                    &self.debug.console,
+                    self.debug.console_dropped,
                 );
                 gone.session.disconnect();
                 ended_names.push(gone.name);
@@ -116,7 +116,7 @@ impl App {
         }
         // `stopAll: true` (#567): a background member ending takes the set
         // down with it, the same as the focused one ending does below.
-        if self.debug_stop_all && !ended_names.is_empty() && !self.debug_sessions.is_empty() {
+        if self.debug.stop_all && !ended_names.is_empty() && !self.debug.sessions.is_empty() {
             self.debug_stop();
             self.status = format!(
                 "{} ended — stopAll stopped the rest of the compound",
@@ -125,7 +125,7 @@ impl App {
             self.run_post_debug_tasks();
             return true;
         }
-        if !ended_names.is_empty() && !self.debug_sessions.is_empty() {
+        if !ended_names.is_empty() && !self.debug.sessions.is_empty() {
             self.report_member_ended(&ended_names.join(", "));
         }
         // A background member stopped (a breakpoint, an exception, a pause).
@@ -133,10 +133,11 @@ impl App {
         // one, as VS Code does; otherwise say so rather than steal the view
         // from a stop the user is already inspecting.
         if let Some(index) = background_stopped
-            && let Some(name) = self.debug_sessions.names().get(index).cloned()
+            && let Some(name) = self.debug.sessions.names().get(index).cloned()
         {
             let focused_is_stopped = self
-                .debug_sessions
+                .debug
+                .sessions
                 .focused()
                 .is_some_and(|s| s.phase == SessionPhase::Stopped)
                 || events.iter().any(|e| matches!(e, DapEvent::Stopped { .. }));
@@ -144,7 +145,8 @@ impl App {
             // the teardown reads the FOCUSED member: moving the view first
             // would carry the ending into its backlog and leave it running.
             let focused_ended = self
-                .debug_sessions
+                .debug
+                .sessions
                 .focused()
                 .is_some_and(|s| s.phase == SessionPhase::Terminated)
                 || events.iter().any(|e| matches!(e, DapEvent::Terminated));
@@ -165,7 +167,7 @@ impl App {
                 DapEvent::Output { category, text }
                     if crate::dap::session::output_is_user_visible(&category) =>
                 {
-                    let focused = self.debug_sessions.focused_index();
+                    let focused = self.debug.sessions.focused_index();
                     self.debug_console_push_output(focused, &category, &text, false);
                 }
                 // REPL submissions echo "❯ expr" then the result; watch/hover
@@ -200,10 +202,11 @@ impl App {
                     success,
                 } if context == "clipboard" => {
                     if self
-                        .debug_copy_pending
+                        .debug
+                        .copy_pending
                         .as_ref()
                         .is_some_and(|(expr, _)| *expr == expression)
-                        && let Some((_, fallback)) = self.debug_copy_pending.take()
+                        && let Some((_, fallback)) = self.debug.copy_pending.take()
                     {
                         let text = if success { result } else { fallback };
                         self.status = self.copy_where_pasted(&text).status("value");
@@ -221,7 +224,7 @@ impl App {
                     self.run_debug.feedback = Some(format!("Paused ({reason})"));
                     self.run_debug.feedback_is_error = false;
                     self.watch_baseline_pending = true;
-                    self.debug_pause_reason = Some(reason);
+                    self.debug.pause_reason = Some(reason);
                 }
                 // What the exception stop threw (#864): the panel's pill and
                 // the status line, which has the width the pill lacks.
@@ -243,7 +246,8 @@ impl App {
                         PathBuf,
                         std::collections::BTreeSet<usize>,
                     > = self
-                        .debug_sessions
+                        .debug
+                        .sessions
                         .focused()
                         .map(|s| s.unverified_breakpoints.clone().into_iter().collect())
                         .unwrap_or_default();
@@ -258,12 +262,13 @@ impl App {
                 _ => {}
             }
         }
-        let phase = self.debug_sessions.focused().map(|s| s.phase);
+        let phase = self.debug.sessions.focused().map(|s| s.phase);
         match phase {
             Some(SessionPhase::Stopped) => {
-                self.debug_ever_stopped = true;
+                self.debug.ever_stopped = true;
                 let loc = self
-                    .debug_sessions
+                    .debug
+                    .sessions
                     .focused()
                     .and_then(|s| s.current_location.clone());
                 // Said once this stop's stack trace has placed it, so the
@@ -273,12 +278,13 @@ impl App {
                 // and so does a top frame without a source: that stop is
                 // read without a file and line rather than with stale ones.
                 let top = self
-                    .debug_sessions
+                    .debug
+                    .sessions
                     .focused()
                     .and_then(|s| s.stack_frames.first())
                     .map(|f| (f.name.clone(), f.path.is_some()));
                 if let Some((frame, has_source)) = top
-                    && let Some(reason) = self.debug_pause_reason.take()
+                    && let Some(reason) = self.debug.pause_reason.take()
                 {
                     let at = if has_source { loc.as_ref() } else { None };
                     let said = self.debug_pause_announcement(&reason, at, &frame);
@@ -298,7 +304,7 @@ impl App {
                 }
             }
             Some(SessionPhase::Terminated) => {
-                self.debug_pause_reason = None;
+                self.debug.pause_reason = None;
                 self.editor.stop_line = None;
                 self.editor.unverified_breakpoints.clear();
                 // A session that ends on its own must take croft's own
@@ -319,23 +325,25 @@ impl App {
                 // avoid - and would make every compound behave as
                 // `stopAll: true`, which is neither VS Code's default nor what
                 // the file asked for.
-                let ended = self.debug_sessions.focused_index();
+                let ended = self.debug.sessions.focused_index();
                 let ended_name = self
-                    .debug_sessions
+                    .debug
+                    .sessions
                     .focused_name()
                     .unwrap_or("the session")
                     .to_string();
                 // The adapter refused to start the program (#264): its reason
                 // is the message, not "Debug session ended".
                 let launch_error = self
-                    .debug_sessions
+                    .debug
+                    .sessions
                     .focused()
                     .and_then(|s| s.launch_error.clone());
-                if let Some(mut gone) = self.debug_sessions.remove(ended) {
+                if let Some(mut gone) = self.debug.sessions.remove(ended) {
                     mirror_open_console_lines(
                         &mut gone.console,
-                        &self.debug_console,
-                        self.debug_console_dropped,
+                        &self.debug.console,
+                        self.debug.console_dropped,
                     );
                     gone.session.disconnect();
                 }
@@ -345,13 +353,13 @@ impl App {
                 // session.
                 let waiting = self.members_waiting_for_setup();
                 let stopped_all =
-                    self.debug_stop_all && (!self.debug_sessions.is_empty() || waiting > 0);
+                    self.debug.stop_all && (!self.debug.sessions.is_empty() || waiting > 0);
                 if stopped_all {
                     self.debug_stop();
                     self.status =
                         format!("{ended_name} ended — stopAll stopped the rest of the compound");
                 }
-                if !self.debug_sessions.is_empty() {
+                if !self.debug.sessions.is_empty() {
                     // Siblings are still running, so the debugger is not torn
                     // down: the view moves to one of them.
                     self.report_member_ended(&ended_name);
@@ -380,7 +388,7 @@ impl App {
                     }
                     None => {
                         let msg =
-                            debug_end_message(had_breakpoints, self.debug_ever_stopped).to_string();
+                            debug_end_message(had_breakpoints, self.debug.ever_stopped).to_string();
                         // The status bar still read "Debugging x — F5
                         // continue · F10 step over" after the end (#867).
                         // stopAll's own explanation above is left standing,
@@ -392,7 +400,7 @@ impl App {
                         self.run_debug.feedback_is_error = false;
                     }
                 }
-                // Keep `debug_console` so its output stays visible after the run;
+                // Keep `debug.console` so its output stays visible after the run;
                 // the panel renders it until the next session starts.
                 self.run_debug.session_ended = true;
                 self.run_post_debug_tasks();
