@@ -38,6 +38,18 @@ impl PtyTerminal {
         grid_rows_wrapped(&self.term.lock())
     }
 
+    /// The last `keep` rows of the pane up to its last row that is not
+    /// blank, with every redact rule in `triggers` applied: what a saved
+    /// session keeps of a pane's output (#249), read without copying the
+    /// rest of the scrollback. See [`masked_tail_rows`].
+    pub fn masked_transcript(
+        &self,
+        keep: usize,
+        triggers: &crate::triggers::TriggerSet,
+    ) -> Vec<String> {
+        masked_tail_rows(&self.term.lock(), keep, triggers)
+    }
+
     /// The grid as find's logical lines: soft-wrapped rows joined, so a
     /// match the pane's width cut in two is found (#1275). See
     /// [`join_wrapped_rows`].
@@ -281,6 +293,53 @@ pub(super) fn grid_rows_wrapped(term: &Term<VoidListener>) -> (Vec<String>, Vec<
         l += 1;
     }
     (lines, wraps, top)
+}
+
+/// The last `keep` rows up to the last row that is not blank, masked:
+/// exactly what [`grid_rows_wrapped`] and then [`mask_rows`] over the whole
+/// scrollback give for those rows, cut the same way, without reading every
+/// row. The read starts where the wrapped line holding the cut begins,
+/// since masking goes one wrapped line at a time: a secret across the cut
+/// is masked as it was.
+///
+/// [`mask_rows`]: crate::triggers::mask_rows
+pub(super) fn masked_tail_rows(
+    term: &Term<VoidListener>,
+    keep: usize,
+    triggers: &crate::triggers::TriggerSet,
+) -> Vec<String> {
+    if term.columns() == 0 || keep == 0 {
+        return Vec::new();
+    }
+    let top = term.grid().topmost_line().0;
+    let bottom = term.screen_lines() as i32 - 1;
+    let Some(last) = (top..=bottom)
+        .rev()
+        .find(|&l| !row_text_and_cols(term, l).0.trim().is_empty())
+    else {
+        return Vec::new();
+    };
+    let first = (last + 1 - keep as i32).max(top);
+    let mut from = first;
+    while from > top && row_wraps(term, from - 1) {
+        from -= 1;
+    }
+    let mut lines = Vec::new();
+    let mut wraps = Vec::new();
+    for l in from..=last {
+        let (s, _cols) = row_text_and_cols(term, l);
+        // Trimmed as `grid_rows_wrapped` trims, so the two read alike.
+        let wraps_on = l < bottom && row_wraps(term, l);
+        lines.push(if wraps_on {
+            s
+        } else {
+            s.trim_end().to_string()
+        });
+        wraps.push(wraps_on);
+    }
+    let mut masked = crate::triggers::mask_rows(&lines, &wraps, triggers);
+    masked.drain(..(first - from) as usize);
+    masked
 }
 
 /// One logical line of terminal output as find sees it: a run of rows the

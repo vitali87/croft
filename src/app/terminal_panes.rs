@@ -164,18 +164,12 @@ impl App {
                     // ALT_SCREEN guard of its own, so the check lives here.
                     Vec::new()
                 } else {
-                    let (lines, wraps, _) = t.grid_lines_wrapped();
-                    let end = lines
-                        .iter()
-                        .rposition(|l| !l.trim().is_empty())
-                        .map_or(0, |i| i + 1);
-                    // Masked before the cut, over wrapped rows joined, so a
-                    // secret straddling a wrap (or the cut) is still masked.
-                    // Persisted to disk and replayed next launch: every
-                    // redact rule applies (#360), as for the dump.
-                    let masked = crate::triggers::mask_rows(&lines[..end], &wraps, &triggers);
-                    let start = end.saturating_sub(crate::terminal_session::TRANSCRIPT_LINES);
-                    masked[start..end].to_vec()
+                    // Masked over wrapped rows joined, so a secret straddling
+                    // a wrap (or the cut) is still masked. Persisted to disk
+                    // and replayed next launch: every redact rule applies
+                    // (#360), as for the dump. Only the rows kept are read,
+                    // not the whole scrollback on every split and close.
+                    t.masked_transcript(crate::terminal_session::TRANSCRIPT_LINES, &triggers)
                 },
                 host: t.host_socket().map(|s| s.display().to_string()),
             })
