@@ -1,0 +1,1 @@
+refactor: the workspace's dependency reading (which package ecosystems the root manifests name, `cargo metadata`, and the package.json, go.mod, pyproject.toml and requirements.txt readers) moves out of the DEPENDENCIES view into its own module, `src/dependencies.rs`, with its own tests (#2062). Nothing changes in use.

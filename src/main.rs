@@ -33,6 +33,7 @@ mod cpp_build;
 mod dap;
 mod deep_link;
 mod default_formatter;
+mod dependencies;
 mod devcontainer;
 mod diff;
 mod docx;
