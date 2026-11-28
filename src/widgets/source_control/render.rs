@@ -14,24 +14,25 @@ pub(super) fn badge_color(kind: ChangeKind, theme: crate::theme::Theme) -> Color
     }
 }
 
-impl Widget for &mut SourceControlPanel {
-    fn render(self, area: Rect, buf: &mut Buffer) {
+impl SourceControlPanel {
+    /// Draw the view into `area` with this frame's [`ViewCx`].
+    pub fn draw(&mut self, cx: &ViewCx, area: Rect, buf: &mut Buffer) {
         // Only a stop on screen draws as having the keys (#871).
         self.settle_keys();
-        let focus_blue = self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff));
+        let focus_blue = cx.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff));
         // Black theme: the commit-input focus ring wears the muted brand teal
         // instead of the legacy blue (the outer border becomes the gradient).
-        let accent = if self.focus_gradient {
+        let accent = if cx.theme.gradient() {
             crate::gradient::rgb_color(crate::gradient::INNER_ACCENT)
         } else {
             focus_blue
         };
-        let outer_style = if self.focused {
+        let outer_style = if cx.focused {
             Style::default().fg(focus_blue)
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let outer = crate::widgets::surface::view_block(self.theme, true, outer_style);
+        let outer = crate::widgets::surface::view_block(cx.theme, true, outer_style);
         let inner = outer.inner(area);
         outer.render(area, buf);
         // Black theme: replace the solid focus border with the brand gradient.
@@ -40,9 +41,9 @@ impl Widget for &mut SourceControlPanel {
         crate::widgets::surface::paint_view_focus(
             buf,
             area,
-            self.theme,
-            self.focused,
-            self.focus_gradient,
+            cx.theme,
+            cx.focused,
+            cx.theme.gradient(),
         );
         self.last_area = area;
         self.last_inner = inner;
@@ -72,11 +73,11 @@ impl Widget for &mut SourceControlPanel {
                 .saturating_add(1);
         // Croft Loch: the view title is the strong ink while the view has
         // the keyboard and muted otherwise, never bold, as the Explorer's.
-        let tones = crate::theme::tones(self.theme);
+        let tones = crate::theme::tones(cx.theme);
         let title_style = match tones {
-            Some(t) => Style::default().fg(if self.focused { t.strong() } else { t.muted() }),
+            Some(t) => Style::default().fg(if cx.focused { t.strong() } else { t.muted() }),
             None => Style::default()
-                .fg(self.theme.ui(Color::Rgb(0xb0, 0xb8, 0xc8)))
+                .fg(cx.theme.ui(Color::Rgb(0xb0, 0xb8, 0xc8)))
                 .add_modifier(Modifier::BOLD),
         };
         buf.set_stringn(
@@ -100,13 +101,13 @@ impl Widget for &mut SourceControlPanel {
                 height: 1,
             };
             self.header_refresh_btn = rect;
-            let hovered = crate::widgets::hover::contains(rect, self.hover_pointer);
+            let hovered = crate::widgets::hover::contains(rect, cx.pointer);
             crate::widgets::header_pill::render(
                 buf,
                 refresh_x,
                 inner.y,
                 crate::widgets::header_pill::REFRESH_GLYPH,
-                self.theme,
+                cx.theme,
                 hovered,
             );
             // "⋯" actions pill, one pill-plus-gap to the left of refresh,
@@ -121,7 +122,7 @@ impl Widget for &mut SourceControlPanel {
                     height: 1,
                 };
                 self.header_more_btn = more_rect;
-                let more_hovered = crate::widgets::hover::contains(more_rect, self.hover_pointer);
+                let more_hovered = crate::widgets::hover::contains(more_rect, cx.pointer);
                 // Croft Loch draws the Explorer's midline ellipsis, so the
                 // two views' "more" buttons are one glyph.
                 let more_glyph = match tones {
@@ -133,7 +134,7 @@ impl Widget for &mut SourceControlPanel {
                     more_x,
                     inner.y,
                     more_glyph,
-                    self.theme,
+                    cx.theme,
                     more_hovered,
                 );
             }
@@ -148,11 +149,11 @@ impl Widget for &mut SourceControlPanel {
             self.last_init_repo_button_area = Rect::default();
             self.nested_repo_button_areas.clear();
             self.last_hero_area = Rect::default();
-            self.render_no_repo_empty_state(inner, buf);
+            self.render_no_repo_empty_state(cx, inner, buf);
             // With several folders open, the OTHER folders' repositories
             // stay reachable from the empty state too (#161): the
             // overview paints over the card's top rows.
-            self.render_repositories_section(inner, inner.y + 2, buf);
+            self.render_repositories_section(cx, inner, inner.y + 2, buf);
             return;
         }
         // Repo path: the hero and the card's buttons are only for the empty
@@ -164,7 +165,7 @@ impl Widget for &mut SourceControlPanel {
 
         // Row 2: branch row — a green branch glyph plus the branch name.
         let mut y = inner.y + 2;
-        y = self.render_repositories_section(inner, y, buf);
+        y = self.render_repositories_section(cx, inner, y, buf);
         if y >= inner.y + inner.height {
             return;
         }
@@ -181,7 +182,7 @@ impl Widget for &mut SourceControlPanel {
             "\u{ea68} ",
             Style::default().fg(match tones {
                 Some(t) => t.muted(),
-                None => self.theme.ui(Color::Rgb(0x88, 0xc0, 0xd0)),
+                None => cx.theme.ui(Color::Rgb(0x88, 0xc0, 0xd0)),
             }),
         ));
         let label = self.status.head_label().to_string();
@@ -197,7 +198,7 @@ impl Widget for &mut SourceControlPanel {
         spans.push(Span::styled(
             label,
             Style::default()
-                .fg(tones.map_or_else(|| self.theme.ui(Color::White), |t| t.text()))
+                .fg(tones.map_or_else(|| cx.theme.ui(Color::White), |t| t.text()))
                 .add_modifier(Modifier::BOLD),
         ));
         // What git stopped in the middle of (#1356): the ⋯ menu holds its
@@ -206,20 +207,20 @@ impl Widget for &mut SourceControlPanel {
             spans.push(Span::styled(
                 format!("  {}", op.label()),
                 Style::default()
-                    .fg(self.theme.ui(Color::Rgb(0xeb, 0xcb, 0x8b)))
+                    .fg(cx.theme.ui(Color::Rgb(0xeb, 0xcb, 0x8b)))
                     .add_modifier(Modifier::BOLD),
             ));
         }
         if self.status.ahead > 0 {
             spans.push(Span::styled(
                 format!("  \u{2191}{}", self.status.ahead),
-                Style::default().fg(self.theme.ui(Color::Rgb(0xa3, 0xbe, 0x8c))),
+                Style::default().fg(cx.theme.ui(Color::Rgb(0xa3, 0xbe, 0x8c))),
             ));
         }
         if self.status.behind > 0 {
             spans.push(Span::styled(
                 format!("  \u{2193}{}", self.status.behind),
-                Style::default().fg(self.theme.ui(Color::Rgb(0xeb, 0xcb, 0x8b))),
+                Style::default().fg(cx.theme.ui(Color::Rgb(0xeb, 0xcb, 0x8b))),
             ));
         }
         buf.set_line(inner.x, y, &Line::from(spans), inner.width);
@@ -247,10 +248,10 @@ impl Widget for &mut SourceControlPanel {
                 .min(left),
         };
         self.last_input_area = input_box;
-        let input_border_style = if self.focused && self.keys == KeyStop::Message {
+        let input_border_style = if cx.focused && self.keys == KeyStop::Message {
             Style::default().fg(accent)
         } else {
-            Style::default().fg(self.theme.ui(Color::Rgb(0x60, 0x68, 0x78)))
+            Style::default().fg(cx.theme.ui(Color::Rgb(0x60, 0x68, 0x78)))
         };
         let input_block = Block::default()
             .borders(Borders::ALL)
@@ -261,7 +262,7 @@ impl Widget for &mut SourceControlPanel {
         // the accent while it has the keyboard) in place of the rounded line
         // box. The inner rect is the box's, so the text and the caret land on
         // the same cells.
-        let field_focused = self.focused && self.keys == KeyStop::Message;
+        let field_focused = cx.focused && self.keys == KeyStop::Message;
         match tones {
             Some(t) => crate::widgets::surface::paint_field(
                 buf,
@@ -359,7 +360,7 @@ impl Widget for &mut SourceControlPanel {
                         &visible,
                         text_max,
                         Style::default()
-                            .fg(tones.map_or_else(|| self.theme.ui(Color::White), |t| t.text())),
+                            .fg(tones.map_or_else(|| cx.theme.ui(Color::White), |t| t.text())),
                     );
                 }
             }
@@ -375,7 +376,7 @@ impl Widget for &mut SourceControlPanel {
             return;
         }
         // Black theme: brand-teal Commit button; Croft Dark keeps VS Code blue.
-        let (blue, white) = primary_button_colors(self.theme, self.focus_gradient);
+        let (blue, white) = primary_button_colors(cx.theme, cx.theme.gradient());
         let split_caret_w: u16 = 3;
         let split_gap_w: u16 = 1;
         if inner.width >= 16 + split_caret_w + split_gap_w {
@@ -399,7 +400,7 @@ impl Widget for &mut SourceControlPanel {
             // codicon VS Code paints on its Commit button, replacing the
             // generic Unicode check that did not match the dropdown glyphs.
             if tones.is_some() {
-                self.render_soft_split_button(buf, main_area, caret_area);
+                self.render_soft_split_button(cx, buf, main_area, caret_area);
             } else {
                 render_rounded_button(buf, main_area, "\u{eab2} Commit", blue, white);
                 render_rounded_button(buf, caret_area, "▾", blue, white);
@@ -412,8 +413,8 @@ impl Widget for &mut SourceControlPanel {
                 height: 3,
             };
             self.last_button_area = button_area;
-            let hovered = crate::widgets::hover::contains(button_area, self.hover_pointer);
-            render_button(buf, button_area, "Commit", blue, white, self.theme, hovered);
+            let hovered = crate::widgets::hover::contains(button_area, cx.pointer);
+            render_button(buf, button_area, "Commit", blue, white, cx.theme, hovered);
         }
         y += 3 + 1; // button + 1-row gap
 
@@ -424,9 +425,9 @@ impl Widget for &mut SourceControlPanel {
             && y < inner.y + inner.height
         {
             let style = if self.commit_feedback_is_error {
-                Style::default().fg(self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70)))
+                Style::default().fg(cx.theme.ui(Color::Rgb(0xe7, 0x70, 0x70)))
             } else {
-                Style::default().fg(self.theme.ui(Color::Rgb(0xa3, 0xbe, 0x8c)))
+                Style::default().fg(cx.theme.ui(Color::Rgb(0xa3, 0xbe, 0x8c)))
             };
             // git's headline (#858), wrapped to the panel: a refusal ran on
             // past its edge into the editor, which painted over it (#989).
@@ -452,7 +453,7 @@ impl Widget for &mut SourceControlPanel {
             Some(t) => ("\u{2581}", Style::default().fg(t.hairline())),
             None => (
                 "─",
-                Style::default().fg(self.theme.ui(Color::Rgb(0x40, 0x48, 0x58))),
+                Style::default().fg(cx.theme.ui(Color::Rgb(0x40, 0x48, 0x58))),
             ),
         };
         for x in inner.x..inner.x + inner.width {
@@ -507,7 +508,7 @@ impl Widget for &mut SourceControlPanel {
             return;
         }
 
-        let selected_bg = self.theme.ui(Color::Rgb(0x26, 0x4f, 0x78));
+        let selected_bg = cx.theme.ui(Color::Rgb(0x26, 0x4f, 0x78));
         let end = (self.scroll + viewport).min(total);
         for (row, idx) in (self.scroll..end).enumerate() {
             let row_y = list_area.y + row as u16;
@@ -542,7 +543,7 @@ impl Widget for &mut SourceControlPanel {
                         None => vec![
                             Span::styled(
                                 "\u{25be} ",
-                                Style::default().fg(self.theme.ui(Color::Rgb(0xb0, 0xb8, 0xc8))),
+                                Style::default().fg(cx.theme.ui(Color::Rgb(0xb0, 0xb8, 0xc8))),
                             ),
                             Span::styled(
                                 section_label(*section),
@@ -558,8 +559,8 @@ impl Widget for &mut SourceControlPanel {
                             Span::styled(
                                 format!(" {count} "),
                                 Style::default()
-                                    .fg(self.theme.ui(Color::White))
-                                    .bg(self.theme.ui(Color::Rgb(0x2a, 0x33, 0x42)))
+                                    .fg(cx.theme.ui(Color::White))
+                                    .bg(cx.theme.ui(Color::Rgb(0x2a, 0x33, 0x42)))
                                     .add_modifier(Modifier::BOLD),
                             ),
                         ],
@@ -630,7 +631,7 @@ impl Widget for &mut SourceControlPanel {
                             },
                             t,
                             t.chrome,
-                            self.focused && self.keys == KeyStop::List,
+                            cx.focused && self.keys == KeyStop::List,
                         );
                     }
                     let row_bg = if is_primary {
@@ -640,14 +641,10 @@ impl Widget for &mut SourceControlPanel {
                             Some(t) => crate::gradient::rgb_color(crate::gradient::lerp_rgb(
                                 t.chrome, t.accent, 0.12,
                             )),
-                            None => self.theme.ui(Color::Rgb(0x1f, 0x3a, 0x5c)),
+                            None => cx.theme.ui(Color::Rgb(0x1f, 0x3a, 0x5c)),
                         })
                     } else {
-                        crate::widgets::hover::row_hover_bg(
-                            row_rect,
-                            self.hover_pointer,
-                            self.theme,
-                        )
+                        crate::widgets::hover::row_hover_bg(row_rect, cx.pointer, cx.theme)
                     };
                     let is_selected = is_primary;
                     if let Some(bg) = row_bg {
@@ -681,10 +678,10 @@ impl Widget for &mut SourceControlPanel {
                         .x
                         .saturating_add(row_rect.width.saturating_sub(badge_w + row_padding));
                     let mut badge_style = Style::default()
-                        .fg(badge_color(entry.kind, self.theme))
+                        .fg(badge_color(entry.kind, cx.theme))
                         .add_modifier(Modifier::BOLD);
-                    let mut icon_style = Style::default().fg(self.theme.ui(icon.color));
-                    let mut path_style = Style::default().fg(self.theme.ui(Color::White));
+                    let mut icon_style = Style::default().fg(cx.theme.ui(icon.color));
+                    let mut path_style = Style::default().fg(cx.theme.ui(Color::White));
                     if let Some(bg) = row_bg {
                         badge_style = badge_style.bg(bg);
                         icon_style = icon_style.bg(bg);
@@ -737,7 +734,7 @@ impl Widget for &mut SourceControlPanel {
                     }
                     if show_actions {
                         let action_fg = tones.map_or_else(
-                            || self.theme.ui(Color::Rgb(0xd4, 0xd9, 0xe2)),
+                            || cx.theme.ui(Color::Rgb(0xd4, 0xd9, 0xe2)),
                             |t| t.text(),
                         );
                         let mut action_style = Style::default().fg(action_fg);
@@ -786,7 +783,7 @@ impl Widget for &mut SourceControlPanel {
             }
         }
         if let Some(metrics) = scrollbar_metrics {
-            scrollbar::render_vertical_on_chrome(buf, metrics, self.focused, self.theme);
+            scrollbar::render_vertical_on_chrome(buf, metrics, cx.focused, cx.theme);
         }
     }
 }

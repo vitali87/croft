@@ -40,6 +40,7 @@ pub(crate) use walk::as_typed;
 #[cfg(test)]
 pub(crate) use walk::collect_matches_in_text;
 pub use walk::line_may_match;
+#[cfg(test)]
 pub(crate) use walk::search_workspace;
 pub use walk::search_workspace_streaming_filtered;
 use walk::*;

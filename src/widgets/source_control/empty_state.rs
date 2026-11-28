@@ -81,7 +81,12 @@ impl SourceControlPanel {
     /// Paint the "No repository detected" empty-state card. `inner` is the
     /// panel's inner rect (border already drawn); the SOURCE CONTROL header
     /// sits on `inner.y` so the card starts two rows below.
-    pub(super) fn render_no_repo_empty_state(&mut self, inner: Rect, buf: &mut Buffer) {
+    pub(super) fn render_no_repo_empty_state(
+        &mut self,
+        cx: &ViewCx,
+        inner: Rect,
+        buf: &mut Buffer,
+    ) {
         if inner.height < 4 || inner.width < 8 {
             return;
         }
@@ -100,7 +105,7 @@ impl SourceControlPanel {
             width: card_w,
             height: card_h,
         };
-        let card_border = Style::default().fg(self.theme.ui(Color::Rgb(0x60, 0x68, 0x78)));
+        let card_border = Style::default().fg(cx.theme.ui(Color::Rgb(0x60, 0x68, 0x78)));
         let card_block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -108,11 +113,11 @@ impl SourceControlPanel {
         let card_inner = card_block.inner(card_area);
         // Croft Loch: a raised card with a rim (it never takes the keyboard,
         // so no accent lip) in place of the rounded line box; same inset.
-        let tones = crate::theme::tones(self.theme);
+        let tones = crate::theme::tones(cx.theme);
         match tones {
             Some(t) => {
                 buf.set_style(card_area, Style::default().bg(t.raised()));
-                crate::widgets::surface::paint_quiet_frame(buf, card_area, self.theme);
+                crate::widgets::surface::paint_quiet_frame(buf, card_area, cx.theme);
             }
             None => card_block.render(card_area, buf),
         }
@@ -123,21 +128,17 @@ impl SourceControlPanel {
         // Black theme: the brand's teal card accent and button fill replace
         // the legacy blue line art and VS Code button blue; Croft Dark keeps
         // the historical blues.
-        let blue = if self.focus_gradient {
+        let blue = if cx.theme.gradient() {
             crate::gradient::rgb_color(crate::gradient::CARD_ACCENT)
         } else {
-            self.theme.ui(Color::Rgb(0x60, 0x9a, 0xfe))
+            cx.theme.ui(Color::Rgb(0x60, 0x9a, 0xfe))
         };
-        let dim_blue = self.theme.ui(Color::Rgb(0x4b, 0x50, 0x5a));
-        let text_white = tones.map_or_else(
-            || self.theme.ui(Color::Rgb(0xff, 0xff, 0xff)),
-            |t| t.strong(),
-        );
-        let text_dim = tones.map_or_else(
-            || self.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4)),
-            |t| t.muted(),
-        );
-        let blue_bg = if self.focus_gradient || tones.is_some() {
+        let dim_blue = cx.theme.ui(Color::Rgb(0x4b, 0x50, 0x5a));
+        let text_white =
+            tones.map_or_else(|| cx.theme.ui(Color::Rgb(0xff, 0xff, 0xff)), |t| t.strong());
+        let text_dim =
+            tones.map_or_else(|| cx.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4)), |t| t.muted());
+        let blue_bg = if cx.theme.gradient() || tones.is_some() {
             crate::gradient::rgb_color(crate::gradient::PRIMARY_BTN_BG)
         } else {
             Color::Rgb(BUTTON_BG_RGB.0, BUTTON_BG_RGB.1, BUTTON_BG_RGB.2)
@@ -231,7 +232,7 @@ impl SourceControlPanel {
         let btn_x = card_inner.x + (card_inner.width.saturating_sub(btn_w)) / 2;
         // The button with the keys (#871) lifts as a hovered one does, and
         // only one that fits can have them.
-        let card_has_keys = self.focused && self.keys == KeyStop::Card;
+        let card_has_keys = cx.focused && self.keys == KeyStop::Card;
         // A plain theme's button draws no hover, so its keys lift the fill.
         let fill = |keyed: bool| {
             if keyed && tones.is_none() {
@@ -260,10 +261,9 @@ impl SourceControlPanel {
                     height: 3,
                 };
                 let text = format!("Open {label}");
-                let hovered =
-                    crate::widgets::hover::contains(area, self.hover_pointer) || keyed == Some(i);
+                let hovered = crate::widgets::hover::contains(area, cx.pointer) || keyed == Some(i);
                 let bg = fill(keyed == Some(i));
-                render_button(buf, area, &text, bg, text_white, self.theme, hovered);
+                render_button(buf, area, &text, bg, text_white, cx.theme, hovered);
                 self.nested_repo_button_areas.push((area, path.clone()));
                 y += 4;
             }
@@ -284,11 +284,10 @@ impl SourceControlPanel {
                 height: 3,
             };
             self.last_init_repo_button_area = init_area;
-            let hovered =
-                crate::widgets::hover::contains(init_area, self.hover_pointer) || card_has_keys;
+            let hovered = crate::widgets::hover::contains(init_area, cx.pointer) || card_has_keys;
             let bg = fill(card_has_keys);
             render_button(
-                buf, init_area, init_label, bg, text_white, self.theme, hovered,
+                buf, init_area, init_label, bg, text_white, cx.theme, hovered,
             );
         }
     }

@@ -121,6 +121,7 @@ impl SearchPanel {
     }
 
     /// Run the current query, store the results, and reset selection.
+    #[cfg(test)]
     pub fn run_query(&mut self) {
         self.hits.clear();
         self.add_hits(search_workspace(&self.root, &self.query, self.opts));

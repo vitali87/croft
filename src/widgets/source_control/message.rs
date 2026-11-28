@@ -252,15 +252,16 @@ impl SourceControlPanel {
     /// Absolute (col, row) of the commit-message caret in screen
     /// coordinates, matching the pattern `Editor::cursor_screen_pos` uses
     /// to drive the host terminal's hardware caret. Returns `None` when
-    /// the message box isn't focused, isn't in a repo (no input box painted),
+    /// the view isn't `focused` (has the keyboard), the message box doesn't
+    /// have its keys, the view isn't in a repo (no input box painted),
     /// hasn't been laid out yet, or the cursor would land outside the
     /// visible inner width of the input box. The render path paints
     /// message line `n` at `input_inner.x + 1` on `input_inner.y + n`
     /// (less the scrolled-off lines and columns), so the caret sits at
     /// column `input_box.x + 2 + col`, row `input_box.y + 1 + line`
     /// (rounded border occupies one cell on each side).
-    pub fn cursor_screen_pos(&self) -> Option<(u16, u16)> {
-        if !self.focused || self.keys != KeyStop::Message {
+    pub fn cursor_screen_pos(&self, focused: bool) -> Option<(u16, u16)> {
+        if !focused || self.keys != KeyStop::Message {
             return None;
         }
         let r = self.last_input_area;

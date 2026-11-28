@@ -68,6 +68,7 @@ pub(crate) fn as_typed(query: &str) -> &str {
 /// Walks in parallel using `WalkBuilder::build_parallel` and uses
 /// `grep-searcher` + `grep-regex` (the same engine that powers ripgrep).
 /// Set `cancel` to abort an in-flight scan.
+#[cfg(test)]
 pub fn search_workspace_streaming<F>(
     root: &Path,
     query: &str,
@@ -84,6 +85,7 @@ pub fn search_workspace_streaming<F>(
 /// canonical path is in `skip`. Used for dirty-aware search: files open in
 /// unsaved editors are searched from their in-memory buffer instead, so the
 /// stale on-disk copy must not also contribute (duplicate / outdated) hits.
+#[cfg(test)]
 pub fn search_workspace_streaming_skipping<F>(
     root: &Path,
     query: &str,
@@ -198,6 +200,7 @@ pub(super) fn is_vcs_store(name: &std::ffi::OsStr) -> bool {
 /// Aggregating wrapper around `search_workspace_streaming`. Returns every
 /// match - no arbitrary cap. Honours `.gitignore`. Order is non-deterministic
 /// because the walker is parallel; callers that need ordering must sort.
+#[cfg(test)]
 pub fn search_workspace(root: &Path, query: &str, opts: SearchOpts) -> Vec<SearchHit> {
     let cancel = Arc::new(AtomicBool::new(false));
     let collected: Arc<std::sync::Mutex<Vec<SearchHit>>> =

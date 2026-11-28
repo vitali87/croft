@@ -279,13 +279,13 @@ impl App {
         }
         if self.focus == Pane::Tree
             && self.sidebar_view == SidebarView::SourceControl
-            && self.source_control.cursor_screen_pos().is_some()
+            && self.source_control.cursor_screen_pos(true).is_some()
         {
             return true;
         }
         if self.focus == Pane::Tree
             && self.sidebar_view == SidebarView::Search
-            && self.search.cursor_screen_pos().is_some()
+            && self.search.cursor_screen_pos(true).is_some()
         {
             return true;
         }
@@ -722,14 +722,12 @@ impl App {
             // the keyboard exactly when the side bar does.
             let side_cx = self.view_cx(self.focus == Pane::Tree);
             self.tree.hover_pointer = panel_pointer;
-            self.search.hover_pointer = panel_pointer;
-            self.source_control.hover_pointer = panel_pointer;
             // Explorer stacks its toggled sub-views (Open Editors / Folders /
             // Outline / Timeline / Dependencies) inside the usable strip.
             // Every other sidebar view fills it with its single activity widget.
             match self.sidebar_view {
                 SidebarView::Explorer => self.render_explorer_sections(frame, usable_area),
-                SidebarView::Search => frame.render_widget(&mut self.search, usable_area),
+                SidebarView::Search => self.search.draw(&side_cx, usable_area, frame.buffer_mut()),
                 SidebarView::SourceControl => {
                     scm_drawn = true;
                     // The COMMITS graph section docks under the change list,
@@ -747,7 +745,8 @@ impl App {
                         ..usable_area
                     };
                     self.sync_nested_repos();
-                    frame.render_widget(&mut self.source_control, scm_area);
+                    self.source_control
+                        .draw(&side_cx, scm_area, frame.buffer_mut());
                     if graph_h > 0 {
                         let graph_area = Rect {
                             y: usable_area.y + usable_area.height - graph_h,
@@ -2523,7 +2522,7 @@ impl App {
         if self.focus == Pane::Tree
             && self.sidebar_view == SidebarView::SourceControl
             && pane_caret
-            && let Some((cx, cy)) = self.source_control.cursor_screen_pos()
+            && let Some((cx, cy)) = self.source_control.cursor_screen_pos(true)
         {
             frame.set_cursor_position((cx, cy));
         }
@@ -2535,7 +2534,7 @@ impl App {
         if self.focus == Pane::Tree
             && self.sidebar_view == SidebarView::Search
             && pane_caret
-            && let Some((cx, cy)) = self.search.cursor_screen_pos()
+            && let Some((cx, cy)) = self.search.cursor_screen_pos(true)
         {
             frame.set_cursor_position((cx, cy));
         }

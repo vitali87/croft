@@ -631,9 +631,9 @@ fn explorer(tree: &crate::widgets::file_tree::FileTree, root: &Path) -> String {
 /// is while it is focused, the text selected in the query or another field,
 /// the replace and file fields while shown, the options on, and the hits
 /// with the one selected.
-fn search_view(s: &crate::widgets::search::SearchPanel) -> String {
+fn search_view(s: &crate::widgets::search::SearchPanel, focused: bool) -> String {
     let mut out = format!("{:?}", s.query);
-    if s.focused {
+    if focused {
         out.push_str(&format!(" @{:?}:{}", s.field, s.caret()));
     }
     // A selection is what the next copy or typed key acts on.
@@ -666,9 +666,9 @@ fn search_view(s: &crate::widgets::search::SearchPanel) -> String {
 
 /// The Source Control view: the commit message and its caret, what has
 /// focus, the selected changes and every change listed.
-fn scm_view(sc: &crate::widgets::source_control::SourceControlPanel) -> String {
+fn scm_view(sc: &crate::widgets::source_control::SourceControlPanel, focused: bool) -> String {
     let mut out = format!("{:?}@{}", sc.message, sc.message_cursor);
-    if sc.focused {
+    if focused {
         out.push_str(" +focus");
     }
     match sc.keys {
@@ -737,8 +737,14 @@ fn fingerprint(app: &App, root: &Path) -> Seen {
     // Read from the disk and git once: they are the same for both passes.
     let read = [
         explorer(&app.tree, root),
-        search_view(&app.search),
-        scm_view(&app.source_control),
+        search_view(
+            &app.search,
+            app.focus == Pane::Tree && app.sidebar_view == SidebarView::Search,
+        ),
+        scm_view(
+            &app.source_control,
+            app.focus == Pane::Tree && app.sidebar_view == SidebarView::SourceControl,
+        ),
         git_state(root),
         files_digest(root),
     ];
@@ -1192,9 +1198,18 @@ fn a_keys_effects_name_the_text_selected_in_the_search_view() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(tmp.path(), "main.rs", "fn main() {}\n");
     app.search.query = String::from("total");
-    assert!(!search_view(&app.search).contains("sel="));
+    assert!(
+        !search_view(
+            &app.search,
+            app.focus == Pane::Tree && app.sidebar_view == SidebarView::Search
+        )
+        .contains("sel=")
+    );
     app.search.select_all_query();
-    let view = search_view(&app.search);
+    let view = search_view(
+        &app.search,
+        app.focus == Pane::Tree && app.sidebar_view == SidebarView::Search,
+    );
     assert!(view.contains(" sel=0-5"), "what a copy takes: {view}");
 }
 
