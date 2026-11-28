@@ -636,7 +636,12 @@ impl App {
         };
         let pdf = self.editor.image.as_mut()?.pdf.as_mut()?;
         if pdf.links.is_none() {
-            match crate::pdf::page_links(&pdf.source_path, pdf.current_page) {
+            // Waits on pdftohtml during the click, up to its 5 s budget,
+            // until extraction moves onto a job (#2824).
+            match crate::proc::ui_wait_allowed(
+                "a PDF link click reads the page's links (#2824)",
+                || crate::pdf::page_links(&pdf.source_path, pdf.current_page),
+            ) {
                 Ok(links) => pdf.links = Some(links),
                 // Not cached: a mid-write extraction failure (pdflatex
                 // rebuilding the file) heals on the next click.

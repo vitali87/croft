@@ -1366,7 +1366,12 @@ impl Editor {
         let backend = crate::pdf::detect_backend()
             .ok_or_else(|| anyhow::anyhow!("Install poppler (pdftoppm) to preview PDFs"))?;
         let meta = std::fs::metadata(path)?;
-        let page_count = crate::pdf::detect_page_count(path);
+        // Waits on pdfinfo during the open, up to its 2 s budget, until the
+        // probe moves onto a job (#2824).
+        let page_count =
+            crate::proc::ui_wait_allowed("a PDF opens knowing its page count (#2824)", || {
+                crate::pdf::detect_page_count(path)
+            });
         // A reload comes up on the reader's page in this single
         // rasterisation — clamped when the count is known, so a genuinely
         // shrunken document lands on its new last page. On failure the

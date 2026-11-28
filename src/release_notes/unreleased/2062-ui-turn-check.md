@@ -1,0 +1,1 @@
+refactor: A key press, click, paste, command or frame now marks itself as a UI turn, and in tests croft's program helpers fail when one waits on an outside program without saying why (#2062). Nothing changes in use.

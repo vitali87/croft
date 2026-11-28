@@ -560,6 +560,7 @@ impl App {
     }
 
     pub(super) fn handle_mouse(&mut self, m: MouseEvent) {
+        let _turn = crate::proc::UiTurn::enter();
         self.editor.sync_occurrence_word_sel();
         if self.screencast.is_on()
             && let MouseEventKind::Down(button) = m.kind

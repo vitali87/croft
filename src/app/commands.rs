@@ -910,6 +910,7 @@ impl App {
     /// their dedicated chords use, so the palette can never drift from the
     /// keyboard surface.
     pub(crate) fn run_command(&mut self, cmd: crate::widgets::command_palette::Command) {
+        let _turn = crate::proc::UiTurn::enter();
         use crate::widgets::command_palette::Command as Cmd;
         use crate::widgets::editor::CaseTransform;
         // The tab a tab command acts on (#1427): the clicked tab when a
