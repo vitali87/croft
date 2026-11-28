@@ -2721,7 +2721,7 @@ fn a_failed_spawner_releases_the_lock_so_another_window_can_host() {
         "a window that cannot host must release the lock"
     );
     assert!(
-        a.collab_config.is_none(),
+        a.collab.config.is_none(),
         "the same-tick self-appointment is undone with it"
     );
 

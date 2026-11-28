@@ -99,9 +99,9 @@ fn collab_solo_apps_bootstrap_edit_and_gate_saves() {
     }
 
     let mut owner = App::new(tmp.path().to_path_buf()).unwrap();
-    owner.collab_config = Some((socket.clone(), crate::collab::CollabRole::Owner));
+    owner.collab.config = Some((socket.clone(), crate::collab::CollabRole::Owner));
     let mut guest = App::new(tmp.path().to_path_buf()).unwrap();
-    guest.collab_config = Some((socket.clone(), crate::collab::CollabRole::Guest));
+    guest.collab.config = Some((socket.clone(), crate::collab::CollabRole::Guest));
     owner.open_file_at_launch(&file);
     guest.open_file_at_launch(&file);
 
@@ -118,7 +118,10 @@ fn collab_solo_apps_bootstrap_edit_and_gate_saves() {
 
     // Guest opens the shared file and bootstraps it from the owner's buffer.
     pump_until(&mut owner, &mut guest, "bootstrap", &|_, g| {
-        g.collab.as_ref().is_some_and(|s| s.is_live("f.txt"))
+        g.collab
+            .session
+            .as_ref()
+            .is_some_and(|s| s.is_live("f.txt"))
     });
 
     // Guest types; the owner's buffer converges (through poll_collab's
@@ -216,14 +219,15 @@ fn collab_owner_and_guest_on_plan() -> (tempfile::TempDir, std::path::PathBuf, A
         std::thread::sleep(Duration::from_millis(10));
     }
     let mut owner = App::new(tmp.path().to_path_buf()).unwrap();
-    owner.collab_config = Some((socket.clone(), crate::collab::CollabRole::Owner));
+    owner.collab.config = Some((socket.clone(), crate::collab::CollabRole::Owner));
     let mut guest = App::new(tmp.path().to_path_buf()).unwrap();
-    guest.collab_config = Some((socket, crate::collab::CollabRole::Guest));
+    guest.collab.config = Some((socket, crate::collab::CollabRole::Guest));
     owner.open_file_at_launch(&file);
     guest.open_file_at_launch(&file);
     pump_apps_until(&mut [&mut owner, &mut guest], "bootstrap", |apps| {
         apps[1]
             .collab
+            .session
             .as_ref()
             .is_some_and(|s| s.is_live("plan.txt"))
     });
@@ -286,7 +290,7 @@ fn a_new_owner_receives_the_stranded_guests_edits() {
     use std::time::{Duration, Instant};
     let (tmp, file, mut owner, mut guest) = collab_owner_and_guest_on_plan();
     guest_moves_the_due_date(&mut owner, &mut guest);
-    let socket = owner.collab_config.clone().unwrap().0;
+    let socket = owner.collab.config.clone().unwrap().0;
     drop(owner);
     let until = Instant::now() + Duration::from_secs(3);
     while Instant::now() < until && !guest.status.contains("owner left") {
@@ -297,7 +301,7 @@ fn a_new_owner_receives_the_stranded_guests_edits() {
     guest.editor.cursor_col = "Owner: alice".len();
     guest.editor.insert_str(" and bob");
     let mut owner2 = App::new(tmp.path().to_path_buf()).unwrap();
-    owner2.collab_config = Some((socket, crate::collab::CollabRole::Owner));
+    owner2.collab.config = Some((socket, crate::collab::CollabRole::Owner));
     owner2.open_file_at_launch(&file);
     pump_apps_until(
         &mut [&mut owner2, &mut guest],
@@ -361,9 +365,9 @@ fn splitting_a_live_file_does_not_revert_the_session() {
         std::thread::sleep(Duration::from_millis(10));
     }
     let mut owner = App::new(tmp.path().to_path_buf()).unwrap();
-    owner.collab_config = Some((socket.clone(), crate::collab::CollabRole::Owner));
+    owner.collab.config = Some((socket.clone(), crate::collab::CollabRole::Owner));
     let mut guest = App::new(tmp.path().to_path_buf()).unwrap();
-    guest.collab_config = Some((socket.clone(), crate::collab::CollabRole::Guest));
+    guest.collab.config = Some((socket.clone(), crate::collab::CollabRole::Guest));
     owner.open_file_at_launch(&file);
     guest.open_file_at_launch(&file);
     let pump_until =
@@ -377,7 +381,10 @@ fn splitting_a_live_file_does_not_revert_the_session() {
             }
         };
     pump_until(&mut owner, &mut guest, "bootstrap", &|_, g| {
-        g.collab.as_ref().is_some_and(|s| s.is_live("f.txt"))
+        g.collab
+            .session
+            .as_ref()
+            .is_some_and(|s| s.is_live("f.txt"))
     });
 
     // An hour of unsaved session work, in miniature.
@@ -445,12 +452,12 @@ fn a_guest_without_an_owner_degrades_to_local_editing_and_saves() {
 
     // A guest alone on the relay: nobody answers its snapshot request.
     let mut guest = App::new(tmp.path().to_path_buf()).unwrap();
-    guest.collab_config = Some((socket.clone(), crate::collab::CollabRole::Guest));
+    guest.collab.config = Some((socket.clone(), crate::collab::CollabRole::Guest));
     guest.open_file_at_launch(&file);
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
         guest.poll_collab();
-        if let Some(s) = guest.collab.as_ref()
+        if let Some(s) = guest.collab.session.as_ref()
             && s.is_local_only("f.txt")
         {
             break;
@@ -463,7 +470,12 @@ fn a_guest_without_an_owner_degrades_to_local_editing_and_saves() {
         guest.poll_collab();
     }
     assert!(
-        !guest.collab.as_ref().unwrap().is_bootstrapping("f.txt"),
+        !guest
+            .collab
+            .session
+            .as_ref()
+            .unwrap()
+            .is_bootstrapping("f.txt"),
         "the tick re-armed the input gate after the give-up"
     );
     // The guest is the only author: its save persists.
@@ -501,9 +513,9 @@ fn reconnecting_replays_offline_guest_edits_instead_of_deleting_them() {
         std::thread::sleep(Duration::from_millis(10));
     }
     let mut owner = App::new(tmp.path().to_path_buf()).unwrap();
-    owner.collab_config = Some((socket.clone(), crate::collab::CollabRole::Owner));
+    owner.collab.config = Some((socket.clone(), crate::collab::CollabRole::Owner));
     let mut guest = App::new(tmp.path().to_path_buf()).unwrap();
-    guest.collab_config = Some((socket.clone(), crate::collab::CollabRole::Guest));
+    guest.collab.config = Some((socket.clone(), crate::collab::CollabRole::Guest));
     owner.open_file_at_launch(&file);
     guest.open_file_at_launch(&file);
     let pump_until =
@@ -517,7 +529,10 @@ fn reconnecting_replays_offline_guest_edits_instead_of_deleting_them() {
             }
         };
     pump_until(&mut owner, &mut guest, "bootstrap", &|_, g| {
-        g.collab.as_ref().is_some_and(|s| s.is_live("f.txt"))
+        g.collab
+            .session
+            .as_ref()
+            .is_some_and(|s| s.is_live("f.txt"))
     });
     guest.editor.insert_str("SESSION ");
     pump_until(&mut owner, &mut guest, "session edit converges", &|o, g| {
@@ -527,16 +542,19 @@ fn reconnecting_replays_offline_guest_edits_instead_of_deleting_them() {
     // The link dies: drive the same teardown poll_collab runs after
     // detecting a dead channel (session dropped, config kept). Hold the
     // reconnect backoff while the guest keeps typing offline.
-    let dead = guest.collab.take().unwrap();
+    let dead = guest.collab.session.take().unwrap();
     guest.drop_lost_collab_session(dead);
-    guest.last_collab_connect = Some(Instant::now());
+    guest.collab.last_connect = Some(Instant::now());
     guest.editor.insert_str("OFFLINE ");
     let offline_text = guest.editor.lines.clone();
 
     // Reconnect: the file re-bootstraps from the owner's older snapshot.
-    guest.last_collab_connect = None;
+    guest.collab.last_connect = None;
     pump_until(&mut owner, &mut guest, "reconnect goes live", &|_, g| {
-        g.collab.as_ref().is_some_and(|s| s.is_live("f.txt"))
+        g.collab
+            .session
+            .as_ref()
+            .is_some_and(|s| s.is_live("f.txt"))
     });
     assert!(
         guest.editor.lines[0].contains("OFFLINE"),
@@ -581,9 +599,9 @@ fn reconnect_replay_preserves_owner_edits_made_during_the_outage() {
         std::thread::sleep(Duration::from_millis(10));
     }
     let mut owner = App::new(tmp.path().to_path_buf()).unwrap();
-    owner.collab_config = Some((socket.clone(), crate::collab::CollabRole::Owner));
+    owner.collab.config = Some((socket.clone(), crate::collab::CollabRole::Owner));
     let mut guest = App::new(tmp.path().to_path_buf()).unwrap();
-    guest.collab_config = Some((socket.clone(), crate::collab::CollabRole::Guest));
+    guest.collab.config = Some((socket.clone(), crate::collab::CollabRole::Guest));
     owner.open_file_at_launch(&file);
     guest.open_file_at_launch(&file);
     let pump_until =
@@ -597,14 +615,17 @@ fn reconnect_replay_preserves_owner_edits_made_during_the_outage() {
             }
         };
     pump_until(&mut owner, &mut guest, "bootstrap", &|_, g| {
-        g.collab.as_ref().is_some_and(|s| s.is_live("f.txt"))
+        g.collab
+            .session
+            .as_ref()
+            .is_some_and(|s| s.is_live("f.txt"))
     });
 
     // The guest's link dies through the real teardown (which harvests the
     // merge base); it edits line 1 offline while the owner edits line 3.
-    let dead = guest.collab.take().unwrap();
+    let dead = guest.collab.session.take().unwrap();
     guest.drop_lost_collab_session(dead);
-    guest.last_collab_connect = Some(Instant::now());
+    guest.collab.last_connect = Some(Instant::now());
     guest.editor.insert_str("OFFLINE ");
     let owner_pump = |owner: &mut App| {
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -619,9 +640,12 @@ fn reconnect_replay_preserves_owner_edits_made_during_the_outage() {
     owner_pump(&mut owner);
 
     // Reconnect: both offline-era edits must survive, everywhere.
-    guest.last_collab_connect = None;
+    guest.collab.last_connect = None;
     pump_until(&mut owner, &mut guest, "reconnect goes live", &|_, g| {
-        g.collab.as_ref().is_some_and(|s| s.is_live("f.txt"))
+        g.collab
+            .session
+            .as_ref()
+            .is_some_and(|s| s.is_live("f.txt"))
     });
     pump_until(
         &mut owner,
@@ -664,9 +688,9 @@ fn collab_never_touches_diff_image_or_sheet_tabs() {
         std::thread::sleep(Duration::from_millis(10));
     }
     let mut owner = App::new(tmp.path().to_path_buf()).unwrap();
-    owner.collab_config = Some((socket.clone(), crate::collab::CollabRole::Owner));
+    owner.collab.config = Some((socket.clone(), crate::collab::CollabRole::Owner));
     let mut guest = App::new(tmp.path().to_path_buf()).unwrap();
-    guest.collab_config = Some((socket.clone(), crate::collab::CollabRole::Guest));
+    guest.collab.config = Some((socket.clone(), crate::collab::CollabRole::Guest));
     owner.open_file_at_launch(&file);
     // The guest's diff tab lands at index 0, AHEAD of the text tab: a
     // first-found-by-path lookup would hand it the session's updates.
@@ -683,7 +707,10 @@ fn collab_never_touches_diff_image_or_sheet_tabs() {
             }
         };
     pump_until(&mut owner, &mut guest, "bootstrap", &|_, g| {
-        g.collab.as_ref().is_some_and(|s| s.is_live("f.txt"))
+        g.collab
+            .session
+            .as_ref()
+            .is_some_and(|s| s.is_live("f.txt"))
     });
     owner.editor.insert_str("OWNER ");
     pump_until(
@@ -727,9 +754,9 @@ fn a_disconnected_guest_can_still_save_its_shared_file() {
         std::thread::sleep(Duration::from_millis(10));
     }
     let mut owner = App::new(tmp.path().to_path_buf()).unwrap();
-    owner.collab_config = Some((socket.clone(), crate::collab::CollabRole::Owner));
+    owner.collab.config = Some((socket.clone(), crate::collab::CollabRole::Owner));
     let mut guest = App::new(tmp.path().to_path_buf()).unwrap();
-    guest.collab_config = Some((socket.clone(), crate::collab::CollabRole::Guest));
+    guest.collab.config = Some((socket.clone(), crate::collab::CollabRole::Guest));
     owner.open_file_at_launch(&file);
     guest.open_file_at_launch(&file);
     let pump_until =
@@ -743,12 +770,15 @@ fn a_disconnected_guest_can_still_save_its_shared_file() {
             }
         };
     pump_until(&mut owner, &mut guest, "bootstrap", &|_, g| {
-        g.collab.as_ref().is_some_and(|s| s.is_live("f.txt"))
+        g.collab
+            .session
+            .as_ref()
+            .is_some_and(|s| s.is_live("f.txt"))
     });
 
     // The link dies; the guest keeps editing offline and saves.
-    guest.collab = None;
-    guest.last_collab_connect = Some(Instant::now());
+    guest.collab.session = None;
+    guest.collab.last_connect = Some(Instant::now());
     guest.editor.insert_str("OFF ");
     guest.save();
     assert_eq!(
@@ -783,9 +813,9 @@ fn offline_edits_in_split_panes_all_survive_a_reconnect() {
         std::thread::sleep(Duration::from_millis(10));
     }
     let mut owner = App::new(tmp.path().to_path_buf()).unwrap();
-    owner.collab_config = Some((socket.clone(), crate::collab::CollabRole::Owner));
+    owner.collab.config = Some((socket.clone(), crate::collab::CollabRole::Owner));
     let mut guest = App::new(tmp.path().to_path_buf()).unwrap();
-    guest.collab_config = Some((socket.clone(), crate::collab::CollabRole::Guest));
+    guest.collab.config = Some((socket.clone(), crate::collab::CollabRole::Guest));
     owner.open_file_at_launch(&file);
     guest.open_file_at_launch(&file);
     let pump_until =
@@ -799,7 +829,10 @@ fn offline_edits_in_split_panes_all_survive_a_reconnect() {
             }
         };
     pump_until(&mut owner, &mut guest, "bootstrap", &|_, g| {
-        g.collab.as_ref().is_some_and(|s| s.is_live("f.txt"))
+        g.collab
+            .session
+            .as_ref()
+            .is_some_and(|s| s.is_live("f.txt"))
     });
     guest.editor.insert_str("SESSION ");
     pump_until(&mut owner, &mut guest, "session edit converges", &|o, g| {
@@ -815,8 +848,8 @@ fn offline_edits_in_split_panes_all_survive_a_reconnect() {
     });
 
     // The link dies. Both panes are edited while offline.
-    guest.collab = None;
-    guest.last_collab_connect = Some(Instant::now());
+    guest.collab.session = None;
+    guest.collab.last_connect = Some(Instant::now());
     guest.editor.insert_str("RIGHT ");
     guest.poll_collab();
     guest.focus_editor_group(true);
@@ -824,7 +857,7 @@ fn offline_edits_in_split_panes_all_survive_a_reconnect() {
     guest.poll_collab();
 
     // Reconnect: every offline edit must reach the owner.
-    guest.last_collab_connect = None;
+    guest.collab.last_connect = None;
     pump_until(
         &mut owner,
         &mut guest,
@@ -846,7 +879,7 @@ fn changing_the_workspace_root_drops_stale_collab_carets() {
     let inner = tmp.path().join("inner");
     std::fs::create_dir_all(&inner).unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.collab_carets.insert(
+    app.collab.carets.insert(
         7,
         CollabCaret {
             file: String::from("src/main.rs"),
@@ -858,7 +891,7 @@ fn changing_the_workspace_root_drops_stale_collab_carets() {
     );
     app.change_workspace_root(inner);
     assert!(
-        app.collab_carets.is_empty(),
+        app.collab.carets.is_empty(),
         "old-workspace carets must not survive a re-root"
     );
 }
@@ -873,7 +906,7 @@ fn solo_guest_never_hosts_the_navigator() {
     app.pair.record_path = tmp.path().join("x.pair.json");
     app.pair.socket = socket.clone();
     app.pair.host_lock_path = tmp.path().join("x.pair-host.lock");
-    app.collab_config = Some((socket, crate::collab::CollabRole::Guest));
+    app.collab.config = Some((socket, crate::collab::CollabRole::Guest));
     app.pair.spawn_override = Some(Box::new(|_| {
         panic!("a solo guest must never spawn the pilot");
     }));
@@ -895,7 +928,7 @@ fn solo_guest_never_hosts_the_navigator() {
 }
 
 /// The AI-stream badge lifecycle: a pilot's StreamState(active) sets
-/// `collab_stream` on a dirty tick, the cancel action broadcasts
+/// `collab.stream` on a dirty tick, the cancel action broadcasts
 /// StreamCancel to the pilot, and StreamState(inactive) clears the badge.
 /// With no active stream, cancel is a hint, not a broadcast.
 #[test]
@@ -918,7 +951,7 @@ fn collab_stream_state_drives_the_badge_and_cancel_broadcasts() {
     }
 
     let mut owner = App::new(tmp.path().to_path_buf()).unwrap();
-    owner.collab_config = Some((socket.clone(), crate::collab::CollabRole::Owner));
+    owner.collab.config = Some((socket.clone(), crate::collab::CollabRole::Owner));
     owner.open_file_at_launch(&file);
 
     // Cancel with no stream: a hint, nothing on the wire required yet.
@@ -934,7 +967,7 @@ fn collab_stream_state_drives_the_badge_and_cancel_broadcasts() {
     // (poll_collab's lazy connect is throttled and can lose that race
     // under a contended parallel suite).
     let deadline = Instant::now() + Duration::from_secs(5);
-    while owner.collab.is_none() {
+    while owner.collab.session.is_none() {
         assert!(Instant::now() < deadline, "owner never joined the relay");
         owner.poll_collab();
         std::thread::sleep(Duration::from_millis(5));
@@ -958,13 +991,13 @@ fn collab_stream_state_drives_the_badge_and_cancel_broadcasts() {
     pilot.send_stream_state("f.txt", true);
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut dirty_on_arrival = false;
-    while owner.collab_stream.is_none() {
+    while owner.collab.stream.is_none() {
         assert!(Instant::now() < deadline, "badge never appeared");
         dirty_on_arrival = owner.poll_collab();
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(dirty_on_arrival, "the badge tick must request a redraw");
-    let stream = owner.collab_stream.as_ref().unwrap();
+    let stream = owner.collab.stream.as_ref().unwrap();
     assert_eq!(
         (stream.name.as_str(), stream.file.as_str()),
         ("pilot", "f.txt")
@@ -988,7 +1021,7 @@ fn collab_stream_state_drives_the_badge_and_cancel_broadcasts() {
     // Stream ends: the badge clears.
     pilot.send_stream_state("f.txt", false);
     let deadline = Instant::now() + Duration::from_secs(5);
-    while owner.collab_stream.is_some() {
+    while owner.collab.stream.is_some() {
         assert!(Instant::now() < deadline, "badge never cleared");
         owner.poll_collab();
         std::thread::sleep(Duration::from_millis(5));
@@ -1107,7 +1140,7 @@ fn collab_caret_label_fade_signals_one_redraw_per_transition() {
         "no carets, no labels, no redraw"
     );
 
-    app.collab_carets.insert(
+    app.collab.carets.insert(
         2,
         CollabCaret {
             file: "f.txt".into(),
@@ -1120,7 +1153,7 @@ fn collab_caret_label_fade_signals_one_redraw_per_transition() {
     assert!(app.collab_labels_dirty(), "fresh tag: one redraw");
     assert!(!app.collab_labels_dirty(), "still visible: quiet");
 
-    app.collab_carets.get_mut(&2).unwrap().last_moved =
+    app.collab.carets.get_mut(&2).unwrap().last_moved =
         std::time::Instant::now() - std::time::Duration::from_secs(3);
     assert!(app.collab_labels_dirty(), "expired tag: one redraw");
     assert!(!app.collab_labels_dirty(), "stays hidden: quiet");

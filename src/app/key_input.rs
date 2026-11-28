@@ -1618,7 +1618,7 @@ impl App {
                 // lands (a keystroke now would race the owner's canonical
                 // text). One gate at the dispatch covers every editor edit
                 // path; the window is the bootstrap round-trip.
-                if let Some(session) = self.collab.as_ref()
+                if let Some(session) = self.collab.session.as_ref()
                     && let Some(file) = self
                         .editor
                         .path

@@ -1004,7 +1004,7 @@ The resident navigator's in-process host. The App spawns the pilot itself, the w
 
 **Two kinds of turn.** Ask turns (`Cmd+K Q`, gutter and selection menus) may edit. Yield turns (`Cmd+K Y`) carry the diff since the navigator's last look and are comment-only.
 
-**A persistent visible caret.** The seat keeps one in the navigator's identity orange (`NAVIGATOR_ACCENT`, the comment-box accent). It parks at the ask/reply row and at every landed note (`PairState::park_caret`; pending parks are resolved by the pump after bootstrap and superseded by any newer explicit caret), and streams along during edits. It is identified by the seat's per-file site ids (`caret_sites`, never the display name), both for coloring and for the `collab_carets` cleanup on every unseat path.
+**A persistent visible caret.** The seat keeps one in the navigator's identity orange (`NAVIGATOR_ACCENT`, the comment-box accent). It parks at the ask/reply row and at every landed note (`PairState::park_caret`; pending parks are resolved by the pump after bootstrap and superseded by any newer explicit caret), and streams along during edits. It is identified by the seat's per-file site ids (`caret_sites`, never the display name), both for coloring and for the `collab.carets` cleanup on every unseat path.
 
 **Teardown.** Dropping the host reverts, hangs up, and grace-kills the claude child. A local seat has no child: its turn queue closes and the worker drains out.
 

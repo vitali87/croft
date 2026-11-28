@@ -1,0 +1,1 @@
+refactor: A multiplayer session's state (the relay connection, the merge bases kept through an outage, the peers' carets and an AI pilot's stream) sits in one group beside its code (#2062). Nothing changes in use.

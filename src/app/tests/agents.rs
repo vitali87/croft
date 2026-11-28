@@ -345,7 +345,7 @@ fn cmd_k_x_cancels_the_ai_stream_and_the_stop_row_follows_the_pilot_caret() {
 
     // A stream into the active file with no pilot caret yet: the top
     // visible row wears the button.
-    app.collab_stream = Some(CollabStreamInfo {
+    app.collab.stream = Some(CollabStreamInfo {
         file: "f.txt".into(),
         name: "pilot".into(),
         site: 7,
@@ -354,7 +354,7 @@ fn cmd_k_x_cancels_the_ai_stream_and_the_stop_row_follows_the_pilot_caret() {
     assert_eq!(app.stream_stop_row(), Some(app.editor.scroll));
 
     // The pilot's ghost caret pins the row.
-    app.collab_carets.insert(
+    app.collab.carets.insert(
         7,
         CollabCaret {
             file: "f.txt".into(),
@@ -367,7 +367,7 @@ fn cmd_k_x_cancels_the_ai_stream_and_the_stop_row_follows_the_pilot_caret() {
     assert_eq!(app.stream_stop_row(), Some(5));
 
     // A stream into a file that is not active here shows no button.
-    app.collab_stream.as_mut().unwrap().file = "other.txt".into();
+    app.collab.stream.as_mut().unwrap().file = "other.txt".into();
     assert_eq!(app.stream_stop_row(), None);
 
     // The palette entry drives the same action.
@@ -436,12 +436,12 @@ fn navigator_record_seats_the_pilot_and_self_appoints_owner() {
         },
     )
     .unwrap();
-    assert!(app.collab_config.is_none(), "plain launch precondition");
+    assert!(app.collab.config.is_none(), "plain launch precondition");
     app.pair.last_check = None;
     assert!(app.maybe_seat_navigator());
     assert!(app.pair.host.is_some(), "pilot must seat");
     assert_eq!(
-        app.collab_config,
+        app.collab.config,
         Some((socket.clone(), crate::collab::CollabRole::Owner)),
         "plain launch self-appoints the owner seat"
     );
@@ -452,7 +452,7 @@ fn navigator_record_seats_the_pilot_and_self_appoints_owner() {
     );
     // The self-appointed seat actually connects.
     let deadline = Instant::now() + Duration::from_secs(5);
-    while app.collab.is_none() {
+    while app.collab.session.is_none() {
         assert!(Instant::now() < deadline, "owner seat never connected");
         app.poll_collab();
         std::thread::sleep(Duration::from_millis(5));
@@ -471,7 +471,7 @@ fn navigator_record_seats_the_pilot_and_self_appoints_owner() {
     let pilot_sites = loop {
         app.poll_collab();
         let sites = app.pair.host.as_ref().unwrap().caret_sites();
-        if sites.iter().any(|s| app.collab_carets.contains_key(s)) {
+        if sites.iter().any(|s| app.collab.carets.contains_key(s)) {
             break sites;
         }
         assert!(
@@ -481,7 +481,7 @@ fn navigator_record_seats_the_pilot_and_self_appoints_owner() {
         std::thread::sleep(Duration::from_millis(10));
     };
     // A human who picked the very same display name is not the navigator.
-    app.collab_carets.insert(
+    app.collab.carets.insert(
         9999,
         CollabCaret {
             file: "f.txt".into(),
@@ -511,11 +511,11 @@ fn navigator_record_seats_the_pilot_and_self_appoints_owner() {
     assert!(
         !pilot_sites
             .iter()
-            .any(|s| app.collab_carets.contains_key(s)),
+            .any(|s| app.collab.carets.contains_key(s)),
         "the unseated navigator's caret must not linger"
     );
     assert!(
-        app.collab_carets.contains_key(&9999),
+        app.collab.carets.contains_key(&9999),
         "a human named like the navigator keeps their caret"
     );
 }
@@ -550,7 +550,7 @@ fn app_seats_local_provider_from_record() {
     app.pair.host_lock_path = tmp.path().join("x.pair-host.lock");
     // Already the owner (skip the relay bootstrap): the test exercises the
     // provider mapping, not collab connect.
-    app.collab_config = Some((socket, crate::collab::CollabRole::Owner));
+    app.collab.config = Some((socket, crate::collab::CollabRole::Owner));
     let seen2 = seen.clone();
     app.pair.spawn_override = Some(Box::new(move |cfg| {
         *seen2.borrow_mut() = Some((cfg.provider.clone(), cfg.model.clone()));
@@ -597,7 +597,7 @@ fn a_dead_navigator_is_not_respawned_until_reactivated() {
     app.pair.host_lock_path = tmp.path().join("x.pair-host.lock");
     // Already the owner (skip the relay bootstrap): the test exercises the
     // death latch, not collab connect.
-    app.collab_config = Some((socket, crate::collab::CollabRole::Owner));
+    app.collab.config = Some((socket, crate::collab::CollabRole::Owner));
     let seats2 = seats.clone();
     app.pair.spawn_override = Some(Box::new(move |_cfg| {
         seats2.set(seats2.get() + 1);
@@ -957,7 +957,7 @@ fn a_workspace_switch_that_drops_this_windows_session_ends_its_stream() {
     // This window hosts the navigator, and its pilot is streaming.
     app.pair.host_lock =
         Some(crate::session::try_acquire_pair_host_lock(&locks.path().join("a.lock")).unwrap());
-    app.collab_stream = Some(crate::app::CollabStreamInfo {
+    app.collab.stream = Some(crate::app::CollabStreamInfo {
         file: String::from("a.rs"),
         name: String::from("nav"),
         site: 2,
@@ -967,11 +967,11 @@ fn a_workspace_switch_that_drops_this_windows_session_ends_its_stream() {
     app.change_workspace_root(b.path().to_path_buf());
 
     assert!(
-        app.collab.is_none(),
+        app.collab.session.is_none(),
         "the session this window hosted is gone"
     );
     assert!(
-        app.collab_stream.is_none(),
+        app.collab.stream.is_none(),
         "and so is the stream it carried, badge and all"
     );
 }
@@ -1333,10 +1333,10 @@ fn a_completed_construct_plus_pause_triggers_a_proactive_look() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.open_file_at_launch(&file);
     // Own the workspace's collab session so the pilot's bootstraps answer.
-    app.collab_config = Some((socket.clone(), crate::collab::CollabRole::Owner));
-    app.last_collab_connect = None;
+    app.collab.config = Some((socket.clone(), crate::collab::CollabRole::Owner));
+    app.collab.last_connect = None;
     let deadline = Instant::now() + Duration::from_secs(5);
-    while app.collab.is_none() {
+    while app.collab.session.is_none() {
         assert!(Instant::now() < deadline, "owner seat never connected");
         app.poll_collab();
         std::thread::sleep(Duration::from_millis(5));
@@ -1405,7 +1405,7 @@ fn set_stream(owner: &mut App, pilot: &mut crate::collab::CollabSession, active:
     use std::time::{Duration, Instant};
     pilot.send_stream_state("f.txt", active);
     let deadline = Instant::now() + Duration::from_secs(5);
-    while owner.collab_stream.is_some() != active {
+    while owner.collab.stream.is_some() != active {
         assert!(Instant::now() < deadline, "the stream state never arrived");
         owner.poll_collab();
         std::thread::sleep(Duration::from_millis(5));

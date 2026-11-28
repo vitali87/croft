@@ -330,7 +330,7 @@ fn turn_done_status_keeps_the_notes_visible() {
     app.pair.last_check = None;
     assert!(app.maybe_seat_navigator());
     let deadline = Instant::now() + Duration::from_secs(5);
-    while app.collab.is_none() {
+    while app.collab.session.is_none() {
         assert!(Instant::now() < deadline, "owner seat never connected");
         app.poll_collab();
         std::thread::sleep(Duration::from_millis(5));

@@ -5386,9 +5386,9 @@ fn typing_into_an_unattached_pane_of_a_live_file_is_gated_not_wiped() {
         std::thread::sleep(Duration::from_millis(10));
     }
     let mut owner = App::new(tmp.path().to_path_buf()).unwrap();
-    owner.collab_config = Some((socket.clone(), crate::collab::CollabRole::Owner));
+    owner.collab.config = Some((socket.clone(), crate::collab::CollabRole::Owner));
     let mut guest = App::new(tmp.path().to_path_buf()).unwrap();
-    guest.collab_config = Some((socket.clone(), crate::collab::CollabRole::Guest));
+    guest.collab.config = Some((socket.clone(), crate::collab::CollabRole::Guest));
     owner.open_file_at_launch(&file);
     guest.open_file_at_launch(&file);
     let pump_until =
@@ -5402,7 +5402,10 @@ fn typing_into_an_unattached_pane_of_a_live_file_is_gated_not_wiped() {
             }
         };
     pump_until(&mut owner, &mut guest, "bootstrap", &|_, g| {
-        g.collab.as_ref().is_some_and(|s| s.is_live("f.txt"))
+        g.collab
+            .session
+            .as_ref()
+            .is_some_and(|s| s.is_live("f.txt"))
     });
     guest.editor.insert_str("SESSION ");
     pump_until(&mut owner, &mut guest, "session edit converges", &|o, g| {

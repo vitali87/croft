@@ -3232,35 +3232,9 @@ pub struct App {
     session_presence_mtime: Option<std::time::SystemTime>,
     /// Cadence gate for the presence poll (stat every 500ms, not every tick).
     last_session_presence_poll: std::time::Instant,
-    /// Phase D independent-viewport collab session (docs/MULTIPLAYER.md):
-    /// per-file replicated documents over the workspace's collab relay.
-    /// None until the lazy connect in `poll_collab` succeeds.
-    collab: Option<crate::collab::CollabSession>,
-    /// The collab socket and role the launch tail exported, read once at
-    /// startup. None when this croft is not a collab participant.
-    collab_config: Option<(PathBuf, crate::collab::CollabRole)>,
-    /// Throttle for the lazy relay connect (the owner starts before any
-    /// guest has spawned the relay, so the first attempts fail by design).
-    last_collab_connect: Option<std::time::Instant>,
-    /// Per-file merge base harvested when the relay link died: the last
-    /// replicated text every participant agreed on. A reconnect bootstrap
-    /// replays only this side's offline delta against it (three-way with the
-    /// owner's snapshot), so owner edits made during the outage survive.
-    collab_offline_base: std::collections::HashMap<String, String>,
-    /// Peers' last-known carets by site id. Painted as ghost carets in the
-    /// peer's color when their file is active, with a name tag while the
-    /// caret is inside its fade window.
-    collab_carets: std::collections::HashMap<u64, CollabCaret>,
-    /// The last caret this croft broadcast, so an unmoved cursor sends
-    /// nothing on the tick.
-    collab_caret_sent: Option<(String, usize, usize)>,
-    /// Whether any caret name tag was inside its fade window last tick;
-    /// flipping to false is the one redraw an expiring tag needs.
-    collab_labels_visible: bool,
-    /// Some while an AI pilot (`croft pair`) streams an edit into a shared
-    /// file: drives the status badge and the gutter stop button; cleared by
-    /// the pilot's StreamState(inactive) broadcast.
-    collab_stream: Option<CollabStreamInfo>,
+    /// The multiplayer session: relay, merge bases, peer carets, AI stream
+    /// (see [`agents_collab::CollabState`]).
+    collab: agents_collab::CollabState,
     /// The AI navigator's seat, pair record, host lock, turn and notes
     /// (see [`agents_collab::PairState`]).
     pair: agents_collab::PairState,
@@ -4361,17 +4335,10 @@ impl App {
             session_carets: std::collections::HashMap::new(),
             session_presence_mtime: None,
             last_session_presence_poll: std::time::Instant::now(),
-            collab: None,
-            collab_config: crate::collab::CollabChannel::env_config(),
-            last_collab_connect: None,
-            collab_offline_base: std::collections::HashMap::new(),
-            collab_carets: std::collections::HashMap::new(),
-            collab_caret_sent: None,
-            collab_stream: None,
+            collab: agents_collab::CollabState::new(),
             pair: agents_collab::PairState::new(&root, !loaded_prefs.disable_proactive_navigator),
             #[cfg(test)]
             kernel_start_override: None,
-            collab_labels_visible: false,
             git_output_log: Vec::new(),
             build_diagnostics: std::collections::HashMap::new(),
             build_diag_files_by_pane: std::collections::HashMap::new(),
@@ -5606,7 +5573,7 @@ pub fn run(
     let result = main_loop(&mut app, &mut terminal);
     // An owner's goodbye goes out now (#1147): the drop-to-local and
     // self-update exits below never drop the App.
-    drop(app.collab.take());
+    drop(app.collab.session.take());
 
     // Snapshot the terminal panel for the next launch (cwds are read live
     // here, so plain `cd`s during the session are captured at quit).

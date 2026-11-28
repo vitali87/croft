@@ -1051,7 +1051,7 @@ impl App {
     /// A file live in a collab session: its tabs follow the session, not
     /// each other, so [`Self::sync_symbol_views`] leaves them alone.
     pub(super) fn symbol_path_is_live(&self, path: &Path) -> bool {
-        self.collab.as_ref().is_some_and(|session| {
+        self.collab.session.as_ref().is_some_and(|session| {
             collab_file_key(&self.tree.root, path).is_some_and(|f| session.is_live(&f))
         })
     }

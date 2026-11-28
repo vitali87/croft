@@ -1487,6 +1487,7 @@ impl App {
                 .and_then(|p| collab_file_key(&self.tree.root, p))
                 .is_some_and(|file| {
                     self.collab
+                        .session
                         .as_ref()
                         .is_some_and(|s| !s.is_local_only(&file) && !s.owner_gone())
                 })
@@ -2352,7 +2353,7 @@ impl App {
         // leaving it: its edits are already live with the owner, who saves.
         let guest = self.is_collab_guest();
         let root = self.tree.root.clone();
-        let collab = &self.collab;
+        let collab = &self.collab.session;
         let owner_saves = |p: &Path| {
             guest
                 && collab_file_key(&root, p)
