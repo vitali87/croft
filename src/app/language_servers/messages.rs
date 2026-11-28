@@ -22,7 +22,7 @@ impl App {
     /// `None` (the server's `End`) clears it.
     pub fn drain_lsp_progress(&mut self) -> bool {
         let mut updates = Vec::new();
-        if let Some(lsp) = self.lsp.as_ref() {
+        if let Some(lsp) = self.lsp.manager.as_ref() {
             while let Some(u) = lsp.drain_server_update() {
                 updates.push(u);
             }
@@ -43,10 +43,10 @@ impl App {
         use crate::lsp::manager::ServerEvent;
         match u.event {
             ServerEvent::Progress(Some(message)) => {
-                self.lsp_progress.insert(u.server, message);
+                self.lsp.progress.insert(u.server, message);
                 true
             }
-            ServerEvent::Progress(None) => self.lsp_progress.remove(&u.server).is_some(),
+            ServerEvent::Progress(None) => self.lsp.progress.remove(&u.server).is_some(),
             // An error a server can't recover from on its own, such as
             // rust-analyzer's "Failed to load workspaces", used to sit in
             // OUTPUT while the status bar said all was well (#1599).
@@ -66,7 +66,7 @@ impl App {
                     self.status = server_message_status(&u.server, &text);
                     return true;
                 }
-                self.lsp_questions.push_back(LspQuestion {
+                self.lsp.questions.push_back(LspQuestion {
                     server: u.server,
                     text,
                     actions,
@@ -98,12 +98,12 @@ impl App {
             .is_some_and(|p| p.purpose == ListPurpose::ServerQuestion);
         if !asking {
             // Its picker was replaced or went away without a pick.
-            self.lsp_question = None;
+            self.lsp.question = None;
         }
         if self.list_picker.is_some() {
             return false;
         }
-        let Some(q) = self.lsp_questions.pop_front() else {
+        let Some(q) = self.lsp.questions.pop_front() else {
             return false;
         };
         let rows = q
@@ -117,7 +117,7 @@ impl App {
             .collect();
         let title = server_message_status(&q.server, &q.text);
         self.status = title.clone();
-        self.lsp_question = Some(q);
+        self.lsp.question = Some(q);
         self.open_list_picker(
             ListPicker::new(ListPurpose::ServerQuestion, title, rows),
             "",
@@ -174,11 +174,12 @@ impl App {
     /// (e.g. `rust-analyzer: Indexing 112/340 33%`). Joins multiple busy
     /// servers with `  ·  ` so a Rust + Python workspace shows both.
     pub(in crate::app) fn lsp_progress_status(&self) -> Option<String> {
-        if self.lsp_progress.is_empty() {
+        if self.lsp.progress.is_empty() {
             return None;
         }
         let mut entries: Vec<String> = self
-            .lsp_progress
+            .lsp
+            .progress
             .iter()
             .map(|(server, msg)| format!("{server}: {msg}"))
             .collect();

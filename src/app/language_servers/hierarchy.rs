@@ -10,7 +10,7 @@ impl App {
     pub fn drain_lsp_call_hierarchy(&mut self) -> bool {
         let mut result = None;
         {
-            let Some(lsp) = self.lsp.as_ref() else {
+            let Some(lsp) = self.lsp.manager.as_ref() else {
                 return false;
             };
             while let Some(r) = lsp.drain_call_hierarchy() {
@@ -96,7 +96,7 @@ impl App {
         let Some(path) = self.editor.path.clone() else {
             return;
         };
-        let Some(lsp) = self.lsp.as_mut() else {
+        let Some(lsp) = self.lsp.manager.as_mut() else {
             self.status = String::from("Call hierarchy: no language server for this file");
             return;
         };
@@ -113,7 +113,7 @@ impl App {
         let Some(path) = self.editor.path.clone() else {
             return;
         };
-        let Some(lsp) = self.lsp.as_mut() else {
+        let Some(lsp) = self.lsp.manager.as_mut() else {
             self.status = String::from("Type hierarchy: no language server for this file");
             return;
         };

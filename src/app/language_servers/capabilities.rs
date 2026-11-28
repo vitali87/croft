@@ -33,6 +33,7 @@ impl App {
             return false;
         };
         self.lsp
+            .manager
             .as_ref()
             .and_then(|lsp| supports(lsp, lang))
             .unwrap_or(false)

@@ -469,21 +469,21 @@ impl App {
     /// started (`true`) or ended (`false`). Split from the polling so tests
     /// drive it without a marker file or the 1 Hz gate.
     pub(super) fn apply_source_build_state(&mut self, building: bool) -> bool {
-        match (building, self.lsp_paused_for_build) {
+        match (building, self.lsp.paused_for_build) {
             (true, false) => {
                 // Nothing running is nothing to pause, and nothing to restart
                 // later either: a manager that failed to start stays down.
-                if self.lsp.is_none() {
+                if self.lsp.manager.is_none() {
                     return false;
                 }
                 // Dropping the manager shuts its servers down, which is what
                 // frees the memory. Its Drop waits up to 3 s for them, so it
                 // runs off the UI thread: nothing the user did asked for a
                 // freeze (the build script waits long enough for it).
-                if let Some(old) = self.lsp.take() {
+                if let Some(old) = self.lsp.manager.take() {
                     fs_watch::offload_drop(old);
                 }
-                self.lsp_paused_for_build = true;
+                self.lsp.paused_for_build = true;
                 // A format-on-save in flight dies with the manager, and its
                 // armed save would otherwise fire on some later, unrelated
                 // format reply. Save now, unformatted, as when a reply fails.
@@ -493,44 +493,45 @@ impl App {
                 // Re-open every tab against the servers that come back. The
                 // diagnostics are kept: they are still the best answer until
                 // the restarted servers publish fresh ones.
-                self.lsp_last_seen.clear();
-                self.lsp_progress.clear();
+                self.lsp.last_seen.clear();
+                self.lsp.progress.clear();
                 let msg = "Language servers stopped while croft builds its update on this host";
                 crate::output::push("Language Servers", crate::output::OutputLevel::Info, msg);
                 self.status = String::from(msg);
                 true
             }
             (false, true) => {
-                self.lsp_paused_for_build = false;
-                self.lsp = match crate::lsp::LspManager::new(self.workspace_root().to_path_buf()) {
-                    Ok(m) => {
-                        m.set_extra_roots(
-                            self.roots.iter().skip(1).map(Path::to_path_buf).collect(),
-                        );
-                        crate::output::push(
-                            "Language Servers",
-                            crate::output::OutputLevel::Info,
-                            "Update build finished; language servers restarted",
-                        );
-                        Some(m)
-                    }
-                    Err(e) => {
-                        let msg = format!("Language servers could not restart: {e}");
-                        crate::output::push(
-                            "Language Servers",
-                            crate::output::OutputLevel::Error,
-                            &msg,
-                        );
-                        self.status = msg;
-                        None
-                    }
-                };
-                self.lsp_last_seen.clear();
-                self.lsp_progress.clear();
+                self.lsp.paused_for_build = false;
+                self.lsp.manager =
+                    match crate::lsp::LspManager::new(self.workspace_root().to_path_buf()) {
+                        Ok(m) => {
+                            m.set_extra_roots(
+                                self.roots.iter().skip(1).map(Path::to_path_buf).collect(),
+                            );
+                            crate::output::push(
+                                "Language Servers",
+                                crate::output::OutputLevel::Info,
+                                "Update build finished; language servers restarted",
+                            );
+                            Some(m)
+                        }
+                        Err(e) => {
+                            let msg = format!("Language servers could not restart: {e}");
+                            crate::output::push(
+                                "Language Servers",
+                                crate::output::OutputLevel::Error,
+                                &msg,
+                            );
+                            self.status = msg;
+                            None
+                        }
+                    };
+                self.lsp.last_seen.clear();
+                self.lsp.progress.clear();
                 // The new manager numbers semantic replies from 0 again; the
                 // old high-water marks would reject every reply for a file
                 // until the new count caught up with the old one.
-                self.semantic_generation_seen.clear();
+                self.lsp.semantic_generation_seen.clear();
                 // A tab closed during the pause was never in `lsp_last_seen`
                 // again, so nothing would drop its diagnostics: drop what no
                 // open buffer owns. That includes workspace-scope diagnostics
@@ -539,7 +540,7 @@ impl App {
                 // and until then keeping them would show findings nothing can
                 // retract.
                 let open = self.open_buffer_paths();
-                self.lsp_diagnostics.retain(|p, _| open.contains(p));
+                self.lsp.diagnostics.retain(|p, _| open.contains(p));
                 self.rebuild_problems();
                 true
             }

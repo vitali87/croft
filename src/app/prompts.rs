@@ -285,7 +285,7 @@ impl App {
 
     pub(super) fn close_list_picker(&mut self) {
         // A server question closed without a pick is answered "no action".
-        self.lsp_question = None;
+        self.lsp.question = None;
         if self.list_picker.take().is_some() {
             self.overlays.popup_clear.request();
             self.overlays.activity.mark_dirty();
@@ -818,7 +818,7 @@ impl App {
         };
         let purpose = picker.purpose;
         let selected = picker.selected;
-        let question = self.lsp_question.take();
+        let question = self.lsp.question.take();
         self.close_list_picker();
         let index = row.id.parse::<usize>().unwrap_or(0);
         match purpose {
@@ -1649,7 +1649,7 @@ impl App {
                 // The prompt captured buffer coordinates; the server wants
                 // UTF-16, so convert here rather than casting the char column.
                 let (line, character) = self.editor.pos_to_utf16(row, col);
-                let Some(lsp) = self.lsp.as_mut() else {
+                let Some(lsp) = self.lsp.manager.as_mut() else {
                     if let Some(p) = self.prompt.as_mut() {
                         p.error = Some("No language server for this file".to_string());
                     }

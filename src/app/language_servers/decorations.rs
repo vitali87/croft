@@ -8,7 +8,7 @@ impl App {
     /// file — the inlay fan-out, seq gate included. Links change no
     /// pixels, so this never asks for a redraw.
     pub fn drain_lsp_document_links(&mut self) {
-        let Some(lsp) = self.lsp.as_ref() else {
+        let Some(lsp) = self.lsp.manager.as_ref() else {
             return;
         };
         let mut updates = Vec::new();
@@ -100,7 +100,7 @@ impl App {
     /// a server that answers before indexing (or lacks real spans) never
     /// erases the indentation/region fallback — the outline's guard.
     pub fn drain_lsp_folding_ranges(&mut self) -> bool {
-        let Some(lsp) = self.lsp.as_ref() else {
+        let Some(lsp) = self.lsp.manager.as_ref() else {
             return false;
         };
         let mut updates = Vec::new();
@@ -109,7 +109,7 @@ impl App {
         }
         let mut changed = false;
         for u in updates {
-            if self.lsp_last_seen.get(&u.path) != Some(&u.seq) {
+            if self.lsp.last_seen.get(&u.path) != Some(&u.seq) {
                 continue;
             }
             if u.ranges.is_empty() {
@@ -129,7 +129,7 @@ impl App {
     /// file — the inlay-hints fan-out, seq gate included. An empty batch
     /// clears the swatches (a stylesheet that lost its last color).
     pub fn drain_lsp_document_colors(&mut self) -> bool {
-        let Some(lsp) = self.lsp.as_ref() else {
+        let Some(lsp) = self.lsp.manager.as_ref() else {
             return false;
         };
         let mut updates = Vec::new();
@@ -161,7 +161,7 @@ impl App {
             return;
         };
         let seq = self.editor.edit_seq;
-        let Some(lsp) = self.lsp.as_mut() else {
+        let Some(lsp) = self.lsp.manager.as_mut() else {
             self.status = String::from("No language server for this file");
             return;
         };
@@ -180,7 +180,7 @@ impl App {
     pub fn drain_lsp_color_presentations(&mut self) -> bool {
         let mut results = Vec::new();
         {
-            let Some(lsp) = self.lsp.as_ref() else {
+            let Some(lsp) = self.lsp.manager.as_ref() else {
                 return false;
             };
             while let Some(r) = lsp.drain_color_presentations() {

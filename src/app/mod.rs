@@ -2545,43 +2545,20 @@ pub struct App {
     /// every render so a splitter drag can clamp to the live viewport.
     last_content_width: u16,
     last_content_height: u16,
-    /// Optional LSP orchestrator. None when LspManager::new failed at
-    /// startup (e.g. the background tokio runtime couldn't spawn); the
-    /// rest of the editor stays fully functional without it.
-    pub lsp: Option<crate::lsp::LspManager>,
-    /// Per-path snapshot of the last edit_seq we forwarded to the LSP
-    /// manager. sync_lsp diffs every tick against the current tabs to
-    /// emit did_open / did_change / did_close.
-    lsp_last_seen: std::collections::HashMap<PathBuf, u64>,
+    /// The language servers: manager, sync, diagnostics, progress, questions
+    /// (see [`language_servers::LspState`]).
+    lsp: language_servers::LspState,
     /// Whether this session already looked for shellcheck when a shell
     /// script was opened (#1511), so its notice is shown at most once.
     shell_lint_notice_shown: bool,
     /// The PATH the helper tools servers shell out to are looked up in
     /// (#1511): croft's own, which its servers inherit.
     tool_search_path: Option<std::ffi::OsString>,
-    /// Newest semantic-token request generation already applied per path.
-    /// `seq` alone is not enough: two full requests can be in flight at the
-    /// same seq (`sync_lsp` plus a server-driven refresh), and the request
-    /// retry loop emits an EMPTY batch once its backoff is exhausted, so a
-    /// late empty loser would otherwise blank a good overlay and be written
-    /// to the content-keyed disk cache.
-    semantic_generation_seen: std::collections::HashMap<PathBuf, u64>,
-    /// Diagnostics store: per file, the latest set from each server. Servers
-    /// push complete sets via `textDocument/publishDiagnostics`, so the inner
-    /// map is keyed by server name (ty + ruff can both publish for one file)
-    /// and a server's entry is replaced wholesale on each batch (an empty
-    /// batch removes it). The merged value for the visible file is handed to
-    /// the editor; the store outlives tab switches so re-focusing a file shows
-    /// its squiggles again without waiting for the next server push.
     /// Open-buffer paths as of the last PROBLEMS rebuild. Open Files scope
     /// filters on this set, so the panel must refresh when the set changes —
     /// not only when diagnostics do, or opening a file with stored
     /// diagnostics would show nothing until unrelated churn happened by.
     problems_open_set: std::collections::BTreeSet<PathBuf>,
-    lsp_diagnostics: std::collections::HashMap<
-        PathBuf,
-        std::collections::HashMap<String, Vec<crate::lsp::manager::Diagnostic>>,
-    >,
     /// Markdown-lint's own edit-seq cursor, mirroring `lsp_last_seen` but
     /// independent of the LSP: `.md` files get linted whether or not any
     /// language server is running (there is none for Markdown), so this
@@ -2663,16 +2640,6 @@ pub struct App {
     /// Every (file, source key) SARIF diagnostics were published under, so a
     /// closed log's results can be withdrawn exactly.
     sarif_published: Vec<(PathBuf, String)>,
-    /// Live LSP work-done progress, keyed by server name (e.g. "rust-analyzer"
-    /// -> "Indexing 112/340 33%"). An entry exists only while that server has
-    /// an active task; the status bar surfaces it so a busy-priming server is
-    /// never mistaken for a dead one. Cleared on the server's `End`.
-    lsp_progress: std::collections::HashMap<String, String>,
-    /// Language-server questions (`window/showMessageRequest`, #1599)
-    /// waiting for the list picker, oldest first, and the one it shows.
-    /// Dropping one answers the server "no action".
-    lsp_questions: std::collections::VecDeque<LspQuestion>,
-    lsp_question: Option<LspQuestion>,
     /// Code completion's popup, request, re-asks and resolve
     /// (see [`completion::CompletionState`]).
     completion: completion::CompletionState,
@@ -2968,11 +2935,6 @@ pub struct App {
     /// the local cross-build writes when it finishes shipping a newer
     /// binary, so the running croft can re-exec into it in place.
     update_watch: Option<crate::update_watch::UpdateWatch>,
-    /// True while this croft has stopped its language servers because a
-    /// source build of croft is compiling on the same host (#694), so the
-    /// servers are restarted once it ends. Only a remote-launched croft
-    /// ever sets it.
-    lsp_paused_for_build: bool,
     /// When the build marker was last checked: it is a file read, so at
     /// most once a second rather than every loop iteration.
     build_marker_checked: Option<std::time::Instant>,
@@ -4202,7 +4164,7 @@ impl App {
             osk_auto: crate::iterm2_inline::detect_osk_auto(),
             last_content_width: 0,
             last_content_height: 0,
-            lsp: crate::startup_trace::after(
+            lsp: language_servers::LspState::new(crate::startup_trace::after(
                 "language server manager built",
                 match crate::lsp::LspManager::new(root.clone()) {
                     Ok(m) => Some(m),
@@ -4211,13 +4173,10 @@ impl App {
                         None
                     }
                 },
-            ),
-            lsp_last_seen: std::collections::HashMap::new(),
+            )),
             shell_lint_notice_shown: false,
             tool_search_path: std::env::var_os("PATH"),
-            semantic_generation_seen: std::collections::HashMap::new(),
             problems_open_set: std::collections::BTreeSet::new(),
-            lsp_diagnostics: std::collections::HashMap::new(),
             markdown_lint_last_seen: std::collections::HashMap::new(),
             live_run_files: std::collections::HashSet::new(),
             live_run_sent: std::collections::HashMap::new(),
@@ -4256,9 +4215,6 @@ impl App {
             sarif_added_polled: None,
             sarif_step_signature: None,
             sarif_published: Vec::new(),
-            lsp_progress: std::collections::HashMap::new(),
-            lsp_questions: std::collections::VecDeque::new(),
-            lsp_question: None,
             completion: completion::CompletionState::new(),
             editor_vim_chord: EditorVimChord::default(),
             cmd_k_leader: None,
@@ -4277,7 +4233,6 @@ impl App {
             connect_auth: None,
             install_session: None,
             update_watch: None,
-            lsp_paused_for_build: false,
             build_marker_checked: None,
             drift_probe: None,
             local_drift: None,
@@ -6169,7 +6124,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 // the first file open (#27). Asked now rather than while the
                 // editor was built, so a server's start never competes with
                 // the first frame.
-                if let Some(lsp) = app.lsp.as_ref() {
+                if let Some(lsp) = app.lsp.manager.as_ref() {
                     lsp.prewarm_workspace();
                 }
                 crate::startup_trace::finish();

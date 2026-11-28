@@ -205,13 +205,13 @@ impl App {
         if self.approval_check.is_some() {
             return;
         }
-        let Some(lsp) = self.lsp.as_ref() else {
+        let Some(lsp) = self.lsp.manager.as_ref() else {
             return;
         };
         if crate::lsp::Language::from_path(&path).is_none() {
             return;
         }
-        let opened = !self.lsp_last_seen.contains_key(&path);
+        let opened = !self.lsp.last_seen.contains_key(&path);
         if opened {
             lsp.open_doc(path.clone(), after);
         } else {
@@ -232,17 +232,17 @@ impl App {
         };
         // `sync_lsp` keeps a file open for a tab in any split group (#915).
         let tab_has_it = self.open_buffer_paths().contains(&check.path);
-        if tab_has_it && (!check.opened || !self.lsp_last_seen.contains_key(&check.path)) {
+        if tab_has_it && (!check.opened || !self.lsp.last_seen.contains_key(&check.path)) {
             // A seq no tab has makes `sync_lsp` send the buffer's text next
             // tick, over the proposal's. (A tab opened during a check of a
             // file the check had opened needs the same: the server has it
             // open already, with the proposal.)
-            self.lsp_last_seen.insert(check.path, u64::MAX);
+            self.lsp.last_seen.insert(check.path, u64::MAX);
         } else if check.opened {
-            if let Some(lsp) = self.lsp.as_ref() {
+            if let Some(lsp) = self.lsp.manager.as_ref() {
                 lsp.close_doc(check.path.clone());
             }
-            self.lsp_last_seen.remove(&check.path);
+            self.lsp.last_seen.remove(&check.path);
         }
     }
 
@@ -3209,7 +3209,8 @@ impl App {
             .into_iter()
             .next()?;
         let source = self
-            .lsp_diagnostics
+            .lsp
+            .diagnostics
             .get(&path)
             .and_then(|by_server| {
                 by_server.iter().find_map(|(server, diags)| {

@@ -19,7 +19,7 @@ impl App {
         }
         let lang_known = self.editor_language().is_some();
         if lang_known
-            && self.lsp.is_some()
+            && self.lsp.manager.is_some()
             && let Some(path) = self.editor.path.clone()
         {
             let seq = self.editor.edit_seq;
@@ -34,7 +34,7 @@ impl App {
                 pending.presses += 1;
                 return;
             }
-            if let Some(lsp) = self.lsp.as_mut() {
+            if let Some(lsp) = self.lsp.manager.as_mut() {
                 let id = lsp.request_selection_ranges(path.clone(), positions.clone());
                 self.selection_range_request = Some(PendingSelectionRanges {
                     id,
@@ -65,7 +65,7 @@ impl App {
     /// server's chains or resolve the queued presses via tree-sitter
     /// when the request came back unsupported/empty.
     pub(in crate::app) fn drain_lsp_selection_ranges(&mut self) -> bool {
-        let Some(lsp) = self.lsp.as_ref() else {
+        let Some(lsp) = self.lsp.manager.as_ref() else {
             return false;
         };
         let mut results = Vec::new();
@@ -123,7 +123,7 @@ impl App {
         let eligible = self.editor.diff.is_none()
             && self.editor.sheet.is_none()
             && self.editor.image.is_none()
-            && self.lsp.is_some();
+            && self.lsp.manager.is_some();
         let Some(path) = self.editor.path.clone().filter(|_| eligible) else {
             self.occ_observed = None;
             self.occurrences_request = None;
@@ -152,7 +152,7 @@ impl App {
             return false;
         }
         let (uline, uchar) = self.editor.pos_to_utf16(cur.row, cur.col);
-        let Some(lsp) = self.lsp.as_mut() else {
+        let Some(lsp) = self.lsp.manager.as_mut() else {
             return false;
         };
         let id = lsp.request_document_highlights(cur.path.clone(), uline, uchar);
@@ -166,7 +166,7 @@ impl App {
     pub fn drain_lsp_document_highlights(&mut self) -> bool {
         let mut results = Vec::new();
         {
-            let Some(lsp) = self.lsp.as_ref() else {
+            let Some(lsp) = self.lsp.manager.as_ref() else {
                 return false;
             };
             while let Some(r) = lsp.drain_document_highlights() {

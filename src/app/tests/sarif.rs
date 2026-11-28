@@ -696,7 +696,8 @@ fn an_open_sarif_log_publishes_its_results_as_diagnostics() {
     assert!(app.sync_sarif_diagnostics(), "publishing is a change");
     let target = tmp.path().join("src/a.rs");
     let by_source = app
-        .lsp_diagnostics
+        .lsp
+        .diagnostics
         .get(&target)
         .expect("the result's file has diagnostics");
     let diags = by_source.get("SARIF: lint").expect("keyed by the tool");
@@ -732,12 +733,13 @@ fn closing_the_sarif_tab_withdraws_its_diagnostics() {
     app.editor.open(&log).unwrap();
     app.sync_sarif_diagnostics();
     let target = tmp.path().join("src/a.rs");
-    assert!(app.lsp_diagnostics.contains_key(&target));
+    assert!(app.lsp.diagnostics.contains_key(&target));
     // Replace the log's tab with an ordinary file: no SARIF view is open.
     app.editor.open(&target).unwrap();
     assert!(app.sync_sarif_diagnostics(), "withdrawing is a change");
     assert!(
-        app.lsp_diagnostics
+        app.lsp
+            .diagnostics
             .get(&target)
             .is_none_or(|m| !m.contains_key("SARIF: lint")),
         "nothing left behind"
@@ -834,7 +836,8 @@ fn sarif_fix_tab_previews_and_f_applies_the_fix_as_an_unsaved_edit() {
         again.sync_sarif_diagnostics();
         assert!(
             again
-                .lsp_diagnostics
+                .lsp
+                .diagnostics
                 .get(&tmp.path().join("q.rs"))
                 .is_none_or(|m| m.values().all(|v| v.is_empty())),
             "fixed results are withdrawn from the editor"

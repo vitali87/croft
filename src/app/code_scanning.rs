@@ -135,10 +135,10 @@ impl App {
         // Withdraw everything published before, then publish afresh.
         let mut touched: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
         for (target, key) in std::mem::take(&mut self.sarif_published) {
-            if let Some(by_source) = self.lsp_diagnostics.get_mut(&target) {
+            if let Some(by_source) = self.lsp.diagnostics.get_mut(&target) {
                 by_source.remove(&key);
                 if by_source.is_empty() {
-                    self.lsp_diagnostics.remove(&target);
+                    self.lsp.diagnostics.remove(&target);
                 }
             }
             touched.insert(target);
@@ -214,7 +214,8 @@ impl App {
             }
         }
         for ((target, key), diags) in published {
-            self.lsp_diagnostics
+            self.lsp
+                .diagnostics
                 .entry(target.clone())
                 .or_default()
                 .insert(key.clone(), diags);

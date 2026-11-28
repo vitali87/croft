@@ -219,6 +219,7 @@ fn caret_hover_app(col: usize) -> (App, tempfile::TempDir) {
 
 fn answer_hover(app: &App, request_id: u64, text: &str) {
     app.lsp
+        .manager
         .as_ref()
         .unwrap()
         .push_hover_for_test(crate::lsp::manager::HoverResult {
@@ -680,17 +681,17 @@ fn changing_workspace_root_rebinds_the_lsp_manager_to_the_new_root() {
     // Pretend a file from the old root is already open with the LSP so we can
     // prove the seen-map is reset (otherwise sync_lsp would never re-open it
     // against the new server).
-    app.lsp_last_seen.insert(tmp.path().join("stale.rs"), 7);
+    app.lsp.last_seen.insert(tmp.path().join("stale.rs"), 7);
 
     app.change_workspace_root(inner.clone());
 
     assert_eq!(
-        app.lsp.as_ref().unwrap().workspace_root(),
+        app.lsp.manager.as_ref().unwrap().workspace_root(),
         inner,
         "rust-analyzer's workspace folder must follow the Explorer root; left at the launch dir (e.g. ~/Documents, which has no Cargo.toml) every opened .rs comes back as an unlinked-file with no IDE services"
     );
     assert!(
-        app.lsp_last_seen.is_empty(),
+        app.lsp.last_seen.is_empty(),
         "the LSP seen-map must be cleared on re-root so the next sync_lsp re-opens every live editor tab against the freshly-rooted server"
     );
 }
@@ -949,6 +950,7 @@ fn completion_reply_app() -> (
     app.editor.cursor_col = 9;
     let tx = app
         .lsp
+        .manager
         .as_mut()
         .expect("a test-built App runs a manager")
         .completion_reply_sender_for_test();
@@ -1140,7 +1142,11 @@ fn an_incomplete_re_ask_waits_until_the_edit_is_synced() {
 fn typing_completion_app(text: &str, triggers: &str) -> (tempfile::TempDir, App) {
     let (tmp, app) = word_completion_app(&[("demo.py", text)]);
     let path = app.editor.path.clone().expect("demo.py is open");
-    let lsp = app.lsp.as_ref().expect("a test-built App runs a manager");
+    let lsp = app
+        .lsp
+        .manager
+        .as_ref()
+        .expect("a test-built App runs a manager");
     lsp.set_completion_triggers_for_test(&path, triggers);
     (tmp, app)
 }
@@ -1427,7 +1433,7 @@ fn a_typed_full_stop_does_not_open_the_word_list() {
 fn a_server_s_own_items_are_not_mixed_with_words() {
     let (_tmp, mut app) = word_completion_app(&[("notes.txt", "load_words\nlo")]);
     let path = app.editor.path.clone().unwrap();
-    let lsp = app.lsp.as_mut().unwrap();
+    let lsp = app.lsp.manager.as_mut().unwrap();
     let tx = lsp.completion_reply_sender_for_test();
     lsp.set_document_servers_for_test(&path, &["srv"]);
     app.trigger_completion();
@@ -1446,7 +1452,7 @@ fn a_server_s_own_items_are_not_mixed_with_words() {
 fn a_server_with_nothing_to_offer_leaves_the_words() {
     let (_tmp, mut app) = word_completion_app(&[("notes.txt", "load_words\nlo")]);
     let path = app.editor.path.clone().unwrap();
-    let lsp = app.lsp.as_mut().unwrap();
+    let lsp = app.lsp.manager.as_mut().unwrap();
     let tx = lsp.completion_reply_sender_for_test();
     lsp.set_document_servers_for_test(&path, &["srv"]);
     app.trigger_completion();
@@ -1463,7 +1469,12 @@ fn a_late_server_list_replaces_the_words_and_an_empty_one_keeps_them() {
     // user's place in them; a real list replaces them.
     let (_tmp, mut app) = word_completion_app(&[("notes.txt", "load_a load_b\nlo")]);
     let path = app.editor.path.clone().unwrap();
-    let tx = app.lsp.as_mut().unwrap().completion_reply_sender_for_test();
+    let tx = app
+        .lsp
+        .manager
+        .as_mut()
+        .unwrap()
+        .completion_reply_sender_for_test();
     app.trigger_completion();
     assert_eq!(popup_labels(&app), ["load_a", "load_b"]);
     app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
@@ -2140,7 +2151,7 @@ fn diagnostics_store_applies_to_the_active_editor_on_drain() {
         String::from("vtsls"),
         vec![diag(6, 7, DiagnosticSeverity::Error)],
     );
-    app.lsp_diagnostics.insert(file.clone(), by_server);
+    app.lsp.diagnostics.insert(file.clone(), by_server);
     // Nothing arrives on the channel, but the active file's diagnostics are
     // unapplied (a "tab switch"), so the drain must push the stored set in.
     let changed = app.drain_lsp_diagnostics();
@@ -2170,7 +2181,7 @@ fn merged_diagnostics_layers_every_server_for_a_file() {
         String::from("ruff"),
         vec![diag(2, 3, DiagnosticSeverity::Warning)],
     );
-    app.lsp_diagnostics.insert(file.clone(), by_server);
+    app.lsp.diagnostics.insert(file.clone(), by_server);
     let merged = app.merged_diagnostics(&file);
     assert_eq!(
         merged.len(),
@@ -3642,6 +3653,7 @@ fn rust_analyzer_commands_are_offered_where_it_serves_the_file() {
     let mut app = app_with_open_file(tmp.path(), "main.rs", "fn main() {}\n");
     let path = app.editor.path.clone().unwrap();
     app.lsp
+        .manager
         .as_ref()
         .expect("a test App has an LSP manager")
         .set_document_clients_for_test(&path, &["rust-analyzer"]);
@@ -3665,6 +3677,7 @@ fn rust_analyzer_commands_are_hidden_where_it_does_not_serve_the_file() {
     let mut app = app_with_open_file(tmp.path(), "m.py", "x = 1\n");
     let path = app.editor.path.clone().unwrap();
     app.lsp
+        .manager
         .as_ref()
         .unwrap()
         .set_document_clients_for_test(&path, &["basedpyright"]);
@@ -3681,7 +3694,7 @@ fn rust_analyzer_commands_stay_offered_after_it_stops_reporting_diagnostics() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(tmp.path(), "main.rs", "fn main() {}\n");
     let path = app.editor.path.clone().unwrap();
-    let lsp = app.lsp.as_ref().unwrap();
+    let lsp = app.lsp.manager.as_ref().unwrap();
     lsp.set_document_clients_for_test(&path, &["rust-analyzer"]);
     lsp.set_document_servers_for_test(&path, &[]);
     assert_eq!(rust_palette_rows(&mut app).len(), 5);
@@ -3702,6 +3715,7 @@ fn app_awaiting_rust_analyzer(
     );
     let path = app.editor.path.clone().unwrap();
     app.lsp
+        .manager
         .as_ref()
         .unwrap()
         .set_document_clients_for_test(&path, &["rust-analyzer"]);
@@ -3831,10 +3845,16 @@ fn a_rust_command_without_rust_analyzer_says_so_and_sends_nothing() {
 fn a_source_build_pauses_the_language_servers_and_its_end_restarts_them() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    assert!(app.lsp.is_some(), "precondition: a manager is running");
+    assert!(
+        app.lsp.manager.is_some(),
+        "precondition: a manager is running"
+    );
 
     assert!(app.apply_source_build_state(true));
-    assert!(app.lsp.is_none(), "the servers must stop for the build");
+    assert!(
+        app.lsp.manager.is_none(),
+        "the servers must stop for the build"
+    );
     assert!(
         !app.apply_source_build_state(true),
         "a build still running changes nothing"
@@ -3842,17 +3862,17 @@ fn a_source_build_pauses_the_language_servers_and_its_end_restarts_them() {
 
     assert!(app.apply_source_build_state(false));
     assert!(
-        app.lsp.is_some(),
+        app.lsp.manager.is_some(),
         "the servers must come back once the build ends"
     );
     assert!(!app.apply_source_build_state(false));
 
     // Nothing running is nothing to pause, and nothing to start later: a
     // manager that failed to start is not brought up by an unrelated build.
-    app.lsp = None;
+    app.lsp.manager = None;
     assert!(!app.apply_source_build_state(true));
     assert!(!app.apply_source_build_state(false));
-    assert!(app.lsp.is_none());
+    assert!(app.lsp.manager.is_none());
 }
 
 /// #694: re-rooting while a build has the language servers stopped must not
@@ -3864,17 +3884,18 @@ fn a_reroot_during_a_source_build_leaves_the_servers_stopped() {
     let other = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     assert!(app.apply_source_build_state(true));
-    assert!(app.lsp.is_none());
+    assert!(app.lsp.manager.is_none());
 
     app.change_workspace_root(other.path().to_path_buf());
     assert!(
-        app.lsp.is_none(),
+        app.lsp.manager.is_none(),
         "a re-root started the servers while the build still runs"
     );
 
     assert!(app.apply_source_build_state(false));
     let lsp = app
         .lsp
+        .manager
         .as_ref()
         .expect("the build's end restarts the servers");
     assert_eq!(
@@ -3895,19 +3916,22 @@ fn restart_all_language_servers_starts_fresh_servers() {
     std::fs::write(&file, "x = 1\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.editor.open(&file).unwrap();
-    assert!(app.lsp.is_some());
+    assert!(app.lsp.manager.is_some());
     let mut by_server = std::collections::HashMap::new();
     by_server.insert(
         String::from("ty"),
         vec![diag(0, 1, DiagnosticSeverity::Error)],
     );
-    app.lsp_diagnostics.insert(file.clone(), by_server);
+    app.lsp.diagnostics.insert(file.clone(), by_server);
     app.rebuild_problems();
-    app.lsp_last_seen.insert(file.clone(), 7);
+    app.lsp.last_seen.insert(file.clone(), 7);
     app.run_command(crate::widgets::command_palette::Command::RestartLanguageServers);
-    assert!(app.lsp.is_some(), "a new manager serves the workspace");
-    assert!(app.lsp_last_seen.is_empty(), "every tab is re-opened");
-    assert!(app.lsp_diagnostics.is_empty(), "stale diagnostics are gone");
+    assert!(
+        app.lsp.manager.is_some(),
+        "a new manager serves the workspace"
+    );
+    assert!(app.lsp.last_seen.is_empty(), "every tab is re-opened");
+    assert!(app.lsp.diagnostics.is_empty(), "stale diagnostics are gone");
     assert_eq!(app.status, "Restarted all language servers");
     let logged = crate::output::snapshot("Language Servers").unwrap_or_default();
     assert!(
@@ -3954,12 +3978,12 @@ fn the_restarts_refuse_without_a_file_or_during_a_build() {
         app.status,
         "Restart for This File needs a file open in the editor"
     );
-    app.lsp_last_seen.insert(tmp.path().join("kept.py"), 3);
-    app.lsp = None;
-    app.lsp_paused_for_build = true;
+    app.lsp.last_seen.insert(tmp.path().join("kept.py"), 3);
+    app.lsp.manager = None;
+    app.lsp.paused_for_build = true;
     app.run_command(crate::widgets::command_palette::Command::RestartLanguageServers);
-    assert!(app.lsp.is_none(), "nothing starts beside the build");
-    assert_eq!(app.lsp_last_seen.len(), 1);
+    assert!(app.lsp.manager.is_none(), "nothing starts beside the build");
+    assert_eq!(app.lsp.last_seen.len(), 1);
     assert!(app.status.contains("builds its update"), "{}", app.status);
 }
 
@@ -3971,11 +3995,11 @@ fn resuming_after_a_build_forgets_the_old_semantic_generations() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let p = tmp.path().join("a.rs");
-    app.semantic_generation_seen.insert(p.clone(), 500);
+    app.lsp.semantic_generation_seen.insert(p.clone(), 500);
     assert!(app.apply_source_build_state(true));
     assert!(app.apply_source_build_state(false));
     assert!(
-        semantic_reply_is_current(app.semantic_generation_seen.get(&p).copied(), 0),
+        semantic_reply_is_current(app.lsp.semantic_generation_seen.get(&p).copied(), 0),
         "the restarted server's first reply must be accepted"
     );
 }
@@ -3988,17 +4012,18 @@ fn resuming_after_a_build_drops_diagnostics_no_open_tab_owns() {
     let mut app = app_with_open_file(tmp.path(), "open.rs", "fn main() {}");
     let open = app.editor.path.clone().unwrap();
     let closed = tmp.path().join("closed.rs");
-    app.lsp_diagnostics.insert(open.clone(), Default::default());
-    app.lsp_diagnostics
+    app.lsp.diagnostics.insert(open.clone(), Default::default());
+    app.lsp
+        .diagnostics
         .insert(closed.clone(), Default::default());
     assert!(app.apply_source_build_state(true));
     assert!(app.apply_source_build_state(false));
     assert!(
-        !app.lsp_diagnostics.contains_key(&closed),
+        !app.lsp.diagnostics.contains_key(&closed),
         "a tab closed during the build kept its diagnostics"
     );
     assert!(
-        app.lsp_diagnostics.contains_key(&open),
+        app.lsp.diagnostics.contains_key(&open),
         "an open tab's diagnostics stay until the new servers publish"
     );
 }
@@ -4132,7 +4157,13 @@ fn the_language_servers_get_the_files_final_newline() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(tmp.path(), "shop.py", SHOP_PY);
     let file = app.editor.path.clone().unwrap();
-    let synced = |app: &App| app.lsp.as_ref().unwrap().synced_text_for_test(&file);
+    let synced = |app: &App| {
+        app.lsp
+            .manager
+            .as_ref()
+            .unwrap()
+            .synced_text_for_test(&file)
+    };
     app.sync_lsp();
     assert_eq!(synced(&app).as_deref(), Some(SHOP_PY));
     insert_at_line_end(&mut app, 1, "  # all");
@@ -4222,12 +4253,12 @@ fn a_live_build_marker_pauses_the_servers_and_its_removal_resumes_them() {
             std::fs::write(sidecar, boot).unwrap();
         }
         assert!(app.poll_source_build_marker());
-        assert!(app.lsp.is_none() && app.lsp_paused_for_build);
+        assert!(app.lsp.manager.is_none() && app.lsp.paused_for_build);
 
         std::fs::remove_file(&marker).unwrap();
         app.build_marker_checked = None; // past the once-a-second gate
         assert!(app.poll_source_build_marker());
-        assert!(app.lsp.is_some() && !app.lsp_paused_for_build);
+        assert!(app.lsp.manager.is_some() && !app.lsp.paused_for_build);
     });
 }
 
@@ -4559,13 +4590,13 @@ fn a_reroot_forgets_the_old_semantic_generations() {
     let other = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let p = tmp.path().join("a.rs");
-    app.semantic_generation_seen.insert(p.clone(), 500);
+    app.lsp.semantic_generation_seen.insert(p.clone(), 500);
     app.change_workspace_root(other.path().to_path_buf());
     assert!(
-        semantic_reply_is_current(app.semantic_generation_seen.get(&p).copied(), 0),
+        semantic_reply_is_current(app.lsp.semantic_generation_seen.get(&p).copied(), 0),
         "the new server's first reply must be accepted"
     );
-    assert!(app.lsp.is_some(), "the new root's servers started");
+    assert!(app.lsp.manager.is_some(), "the new root's servers started");
 }
 
 /// #694: an "all clear" from the last server reporting on a path drops the
@@ -4620,7 +4651,7 @@ fn a_pull_answer_keeps_what_the_same_server_pushed() {
     // The file opens and rust-analyzer's pull finds nothing of its own.
     app.apply_diagnostics_updates(vec![update(true, Vec::new())]);
     app.rebuild_problems();
-    assert_eq!(app.problems.error_count(), 1, "{:?}", app.lsp_diagnostics);
+    assert_eq!(app.problems.error_count(), 1, "{:?}", app.lsp.diagnostics);
     assert_eq!(app.merged_diagnostics(&path), vec![moved.clone()]);
     assert_eq!(app.problems.groups()[0].items[0].source, "rust-analyzer");
     // A save: cargo check pushes again, then the pull finds a warning.
@@ -4996,6 +5027,7 @@ fn an_empty_format_reply_from_another_server_does_not_blame_shfmt() {
 /// would.
 fn register_bash_servers(app: &mut App, names: &[&'static str]) {
     app.lsp
+        .manager
         .as_mut()
         .expect("a test App has an LSP manager")
         .set_registered_servers_for_test(crate::lsp::Language::BASH, names);

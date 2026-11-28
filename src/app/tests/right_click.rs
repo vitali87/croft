@@ -210,7 +210,7 @@ fn the_problem_menu() {
             origin: None,
         }],
     );
-    app.lsp_diagnostics.insert(file.clone(), by_server);
+    app.lsp.diagnostics.insert(file.clone(), by_server);
     app.rebuild_problems();
     app.bottom_panel_tab = BottomPanelTab::Problems;
     app.focus_pane(Pane::Editor);
@@ -768,7 +768,7 @@ fn shift_f10_in_problems_opens_the_first_problems_menu() {
             warning(2, "`f2` is never used"),
         ],
     );
-    app.lsp_diagnostics.insert(file.clone(), by_server);
+    app.lsp.diagnostics.insert(file.clone(), by_server);
     app.rebuild_problems();
     app.bottom_panel_tab = BottomPanelTab::Problems;
     app.focus_pane(Pane::Terminal);

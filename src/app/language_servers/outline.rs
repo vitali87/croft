@@ -68,7 +68,7 @@ impl App {
         }
         // `lsp_last_seen` carries the edit seq the manager last saw for an open
         // doc; absent means no language server tracks this file.
-        let seq = self.lsp_last_seen.get(&path).copied();
+        let seq = self.lsp.last_seen.get(&path).copied();
         let key = (path.clone(), seq);
         if self.outline_synced.as_ref() != Some(&key) {
             self.outline_synced = Some(key);
@@ -91,7 +91,7 @@ impl App {
                 // parse's key unchanged and left it on "Loading" (#2586).
                 self.outline_parsed_for = None;
             }
-            if lsp_pending && let (Some(lsp), Some(seq)) = (self.lsp.as_ref(), seq) {
+            if lsp_pending && let (Some(lsp), Some(seq)) = (self.lsp.manager.as_ref(), seq) {
                 lsp.request_document_symbols(path, seq);
             }
         }
@@ -234,7 +234,7 @@ impl App {
     /// that knows which request is outstanding.
     pub fn drain_lsp_document_symbols(&mut self) -> bool {
         let mut replies = Vec::new();
-        if let Some(lsp) = self.lsp.as_ref() {
+        if let Some(lsp) = self.lsp.manager.as_ref() {
             while let Some(r) = lsp.drain_document_symbols() {
                 replies.push((r.path, r.seq, r.symbols));
             }

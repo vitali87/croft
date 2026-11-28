@@ -1427,13 +1427,13 @@ impl App {
     /// a server like ty watches nothing itself, so a `git checkout` or an
     /// agent's edit to a file no tab holds stayed stale in it.
     pub(super) fn forward_disk_changes_to_lsp(&mut self, drain: &fs_watch::FsDrain) {
-        if self.lsp.is_none() {
+        if self.lsp.manager.is_none() {
             return;
         }
         let known = self.file_finder_index.clone();
         let known = known.as_deref().map_or(&[][..], Vec::as_slice);
         let changes = fs_watch::watched_file_changes(drain, known);
-        if let Some(lsp) = self.lsp.as_mut().filter(|_| !changes.is_empty()) {
+        if let Some(lsp) = self.lsp.manager.as_mut().filter(|_| !changes.is_empty()) {
             lsp.did_change_watched_files(changes);
         }
     }
@@ -2020,7 +2020,7 @@ impl App {
             .send(SearchRequest::SetRoots(roots.clone()));
         self.search_roots_changed();
         self.search.roots = roots.clone();
-        if let Some(lsp) = &self.lsp {
+        if let Some(lsp) = &self.lsp.manager {
             lsp.set_extra_roots(roots.into_iter().skip(1).collect());
         }
     }
@@ -2212,10 +2212,10 @@ impl App {
         // starting them now would put rust-analyzer back beside the compile.
         // The manager drops either way, and the end of the build starts one
         // at the new root, since the resume reads `workspace_root()`.
-        if let Some(old) = self.lsp.take() {
+        if let Some(old) = self.lsp.manager.take() {
             fs_watch::offload_drop(old);
         }
-        self.lsp = match self.lsp_paused_for_build {
+        self.lsp.manager = match self.lsp.paused_for_build {
             true => None,
             false => match crate::lsp::LspManager::new(new_root.clone()) {
                 Ok(m) => Some(m),
@@ -2233,12 +2233,12 @@ impl App {
                 }
             },
         };
-        self.lsp_last_seen.clear();
-        self.lsp_diagnostics.clear();
-        self.lsp_progress.clear();
+        self.lsp.last_seen.clear();
+        self.lsp.diagnostics.clear();
+        self.lsp.progress.clear();
         // A new manager numbers semantic replies from 0 again (see the
         // build resume, which hits the same thing).
-        self.semantic_generation_seen.clear();
+        self.lsp.semantic_generation_seen.clear();
         // Build diagnostics describe the OLD workspace's files; a re-root
         // that kept them showed the previous project's errors forever.
         self.build_diagnostics.clear();
@@ -2825,11 +2825,12 @@ impl App {
         }
         let Some(lsp) = self
             .lsp
+            .manager
             .as_mut()
             .filter(|l| l.any_server_wants_file_renames())
         else {
             if self.run_file_move(op)
-                && let Some(lsp) = self.lsp.as_mut()
+                && let Some(lsp) = self.lsp.manager.as_mut()
             {
                 lsp.did_rename_files(renames);
             }
@@ -2854,7 +2855,7 @@ impl App {
             return false;
         };
         let mut answer = None;
-        if let Some(lsp) = self.lsp.as_ref() {
+        if let Some(lsp) = self.lsp.manager.as_ref() {
             while let Some(result) = lsp.drain_will_rename_files() {
                 if result.request_id == pending.request_id {
                     answer = Some(result.edits);
@@ -2911,7 +2912,7 @@ impl App {
                 }
             }
         }
-        if let Some(lsp) = self.lsp.as_mut() {
+        if let Some(lsp) = self.lsp.manager.as_mut() {
             lsp.did_rename_files(pending.renames);
         }
     }

@@ -486,10 +486,10 @@ impl App {
         // punctuation there is no symbol to describe, so show the diagnostic
         // alone right away.
         let word = self.editor.word_at(line, c).is_some();
-        // Converted before the match: `self.lsp.as_mut()` borrows self for the
+        // Converted before the match: `self.lsp.manager.as_mut()` borrows self for the
         // whole scrutinee, so the editor is unreachable inside the arm.
         let (uline, uchar) = self.editor.pos_to_utf16(line, c);
-        match (word, self.editor.path.clone(), self.lsp.as_mut()) {
+        match (word, self.editor.path.clone(), self.lsp.manager.as_mut()) {
             (true, Some(path), Some(lsp)) => {
                 let id = lsp.request_hover(path, uline, uchar);
                 self.hover.request_id = Some(id);
@@ -531,7 +531,7 @@ impl App {
     }
 
     pub fn drain_lsp_hover(&mut self) -> bool {
-        let Some(lsp) = self.lsp.as_ref() else {
+        let Some(lsp) = self.lsp.manager.as_ref() else {
             return false;
         };
         let mut changed = false;

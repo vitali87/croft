@@ -919,7 +919,7 @@ fn workbench(theme: crate::theme::Theme) -> (Fixture, App) {
             origin: None,
         }],
     );
-    app.lsp_diagnostics.insert(main.clone(), by_server);
+    app.lsp.diagnostics.insert(main.clone(), by_server);
     let merged = app.merged_diagnostics(&main);
     app.editor.apply_diagnostics(main, merged);
     app.rebuild_problems();

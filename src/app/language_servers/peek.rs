@@ -117,7 +117,7 @@ impl App {
             self.status = String::from("No file open");
             return;
         };
-        let Some(lsp) = self.lsp.as_mut() else {
+        let Some(lsp) = self.lsp.manager.as_mut() else {
             self.status = String::from("No language server for this file");
             return;
         };

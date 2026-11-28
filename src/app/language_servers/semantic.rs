@@ -9,7 +9,7 @@ impl App {
     /// currently shows that file. Returns true when an overlay changed and
     /// the next frame should redraw.
     pub fn drain_lsp_semantic_tokens(&mut self) -> bool {
-        let Some(lsp) = self.lsp.as_ref() else {
+        let Some(lsp) = self.lsp.manager.as_ref() else {
             return false;
         };
         // Collect first so the immutable borrow of `lsp` ends before the
@@ -27,7 +27,7 @@ impl App {
             // `is_full` cache store below would persist that under the NEW
             // content's key, replaying it on every future open.
             if !semantic_reply_is_current(
-                self.semantic_generation_seen.get(&u.path).copied(),
+                self.lsp.semantic_generation_seen.get(&u.path).copied(),
                 u.generation,
             ) {
                 continue;
@@ -50,7 +50,8 @@ impl App {
             // server's cold analysis. Only when a visible editor holds the file
             // unchanged, so the cache key matches the bytes the next open reads.
             if applied_anywhere {
-                self.semantic_generation_seen
+                self.lsp
+                    .semantic_generation_seen
                     .insert(u.path.clone(), u.generation);
             }
             if u.is_full && applied_anywhere {
@@ -81,7 +82,7 @@ impl App {
     /// files the manager has open. The fresh full batch replaces the partial
     /// one via the editor's `is_full` guard.
     pub fn refresh_semantic_tokens_if_requested(&self) {
-        let Some(lsp) = self.lsp.as_ref() else {
+        let Some(lsp) = self.lsp.manager.as_ref() else {
             return;
         };
         if !lsp.take_semantic_refresh() {
@@ -95,7 +96,7 @@ impl App {
         for p in paths {
             // Re-request at the seq the doc was last synced at, so a reply
             // arriving after an external reload is recognised as stale.
-            if let Some(&seq) = self.lsp_last_seen.get(&p) {
+            if let Some(&seq) = self.lsp.last_seen.get(&p) {
                 lsp.request_semantic_tokens(p, seq);
             }
         }

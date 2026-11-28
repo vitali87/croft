@@ -100,7 +100,7 @@ impl App {
             if !current.insert(path.clone()) {
                 continue;
             }
-            if self.lsp.as_ref().is_some_and(|lsp| {
+            if self.lsp.manager.as_ref().is_some_and(|lsp| {
                 lsp.document_reported_by(path, crate::markdown_lint::SUPERSEDED_BY)
             }) {
                 superseded.push(path.clone());
@@ -126,11 +126,11 @@ impl App {
         }
         for (path, lines, seq) in to_lint {
             let diags = crate::markdown_lint::lint(&lines.join("\n"));
-            let by_server = self.lsp_diagnostics.entry(path.clone()).or_default();
+            let by_server = self.lsp.diagnostics.entry(path.clone()).or_default();
             if diags.is_empty() {
                 changed |= by_server.remove("Markdown Lint").is_some();
                 if by_server.is_empty() {
-                    self.lsp_diagnostics.remove(&path);
+                    self.lsp.diagnostics.remove(&path);
                 }
             } else if by_server.get("Markdown Lint") != Some(&diags) {
                 // Only a different set is a change: storing the same
@@ -150,10 +150,10 @@ impl App {
             .collect();
         for p in closed {
             self.markdown_lint_last_seen.remove(&p);
-            if let Some(by_server) = self.lsp_diagnostics.get_mut(&p) {
+            if let Some(by_server) = self.lsp.diagnostics.get_mut(&p) {
                 changed |= by_server.remove("Markdown Lint").is_some();
                 if by_server.is_empty() {
-                    self.lsp_diagnostics.remove(&p);
+                    self.lsp.diagnostics.remove(&p);
                 }
             }
         }
@@ -173,14 +173,14 @@ impl App {
         if self.markdown_lint_last_seen.remove(path).is_none() {
             return false;
         }
-        let Some(by_server) = self.lsp_diagnostics.get_mut(path) else {
+        let Some(by_server) = self.lsp.diagnostics.get_mut(path) else {
             return false;
         };
         if by_server.remove("Markdown Lint").is_none() {
             return false;
         }
         if by_server.is_empty() {
-            self.lsp_diagnostics.remove(path);
+            self.lsp.diagnostics.remove(path);
         }
         self.show_merged_diagnostics(path);
         true
@@ -201,7 +201,8 @@ impl App {
     /// the editor. Servers are layered, not merged across (each owns its own
     /// findings), so this is a simple concatenation of every server's set.
     pub(super) fn merged_diagnostics(&self, path: &Path) -> Vec<crate::lsp::manager::Diagnostic> {
-        self.lsp_diagnostics
+        self.lsp
+            .diagnostics
             .get(path)
             .map(|by_server| {
                 diagnostics_by_source(by_server)
@@ -769,7 +770,8 @@ impl App {
     pub(super) fn rebuild_problems(&mut self) -> bool {
         use crate::widgets::problems::{ProblemGroup, ProblemItem, ProblemRelated};
         let mut paths: Vec<&PathBuf> = self
-            .lsp_diagnostics
+            .lsp
+            .diagnostics
             .keys()
             .chain(self.build_diagnostics.keys())
             .collect();
@@ -790,7 +792,7 @@ impl App {
                 continue;
             }
             let mut items: Vec<ProblemItem> = Vec::new();
-            if let Some(by_server) = self.lsp_diagnostics.get(path) {
+            if let Some(by_server) = self.lsp.diagnostics.get(path) {
                 // Hints (unused names, unreachable code) stay in the editor
                 // and its hover, out of the list and its count, as in VS
                 // Code (#1522).
@@ -863,7 +865,7 @@ impl App {
         // Collect first so the immutable borrow of `lsp` ends before the store
         // and the editors are mutated below.
         let mut updates = Vec::new();
-        if let Some(lsp) = self.lsp.as_ref() {
+        if let Some(lsp) = self.lsp.manager.as_ref() {
             while let Some(u) = lsp.drain_diagnostics() {
                 updates.push(u);
             }
@@ -892,7 +894,7 @@ impl App {
                 continue;
             }
             touched.insert(u.path.clone());
-            store_diagnostics_update(&mut self.lsp_diagnostics, u);
+            store_diagnostics_update(&mut self.lsp.diagnostics, u);
         }
         // The active editor re-decodes when its file was touched this tick OR
         // when it now shows a file whose stored diagnostics it hasn't applied

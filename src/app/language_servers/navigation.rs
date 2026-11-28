@@ -43,7 +43,7 @@ impl App {
         let mut peek = None;
         let mut empty_reply = false;
         {
-            let Some(lsp) = self.lsp.as_ref() else {
+            let Some(lsp) = self.lsp.manager.as_ref() else {
                 return false;
             };
             let mut peek_replied = false;
@@ -90,7 +90,7 @@ impl App {
     }
 
     pub fn drain_lsp_declaration(&mut self) -> bool {
-        let Some(lsp) = self.lsp.as_ref() else {
+        let Some(lsp) = self.lsp.manager.as_ref() else {
             return false;
         };
         let Some(reply) = take_reply(
@@ -110,7 +110,7 @@ impl App {
     }
 
     pub fn drain_lsp_type_definition(&mut self) -> bool {
-        let Some(lsp) = self.lsp.as_ref() else {
+        let Some(lsp) = self.lsp.manager.as_ref() else {
             return false;
         };
         let Some(reply) = take_reply(
@@ -156,7 +156,7 @@ impl App {
         let mut unsupported = false;
         let mut responded = false;
         {
-            let Some(lsp) = self.lsp.as_ref() else {
+            let Some(lsp) = self.lsp.manager.as_ref() else {
                 return false;
             };
             while let Some(result) = lsp.drain_implementation() {
@@ -195,7 +195,7 @@ impl App {
         let mut unsupported = false;
         let mut responded = false;
         {
-            let Some(lsp) = self.lsp.as_ref() else {
+            let Some(lsp) = self.lsp.manager.as_ref() else {
                 return false;
             };
             while let Some(result) = lsp.drain_references() {
@@ -327,7 +327,7 @@ impl App {
             return;
         };
         let (uline, uchar) = self.editor.pos_to_utf16(line, c);
-        let Some(lsp) = self.lsp.as_mut() else {
+        let Some(lsp) = self.lsp.manager.as_mut() else {
             return;
         };
         let id = lsp.request_definition(path, uline, uchar);
@@ -354,7 +354,7 @@ impl App {
             .editor
             .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
         let path = self.editor.path.clone()?;
-        let lsp = self.lsp.as_mut()?;
+        let lsp = self.lsp.manager.as_mut()?;
         Some(request(lsp, path, line, character))
     }
 

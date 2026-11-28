@@ -16,7 +16,7 @@ impl App {
         let Some(path) = self.editor.path.clone() else {
             return;
         };
-        let Some(&seq) = self.lsp_last_seen.get(&path) else {
+        let Some(&seq) = self.lsp.last_seen.get(&path) else {
             return;
         };
         if self.code_lens_requested.get(&path) == Some(&seq)
@@ -27,7 +27,7 @@ impl App {
         {
             return;
         }
-        if let Some(lsp) = self.lsp.as_ref() {
+        if let Some(lsp) = self.lsp.manager.as_ref() {
             lsp.request_code_lens(path.clone(), seq);
             self.code_lens_requested.insert(path, seq);
         }
@@ -37,7 +37,7 @@ impl App {
     /// for an older seq is dropped; the tab keeps its lenses, each shown only
     /// while its own line is unchanged.
     pub fn drain_lsp_code_lens(&mut self) -> bool {
-        let Some(lsp) = self.lsp.as_ref() else {
+        let Some(lsp) = self.lsp.manager.as_ref() else {
             return false;
         };
         let mut updates = Vec::new();
@@ -46,7 +46,7 @@ impl App {
         }
         let mut changed = false;
         for u in updates {
-            if !self.code_lens_enabled || self.lsp_last_seen.get(&u.path) != Some(&u.seq) {
+            if !self.code_lens_enabled || self.lsp.last_seen.get(&u.path) != Some(&u.seq) {
                 continue;
             }
             self.for_each_tab_of(&u.path, |tab| {
@@ -103,7 +103,9 @@ impl App {
                 self.debug_test_at_cursor();
             }
             crate::code_lens::LensAction::ServerCommand { command, arguments } => {
-                if let (Some(lsp), Some(path)) = (self.lsp.as_mut(), self.editor.path.clone()) {
+                if let (Some(lsp), Some(path)) =
+                    (self.lsp.manager.as_mut(), self.editor.path.clone())
+                {
                     lsp.execute_command(path, command, arguments);
                     self.status = format!("Ran \u{201c}{}\u{201d}", lens.title);
                 }

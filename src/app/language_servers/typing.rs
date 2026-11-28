@@ -41,6 +41,7 @@ impl App {
         };
         let triggers = self
             .lsp
+            .manager
             .as_ref()
             .and_then(|lsp| lsp.language_on_type_triggers(lang));
         if !triggers.is_some_and(|t| t.contains(ch)) {
@@ -50,7 +51,7 @@ impl App {
             .editor
             .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
         let (tab_size, insert_spaces) = self.editor.indent_preference();
-        let Some(lsp) = self.lsp.as_mut() else {
+        let Some(lsp) = self.lsp.manager.as_mut() else {
             return;
         };
         let id = lsp.request_on_type_formatting(
@@ -108,7 +109,7 @@ impl App {
     pub fn drain_lsp_on_type_format(&mut self) -> bool {
         let mut results = Vec::new();
         {
-            let Some(lsp) = self.lsp.as_ref() else {
+            let Some(lsp) = self.lsp.manager.as_ref() else {
                 return false;
             };
             while let Some(r) = lsp.drain_on_type_formatting() {
@@ -159,7 +160,7 @@ impl App {
     pub fn tick_linked_editing(&mut self) -> bool {
         const LINKED_IDLE: std::time::Duration = std::time::Duration::from_millis(250);
         let mirrored = self.editor.mirror_linked_edit();
-        let eligible = self.editor_is_text() && self.lsp.is_some();
+        let eligible = self.editor_is_text() && self.lsp.manager.is_some();
         let Some(path) = self.editor.path.clone().filter(|_| eligible) else {
             self.linked_observed = None;
             self.linked_request = None;
@@ -194,7 +195,7 @@ impl App {
             return mirrored;
         }
         let (uline, uchar) = self.editor.cursor_position_utf16();
-        let Some(lsp) = self.lsp.as_mut() else {
+        let Some(lsp) = self.lsp.manager.as_mut() else {
             return mirrored;
         };
         let id = lsp.request_linked_editing(cur.path.clone(), uline, uchar);
@@ -212,7 +213,7 @@ impl App {
     pub fn drain_lsp_linked_editing(&mut self) -> bool {
         let mut results = Vec::new();
         {
-            let Some(lsp) = self.lsp.as_ref() else {
+            let Some(lsp) = self.lsp.manager.as_ref() else {
                 return false;
             };
             while let Some(r) = lsp.drain_linked_editing() {

@@ -188,7 +188,7 @@ const BACKGROUND_PASS_CALLS: &[&str] = &[
     "app.poll_zoxide_install",
     "crate::lsp::install::take_status",
     "crate::lsp::install::take_just_installed",
-    "app.lsp_last_seen.retain",
+    "app.lsp.last_seen.retain",
 ];
 
 /// The `app.` and `crate::` calls the background pass makes, in the order it
