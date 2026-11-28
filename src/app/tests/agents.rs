@@ -945,6 +945,83 @@ fn a_workspace_switch_announces_the_new_workspaces_host_refusal() {
     );
 }
 
+/// #2062: after a workspace switch the navigator's state is a fresh one for
+/// the new root, apart from what `PairState::rebind` says it keeps. The
+/// pattern names every field, so a field added later has to say here
+/// whether a switch starts it over.
+#[test]
+fn a_workspace_switch_leaves_the_navigator_fresh_for_the_new_root() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let locks = tempfile::tempdir().unwrap();
+    let mut app = App::new(a.path().to_path_buf()).unwrap();
+    // What a workspace's navigator collects while it runs.
+    app.pair.last_check = Some(std::time::Instant::now());
+    app.pair
+        .navigator_notes
+        .insert("a.rs".into(), vec![(1, 0, "n".into())]);
+    app.pair.commentary_buf.push_str("prose so far");
+    app.pair.turn_origin = Some(("a.rs".into(), 3));
+    app.pair.notes_this_turn = 2;
+    app.pair.last_noted_file = Some("a.rs".into());
+    app.pair.noted_files.insert("a.rs".into());
+    app.pair.host_lock =
+        Some(crate::session::try_acquire_pair_host_lock(&locks.path().join("a.lock")).unwrap());
+    app.pair.navigator_down = true;
+    app.pair.last_record_raw = Some(b"{}".to_vec());
+    app.pair.lock_denied = Some(crate::app::agents_collab::PairLockDenial::Busy);
+    // What it keeps: the setting, the scan memo, the test seam.
+    let proactive = !app.pair.proactive_navigator_enabled;
+    app.pair.proactive_navigator_enabled = proactive;
+    let scanned = a.path().join("a.rs");
+    app.pair.proactive_scanned.insert(scanned.clone(), 7);
+    app.pair.spawn_override = Some(Box::new(local_test_spawn));
+
+    app.change_workspace_root(b.path().to_path_buf());
+
+    let crate::app::agents_collab::PairState {
+        host,
+        record_path,
+        socket,
+        host_lock_path,
+        last_check,
+        navigator_notes,
+        commentary_buf,
+        turn_origin,
+        notes_this_turn,
+        last_noted_file,
+        noted_files,
+        host_lock,
+        navigator_down,
+        last_record_raw,
+        lock_denied,
+        proactive_navigator_enabled,
+        proactive_scanned,
+        spawn_override,
+    } = &app.pair;
+    assert!(host.is_none());
+    assert_eq!(*record_path, crate::session::pair_record_path(b.path()));
+    assert_eq!(*socket, crate::session::collab_socket_path(b.path()));
+    assert_eq!(
+        *host_lock_path,
+        crate::session::pair_host_lock_path(b.path())
+    );
+    assert!(last_check.is_none());
+    assert!(navigator_notes.is_empty());
+    assert!(commentary_buf.is_empty());
+    assert!(turn_origin.is_none());
+    assert_eq!(*notes_this_turn, 0);
+    assert!(last_noted_file.is_none());
+    assert!(noted_files.is_empty());
+    assert!(host_lock.is_none());
+    assert!(!navigator_down);
+    assert!(last_record_raw.is_none());
+    assert!(lock_denied.is_none());
+    assert_eq!(*proactive_navigator_enabled, proactive);
+    assert_eq!(proactive_scanned.get(&scanned), Some(&7));
+    assert!(spawn_override.is_some());
+}
+
 /// Re-running `croft pair` after a failed seat must retry: the CLI promises
 /// "a running croft seats it within a second", but an enabled→enabled
 /// rewrite has no transition for the death latch to observe. The record's

@@ -2335,43 +2335,31 @@ impl App {
         self.file_finder_index_dirty = false;
         self.kick_file_finder_index_rebuild();
         // Rebind the resident navigator: the activation record, relay
-        // socket, and single-host lock are all keyed by workspace root
-        // (captured at App::new), so without this a `croft pair` run in the
-        // NEW root writes a record this window never reads and the
-        // navigator can never seat again after a re-root. Any seat from the
-        // old root is torn down with its comment boxes; if this window had
-        // self-appointed the old root's collab owner, that session goes too
-        // (a fresh activation self-appoints against the new root).
-        if let Some(host) = self.pair.host.take() {
+        // socket, and single-host lock are all keyed by workspace root, so
+        // without this a `croft pair` run in the NEW root writes a record
+        // this window never reads and the navigator can never seat again
+        // after a re-root. Everything else the navigator keeps starts over
+        // with it (`PairState::rebind`): the old root's comment boxes, turn,
+        // death latch and refusal already said (#2878, #2879). Its seat is
+        // torn down here; if this window had self-appointed the old root's
+        // collab owner, that session goes too (a fresh activation
+        // self-appoints against the new root).
+        let (host, host_lock) = self.pair.rebind(&new_root);
+        if let Some(host) = host {
             let sites = host.caret_sites();
             self.collab_carets.retain(|s, _| !sites.contains(s));
             self.status = String::from("Navigator unseated (workspace changed)");
         }
-        self.pair.navigator_notes.clear();
-        self.pair.commentary_buf.clear();
-        self.pair.turn_origin = None;
-        // The turn counters die with the seat, as on turning it off: kept,
-        // the next seat's first TurnDone reported this one's notes (#2878).
-        self.pair.notes_this_turn = 0;
-        self.pair.last_noted_file = None;
-        self.pair.noted_files.clear();
         self.clear_problem_fix();
         self.editor.comment_focus = None;
-        if self.pair.host_lock.take().is_some() {
+        if host_lock.is_some() {
             self.collab = None;
             self.collab_config = None;
         }
+        drop(host_lock);
         // Old-root merge bases are keyed by root-relative file, like the
         // carets below: never let them merge into a same-named file here.
         self.collab_offline_base.clear();
-        self.pair.record_path = crate::session::pair_record_path(&new_root);
-        self.pair.socket = crate::session::collab_socket_path(&new_root);
-        self.pair.host_lock_path = crate::session::pair_host_lock_path(&new_root);
-        self.pair.navigator_down = false; // the death latch belonged to the old root
-        // So did the host-lock refusal already said: the new root's is said
-        // afresh, even when it is for the same reason (#2879).
-        self.pair.lock_denied = None;
-        self.pair.last_check = None; // read the new record this tick, not in 1s
         // Old-workspace carets are keyed by root-relative file, so a
         // same-named file under the new root would wear a departed peer's
         // caret. The live session repopulates its own on the next poll.

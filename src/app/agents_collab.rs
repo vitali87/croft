@@ -121,6 +121,34 @@ impl PairState {
             spawn_override: None,
         }
     }
+
+    /// Start over for the workspace at `root` (#2062): everything here
+    /// belongs to one workspace and is built afresh by [`Self::new`], so a
+    /// field added later is reset by a switch without anyone listing it.
+    /// Kept: the proactive-looks setting, which is not the workspace's;
+    /// which buffer states the proactive look has already scanned, which is
+    /// keyed by the file's full path and edit count, as before the switch;
+    /// and the test seam.
+    ///
+    /// Returns the old workspace's seat and host lock: their teardown
+    /// reaches outside the group (the seat's carets, the collab session the
+    /// lock appointed), so the caller does it.
+    pub(super) fn rebind(
+        &mut self,
+        root: &Path,
+    ) -> (
+        Option<crate::pair_host::PairHost>,
+        Option<crate::session::PairHostLock>,
+    ) {
+        let fresh = Self {
+            proactive_scanned: std::mem::take(&mut self.proactive_scanned),
+            #[cfg(test)]
+            spawn_override: self.spawn_override.take(),
+            ..Self::new(root, self.proactive_navigator_enabled)
+        };
+        let old = std::mem::replace(self, fresh);
+        (old.host, old.host_lock)
+    }
 }
 
 /// Canonicalise `path` even when it no longer exists.
