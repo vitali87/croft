@@ -299,6 +299,35 @@ class PureMoves(unittest.TestCase):
             code, out = repo.check()
             self.assertIn("0 visibility widened, 1 respelled to the same reach", out)
 
+    def test_a_private_test_moved_to_another_test_module_is_a_move(self):
+        """A test moved beside the code it tests changes module, so its
+        private reach differs; but only test code can name it, and the test
+        build fails if a user of it lost it. A helper both sides still use is
+        copied and says so. Outside test modules both stay changes."""
+        test = "    #[test]\n    fn adds() {\n        assert_eq!(1 + 1, 2);\n    }\n"
+        helper = "    fn lines() -> u8 {\n        1\n    }\n"
+        a_with = "#[cfg(test)]\nmod tests {\n" + test + "\n" + helper + "}\n"
+        a_without = "#[cfg(test)]\nmod tests {\n" + helper + "}\n"
+        b = "#[cfg(test)]\nmod tests {\n" + test + "\n" + helper + "}\n"
+        repo = self.repo({"src/main.rs": "mod a;\n", "src/a.rs": a_with})
+        repo.commit({"src/main.rs": "mod a;\nmod b;\n", "src/a.rs": a_without, "src/b.rs": b})
+        code, out = repo.check()
+        self.assertEqual(code, 0, out)
+        self.assertIn("moved    fn src/a.rs::tests::adds -> src/b.rs::tests::adds", out)
+        self.assertIn("copied   fn src/b.rs::tests::lines", out)
+        self.assertIn("1 copied", out)
+        plain = "fn helper() -> u8 {\n    1\n}\n"
+        for after, says in [
+            ({"src/a.rs": "", "src/b.rs": plain}, "visibility narrowed or not comparable"),
+            ({"src/b.rs": plain}, "ADDED    fn src/b.rs::helper"),
+        ]:
+            with self.subTest(after=sorted(after)), tempfile.TemporaryDirectory() as tmp:
+                repo = Repo(Path(tmp), {"src/main.rs": "mod a;\nmod b;\n", "src/a.rs": plain})
+                repo.commit(after)
+                code, out = repo.check()
+                self.assertEqual(code, 1, out)
+                self.assertIn(says, out)
+
     def test_module_scopes_read_every_spelling(self):
         app = pm.module_of("src/app/codeql.rs")
         self.assertEqual(app, ("crate", "app", "codeql"))

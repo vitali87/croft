@@ -14,7 +14,12 @@ src/app/codeql.rs and `pub(in crate::app)` in src/app/codeql/run.rs are the
 same reach, and `pub(super)` moved a level down is narrower; elsewhere, where
 the crate root is not known, two spellings at one rank (`pub(super)` and
 `pub(in a)`) do not compare. Each widening is listed, and so is a visibility
-respelled to the same reach. A wider visibility can push a line past the width limit, so
+respelled to the same reach. Private items in test modules (a module named
+`tests` or `*_tests`, inline or a file of its own) compare across modules:
+only test code can name them, and the test build fails if any user of one
+lost it, so a test moved beside the code it tests is a move. A test helper
+copied into a second test module, identical to one that stays, is listed as
+a copy rather than an addition. A wider visibility can push a line past the width limit, so
 rustfmt lays the item out anew; an item whose text differs is still a match
 when rustfmt, given both versions without their visibility, prints the same
 text for each. rustfmt changes layout only, never meaning, and it keeps every
@@ -501,8 +506,19 @@ def vis_module(it):
     return module_of(it.file, it.mods)
 
 
+def in_tests(it):
+    """Whether `it` sits in a test module: one named `tests` or `*_tests`,
+    inline or a file of its own, at any depth under src/."""
+    module = module_of(it.file, it.mods)
+    return module is not None and any(m == "tests" or m.endswith("_tests") for m in module)
+
+
 def item_widens(o, n):
-    """`widens` for two items, by the modules they sit in."""
+    """`widens` for two items, by the modules they sit in. Two private items
+    of test modules compare wherever they sit: only test code can name them,
+    and the test build fails if a user of one lost it."""
+    if o.vis == n.vis == "" and in_tests(o) and in_tests(n):
+        return True
     return widens(o.vis, n.vis, vis_module(o), vis_module(n))
 
 
@@ -717,13 +733,20 @@ def check(base, head, if_declared):
     unchanged, widened, moved, changed, removed, added, relaid = compare(
         sides[0][0], sides[1][0], lambda o, n: laid_out_alike(o, n, ed)
     )
+    # A test helper both sides of a split still use is copied, not added:
+    # identical to an item of the base, in a test module.
+    base_texts = {(o.kind, o.name, o.ctx, o.norm) for o in sides[0][0]}
+    copied = [n for n in added if in_tests(n) and (n.kind, n.name, n.ctx, n.norm) in base_texts]
+    added = [n for n in added if n not in copied]
     respelled = [(o, n) for o, n in widened + moved if o.vis != n.vis]
     same = sum(1 for o, n in respelled if same_reach(o, n))
     wider = len(respelled) - same
     print(f"Pure-move check of {len(changed_files)} changed Rust file(s), {base}..{head}")
     print(
         f"  {unchanged} unchanged, {len(moved)} moved, {len(changed)} changed, "
-        f"{len(added)} added, {len(removed)} removed; {wider} visibility widened, "
+        f"{len(added)} added, "
+        + (f"{len(copied)} copied, " if copied else "")
+        + f"{len(removed)} removed; {wider} visibility widened, "
         + (f"{same} respelled to the same reach, " if same else "")
         + f"{len(relaid)} laid out anew by rustfmt"
     )
@@ -753,6 +776,8 @@ def check(base, head, if_declared):
             print(f"      ... {len(diff) - 40} more diff line(s)")
     for it in removed:
         print(f"  REMOVED  {it.kind} {label(it)} ({span(it)})")
+    for it in copied:
+        print(f"  copied   {it.kind} {label(it)} ({span(it)}), a test helper kept on both sides")
     for it in added:
         print(f"  ADDED    {it.kind} {label(it)} ({span(it)})")
     for e in errors:
