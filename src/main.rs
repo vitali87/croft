@@ -151,6 +151,8 @@ mod triggers;
 mod undo_rebase;
 mod update_check;
 mod update_watch;
+#[cfg(test)]
+mod view_boundary;
 mod view_ipc;
 mod vim;
 mod voice;
