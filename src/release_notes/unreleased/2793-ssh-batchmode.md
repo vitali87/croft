@@ -1,1 +1,0 @@
-fix: A command croft runs through the remote connection, once that connection has gone, no longer asks for a password over croft's screen: a fresh login that would need one fails at once (one with a key or agent still goes through), and an unreachable host is given up on in 10 seconds instead of the system's network timeout (#2793).
