@@ -613,13 +613,14 @@ mod lock_probe {
 
     type Grid = Arc<FairMutex<Term<VoidListener>>>;
 
-    /// The panes asked about, each with where its answers go.
-    static ASKED: std::sync::Mutex<
-        Vec<(
-            std::sync::Weak<FairMutex<Term<VoidListener>>>,
-            std::sync::mpsc::Sender<bool>,
-        )>,
-    > = std::sync::Mutex::new(Vec::new());
+    /// A pane asked about, and where its answers go.
+    type Asked = (
+        std::sync::Weak<FairMutex<Term<VoidListener>>>,
+        std::sync::mpsc::Sender<bool>,
+    );
+
+    /// The panes asked about.
+    static ASKED: std::sync::Mutex<Vec<Asked>> = std::sync::Mutex::new(Vec::new());
 
     /// Answers, one per read from here on, whether `grid` was free.
     pub(super) fn ask(grid: &Grid) -> std::sync::mpsc::Receiver<bool> {
