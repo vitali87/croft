@@ -3409,6 +3409,10 @@ pub struct App {
     /// alive but hidden until Cmd+K ⇧T restores the newest or the tick reaps
     /// entries older than [`UNDO_CLOSE_GRACE`]. Newest last.
     pub closed_terminals: Vec<ClosedTerminal>,
+    /// Panes being ended on background jobs ([`App::end_terminal`]): their
+    /// shell's hang-up grace and the wait for their reader never stop the
+    /// UI. The tick clears the finished ones; quitting waits for them all.
+    ending_terminals: Vec<crate::jobs::Job<()>>,
     /// Recently closed editor tabs (VS Code "Reopen Closed Editor"): the
     /// path plus enough view state (pin, cursor, scroll) to restore the tab
     /// as it was. Newest last; Cmd+K ⇧W pops. Bounded at
@@ -4858,6 +4862,7 @@ impl App {
             notifier: crate::notifications::Notifier::new(&loaded_prefs.notifications),
             host_accents: compile_host_accents(&loaded_prefs.host_accents),
             closed_terminals: Vec::new(),
+            ending_terminals: Vec::new(),
             closed_tabs: Vec::new(),
             file_finder: None,
             quick_open_range: None,

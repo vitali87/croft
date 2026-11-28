@@ -330,6 +330,68 @@ fn close_active_terminal_drops_the_active_one() {
     assert_eq!(app.active_terminal, 0);
 }
 
+/// A closed pane whose undo window lapsed ends in the background: the tick
+/// that reaps it returns at once, even when its shell ignores hang-up, and
+/// the shell is gone once the ending lands. Dropped on the UI thread, the
+/// reap stopped croft for the whole hang-up grace, over 200 ms here.
+#[test]
+fn reaping_a_closed_pane_never_waits_for_its_shell() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // The marker is assembled at run time, so the pane's `▶ …` header,
+    // which echoes the command, never matches the wait.
+    let stubborn = PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from("trap '' HUP; x=ar; echo \"${x}med\"; while :; do sleep 1; done"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    let pid = stubborn.pid().expect("the shell is running") as libc::pid_t;
+    app.insert_terminal(stubborn);
+    let idx = app.active_terminal;
+    // The hang-up must find the trap set, or the shell leaves at once and
+    // there is no grace to wait through.
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the shell to ignore hang-up",
+        || {
+            app.terminals[idx]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.contains("armed"))
+        },
+    );
+    assert!(app.close_terminal_at(idx));
+    for parked in &mut app.closed_terminals {
+        parked.closed_at =
+            std::time::Instant::now() - UNDO_CLOSE_GRACE - std::time::Duration::from_secs(1);
+    }
+    let reap = std::time::Instant::now();
+    app.reap_closed_terminals();
+    let took = reap.elapsed();
+    assert!(app.closed_terminals.is_empty(), "the expired pane is reaped");
+    assert!(
+        took < std::time::Duration::from_millis(100),
+        "the reap waited {took:?} for the shell to end"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !app.ending_terminals.is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the pane must finish ending"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        app.reap_closed_terminals();
+    }
+    // SAFETY: signal 0 only asks whether the pid exists.
+    let alive = unsafe { libc::kill(pid, 0) } == 0;
+    assert!(!alive, "the shell that ignored hang-up was killed and reaped");
+}
+
 #[test]
 fn close_active_terminal_refuses_to_drop_the_last_one() {
     let tmp = tempfile::tempdir().unwrap();
