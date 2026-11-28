@@ -319,6 +319,10 @@ pub(super) fn claim_command(inbox_dir: &str, id: &str) -> String {
     )
 }
 
+/// Answer request `request_id` with `message` in its `.err`. The message
+/// goes on ssh's stdin, not its command line: a reason as long as a noisy
+/// tar's warnings is past what one argument may hold, and refused there it
+/// left no `.err`, so the remote waited out its whole timeout (#2795).
 pub(super) fn write_relay_err(
     host: &str,
     socket: &Path,
@@ -329,22 +333,29 @@ pub(super) fn write_relay_err(
     let dest_dir = format!("{inbox_dir}/{request_id}");
     let err_path = format!("{dest_dir}/.err");
     let cmd = format!(
-        "mkdir -p {dir} && printf %s {msg} > {err}",
+        "mkdir -p {dir} && cat > {err}",
         dir = shell_quote(&dest_dir),
-        msg = shell_quote(message),
         err = shell_quote(&err_path),
     );
-    let _ = crate::proc::command("ssh")
+    let Ok(mut ssh) = crate::proc::command("ssh")
         .arg("-S")
         .arg(socket)
         .arg("-o")
         .arg("ControlMaster=no")
         .arg(host)
         .arg(&cmd)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status();
+        .spawn()
+    else {
+        return;
+    };
+    if let Some(mut stdin) = ssh.stdin.take() {
+        // A remote that stops reading only ends this write early.
+        let _ = std::io::Write::write_all(&mut stdin, message.as_bytes());
+    }
+    let _ = ssh.wait();
 }
 
 /// Stable id for the drop-relay directory, keyed on the launch arg — the exact

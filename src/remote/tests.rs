@@ -2703,3 +2703,126 @@ fn remote_launch_carries_whether_underline_colours_are_read() {
         "{launch}"
     );
 }
+
+/// #2795: a `tar` that prints more warnings than a pipe holds before its
+/// archive no longer hangs the pull, and with it every relay request after.
+#[cfg(unix)]
+#[test]
+fn a_pull_finishes_when_tar_prints_more_than_a_pipe_holds() {
+    // Not under a hidden folder, which a pull refuses before tar runs.
+    let dir = tempfile::Builder::new()
+        .prefix("croft-pull")
+        .tempdir()
+        .unwrap();
+    let src = dir.path().join("notes.txt");
+    std::fs::write(&src, "hello").unwrap();
+    let bin = tempfile::Builder::new()
+        .prefix("croft-bin")
+        .tempdir()
+        .unwrap();
+    let bin_path = bin.path().to_path_buf();
+    let log = bin.path().join("ssh-args");
+    let src = src.display().to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let log_for_ssh = log.clone();
+    std::thread::spawn(move || {
+        crate::proc::stand_in_script(
+            &bin_path,
+            "tar",
+            "head -c 1048576 /dev/zero >&2\necho archive\n",
+        );
+        crate::proc::stand_in_script(
+            &bin_path,
+            "ssh",
+            &format!(
+                "echo \"$*\" >> '{}'\ncat >/dev/null\n",
+                log_for_ssh.display()
+            ),
+        );
+        super::handle_pull_request(
+            "host",
+            std::path::Path::new("/nonexistent/ctl"),
+            "/tmp/inbox",
+            "req1",
+            &src,
+        );
+        let _ = tx.send(());
+    });
+    assert!(
+        rx.recv_timeout(std::time::Duration::from_secs(20)).is_ok(),
+        "the pull hung on tar's warnings"
+    );
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(calls.contains("tar -x"), "the archive was sent: {calls}");
+}
+
+/// #2795: a `tar` that fails after more warnings than one command-line
+/// argument holds still has its failure reach the remote. The reason went
+/// on ssh's command line, which the system refuses past 128 KiB, so no
+/// `.err` was written and the remote waited out its 120 s instead.
+#[cfg(unix)]
+#[test]
+fn a_noisy_tar_failure_reaches_the_remote() {
+    let dir = tempfile::Builder::new()
+        .prefix("croft-pull")
+        .tempdir()
+        .unwrap();
+    let src = dir.path().join("notes.txt");
+    std::fs::write(&src, "hello").unwrap();
+    let bin = tempfile::Builder::new()
+        .prefix("croft-bin")
+        .tempdir()
+        .unwrap();
+    let bin_path = bin.path().to_path_buf();
+    let calls = bin.path().join("ssh-args");
+    let fed = bin.path().join("ssh-stdin");
+    let src = src.display().to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (calls_for_ssh, fed_for_ssh) = (calls.clone(), fed.clone());
+    std::thread::spawn(move || {
+        crate::proc::stand_in_script(
+            &bin_path,
+            "tar",
+            "yes 'tar: notes.txt: Cannot open: Permission denied' | head -c 524288 >&2\n\
+             echo 'tar: Exiting with failure status due to previous errors' >&2\n\
+             exit 2\n",
+        );
+        crate::proc::stand_in_script(
+            &bin_path,
+            "ssh",
+            &format!(
+                "echo \"$*\" >> '{}'\ncat >> '{}'\n",
+                calls_for_ssh.display(),
+                fed_for_ssh.display()
+            ),
+        );
+        super::handle_pull_request(
+            "host",
+            std::path::Path::new("/nonexistent/ctl"),
+            "/tmp/inbox",
+            "req1",
+            &src,
+        );
+        let _ = tx.send(());
+    });
+    assert!(
+        rx.recv_timeout(std::time::Duration::from_secs(20)).is_ok(),
+        "the pull hung on tar's warnings"
+    );
+    let calls = std::fs::read_to_string(&calls).unwrap_or_default();
+    assert!(
+        calls.contains("/tmp/inbox/req1/.err"),
+        "the failure was written back: {}",
+        calls
+            .lines()
+            .map(|l| &l[..l.len().min(200)])
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let fed = std::fs::read_to_string(&fed).unwrap_or_default();
+    assert!(
+        fed.contains("tar: Exiting with failure status due to previous errors"),
+        "the failure says why: {} bytes fed",
+        fed.len()
+    );
+}
