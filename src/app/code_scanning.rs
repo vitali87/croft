@@ -4,9 +4,13 @@
 
 use super::*;
 
-/// GET `url`'s body, up to 64 MiB, for a SARIF location's source.
+/// The largest SARIF location source croft downloads to show.
+const SARIF_SOURCE_CAP: u64 = 64 << 20;
+
+/// GET `url`'s body for a SARIF location's source, refused past
+/// [`SARIF_SOURCE_CAP`]: a larger file opened cut short, as if whole
+/// (#2791).
 pub(super) fn fetch_sarif_source(url: &str) -> Result<Vec<u8>, String> {
-    use std::io::Read;
     let resp = crate::net::builder(url)
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -18,12 +22,7 @@ pub(super) fn fetch_sarif_source(url: &str) -> Result<Vec<u8>, String> {
             ureq::Error::Status(code, _) => format!("HTTP {code}"),
             other => other.to_string(),
         })?;
-    let mut bytes = Vec::new();
-    resp.into_reader()
-        .take(64 << 20)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
-    Ok(bytes)
+    crate::net::read_capped(resp.into_reader(), SARIF_SOURCE_CAP).map_err(|e| e.to_string())
 }
 
 /// How long one code scanning `gh` call may take before it is killed and
