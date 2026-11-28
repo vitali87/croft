@@ -100,7 +100,7 @@ impl App {
         self.run_debug.feedback = Some(msg.clone());
         self.run_debug.feedback_is_error = false;
         self.status = msg;
-        self.debug_build = Some((path.to_path_buf(), rx));
+        self.debug.build = Some((path.to_path_buf(), rx));
     }
 
     /// F5's C/C++ build, once it is done: the source it debugs and the
@@ -111,7 +111,7 @@ impl App {
         PathBuf,
         Result<crate::cpp_build::Built, crate::cpp_build::Failed>,
     )> {
-        let (_, rx) = self.debug_build.as_ref()?;
+        let (_, rx) = self.debug.build.as_ref()?;
         let result = match rx.try_recv() {
             Ok(r) => r,
             Err(std::sync::mpsc::TryRecvError::Empty) => return None,
@@ -120,7 +120,7 @@ impl App {
                 output: String::new(),
             }),
         };
-        let (source, _) = self.debug_build.take()?;
+        let (source, _) = self.debug.build.take()?;
         Some((source, result))
     }
 

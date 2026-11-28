@@ -12,7 +12,7 @@ impl App {
         if !self.inline_values_enabled {
             return;
         }
-        let Some(session) = self.debug_sessions.focused() else {
+        let Some(session) = self.debug.sessions.focused() else {
             return;
         };
         if session.phase != SessionPhase::Stopped {

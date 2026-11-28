@@ -57,7 +57,8 @@ impl App {
         tagged: bool,
     ) {
         let Some((_, named)) = self
-            .debug_sessions
+            .debug
+            .sessions
             .iter_named_mut_indexed()
             .find(|(i, _)| *i == index)
         else {
@@ -76,8 +77,8 @@ impl App {
         let mut slot = stream
             .shown_at
             .take()
-            .and_then(|at| at.checked_sub(self.debug_console_dropped))
-            .filter(|&i| i < self.debug_console.len());
+            .and_then(|at| at.checked_sub(self.debug.console_dropped))
+            .filter(|&i| i < self.debug.console.len());
         let tag = |mut line: crate::ansi_text::AnsiLine| {
             if let Some(prefix) = &prefix {
                 line.prefix(prefix);
@@ -94,23 +95,24 @@ impl App {
                         crate::output::OutputLevel::Info,
                         &line.text,
                     );
-                    self.debug_console[i] = line;
+                    self.debug.console[i] = line;
                 }
                 None => self.debug_console_push_line(line),
             }
         }
         let shown_at = open.map(tag).map(|line| match slot {
             Some(i) => {
-                self.debug_console[i] = line;
-                self.debug_console_dropped + i
+                self.debug.console[i] = line;
+                self.debug.console_dropped + i
             }
             None => {
                 self.debug_console_append(line);
-                self.debug_console_dropped + self.debug_console.len() - 1
+                self.debug.console_dropped + self.debug.console.len() - 1
             }
         });
         if let Some((_, named)) = self
-            .debug_sessions
+            .debug
+            .sessions
             .iter_named_mut_indexed()
             .find(|(i, _)| *i == index)
         {
@@ -133,11 +135,11 @@ impl App {
     /// backlog and counting the lines the cap drops off its front.
     pub(in crate::app) fn debug_console_append(&mut self, line: crate::ansi_text::AnsiLine) {
         const CAP: usize = 1000;
-        self.debug_console.push(line);
-        if self.debug_console.len() > CAP {
-            let overflow = self.debug_console.len() - CAP;
-            self.debug_console.drain(..overflow);
-            self.debug_console_dropped += overflow;
+        self.debug.console.push(line);
+        if self.debug.console.len() > CAP {
+            let overflow = self.debug.console.len() - CAP;
+            self.debug.console.drain(..overflow);
+            self.debug.console_dropped += overflow;
         }
     }
 
@@ -149,7 +151,7 @@ impl App {
         if expr.is_empty() {
             return;
         }
-        match self.debug_sessions.focused_mut() {
+        match self.debug.sessions.focused_mut() {
             Some(session) => session.evaluate(&expr, "repl"),
             None => self.debug_console_push(String::from("(no debug session)")),
         }
@@ -160,7 +162,7 @@ impl App {
     /// None (so the normal LSP hover proceeds).
     pub(in crate::app) fn debug_hover_value(&self, line: usize, c: usize) -> Option<String> {
         use crate::dap::session::SessionPhase;
-        let session = self.debug_sessions.focused()?;
+        let session = self.debug.sessions.focused()?;
         if session.phase != SessionPhase::Stopped {
             return None;
         }

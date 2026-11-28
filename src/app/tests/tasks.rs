@@ -1365,11 +1365,11 @@ fn a_task_pane_whose_shell_left_the_directory_is_not_reused() {
 #[test]
 fn stopping_a_session_runs_its_post_debug_task_once() {
     let (_tmp, mut app) = app_with_cleanup_task();
-    app.debug_sessions.push("A", stub_member(false));
-    app.debug_post_tasks = vec![String::from("cleanup")];
+    app.debug.sessions.push("A", stub_member(false));
+    app.debug.post_tasks = vec![String::from("cleanup")];
     app.debug_stop_by_user();
     assert_eq!(last_task_label(&app).as_deref(), Some("cleanup"));
-    assert!(app.debug_post_tasks.is_empty(), "it runs once, not again");
+    assert!(app.debug.post_tasks.is_empty(), "it runs once, not again");
 }
 
 /// With nothing running there is no session to clean up after: a launch
@@ -1377,7 +1377,7 @@ fn stopping_a_session_runs_its_post_debug_task_once() {
 #[test]
 fn stopping_with_no_session_runs_no_post_debug_task() {
     let (_tmp, mut app) = app_with_cleanup_task();
-    app.debug_post_tasks = vec![String::from("cleanup")];
+    app.debug.post_tasks = vec![String::from("cleanup")];
     app.debug_stop_by_user();
     assert_eq!(last_task_label(&app), None);
 }
@@ -1386,10 +1386,10 @@ fn stopping_with_no_session_runs_no_post_debug_task() {
 #[test]
 fn a_session_ending_on_its_own_runs_its_post_debug_task() {
     let (_tmp, mut app) = app_with_cleanup_task();
-    app.debug_sessions.push("A", stub_member(true));
-    app.debug_post_tasks = vec![String::from("cleanup")];
+    app.debug.sessions.push("A", stub_member(true));
+    app.debug.post_tasks = vec![String::from("cleanup")];
     poll_until_shrinks(&mut app, 1);
-    assert!(app.debug_sessions.is_empty(), "the stub terminated");
+    assert!(app.debug.sessions.is_empty(), "the stub terminated");
     assert_eq!(last_task_label(&app).as_deref(), Some("cleanup"));
 }
 
@@ -1399,10 +1399,10 @@ fn a_session_ending_on_its_own_runs_its_post_debug_task() {
 fn a_post_debug_task_message_outlives_the_end_message() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.debug_sessions.push("out.py", stub_member(true));
-    app.debug_post_tasks = vec![String::from("missing")];
+    app.debug.sessions.push("out.py", stub_member(true));
+    app.debug.post_tasks = vec![String::from("missing")];
     poll_until_shrinks(&mut app, 1);
-    assert!(app.debug_sessions.is_empty(), "the stub terminated");
+    assert!(app.debug.sessions.is_empty(), "the stub terminated");
     assert!(
         app.status
             .starts_with("postDebugTask \"missing\" not found"),

@@ -1248,7 +1248,7 @@ impl App {
         // everywhere.
         let terminal_owns_fkeys = self.focus == Pane::Terminal
             && matches!(self.bottom_panel_tab, BottomPanelTab::Terminal)
-            && self.debug_sessions.is_empty()
+            && self.debug.sessions.is_empty()
             && key.modifiers.is_empty();
         if matches!(key.code, KeyCode::F(5)) && !terminal_owns_fkeys {
             let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -1272,13 +1272,13 @@ impl App {
         // F6 pauses a running program (VS Code's Pause key) ONLY while a debug
         // session is live; with no session it falls through to its long-standing
         // role as croft's cycle-focus key.
-        if matches!(key.code, KeyCode::F(6)) && !self.debug_sessions.is_empty() {
+        if matches!(key.code, KeyCode::F(6)) && !self.debug.sessions.is_empty() {
             self.debug_pause();
             return Ok(());
         }
         // Debug: Switch Session (#567), only while debugging: with no session
         // the chord is not claimed at all.
-        if is_switch_debug_session_key(key) && !self.debug_sessions.is_empty() {
+        if is_switch_debug_session_key(key) && !self.debug.sessions.is_empty() {
             self.switch_debug_session();
             return Ok(());
         }

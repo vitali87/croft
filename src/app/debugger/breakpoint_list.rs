@@ -131,7 +131,7 @@ impl App {
             .map(|lines| self.editor.source_breakpoints(path, lines))
             .unwrap_or_default();
         let owned = path.to_path_buf();
-        for session in self.debug_sessions.iter_mut() {
+        for session in self.debug.sessions.iter_mut() {
             session.update_breakpoints(&owned, &specs);
         }
         self.status = format!(

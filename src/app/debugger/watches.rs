@@ -20,7 +20,8 @@ impl App {
                 .collect();
         }
         if let Some(session) = self
-            .debug_sessions
+            .debug
+            .sessions
             .focused_mut()
             .filter(|s| s.phase == crate::dap::session::SessionPhase::Stopped)
         {
@@ -44,7 +45,8 @@ impl App {
         }
         self.watch_exprs.push(expr.clone());
         if let Some(session) = self
-            .debug_sessions
+            .debug
+            .sessions
             .focused_mut()
             .filter(|s| s.phase == crate::dap::session::SessionPhase::Stopped)
         {

@@ -9,7 +9,7 @@ impl App {
     /// Starts with the adapter.
     pub fn open_add_debug_config(&mut self) {
         use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
-        self.debug_config_draft = None;
+        self.debug.config_draft = None;
         let rows = crate::dap::configs::DRAFT_TYPES
             .iter()
             .map(|(id, label)| ListRow {
@@ -36,7 +36,7 @@ impl App {
         retry: Option<&str>,
     ) {
         use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
-        let Some(draft) = self.debug_config_draft.as_ref() else {
+        let Some(draft) = self.debug.config_draft.as_ref() else {
             return;
         };
         let Some(field) = field else {
@@ -59,7 +59,7 @@ impl App {
         field: crate::dap::configs::DraftField,
         value: &str,
     ) {
-        let Some(draft) = self.debug_config_draft.as_mut() else {
+        let Some(draft) = self.debug.config_draft.as_mut() else {
             return;
         };
         match draft.set(field, value) {
@@ -77,13 +77,13 @@ impl App {
     /// Write the finished draft to `.croft/launch.json` and pick up the file
     /// again, so the new configuration is in the picker and F5 at once.
     pub(in crate::app) fn finish_debug_config_draft(&mut self) {
-        let Some(draft) = self.debug_config_draft.take() else {
+        let Some(draft) = self.debug.config_draft.take() else {
             return;
         };
         let root = self.active_workspace_root();
         match crate::dap::configs::add_to_croft_launch_json(&root, &draft) {
             Ok(_) => {
-                self.debug_configs = crate::dap::configs::discover_configs(&root);
+                self.debug.configs = crate::dap::configs::discover_configs(&root);
                 self.selected_debug_config = Some(draft.name.clone());
                 self.selected_debug_compound = None;
                 self.run_debug.selected_config = Some(draft.name.clone());
@@ -101,8 +101,8 @@ impl App {
     pub fn open_debug_config_picker(&mut self) {
         use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
         let root = self.active_workspace_root();
-        self.debug_configs = crate::dap::configs::discover_configs(&root);
-        self.debug_compounds = crate::dap::configs::discover_compounds(&root);
+        self.debug.configs = crate::dap::configs::discover_configs(&root);
+        self.debug.compounds = crate::dap::configs::discover_compounds(&root);
         let mut rows = vec![ListRow {
             id: String::from("active"),
             label: String::from("Debug active file — no configuration"),
@@ -118,7 +118,7 @@ impl App {
         // launch a different configuration than the row says as soon as any
         // entry declares a `presentation`.
         let entries: Vec<(ListRow, Option<crate::dap::configs::Presentation>)> = self
-            .debug_configs
+            .debug.configs
             .iter()
             .enumerate()
             .map(|(i, c)| {
@@ -136,7 +136,7 @@ impl App {
             // otherwise it reports what is missing (#310) rather than
             // launching a subset, which would debug something other than what
             // was asked for.
-            .chain(self.debug_compounds.iter().enumerate().map(|(i, c)| {
+            .chain(self.debug.compounds.iter().enumerate().map(|(i, c)| {
                 (
                     ListRow {
                         id: format!("compound:{i}"),

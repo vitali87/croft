@@ -245,7 +245,8 @@ impl App {
         let (active, status, rows) = self.build_debug_view();
         self.run_debug.debug_active = active;
         self.run_debug.debug_paused = self
-            .debug_sessions
+            .debug
+            .sessions
             .focused()
             .is_some_and(|s| s.phase == crate::dap::session::SessionPhase::Stopped);
         if active {
@@ -256,8 +257,8 @@ impl App {
                 self.run_debug.debug_scroll = max_scroll;
             }
             // Show the console tail (most recent output / REPL lines).
-            let n = self.debug_console.len();
-            self.run_debug.console_tail = self.debug_console[n.saturating_sub(50)..].to_vec();
+            let n = self.debug.console.len();
+            self.run_debug.console_tail = self.debug.console[n.saturating_sub(50)..].to_vec();
         } else {
             self.run_debug.debug_rows.clear();
             self.run_debug.debug_scroll = 0;
@@ -265,9 +266,9 @@ impl App {
             self.run_debug.repl_input.clear();
             // Retain the just-ended session's console output until the next run;
             // otherwise the idle Run panel shows nothing.
-            if self.run_debug.session_ended && !self.debug_console.is_empty() {
-                let n = self.debug_console.len();
-                self.run_debug.console_tail = self.debug_console[n.saturating_sub(50)..].to_vec();
+            if self.run_debug.session_ended && !self.debug.console.is_empty() {
+                let n = self.debug.console.len();
+                self.run_debug.console_tail = self.debug.console[n.saturating_sub(50)..].to_vec();
             } else {
                 self.run_debug.console_tail.clear();
             }
@@ -282,7 +283,7 @@ impl App {
     ) -> (bool, String, Vec<crate::widgets::run_debug::DebugRow>) {
         use crate::dap::session::SessionPhase;
         use crate::widgets::run_debug::{DebugRow, DebugRowKind};
-        let Some(session) = self.debug_sessions.focused() else {
+        let Some(session) = self.debug.sessions.focused() else {
             return (false, String::new(), Vec::new());
         };
         // Active for any live session: while Running the tree is empty but the
@@ -369,7 +370,7 @@ impl App {
                 continue;
             }
             if let Some(vars) = session.variables.get(&scope.variables_ref) {
-                push_variable_rows(&mut rows, session, &self.debug_expanded, vars, 2);
+                push_variable_rows(&mut rows, session, &self.debug.expanded, vars, 2);
             }
         }
         rows.push(DebugRow {
@@ -421,28 +422,28 @@ impl App {
         };
         match row.kind.clone() {
             DebugRowKind::Thread { id, .. } => {
-                if let Some(session) = self.debug_sessions.focused_mut() {
+                if let Some(session) = self.debug.sessions.focused_mut() {
                     session.select_thread(id);
                 }
-                self.debug_expanded.clear();
+                self.debug.expanded.clear();
             }
             DebugRowKind::Frame { id, .. } => {
-                if let Some(session) = self.debug_sessions.focused_mut() {
+                if let Some(session) = self.debug.sessions.focused_mut() {
                     session.load_frame(id);
                 }
                 // Collapse expansions: variable refs are frame-scoped.
-                self.debug_expanded.clear();
+                self.debug.expanded.clear();
             }
             DebugRowKind::Variable {
                 reference,
                 expandable: true,
                 ..
             } => {
-                if self.debug_expanded.contains(&reference) {
-                    self.debug_expanded.remove(&reference);
+                if self.debug.expanded.contains(&reference) {
+                    self.debug.expanded.remove(&reference);
                 } else {
-                    self.debug_expanded.insert(reference);
-                    if let Some(session) = self.debug_sessions.focused_mut() {
+                    self.debug.expanded.insert(reference);
+                    if let Some(session) = self.debug.sessions.focused_mut() {
                         session.expand_variable(reference);
                     }
                 }
@@ -456,7 +457,7 @@ impl App {
                 open: Some(_),
                 ..
             } => {
-                if let Some(session) = self.debug_sessions.focused_mut() {
+                if let Some(session) = self.debug.sessions.focused_mut() {
                     session.toggle_expensive_scope(index);
                 }
             }
@@ -537,13 +538,14 @@ impl App {
         use crate::dap::session::SessionPhase;
         if let Some(expr) = expression
             && let Some(session) = self
-                .debug_sessions
+                .debug
+                .sessions
                 .focused_mut()
                 .filter(|s| s.phase == SessionPhase::Stopped)
             && session.supports("supportsClipboardContext")
         {
             session.evaluate(&expr, "clipboard");
-            self.debug_copy_pending = Some((expr, value));
+            self.debug.copy_pending = Some((expr, value));
             self.status = String::from("Copying value…");
             return;
         }
@@ -553,7 +555,7 @@ impl App {
     /// Copy Call Stack (#1546): every frame of the paused thread, innermost
     /// first, as `name (path:line)`, VS Code's form.
     pub(in crate::app) fn copy_call_stack(&mut self) {
-        let Some(session) = self.debug_sessions.focused() else {
+        let Some(session) = self.debug.sessions.focused() else {
             return;
         };
         let text = session
@@ -585,9 +587,9 @@ impl App {
         // A fresh session: drop the previous run's retained console + stop
         // tracking so the "exited without hitting a breakpoint" hint and the
         // console reflect only this run.
-        self.debug_console_dropped += self.debug_console.len();
-        self.debug_console.clear();
-        self.debug_ever_stopped = false;
+        self.debug.console_dropped += self.debug.console.len();
+        self.debug.console.clear();
+        self.debug.ever_stopped = false;
         self.run_debug.session_ended = false;
         self.show_tree = true;
         self.set_sidebar_view(SidebarView::RunDebug);

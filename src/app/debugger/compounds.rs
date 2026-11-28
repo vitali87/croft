@@ -44,7 +44,7 @@ impl App {
         // Resolve first: a compound naming a configuration no
         // launch.json declares is a config error worth
         // reporting now, separately from the unbuilt feature.
-        // The un-deduped list: `debug_configs` is the picker's
+        // The un-deduped list: `debug.configs` is the picker's
         // display list and drops a lower-precedence duplicate by
         // name, which is the very entry a `.vscode` compound
         // naming that name has to bind.
@@ -160,7 +160,7 @@ impl App {
                 cfg.answers.extend(compound.answers.clone());
                 // One member has no siblings to stop, so its `stopAll` is set
                 // false rather than inherited from whatever ran before.
-                self.debug_stop_all = false;
+                self.debug.stop_all = false;
                 match compound.pre_launch_task.clone() {
                     // #318: the compound's own task runs
                     // first, and the member starts only if it
@@ -255,11 +255,11 @@ impl App {
         // every validation, spawn and attach failure alike, so reporting
         // `Launched` unconditionally counted members that never started and
         // made "N of M started" name an N the user does not have.
-        let before = self.debug_sessions.len();
+        let before = self.debug.sessions.len();
         let building = self.pending_cargo_launches.len();
         let preparing = self.parked_setup_launches();
         self.launch_resolved_into_set(rc);
-        if self.debug_sessions.len() > before {
+        if self.debug.sessions.len() > before {
             MemberOutcome::Launched
         } else if self.pending_cargo_launches.len() > building {
             MemberOutcome::Building
@@ -387,17 +387,17 @@ impl App {
         stop_all: bool,
     ) {
         self.debug_stop();
-        self.debug_post_tasks.clear();
+        self.debug.post_tasks.clear();
         // Set only here, once the old set is gone: a compound refused before
         // this point leaves the running set untouched, and must leave its
         // `stopAll` out of it too (#567).
-        self.debug_stop_all = stop_all;
+        self.debug.stop_all = stop_all;
         // A launch supersedes any older one still parked behind its task:
         // left in place, that task's exit would launch its config and stop
         // this set (#567). The task-gated path reaches here via `take()`, so
         // this only ever drops a STALE parking.
         self.supersede_waiting_launches();
-        self.debug_build = None;
+        self.debug.build = None;
         let total = members.len();
         let mut started = 0usize;
         let mut building: Vec<String> = Vec::new();
@@ -423,7 +423,7 @@ impl App {
         if started == 0 && building.is_empty() && !preparing.is_empty() {
             // Every member that could start waits for its debugger to be
             // set up (#2803): each joins the set when that is done.
-            self.debug_compound = Some(compound.clone());
+            self.debug.compound = Some(compound.clone());
             let waiting = format!(
                 "setting up the debugger for {} \u{2014} sessions start when it is ready{skipped}",
                 preparing.join(", ")
@@ -436,7 +436,7 @@ impl App {
         if started == 0 && !building.is_empty() {
             // Every member that could start is still building with cargo
             // (#1392): each joins the set when its build lands.
-            self.debug_compound = Some(compound.clone());
+            self.debug.compound = Some(compound.clone());
             // Members waiting for their debugger to be set up (#2803) join
             // the same way, and are named with them.
             let also = if preparing.is_empty() {
@@ -473,8 +473,8 @@ impl App {
         // The FIRST member takes focus, not the last: a compound is usually
         // written server-first, and landing the user on whichever happened to
         // start last would put them in the wrong one.
-        self.debug_sessions.focus(0);
-        self.debug_compound = Some(compound.clone());
+        self.debug.sessions.focus(0);
+        self.debug.compound = Some(compound.clone());
         // Reveal FIRST, then write the feedback: `reveal_debug_view` runs
         // `refresh_run_debug`, which clears `feedback` unconditionally, so
         // doing it afterwards wiped every line built below - including the
@@ -488,7 +488,7 @@ impl App {
         // several the user has to be told which are running and which one the
         // call stack and variables belong to, or the view describes a session
         // they cannot identify.
-        let mut running = self.debug_sessions.names().join(", ");
+        let mut running = self.debug.sessions.names().join(", ");
         if !building.is_empty() {
             // Not failed: they join the set when their cargo builds land.
             running = format!("{running}; building {}", building.join(", "));
@@ -516,7 +516,8 @@ impl App {
         });
         self.run_debug.feedback_is_error = started != total;
         let focused = self
-            .debug_sessions
+            .debug
+            .sessions
             .focused_name()
             .unwrap_or("?")
             .to_string();
@@ -583,11 +584,11 @@ impl App {
         task_label: &str,
         member: crate::dap::configs::DebugConfig,
     ) {
-        if !self.debug_sessions.is_empty() {
+        if !self.debug.sessions.is_empty() {
             self.debug_stop();
         }
         self.supersede_waiting_launches();
-        self.debug_build = None;
+        self.debug.build = None;
         let root = self.active_workspace_root();
         let tasks = crate::tasks::discover_tasks(&root);
         let task = match crate::tasks::find_task(tasks, task_label) {
@@ -620,14 +621,16 @@ impl App {
     /// session the view now shows, and every one still running. Without this
     /// both kept naming the ended session.
     pub(in crate::app) fn report_member_ended(&mut self, ended: &str) {
-        let running = self.debug_sessions.names().join(", ");
+        let running = self.debug.sessions.names().join(", ");
         let focused = self
-            .debug_sessions
+            .debug
+            .sessions
             .focused_name()
             .unwrap_or("?")
             .to_string();
         let what = self
-            .debug_compound
+            .debug
+            .compound
             .as_deref()
             .map_or_else(String::new, |c| format!(" compound {c}"));
         self.run_debug.feedback = Some(format!("Debugging{what}: {running} ({ended} ended)"));
@@ -640,7 +643,8 @@ impl App {
     /// their debugger to be set up (#2803), and start when it is ready.
     pub(in crate::app) fn report_member_ended_before_the_rest(&mut self, ended: &str) {
         let what = self
-            .debug_compound
+            .debug
+            .compound
             .as_deref()
             .map_or_else(String::new, |c| format!(" compound {c}"));
         self.run_debug.feedback = Some(format!(
@@ -665,8 +669,8 @@ impl App {
         events: &mut Vec<crate::dap::session::DapEvent>,
     ) {
         use crate::dap::session::DapEvent;
-        let old = self.debug_sessions.focused_index();
-        if index == old || !self.debug_sessions.focus(index) {
+        let old = self.debug.sessions.focused_index();
+        if index == old || !self.debug.sessions.focus(index) {
             return;
         }
         let mut keep = Vec::new();
@@ -682,14 +686,15 @@ impl App {
             }
         }
         if let Some((_, named)) = self
-            .debug_sessions
+            .debug
+            .sessions
             .iter_named_mut_indexed()
             .find(|(i, _)| *i == old)
         {
             keep.append(&mut named.backlog);
             named.backlog = keep;
         }
-        *events = self.debug_sessions.take_focused_backlog();
+        *events = self.debug.sessions.take_focused_backlog();
         // The arrow belongs to the session that was focused; the phase pass
         // after the event loop redraws it for the new one.
         self.editor.stop_line = None;
@@ -699,17 +704,18 @@ impl App {
     /// one stopped in the background can be inspected. Its queued events
     /// replay on the next poll.
     pub(in crate::app) fn switch_debug_session(&mut self) {
-        if self.debug_sessions.len() < 2 {
+        if self.debug.sessions.len() < 2 {
             self.status = String::from("Only one debug session is running");
             return;
         }
-        let next = (self.debug_sessions.focused_index() + 1) % self.debug_sessions.len();
+        let next = (self.debug.sessions.focused_index() + 1) % self.debug.sessions.len();
         let mut none = Vec::new();
         self.refocus_debug_session(next, &mut none);
         // Nothing drained this tick belongs to the old session here, so the
         // new session's backlog goes back to wait for the next poll.
         if let Some((_, named)) = self
-            .debug_sessions
+            .debug
+            .sessions
             .iter_named_mut_indexed()
             .find(|(i, _)| *i == next)
         {
@@ -717,11 +723,12 @@ impl App {
             named.backlog = none;
         }
         let name = self
-            .debug_sessions
+            .debug
+            .sessions
             .focused_name()
             .unwrap_or("?")
             .to_string();
-        let running = self.debug_sessions.names().join(", ");
+        let running = self.debug.sessions.names().join(", ");
         self.status = format!("Debugging {name} · running: {running}");
         self.refresh_debug_panel();
     }
@@ -734,9 +741,9 @@ impl App {
         rc: &crate::dap::configs::ResolvedConfig,
     ) {
         if let Some(task) = &rc.post_debug_task
-            && !self.debug_post_tasks.contains(task)
+            && !self.debug.post_tasks.contains(task)
         {
-            self.debug_post_tasks.push(task.clone());
+            self.debug.post_tasks.push(task.clone());
         }
     }
 
@@ -744,7 +751,7 @@ impl App {
     /// A label no tasks.json declares is reported rather than skipped, the
     /// same contract `preLaunchTask` has.
     pub(in crate::app) fn run_post_debug_tasks(&mut self) {
-        let labels = std::mem::take(&mut self.debug_post_tasks);
+        let labels = std::mem::take(&mut self.debug.post_tasks);
         if labels.is_empty() {
             return;
         }

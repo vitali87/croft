@@ -11,7 +11,7 @@ impl App {
             return;
         };
         let line = self.editor.cursor_row as u32 + 1;
-        match self.debug_sessions.focused_mut() {
+        match self.debug.sessions.focused_mut() {
             Some(session) if session.stopped_thread.is_some() => {
                 session.run_to_cursor(&path, line);
                 self.status = format!("Running to line {line}");
@@ -44,7 +44,7 @@ impl App {
     /// starts one, so a binding for it is inert with nothing to continue.
     pub(in crate::app) fn debug_continue(&mut self) {
         use crate::dap::session::SessionPhase;
-        match self.debug_sessions.focused().map(|s| s.phase) {
+        match self.debug.sessions.focused().map(|s| s.phase) {
             Some(SessionPhase::Stopped) => self.debug_start_or_continue(),
             Some(_) => self.status = String::from("The program is already running"),
             None => self.status = String::from("No debug session to continue"),
@@ -56,7 +56,7 @@ impl App {
     /// that cannot say steps in plainly, as F11 does.
     pub(in crate::app) fn debug_step_into_target(&mut self) {
         use crate::dap::session::{SessionPhase, StepInTargetsAsk};
-        let Some(session) = self.debug_sessions.focused_mut() else {
+        let Some(session) = self.debug.sessions.focused_mut() else {
             self.status = String::from("No debug session to step");
             return;
         };
@@ -106,7 +106,7 @@ impl App {
     pub(in crate::app) fn debug_step_into(&mut self, target: Option<i64>) {
         match target {
             Some(id) => {
-                if let Some(session) = self.debug_sessions.focused_mut() {
+                if let Some(session) = self.debug.sessions.focused_mut() {
                     session.step_in_target(id);
                     self.editor.stop_line = None;
                     self.clear_inline_values();
@@ -118,7 +118,7 @@ impl App {
 
     /// F10/F11/Shift+F11: step the paused thread (`next` / `stepIn` / `stepOut`).
     pub fn debug_step(&mut self, command: &str) {
-        if let Some(session) = self.debug_sessions.focused_mut() {
+        if let Some(session) = self.debug.sessions.focused_mut() {
             session.step(command);
             self.editor.stop_line = None;
             self.clear_inline_values();
@@ -127,7 +127,7 @@ impl App {
 
     /// F6: interrupt a running program so it stops at the current line.
     pub fn debug_pause(&mut self) {
-        match self.debug_sessions.focused_mut() {
+        match self.debug.sessions.focused_mut() {
             Some(session) => {
                 session.pause();
                 self.status = String::from("Pausing");
@@ -139,7 +139,7 @@ impl App {
     /// Restart: tear down the current session and relaunch the active file with
     /// the same breakpoints.
     pub fn debug_restart(&mut self) {
-        if !self.debug_sessions.is_empty() {
+        if !self.debug.sessions.is_empty() {
             self.debug_stop();
         }
         self.start_selected_debug();
@@ -149,12 +149,12 @@ impl App {
     /// `postDebugTask` runs (#250); the internal `debug_stop` a relaunch uses
     /// to replace the set is not, so it lives here rather than in there.
     pub(in crate::app) fn debug_stop_by_user(&mut self) {
-        let was_running = !self.debug_sessions.is_empty();
+        let was_running = !self.debug.sessions.is_empty();
         self.debug_stop();
         if was_running {
             self.run_post_debug_tasks();
         } else {
-            self.debug_post_tasks.clear();
+            self.debug.post_tasks.clear();
         }
     }
 
@@ -164,24 +164,24 @@ impl App {
         // several; disconnecting only the one the user happens to be looking
         // at would leave its siblings running with nothing on screen owning
         // them, which is the orphaning the issue names.
-        for (_, named) in self.debug_sessions.iter_named_mut_indexed() {
+        for (_, named) in self.debug.sessions.iter_named_mut_indexed() {
             mirror_open_console_lines(
                 &mut named.console,
-                &self.debug_console,
-                self.debug_console_dropped,
+                &self.debug.console,
+                self.debug.console_dropped,
             );
             named.session.disconnect();
         }
-        self.debug_sessions.clear();
+        self.debug.sessions.clear();
         // A `cargo` build still running for a launch (#1392) must not start
         // its debuggee after the user stopped debugging, nor a launch
         // waiting for its debugger to be set up (#2803).
         self.pending_cargo_launches.clear();
         self.forget_parked_setup_launches();
-        self.debug_compound = None;
+        self.debug.compound = None;
         // A C/C++ build still running must not launch once it finishes
         // (#1359): Stop means stop.
-        self.debug_build = None;
+        self.debug.build = None;
         self.reset_watch_runtime();
         // Sweep js-debug's detached watchdog (and any leftover tree) once it has
         // reparented to init after the server dies. See the Terminated arm in

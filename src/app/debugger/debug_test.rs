@@ -33,7 +33,7 @@ impl App {
     /// binary launches under lldb-dap with the name as its libtest filter.
     /// Shared by debug-at-cursor and Alt+click on the gutter play glyph.
     pub(in crate::app) fn debug_named_test(&mut self, name: String) {
-        if !self.debug_sessions.is_empty() {
+        if !self.debug.sessions.is_empty() {
             self.status = String::from("A debug session is already running (Shift+F5 stops it)");
             return;
         }
@@ -259,7 +259,7 @@ impl App {
     /// background build hands over the binary.
     pub(in crate::app) fn launch_lldb_test_debug(&mut self, binary: &Path, name: &str) {
         use std::collections::BTreeMap;
-        if !self.debug_sessions.is_empty() {
+        if !self.debug.sessions.is_empty() {
             // The build took minutes and the user started another session
             // meanwhile: this launch is abandoned, so the breakpoint it
             // armed has nothing to clean up after it (#373).
@@ -344,7 +344,7 @@ impl App {
     /// Set a TEMPORARY breakpoint at the assertion the last run of `name`
     /// failed on (#373), unless the user already has one there.
     ///
-    /// Recorded in `debug_temp_breakpoint` so [`Self::disarm_failure_breakpoint`]
+    /// Recorded in `debug.temp_breakpoint` so [`Self::disarm_failure_breakpoint`]
     /// can take exactly this one back out: a breakpoint croft set and then
     /// left behind would be indistinguishable from one the user set, and
     /// would keep stopping them on a line they never chose.
@@ -363,12 +363,12 @@ impl App {
         if !lines.insert(line) {
             return;
         }
-        self.debug_temp_breakpoint = Some((file.clone(), line));
+        self.debug.temp_breakpoint = Some((file.clone(), line));
         // Recorded for the caller to append to whatever message it shows:
         // setting `status` here would be overwritten moments later by the
         // launch's own ("Building test binary…"), so the user would never
         // learn a breakpoint had been set for them.
-        self.debug_temp_note = Some(format!(
+        self.debug.temp_note = Some(format!(
             "breaking at {}:{line} where it last failed",
             file.file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -378,7 +378,7 @@ impl App {
 
     /// Append the armed-breakpoint note to `msg`, if one was armed (#373).
     pub(in crate::app) fn with_failure_note(&self, msg: String) -> String {
-        match &self.debug_temp_note {
+        match &self.debug.temp_note {
             Some(note) => format!("{msg} — {note}"),
             None => msg,
         }
@@ -388,8 +388,8 @@ impl App {
     /// still ours. The user may have removed it themselves mid-session, in
     /// which case there is nothing to take back.
     pub(in crate::app) fn disarm_failure_breakpoint(&mut self) {
-        self.debug_temp_note = None;
-        let Some((file, line)) = self.debug_temp_breakpoint.take() else {
+        self.debug.temp_note = None;
+        let Some((file, line)) = self.debug.temp_breakpoint.take() else {
             return;
         };
         if let Some(lines) = self.editor.breakpoints.get_mut(&file) {
