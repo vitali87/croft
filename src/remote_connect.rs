@@ -58,21 +58,9 @@ impl SshAuth {
             .context("openpty for ssh auth")?;
 
         let mut cmd = CommandBuilder::new(crate::proc::program("ssh"));
-        cmd.arg("-M");
-        cmd.arg("-S");
-        cmd.arg(&socket_path);
-        cmd.arg("-N");
-        cmd.arg("-T");
-        cmd.arg("-o");
-        cmd.arg("BatchMode=no");
-        // Reaching the host and its greeting only, not the login: an
-        // unreachable host fails in 10 s, as `croft remote` does, instead of
-        // waiting out the system's TCP timeout (#2796).
-        cmd.arg("-o");
-        cmd.arg("ConnectTimeout=10");
-        cmd.arg("-o");
-        cmd.arg("ServerAliveInterval=15");
-        cmd.arg(host);
+        // An unreachable host fails in 10 s, as `croft remote` does, instead
+        // of waiting out the system's TCP timeout (#2796).
+        cmd.args(crate::remote::dialog_master_args(&socket_path, host));
         cmd.env("TERM", "dumb");
         cmd.env_remove("SSH_ASKPASS");
         cmd.env_remove("SSH_ASKPASS_REQUIRE");
@@ -177,12 +165,9 @@ impl SshAuth {
         let _ = self.child.kill();
         let _ = self.child.wait();
         if self.socket_path.exists() {
-            let _ = crate::proc::command("ssh")
-                .arg("-S")
-                .arg(&self.socket_path)
-                .arg("-O")
-                .arg("exit")
+            let _ = crate::remote::Ssh::control(&self.socket_path, "exit")
                 .arg(&self.host)
+                .into_command()
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status();
@@ -217,12 +202,9 @@ impl Drop for SshAuth {
             let _ = self.child.wait();
         }
         if !self.handed_off && self.socket_path.exists() {
-            let _ = crate::proc::command("ssh")
-                .arg("-S")
-                .arg(&self.socket_path)
-                .arg("-O")
-                .arg("exit")
+            let _ = crate::remote::Ssh::control(&self.socket_path, "exit")
                 .arg(&self.host)
+                .into_command()
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status();

@@ -58,10 +58,7 @@ impl BulkLane {
     /// The `-e` remote-shell string rsync should use: the bulk socket in
     /// dedicated mode, the interactive socket otherwise.
     pub fn rsync_ssh_arg(&self, interactive_socket: &Path) -> String {
-        format!(
-            "ssh -S {} -o ControlMaster=no",
-            crate::remote::shell_quote_for_e_arg(self.socket(interactive_socket)),
-        )
+        crate::remote::rsync_transport(self.socket(interactive_socket))
     }
 
     /// Extra rsync args pacing the transfer. Always present: even a
@@ -83,9 +80,9 @@ impl BulkLane {
     /// this path is the fallback `cargo install`, which would otherwise hold
     /// the user's keystrokes for the whole multi-minute build.
     pub fn ssh_command(&self, interactive_socket: &Path) -> Command {
-        let mut command = self.base_ssh_command(interactive_socket);
-        command.arg("-n").stdin(Stdio::null());
-        command
+        crate::remote::Ssh::client(self.socket(interactive_socket))
+            .no_stdin()
+            .into_command()
     }
 
     /// An ssh invocation the caller intends to WRITE to. Only the throughput
@@ -94,80 +91,12 @@ impl BulkLane {
     /// pipe the probe writes into. Terminal isolation is not at stake here
     /// because the caller replaces stdin with its own pipe either way.
     pub fn probe_ssh_command(&self, interactive_socket: &Path) -> Command {
-        self.base_ssh_command(interactive_socket)
-    }
-
-    fn base_ssh_command(&self, interactive_socket: &Path) -> Command {
-        let mut command = crate::proc::command("ssh");
-        command
-            .arg("-S")
-            .arg(self.socket(interactive_socket))
-            .arg("-o")
-            .arg("ControlMaster=no")
-            .arg("-o")
-            .arg("ConnectTimeout=10")
-            .arg("-o")
-            .arg("ServerAliveInterval=10")
-            .arg("-o")
-            .arg("ServerAliveCountMax=3");
-        command
+        crate::remote::Ssh::client(self.socket(interactive_socket)).into_command()
     }
 
     pub fn bwlimit_kbps(&self) -> u32 {
         self.bwlimit_kbps
     }
-}
-
-/// Args for the auth probe: succeeds only when the host authenticates
-/// without prompting (key/agent), over a fresh connection that must not
-/// touch any existing control socket.
-pub fn probe_args(host: &str) -> Vec<String> {
-    [
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "ControlMaster=no",
-        "-o",
-        "ControlPath=none",
-        "-o",
-        "ConnectTimeout=5",
-        host,
-        "true",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect()
-}
-
-/// Args opening the dedicated bulk master. BatchMode so a password host
-/// fails fast instead of hanging on a prompt nobody can answer, IPQoS
-/// throughput so routers with working AQM deprioritize the bulk flow
-/// under the interactive session's lowdelay traffic.
-pub fn bulk_master_args(socket_path: &Path, host: &str) -> Vec<String> {
-    let mut args: Vec<String> = vec![
-        String::from("-M"),
-        String::from("-S"),
-        socket_path.to_string_lossy().into_owned(),
-        String::from("-f"),
-        String::from("-N"),
-        String::from("-T"),
-    ];
-    args.extend(
-        [
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "IPQoS=throughput",
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "ServerAliveInterval=15",
-        ]
-        .into_iter()
-        .map(String::from),
-    );
-    args.push(host.to_string());
-    args
 }
 
 /// Half the measured rate, clamped to the floor. Halving leaves steady
@@ -193,15 +122,10 @@ struct MasterGuard {
 
 impl Drop for MasterGuard {
     fn drop(&mut self) {
-        let _ = crate::proc::command("ssh")
-            .arg("-S")
-            .arg(&self.socket_path)
-            .arg("-O")
-            .arg("exit")
+        let _ = crate::remote::Ssh::control(&self.socket_path, "exit")
             .arg(&self.host)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .quiet()
+            .into_command()
             .status();
         let _ = std::fs::remove_dir_all(&self.socket_dir);
     }
@@ -263,11 +187,12 @@ pub fn establish(host: &str, interactive_socket: &Path, log: impl Fn(String)) ->
 }
 
 fn open_dedicated_master(host: &str) -> Option<MasterGuard> {
-    let probe_ok = crate::proc::command("ssh")
-        .args(probe_args(host))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+    // The host must let a fresh connection in without a prompt: reusing the
+    // session's master would always succeed, and a password prompt on the
+    // bulk master would hang the install thread for good.
+    let probe_ok = crate::remote::Ssh::fresh_check(host)
+        .quiet()
+        .into_command()
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
@@ -279,11 +204,10 @@ fn open_dedicated_master(host: &str) -> Option<MasterGuard> {
     // another local user had made first (#2717).
     let socket_dir = crate::remote::ssh_control_dir().ok()?;
     let socket_path = socket_dir.join("ctl");
-    let started = crate::proc::command("ssh")
-        .args(bulk_master_args(&socket_path, host))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+    let started = crate::remote::Ssh::bulk_master(&socket_path)
+        .arg(host)
+        .quiet()
+        .into_command()
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
@@ -361,9 +285,17 @@ mod tests {
         );
     }
 
+    /// The arguments `ssh` builds.
+    fn args_of(ssh: crate::remote::Ssh) -> Vec<String> {
+        ssh.into_command()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
     #[test]
     fn probe_requires_batchmode_and_bypasses_every_control_socket() {
-        let args = probe_args("myhost");
+        let args = args_of(crate::remote::Ssh::fresh_check("myhost"));
         assert!(args.contains(&String::from("BatchMode=yes")));
         assert!(args.contains(&String::from("ControlMaster=no")));
         assert!(
@@ -376,7 +308,8 @@ mod tests {
 
     #[test]
     fn bulk_master_opens_a_second_batchmode_master_marked_as_bulk_traffic() {
-        let args = bulk_master_args(Path::new("/tmp/bulk/ctl"), "myhost");
+        let args =
+            args_of(crate::remote::Ssh::bulk_master(Path::new("/tmp/bulk/ctl")).arg("myhost"));
         assert!(args.contains(&String::from("-M")));
         assert!(args.contains(&String::from("/tmp/bulk/ctl")));
         assert!(args.contains(&String::from("-N")));

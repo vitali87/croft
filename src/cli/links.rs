@@ -18,10 +18,9 @@ pub(super) fn open_link(url: &str) -> Result<()> {
     if let Some(args) = crate::deep_link::decide_argv(&link, home.as_deref()) {
         // Answer where the edit waits, then report: nothing to attach to.
         let status = match &link.host {
-            Some(alias) => crate::proc::command("ssh")
-                .arg("--")
-                .arg(alias)
+            Some(alias) => crate::remote::Ssh::direct(alias)
                 .arg(crate::deep_link::remote_shell_command(&args))
+                .into_command()
                 .status()?,
             None => std::process::Command::new(std::env::current_exe()?)
                 .args(&args)

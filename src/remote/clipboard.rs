@@ -11,16 +11,11 @@ pub(super) fn handle_clipboard_request(
 ) {
     let dest_dir = format!("{inbox_dir}/{request_id}");
     let mkdir = format!("mkdir -p {}", shell_quote(&dest_dir));
-    let mkdir_ok = crate::proc::command("ssh")
-        .arg("-S")
-        .arg(socket)
-        .arg("-o")
-        .arg("ControlMaster=no")
+    let mkdir_ok = Ssh::bare_client(socket)
         .arg(host)
         .arg(&mkdir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .quiet()
+        .into_command()
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
@@ -45,13 +40,10 @@ pub(super) fn handle_clipboard_request(
         "cat > {dst}",
         dst = shell_quote(&format!("{dest_dir}/clipboard.txt")),
     );
-    let mut ssh_recv = match crate::proc::command("ssh")
-        .arg("-S")
-        .arg(socket)
-        .arg("-o")
-        .arg("ControlMaster=no")
+    let mut ssh_recv = match Ssh::bare_client(socket)
         .arg(host)
         .arg(&remote_cmd)
+        .into_command()
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -77,16 +69,11 @@ pub(super) fn handle_clipboard_request(
     match status {
         Ok(s) if s.success() => {
             let touch = format!("touch {}/.ok", shell_quote(&dest_dir));
-            let _ = crate::proc::command("ssh")
-                .arg("-S")
-                .arg(socket)
-                .arg("-o")
-                .arg("ControlMaster=no")
+            let _ = Ssh::bare_client(socket)
                 .arg(host)
                 .arg(&touch)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .quiet()
+                .into_command()
                 .status();
         }
         Ok(s) => write_relay_err(
@@ -148,13 +135,10 @@ pub(super) fn handle_copy_request(host: &str, socket: &Path, inbox_dir: &str, re
         retry_busy: false,
     }
     .run(
-        crate::proc::command("ssh")
-            .arg("-S")
-            .arg(socket)
-            .arg("-o")
-            .arg("ControlMaster=no")
+        &mut Ssh::bare_client(socket)
             .arg(host)
-            .arg(&remote_cmd),
+            .arg(&remote_cmd)
+            .into_command(),
     );
     let payload = match ran {
         Ok(ran) => ran.stdout.into_bytes(),
