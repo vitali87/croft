@@ -1291,12 +1291,12 @@ fn the_scrubber_never_seeks_under_a_popup() {
         app.editor.open(&repo.path().join("a.txt")).unwrap();
         app.scrub_history();
         draw(&mut app, 120, 30);
-        let track = app.scrub_slider;
+        let track = app.scrub.slider;
         assert!(track.width > 10, "setup: the slider lays out");
-        let before = app.scrub_view.as_ref().map(|v| v.lines.clone());
+        let before = app.scrub.view.as_ref().map(|v| v.lines.clone());
         let _hook = open(&mut app, p);
         left_click(&mut app, track.x, track.y);
-        if app.scrub_view.as_ref().map(|v| v.lines.clone()) != before {
+        if app.scrub.view.as_ref().map(|v| v.lines.clone()) != before {
             sought.push(format!("{p:?}"));
         }
     }

@@ -52,12 +52,14 @@ impl App {
             // While scrubbing (#371) the outline is the commit's, so the
             // chain follows the historical view's caret.
             let line = self
-                .scrub_view
+                .scrub
+                .view
                 .as_ref()
                 .map_or(self.editor.cursor_row, |v| v.cursor_row) as u32;
             let symbols = self.outline.symbols();
             let col = self
-                .scrub_view
+                .scrub
+                .view
                 .as_ref()
                 .map_or(self.editor.cursor_col, |v| v.cursor_col) as u32;
             for i in breadcrumb_symbol_chain(symbols, line, col) {
@@ -111,11 +113,13 @@ impl App {
         }
         if self.outline.path() == Some(path) {
             let line = self
-                .scrub_view
+                .scrub
+                .view
                 .as_ref()
                 .map_or(self.editor.cursor_row, |v| v.cursor_row) as u32;
             let col = self
-                .scrub_view
+                .scrub
+                .view
                 .as_ref()
                 .map_or(self.editor.cursor_col, |v| v.cursor_col) as u32;
             targets.extend(

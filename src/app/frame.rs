@@ -1032,10 +1032,10 @@ impl App {
                     0
                 }
             };
-            if self.scrubber.is_some() && self.scrub_for != self.editor.path {
+            if self.scrub.scrubber.is_some() && self.scrub.view_for != self.editor.path {
                 self.rebuild_scrub_view();
             }
-            let paint_history = self.scrub_view.is_some();
+            let paint_history = self.scrub.view.is_some();
             let active_idx = self.editor_layout.active_dfs_index();
             let focused_area = if self.editor_layout.is_split() {
                 let mut rects = rects;
@@ -1113,7 +1113,7 @@ impl App {
             // text (#371); the tab strip stays the live one, while the breadcrumbs
             // and Outline follow the commit (see `sync_outline`).
             if paint_history
-                && let Some(view) = self.scrub_view.as_mut()
+                && let Some(view) = self.scrub.view.as_mut()
                 && self.editor.last_body.width > 0
             {
                 view.theme = self.theme;

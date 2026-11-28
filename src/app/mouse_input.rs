@@ -616,7 +616,7 @@ impl App {
             self.editor.end_box_select();
         }
         self.gesture = None;
-        self.scrub_dragging = false;
+        self.scrub.dragging = false;
         if self.tree_drag.take().is_some() {
             self.tree.drag_target = None;
         }
@@ -819,20 +819,20 @@ impl App {
         // The history scrubber's slider (#371): a press on the track seeks
         // there, and a drag that started on it keeps seeking wherever the
         // pointer goes, so the handle can be dragged off the row and back.
-        if self.scrubber.is_some() && !self.popup_open() {
-            let on_track = rect_contains(self.scrub_slider, m.column, m.row);
+        if self.scrub.scrubber.is_some() && !self.popup_open() {
+            let on_track = rect_contains(self.scrub.slider, m.column, m.row);
             match m.kind {
                 MouseEventKind::Down(MouseButton::Left) if on_track => {
-                    self.scrub_dragging = true;
+                    self.scrub.dragging = true;
                     self.scrub_seek_column(m.column);
                     return;
                 }
-                MouseEventKind::Drag(MouseButton::Left) if self.scrub_dragging => {
+                MouseEventKind::Drag(MouseButton::Left) if self.scrub.dragging => {
                     self.scrub_seek_column(m.column);
                     return;
                 }
-                MouseEventKind::Up(MouseButton::Left) if self.scrub_dragging => {
-                    self.scrub_dragging = false;
+                MouseEventKind::Up(MouseButton::Left) if self.scrub.dragging => {
+                    self.scrub.dragging = false;
                     return;
                 }
                 _ => {}
@@ -2666,7 +2666,7 @@ impl App {
                     }
                 } else if in_editor_pane && !in_editor {
                     let crumb = self.editor.breadcrumb_index_at(m.column, m.row);
-                    if let Some(i) = crumb.filter(|_| self.scrub_view.is_none()) {
+                    if let Some(i) = crumb.filter(|_| self.scrub.view.is_none()) {
                         // A crumb opens its picker (#1608): a folder's
                         // entries, the file's folder, or the symbol's
                         // siblings.
