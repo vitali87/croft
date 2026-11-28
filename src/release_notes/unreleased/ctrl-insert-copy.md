@@ -1,0 +1,1 @@
+feat: Ctrl+Insert copies the selection and Shift+Insert pastes, the classic CUA pair next to Ctrl+C and Ctrl+V. Both work wherever those do (the editor, the search and source-control inputs, the terminal pane for paste) and are listed in the Shortcuts view.
