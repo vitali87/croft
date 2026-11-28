@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::widgets::search::{SearchHit, SearchOpts};
+use crate::search::{SearchHit, SearchOpts};
 
 /// The query a Search Editor runs, as its header spells it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

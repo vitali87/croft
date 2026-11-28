@@ -37,7 +37,7 @@ impl PtyTerminal {
 
     /// Set (or clear) the find highlight. Every occurrence of `needle` is
     /// painted across the visible grid on the next render.
-    pub fn set_search(&mut self, needle: Option<String>, opts: crate::widgets::search::SearchOpts) {
+    pub fn set_search(&mut self, needle: Option<String>, opts: crate::search::SearchOpts) {
         self.search_needle = needle.filter(|s| !s.is_empty());
         self.search_opts = opts;
         self.pty_dirty.store(true, Ordering::Release);

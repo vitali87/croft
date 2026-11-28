@@ -15,11 +15,6 @@ mod render;
 mod replace;
 mod results;
 use crate::search::*;
-pub use crate::search::{
-    PathFilter, SearchEvent, SearchHit, SearchOpts, SearchRequest, line_may_match, preserve_case,
-    search_worker_loop, search_workspace_streaming_filtered, split_for_highlight,
-};
-pub(crate) use crate::search::{Pattern, as_typed};
 
 /// How far the Search panel's run got (#2608).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

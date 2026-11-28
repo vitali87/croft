@@ -146,7 +146,7 @@ pub struct FileTree {
     pub agent_touched: Arc<HashSet<PathBuf>>,
     /// The project's `files_exclude` globs (#1345): matching entries are
     /// not listed, like VS Code's `files.exclude`.
-    pub exclude: crate::widgets::search::PathFilter,
+    pub exclude: crate::search::PathFilter,
     /// Fold a folder whose only entry is a folder into one row with it
     /// (#1486). On by default; the `disable_compact_folders` setting clears
     /// it through [`Self::set_compact_folders`].

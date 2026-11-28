@@ -797,7 +797,7 @@ impl PtyTerminal {
             manual_name: None,
             auto_label: String::new(),
             search_needle: None,
-            search_opts: crate::widgets::search::SearchOpts::default(),
+            search_opts: crate::search::SearchOpts::default(),
             current_match: None,
             bell,
             clipboard_store,

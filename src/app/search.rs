@@ -83,7 +83,7 @@ impl App {
             query: self.search.query.clone(),
             opts: self.search.opts,
         });
-        let term = if crate::widgets::search::as_typed(&self.search.query).is_empty() {
+        let term = if crate::search::as_typed(&self.search.query).is_empty() {
             None
         } else {
             Some(self.search.query.clone())
@@ -97,7 +97,7 @@ impl App {
     /// and `Crashed` say how far the run got. Returns true iff the panel
     /// changed, so the main loop knows to redraw.
     pub fn drain_search_results(&mut self) -> bool {
-        use crate::widgets::search::SearchEvent;
+        use crate::search::SearchEvent;
         let mut applied = false;
         // Every batch waiting is merged in one pass (#1340).
         let mut arrived = Vec::new();
@@ -379,7 +379,7 @@ impl App {
             self.status = String::from("Replace All is owner-only in a shared session");
             return;
         }
-        if crate::widgets::search::as_typed(&self.search.query).is_empty() {
+        if crate::search::as_typed(&self.search.query).is_empty() {
             self.status = String::from("Replace All: enter a search term first");
             return;
         }
@@ -478,7 +478,7 @@ impl App {
         self.status = String::from("Replace All cancelled");
     }
 
-    pub(super) fn open_search_hit(&mut self, hit: &crate::widgets::search::SearchHit) {
+    pub(super) fn open_search_hit(&mut self, hit: &crate::search::SearchHit) {
         match self.editor.open_preview(&hit.path) {
             Ok(()) => {
                 self.sync_open_file_poll_mtime();
@@ -491,7 +491,7 @@ impl App {
                 // horizontally and the user lands on the match instead of the
                 // line's leftmost cell - which on a 200k-char line means
                 // never seeing the match without manual scrolling.
-                let needle = crate::widgets::search::as_typed(&self.search.query);
+                let needle = crate::search::as_typed(&self.search.query);
                 let opts = self.search.opts;
                 let line = self.editor.lines.get(row).cloned().unwrap_or_default();
                 // Locate the first match on the line: its start column and
@@ -505,8 +505,7 @@ impl App {
                 } else {
                     let mut col = 0usize;
                     let mut found = None;
-                    for (chunk, is_match) in
-                        crate::widgets::search::split_for_highlight(&line, needle, opts)
+                    for (chunk, is_match) in crate::search::split_for_highlight(&line, needle, opts)
                     {
                         if is_match {
                             found = Some((col, chunk.chars().count()));
@@ -1433,7 +1432,7 @@ impl App {
         &self,
         forward: bool,
         needle: &str,
-        opts: crate::widgets::search::SearchOpts,
+        opts: crate::search::SearchOpts,
         row: usize,
         col: usize,
         skip_current: bool,
@@ -2007,12 +2006,12 @@ impl App {
         let query = header.query.clone();
         let header_query = query.clone();
         let opts = header.opts;
-        let filter = crate::widgets::search::PathFilter::new(&header.include, &header.exclude);
+        let filter = crate::search::PathFilter::new(&header.include, &header.exclude);
         std::thread::spawn(move || {
             let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let sink = hits.clone();
             let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            crate::widgets::search::search_workspace_streaming_filtered(
+            crate::search::search_workspace_streaming_filtered(
                 &root,
                 &query,
                 opts,
@@ -2090,7 +2089,7 @@ impl App {
         } else {
             "Search: project exclusions off, searching every folder"
         });
-        if !crate::widgets::search::as_typed(&self.search.query).is_empty() {
+        if !crate::search::as_typed(&self.search.query).is_empty() {
             self.submit_search_query();
         }
     }
@@ -2104,7 +2103,7 @@ impl App {
         if self.search.project_exclude.is_empty() {
             return entries;
         }
-        let filter = crate::widgets::search::PathFilter::excluding(&self.search.project_exclude);
+        let filter = crate::search::PathFilter::excluding(&self.search.project_exclude);
         let kept = entries
             .iter()
             .filter(|e| {

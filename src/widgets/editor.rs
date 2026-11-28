@@ -378,7 +378,7 @@ pub struct Editor {
     /// `(edit_seq, needle, options)`. The ruler renders every frame, and
     /// re-running the search (a regex compile included) over the whole buffer
     /// per frame is input lag on a large file.
-    ruler_search_cache: Option<(u64, String, crate::widgets::search::SearchOpts, Vec<usize>)>,
+    ruler_search_cache: Option<(u64, String, crate::search::SearchOpts, Vec<usize>)>,
     /// Overview ruler: each line's first visual row in wrap mode, text rows
     /// only, keyed by `(edit_seq, wrap width)`. Comment-box rows are few and
     /// change without an edit, so they are added at mapping time instead.
@@ -974,7 +974,7 @@ pub struct Editor {
     /// sensitivity, whole-word boundaries, regex. Mirrors `SearchPanel.opts`
     /// so the editor's yellow highlight stays consistent with what the
     /// search panel claims is a match.
-    pub search_highlight_opts: crate::widgets::search::SearchOpts,
+    pub search_highlight_opts: crate::search::SearchOpts,
     /// When the inline editor Find overlay (Cmd+F) is open and the cursor
     /// has landed on a match, this records (row, col_chars, len_chars) so
     /// the renderer can paint the active match in a stronger orange while
@@ -1287,7 +1287,7 @@ impl Editor {
             registry: LangRegistry::new(),
             overview_ruler: true,
             search_highlight: None,
-            search_highlight_opts: crate::widgets::search::SearchOpts::default(),
+            search_highlight_opts: crate::search::SearchOpts::default(),
             active_search_match: None,
             find_range: None,
             markdown_preview: None,
@@ -1534,7 +1534,7 @@ pub struct EditorTabs {
     search_highlight_term: Option<String>,
     /// Toggle state matching `search_highlight_term`. Same propagation
     /// strategy: every newly-created editor inherits these.
-    search_highlight_opts: crate::widgets::search::SearchOpts,
+    search_highlight_opts: crate::search::SearchOpts,
     /// Last pointer cell, fed in by `App` before each render so the tab
     /// strip can paint a hover lift on the tab body under the pointer and a
     /// pill behind the close `\u{2715}` cell when the pointer rests on it.

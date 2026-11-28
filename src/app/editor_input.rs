@@ -256,7 +256,7 @@ impl App {
             self.status = String::from("vim mode on");
         } else {
             self.editor
-                .set_search_highlight(None, crate::widgets::search::SearchOpts::default());
+                .set_search_highlight(None, crate::search::SearchOpts::default());
             self.status = String::from("vim mode off");
         }
         // Saved as the mode the next launch starts in (#1286). Under test
@@ -285,7 +285,7 @@ impl App {
             self.end_vim_undo_groups();
             if !on {
                 self.editor
-                    .set_search_highlight(None, crate::widgets::search::SearchOpts::default());
+                    .set_search_highlight(None, crate::search::SearchOpts::default());
             }
         }
     }
@@ -1948,10 +1948,8 @@ impl App {
     }
 
     pub(super) fn vim_search(&mut self, dir: crate::vim::SearchDir, term: &str) {
-        self.editor.set_search_highlight(
-            Some(term.to_string()),
-            crate::widgets::search::SearchOpts::default(),
-        );
+        self.editor
+            .set_search_highlight(Some(term.to_string()), crate::search::SearchOpts::default());
         match self.vim_find_match(dir, term) {
             Some((row, col)) => {
                 self.editor.cursor_row = row;

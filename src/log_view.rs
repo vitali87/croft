@@ -26,8 +26,8 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::ansi_text::{AnsiLine, AnsiSpan, AnsiStyle, parse_into, parse_line};
+use crate::search::{SearchOpts, line_may_match};
 use crate::widgets::editor_find::{MatchPos, line_matches};
-use crate::widgets::search::{SearchOpts, line_may_match};
 
 /// Whether a NEWLY opened view highlights (#466). The app sets it from the
 /// `disable_log_highlight` preference at startup, on a settings remerge (a

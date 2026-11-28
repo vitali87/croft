@@ -13782,7 +13782,7 @@ fn editor_tabs_search_highlight_survives_close_then_open_via_preview() {
     t.open_pinned(f1.path()).unwrap();
     t.set_search_highlight(
         Some(String::from("needle")),
-        crate::widgets::search::SearchOpts::default(),
+        crate::search::SearchOpts::default(),
     );
     // Close the first (and only non-blank) tab — leaves the blank
     // initial tab.
@@ -13820,7 +13820,7 @@ fn editor_tabs_search_highlight_survives_open_pinned_after_close() {
     t.open_pinned(f2.path()).unwrap();
     t.set_search_highlight(
         Some(String::from("needle")),
-        crate::widgets::search::SearchOpts::default(),
+        crate::search::SearchOpts::default(),
     );
     // Close f1; both should still be highlighted, and now a fresh open
     // of a third file should inherit too.
@@ -13852,12 +13852,12 @@ fn editor_tabs_set_search_highlight_propagates_to_every_tab() {
     t.open_pinned(f2.path()).unwrap();
     t.set_search_highlight(
         Some(String::from("term")),
-        crate::widgets::search::SearchOpts::default(),
+        crate::search::SearchOpts::default(),
     );
     for ed in &t.editors {
         assert_eq!(ed.search_highlight.as_deref(), Some("term"));
     }
-    t.set_search_highlight(None, crate::widgets::search::SearchOpts::default());
+    t.set_search_highlight(None, crate::search::SearchOpts::default());
     for ed in &t.editors {
         assert!(ed.search_highlight.is_none());
     }

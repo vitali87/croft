@@ -345,7 +345,7 @@ pub(super) fn render_log(
     bg: Color,
     theme: crate::theme::Theme,
     scroll: usize,
-    search: Option<(&str, crate::widgets::search::SearchOpts)>,
+    search: Option<(&str, crate::search::SearchOpts)>,
     active: Option<(usize, usize, usize)>,
 ) {
     let bg_style = Style::default().bg(bg);

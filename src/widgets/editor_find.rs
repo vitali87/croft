@@ -1,4 +1,4 @@
-use crate::widgets::search::{Pattern, SearchOpts, split_for_highlight};
+use crate::search::{Pattern, SearchOpts, split_for_highlight};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -435,7 +435,7 @@ fn shaped(
         return replacement;
     }
     let matched: String = line.chars().skip(col_chars).take(len_chars).collect();
-    crate::widgets::search::preserve_case(&matched, &replacement)
+    crate::search::preserve_case(&matched, &replacement)
 }
 
 /// Translate VS Code's regex-replacement escapes (`\n`, `\t`, `\r`, `\\`)
@@ -468,7 +468,7 @@ fn unescape_escapes(replacement: &str) -> String {
 /// `replacement` shaped after `matched` under Preserve Case (#1612).
 fn case_of(matched: &str, replacement: &str, opts: SearchOpts) -> String {
     if opts.preserve_case {
-        crate::widgets::search::preserve_case(matched, replacement)
+        crate::search::preserve_case(matched, replacement)
     } else {
         replacement.to_string()
     }

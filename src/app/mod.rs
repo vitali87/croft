@@ -127,6 +127,7 @@ use crate::paths::croft_cache_dir;
 use crate::theme::BRAND_ORANGE;
 use crate::widgets::terminal::cwd_of_pid;
 
+use crate::search::SearchRequest;
 use crate::widgets::{
     dependencies::{DependenciesPanel, Dependency, Ecosystem},
     editor::{Editor, EditorTabs},
@@ -135,7 +136,7 @@ use crate::widgets::{
     outline::OutlinePanel,
     remote::RemotePanel,
     run_debug::RunDebugPanel,
-    search::{SearchPanel, SearchProgress, SearchRequest},
+    search::{SearchPanel, SearchProgress},
     source_control::SourceControlPanel,
     terminal::{MouseAction, MouseButtonKind, MouseMods, PtyTerminal},
     timeline::TimelinePanel,
@@ -2029,11 +2030,11 @@ pub struct App {
     /// Channel to the background search worker. Each keystroke or toggle
     /// flip pushes a `(query, opts)` request here; the worker debounces
     /// and runs `search_workspace` off the UI thread.
-    search_query_tx: std::sync::mpsc::Sender<crate::widgets::search::SearchRequest>,
+    search_query_tx: std::sync::mpsc::Sender<crate::search::SearchRequest>,
     /// Results coming back from the search worker: `(query, hits)`. The
     /// query is echoed so we can drop stale results when the user has
     /// typed past the query that produced them.
-    search_results_rx: std::sync::mpsc::Receiver<crate::widgets::search::SearchEvent>,
+    search_results_rx: std::sync::mpsc::Receiver<crate::search::SearchEvent>,
     /// Pixel size of one terminal cell, captured in `init_graphics`.
     /// Required to bake OSC-1337 images at exact viewport pixel size so
     /// iTerm draws them with no stretching or letterboxing.
@@ -2715,7 +2716,7 @@ pub struct App {
     search_editor_job: Option<(
         PathBuf,
         crate::search_editor::Header,
-        std::sync::mpsc::Receiver<Vec<crate::widgets::search::SearchHit>>,
+        std::sync::mpsc::Receiver<Vec<crate::search::SearchHit>>,
     )>,
     /// The open SARIF logs (path, disk stamp) the published diagnostics were
     /// built from (#577); a different set means publish again.
@@ -4217,11 +4218,7 @@ impl App {
         let (search_results_tx, search_results_rx) = std::sync::mpsc::channel();
         let search_root = root.clone();
         std::thread::spawn(move || {
-            crate::widgets::search::search_worker_loop(
-                search_root,
-                search_query_rx,
-                search_results_tx,
-            );
+            crate::search::search_worker_loop(search_root, search_query_rx, search_results_tx);
         });
         // Pre-build the Cmd+P file index on a background job so the
         // first Cmd+P keystroke does not stall the UI for the length of a
