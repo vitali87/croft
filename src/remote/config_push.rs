@@ -233,8 +233,7 @@ pub(super) fn read_remote_config(
 pub(super) fn print_config_diff(ssh: &SshControl, name: &str) -> Result<()> {
     let local = crate::paths::config_dir().join(name);
     let remote = read_remote_config(&ssh.socket_path, &ssh.host, name)?;
-    let tmp = std::env::temp_dir().join(format!("croft-sync-{}-{name}", std::process::id()));
-    std::fs::write(&tmp, &remote)?;
+    let tmp = scratch_file(name, &remote)?;
     let local_arg = if local.is_file() {
         local
     } else {
@@ -254,6 +253,36 @@ pub(super) fn print_config_diff(ssh: &SshControl, name: &str) -> Result<()> {
         println!("{name} is the same on {} and here", ssh.host);
     }
     Ok(())
+}
+
+/// A new file holding `bytes` in the temp dir, for `diff` to read. Its name
+/// carries the time and a counter as well as the pid, and it is made fresh
+/// ([`write_new`]), so a name another local user took first, a planted
+/// symlink included, is refused rather than followed (#2794).
+fn scratch_file(name: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let path = std::env::temp_dir().join(format!(
+        "croft-sync-{}-{nanos}-{}-{name}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    write_new(&path, bytes)?;
+    Ok(path)
+}
+
+/// Write `bytes` to `path`, which must not exist yet: a file, or a symlink to
+/// one, already there is an error and is left as it was. Readable by the
+/// user only.
+fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    opts.open(path)?.write_all(bytes)
 }
 
 impl SyncExclusions {
@@ -322,4 +351,37 @@ pub(super) fn ship_file_rsync_command(
     rsync.arg("-e").arg(lane.rsync_ssh_arg(interactive_socket));
     rsync.arg(local).arg(dest);
     rsync
+}
+
+#[cfg(all(test, unix))]
+mod scratch_tests {
+    use super::*;
+
+    /// #2794: a name someone else took first, here a symlink to a file of the
+    /// user's, is refused and its target left as it was; a fresh name is
+    /// written, readable by the user only.
+    #[test]
+    fn a_scratch_file_never_follows_a_planted_symlink() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        let planted = dir.path().join("croft-sync-planted");
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+        let refused = write_new(&planted, b"remote config").unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+
+        let fresh = dir.path().join("croft-sync-fresh");
+        write_new(&fresh, b"remote config").unwrap();
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"remote config");
+        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        let a = scratch_file("croft.toml", b"x").unwrap();
+        let b = scratch_file("croft.toml", b"y").unwrap();
+        assert_ne!(a, b, "each diff gets a name of its own");
+        let _ = std::fs::remove_file(a);
+        let _ = std::fs::remove_file(b);
+    }
 }
