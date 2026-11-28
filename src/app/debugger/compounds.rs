@@ -412,12 +412,20 @@ impl App {
                 MemberOutcome::Failed => {}
             }
         }
+        // A member croft declined to launch without its own task is named
+        // on every line that reports the set, the waiting ones included: the
+        // user has to run that task themselves.
+        let skipped = if unrun.is_empty() {
+            String::new()
+        } else {
+            format!(" ({} needs its preLaunchTask run first)", unrun.join(", "))
+        };
         if started == 0 && building.is_empty() && !preparing.is_empty() {
             // Every member that could start waits for its debugger to be
             // set up (#2803): each joins the set when that is done.
             self.debug_compound = Some(compound.clone());
             let waiting = format!(
-                "setting up the debugger for {} \u{2014} sessions start when it is ready",
+                "setting up the debugger for {} \u{2014} sessions start when it is ready{skipped}",
                 preparing.join(", ")
             );
             self.run_debug.feedback = Some(format!("compound {compound}: {waiting}"));
@@ -437,12 +445,12 @@ impl App {
                 format!("; setting up the debugger for {}", preparing.join(", "))
             };
             self.run_debug.feedback = Some(format!(
-                "compound {compound}: building {}{also} \u{2014} sessions start when cargo finishes",
+                "compound {compound}: building {}{also} \u{2014} sessions start when cargo finishes{skipped}",
                 building.join(", ")
             ));
             self.run_debug.feedback_is_error = building.len() + preparing.len() != total;
             self.status = format!(
-                "compound \"{compound}\": building {}{also} \u{2014} sessions start when cargo finishes",
+                "compound \"{compound}\": building {}{also} \u{2014} sessions start when cargo finishes{skipped}",
                 building.join(", ")
             );
             return;
