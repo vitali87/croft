@@ -615,18 +615,7 @@ impl App {
         if self.editor.box_selecting() {
             self.editor.end_box_select();
         }
-        self.splitter_drag = None;
-        self.minimap_drag = false;
-        self.scrollbar_drag = None;
-        self.editor_hscrollbar_drag = false;
-        self.breakpoint_lane_press = false;
-        self.outline_scrollbar_drag = false;
-        self.secondary_outline_scrollbar_drag = false;
-        self.open_editors_scrollbar_drag = false;
-        self.timeline_scrollbar_drag = false;
-        self.deps_scrollbar_drag = false;
-        self.testing_scrollbar_drag = false;
-        self.graph_scrollbar_drag = false;
+        self.gesture = None;
         self.scrub_dragging = false;
         if self.tree_drag.take().is_some() {
             self.tree.drag_target = None;
@@ -640,6 +629,71 @@ impl App {
         }
         if let Some(log) = self.editor.log.as_mut() {
             log.dragging = false;
+        }
+    }
+
+    /// A drag while `gesture` is live: the splitter, scrollbar thumb or
+    /// minimap follows the pointer; a breakpoint-lane press drops it.
+    fn drag_gesture(&mut self, gesture: Gesture, column: u16, row: u16) {
+        match gesture {
+            Gesture::Splitter(kind) => self.handle_splitter_drag(kind, column, row),
+            Gesture::Minimap => self.minimap_scroll_to_row(row),
+            Gesture::EditorHScrollbar => {
+                self.editor.scroll_to_bar_x(column);
+                self.poke_cursor();
+            }
+            // The lane press owns its gesture: no selection drag (#1544).
+            Gesture::BreakpointLane => {}
+            Gesture::Scrollbar(bar) => self.drag_scrollbar(bar, row),
+        }
+    }
+
+    /// The thumb of `bar` follows the pointer to `row`.
+    fn drag_scrollbar(&mut self, bar: Bar, row: u16) {
+        match bar {
+            Bar::Editor => {
+                self.editor.scroll_to_bar_y(row);
+                self.poke_cursor();
+            }
+            Bar::Explorer => {
+                self.tree.scroll_to_bar_y(row);
+            }
+            Bar::OpenEditors => {
+                self.open_editors.scroll_to_bar_y(row);
+            }
+            Bar::Outline => {
+                self.outline.scroll_to_bar_y(row);
+            }
+            Bar::SecondaryOutline => {
+                self.with_secondary_outline(|o| o.scroll_to_bar_y(row));
+            }
+            Bar::Timeline => {
+                self.timeline.scroll_to_bar_y(row);
+            }
+            Bar::Dependencies => {
+                self.dependencies.scroll_to_bar_y(row);
+            }
+            Bar::Remote => {
+                self.remote.scroll_to_bar_y(row);
+            }
+            Bar::Search => {
+                self.search.scroll_to_bar_y(row);
+            }
+            Bar::SourceControl => {
+                self.source_control.scroll_to_bar_y(row);
+            }
+            Bar::Testing => {
+                self.testing.scroll_to_bar_y(row);
+            }
+            Bar::CommitGraph => {
+                self.commit_graph.scroll_to_bar_y(row);
+            }
+            Bar::Problems => {
+                self.problems.scroll_to_bar_y(row);
+            }
+            Bar::Output => {
+                self.output.scroll_to_bar_y(row);
+            }
         }
     }
 
@@ -1697,14 +1751,14 @@ impl App {
                         && !graph_bar
                         && self.decoration_dot_at(m.column, m.row).is_none()
                     {
-                        self.splitter_drag = Some(SplitterDrag::Sidebar);
+                        self.gesture = Some(Gesture::Splitter(SplitterDrag::Sidebar));
                         return;
                     }
                 }
                 // Any seam between editor groups in the grid (any depth). Same
                 // two-cell hit-zone as the other seams.
                 if let Some(seam) = self.seam_at(m.column, m.row) {
-                    self.splitter_drag = Some(SplitterDrag::EditorSeam(seam));
+                    self.gesture = Some(Gesture::Splitter(SplitterDrag::EditorSeam(seam)));
                     return;
                 }
                 // OPEN EDITORS: header toggles collapse; a row activates that
@@ -1714,7 +1768,7 @@ impl App {
                 if rect_contains(self.open_editors.last_area, m.column, m.row) {
                     if rect_contains(self.open_editors.last_scrollbar, m.column, m.row) {
                         self.open_editors.scroll_to_bar_y(m.row);
-                        self.open_editors_scrollbar_drag = true;
+                        self.gesture = Some(Gesture::Scrollbar(Bar::OpenEditors));
                     } else if self.open_editors.hit_save_all(m.column, m.row) {
                         // VS Code's Save All on the section header (#852),
                         // checked first: the header row holds the button.
@@ -1733,7 +1787,7 @@ impl App {
                 if rect_contains(self.timeline.last_area, m.column, m.row) {
                     if rect_contains(self.timeline.last_scrollbar, m.column, m.row) {
                         self.timeline.scroll_to_bar_y(m.row);
-                        self.timeline_scrollbar_drag = true;
+                        self.gesture = Some(Gesture::Scrollbar(Bar::Timeline));
                     } else if self.timeline.hit_header(m.column, m.row) {
                         self.timeline.toggle_collapse();
                     } else if let Some(idx) = self.timeline.row_at(m.row)
@@ -1778,7 +1832,7 @@ impl App {
                 if rect_contains(self.dependencies.last_area, m.column, m.row) {
                     if rect_contains(self.dependencies.last_scrollbar, m.column, m.row) {
                         self.dependencies.scroll_to_bar_y(m.row);
-                        self.deps_scrollbar_drag = true;
+                        self.gesture = Some(Gesture::Scrollbar(Bar::Dependencies));
                     } else if self.dependencies.hit_header(m.column, m.row) {
                         self.dependencies.toggle_collapse();
                     }
@@ -1792,7 +1846,7 @@ impl App {
                 if rect_contains(self.outline.last_area, m.column, m.row) {
                     if rect_contains(self.outline.last_scrollbar, m.column, m.row) {
                         self.outline.scroll_to_bar_y(m.row);
-                        self.outline_scrollbar_drag = true;
+                        self.gesture = Some(Gesture::Scrollbar(Bar::Outline));
                     } else if self.outline.hit_header(m.column, m.row) {
                         self.outline.toggle_collapse();
                     } else if let Some(idx) = self.outline.row_at(m.row)
@@ -1850,7 +1904,7 @@ impl App {
                     {
                         self.focus_pane(Pane::Terminal);
                         self.output.scroll_to_bar_y(m.row);
-                        self.scrollbar_drag = Some(Pane::Terminal);
+                        self.gesture = Some(Gesture::Scrollbar(Bar::Output));
                         return;
                     }
                     if !self.output.click(m.column, m.row) {
@@ -1871,7 +1925,7 @@ impl App {
                     if rect_contains(self.problems.last_scrollbar, m.column, m.row) {
                         self.focus_pane(Pane::Terminal);
                         self.problems.scroll_to_bar_y(m.row);
-                        self.scrollbar_drag = Some(Pane::Terminal);
+                        self.gesture = Some(Gesture::Scrollbar(Bar::Problems));
                         return;
                     }
                     // Toolbar buttons (severity filter / group toggle) consume
@@ -2042,7 +2096,7 @@ impl App {
                     // two files in the Explorer.
                     let in_splitter_x_range = self.sidebar_splitter_x.is_none_or(|x| m.column >= x);
                     if in_splitter_x_range && (m.row == y || m.row == y.saturating_sub(1)) {
-                        self.splitter_drag = Some(SplitterDrag::Terminal);
+                        self.gesture = Some(Gesture::Splitter(SplitterDrag::Terminal));
                         return;
                     }
                 }
@@ -2065,35 +2119,35 @@ impl App {
                 if in_tree_scrollbar {
                     self.focus_pane(Pane::Tree);
                     self.tree.scroll_to_bar_y(m.row);
-                    self.scrollbar_drag = Some(Pane::Tree);
+                    self.gesture = Some(Gesture::Scrollbar(Bar::Explorer));
                     self.tree_click.clear();
                     return;
                 }
                 if in_remote_scrollbar {
                     self.focus_pane(Pane::Tree);
                     self.remote.scroll_to_bar_y(m.row);
-                    self.scrollbar_drag = Some(Pane::Tree);
+                    self.gesture = Some(Gesture::Scrollbar(Bar::Remote));
                     self.tree_click.clear();
                     return;
                 }
                 if in_search_scrollbar {
                     self.focus_pane(Pane::Tree);
                     self.search.scroll_to_bar_y(m.row);
-                    self.scrollbar_drag = Some(Pane::Tree);
+                    self.gesture = Some(Gesture::Scrollbar(Bar::Search));
                     self.tree_click.clear();
                     return;
                 }
                 if rect_contains(self.minimap_img_rect, m.column, m.row) {
                     self.focus_pane(Pane::Editor);
                     self.minimap_scroll_to_row(m.row);
-                    self.minimap_drag = true;
+                    self.gesture = Some(Gesture::Minimap);
                     self.editor_click.clear();
                     return;
                 }
                 if in_editor_scrollbar {
                     self.focus_pane(Pane::Editor);
                     self.editor.scroll_to_bar_y(m.row);
-                    self.scrollbar_drag = Some(Pane::Editor);
+                    self.gesture = Some(Gesture::Scrollbar(Bar::Editor));
                     self.editor_click.clear();
                     self.poke_cursor();
                     return;
@@ -2101,7 +2155,7 @@ impl App {
                 if in_editor_hscrollbar {
                     self.focus_pane(Pane::Editor);
                     self.editor.scroll_to_bar_x(m.column);
-                    self.editor_hscrollbar_drag = true;
+                    self.gesture = Some(Gesture::EditorHScrollbar);
                     self.editor_click.clear();
                     self.poke_cursor();
                     return;
@@ -2187,7 +2241,7 @@ impl App {
                     if rect_contains(self.commit_graph.last_area, m.column, m.row) {
                         if rect_contains(self.commit_graph.last_scrollbar, m.column, m.row) {
                             self.commit_graph.scroll_to_bar_y(m.row);
-                            self.graph_scrollbar_drag = true;
+                            self.gesture = Some(Gesture::Scrollbar(Bar::CommitGraph));
                         } else if self.commit_graph.hit_header(m.column, m.row) {
                             self.commit_graph.toggle_collapse();
                         } else if let Some(row) = self.commit_graph.row_index_at(m.row) {
@@ -2210,7 +2264,7 @@ impl App {
                     // follows a drag, as the COMMITS graph's does (#2860).
                     if rect_contains(self.source_control.last_scrollbar, m.column, m.row) {
                         self.source_control.scroll_to_bar_y(m.row);
-                        self.scrollbar_drag = Some(Pane::Tree);
+                        self.gesture = Some(Gesture::Scrollbar(Bar::SourceControl));
                         self.tree_click.clear();
                         return;
                     }
@@ -2367,7 +2421,7 @@ impl App {
                     // Empty space does nothing.
                     if rect_contains(self.testing.last_scrollbar, m.column, m.row) {
                         self.testing.scroll_to_bar_y(m.row);
-                        self.testing_scrollbar_drag = true;
+                        self.gesture = Some(Gesture::Scrollbar(Bar::Testing));
                     } else if rect_contains(self.testing.last_watch_all, m.column, m.row) {
                         self.toggle_test_watch(crate::testing::watch::WatchScope::All);
                     } else if rect_contains(self.testing.last_cover_all, m.column, m.row) {
@@ -2903,7 +2957,7 @@ impl App {
                         && let Some(line0) = self.editor.breakpoint_lane_line_at(m.column, m.row)
                     {
                         self.debug_toggle_breakpoint_line(line0 + 1);
-                        self.breakpoint_lane_press = true;
+                        self.gesture = Some(Gesture::BreakpointLane);
                         self.poke_cursor();
                         return;
                     }
@@ -3088,89 +3142,8 @@ impl App {
                     }
                     return;
                 }
-                if let Some(kind) = self.splitter_drag.clone() {
-                    self.handle_splitter_drag(kind, m.column, m.row);
-                    return;
-                }
-                if self.minimap_drag {
-                    self.minimap_scroll_to_row(m.row);
-                    return;
-                }
-                if self.editor_hscrollbar_drag {
-                    self.editor.scroll_to_bar_x(m.column);
-                    self.poke_cursor();
-                    return;
-                }
-                // The lane press owns its gesture: no selection drag (#1544).
-                if self.breakpoint_lane_press {
-                    return;
-                }
-                if self.outline_scrollbar_drag {
-                    self.outline.scroll_to_bar_y(m.row);
-                    return;
-                }
-                if self.secondary_outline_scrollbar_drag {
-                    self.with_secondary_outline(|o| o.scroll_to_bar_y(m.row));
-                    return;
-                }
-                if self.open_editors_scrollbar_drag {
-                    self.open_editors.scroll_to_bar_y(m.row);
-                    return;
-                }
-                if self.timeline_scrollbar_drag {
-                    self.timeline.scroll_to_bar_y(m.row);
-                    return;
-                }
-                if self.deps_scrollbar_drag {
-                    self.dependencies.scroll_to_bar_y(m.row);
-                    return;
-                }
-                if self.testing_scrollbar_drag {
-                    self.testing.scroll_to_bar_y(m.row);
-                    return;
-                }
-                if self.graph_scrollbar_drag {
-                    self.commit_graph.scroll_to_bar_y(m.row);
-                    return;
-                }
-                if let Some(pane) = self.scrollbar_drag {
-                    match pane {
-                        Pane::Tree => match self.sidebar_view {
-                            SidebarView::Explorer => {
-                                self.tree.scroll_to_bar_y(m.row);
-                            }
-                            SidebarView::Remote => {
-                                self.remote.scroll_to_bar_y(m.row);
-                            }
-                            SidebarView::SourceControl => {
-                                self.source_control.scroll_to_bar_y(m.row);
-                            }
-                            SidebarView::Search => {
-                                self.search.scroll_to_bar_y(m.row);
-                            }
-                            SidebarView::RunDebug => {}
-                            SidebarView::Extensions => {}
-                            SidebarView::Testing => {}
-                            SidebarView::CodeQL => {}
-                        },
-                        Pane::Editor => {
-                            self.editor.scroll_to_bar_y(m.row);
-                            self.poke_cursor();
-                        }
-                        // In the bottom panel a press latches only PROBLEMS'
-                        // and OUTPUT's scrollbars (#2848).
-                        Pane::Terminal => match self.bottom_panel_tab {
-                            BottomPanelTab::Problems => {
-                                self.problems.scroll_to_bar_y(m.row);
-                            }
-                            BottomPanelTab::Output => {
-                                self.output.scroll_to_bar_y(m.row);
-                            }
-                            BottomPanelTab::Terminal
-                            | BottomPanelTab::Ports
-                            | BottomPanelTab::Captures => {}
-                        },
-                    }
+                if let Some(gesture) = self.gesture.clone() {
+                    self.drag_gesture(gesture, m.column, m.row);
                     return;
                 }
                 // Some terminals emit a Drag at the same cell as the Down even
@@ -3472,40 +3445,7 @@ impl App {
                     self.editor.end_box_select();
                     return;
                 }
-                if self.splitter_drag.take().is_some() {
-                    return;
-                }
-                if std::mem::take(&mut self.minimap_drag) {
-                    return;
-                }
-                if self.scrollbar_drag.take().is_some() {
-                    return;
-                }
-                if std::mem::take(&mut self.editor_hscrollbar_drag) {
-                    return;
-                }
-                if std::mem::take(&mut self.breakpoint_lane_press) {
-                    return;
-                }
-                if std::mem::take(&mut self.outline_scrollbar_drag) {
-                    return;
-                }
-                if std::mem::take(&mut self.secondary_outline_scrollbar_drag) {
-                    return;
-                }
-                if std::mem::take(&mut self.open_editors_scrollbar_drag) {
-                    return;
-                }
-                if std::mem::take(&mut self.timeline_scrollbar_drag) {
-                    return;
-                }
-                if std::mem::take(&mut self.deps_scrollbar_drag) {
-                    return;
-                }
-                if std::mem::take(&mut self.testing_scrollbar_drag) {
-                    return;
-                }
-                if std::mem::take(&mut self.graph_scrollbar_drag) {
+                if self.gesture.take().is_some() {
                     return;
                 }
                 if let Some(drag) = self.tree_drag.take() {

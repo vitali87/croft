@@ -4608,8 +4608,8 @@ fn a_stale_commit_graph_scrollbar_rect_cannot_deaden_the_splitter() {
         modifiers: KeyModifiers::NONE,
     });
     assert_eq!(
-        app.splitter_drag,
-        Some(SplitterDrag::Sidebar),
+        app.gesture,
+        Some(Gesture::Splitter(SplitterDrag::Sidebar)),
         "a stale graph scrollbar rect must not deaden the seam outside Source Control"
     );
     app.handle_mouse(crossterm::event::MouseEvent {
@@ -4627,7 +4627,7 @@ fn a_stale_commit_graph_scrollbar_rect_cannot_deaden_the_splitter() {
         modifiers: KeyModifiers::NONE,
     });
     assert!(
-        app.splitter_drag.is_none(),
+        !matches!(app.gesture, Some(Gesture::Splitter(_))),
         "the live graph scrollbar keeps its exemption from the grab zone"
     );
 }

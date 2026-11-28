@@ -1820,5 +1820,83 @@ fn pressing_and_dragging_the_problems_scrollbar_scrolls_the_list() {
         "dragging the thumb to the track's top must bring the header back"
     );
     app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), bar.x, bar.y));
-    assert!(app.scrollbar_drag.is_none(), "the release ends the drag");
+    assert!(app.gesture.is_none(), "the release ends the drag");
+}
+
+/// #2863: a scrollbar drag belongs to the bar it started on. Press OUTPUT's
+/// bar, switch the panel to PROBLEMS from the keyboard with the button still
+/// held (Ctrl+Shift+M), and drag: PROBLEMS must not scroll. The press used
+/// to record only the panel, and each drag scrolled whichever list the panel
+/// showed by then.
+#[test]
+fn a_drag_begun_on_the_output_scrollbar_leaves_problems_alone_after_a_tab_switch() {
+    use crate::lsp::manager::DiagnosticSeverity;
+    use crate::widgets::problems::ProblemHit;
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("many.rs");
+    std::fs::write(&file, "fn a() {}\n".repeat(120)).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let diagnostics = (0..120)
+        .map(|line| crate::lsp::manager::Diagnostic {
+            start_line: line,
+            start_char: 3,
+            end_line: line,
+            end_char: 4,
+            severity: DiagnosticSeverity::Warning,
+            message: format!("warning on line {line}"),
+            tags: Default::default(),
+            code: None,
+            origin: None,
+        })
+        .collect();
+    let mut by_server = std::collections::HashMap::new();
+    by_server.insert(String::from("rustc"), diagnostics);
+    app.lsp_diagnostics.insert(file.clone(), by_server);
+    app.rebuild_problems();
+    // The bus is process-wide, so the channel carries a name no other test
+    // uses.
+    let channel = "Tab Switch Drag 2863";
+    for i in 0..200 {
+        crate::output::push(
+            channel,
+            crate::output::OutputLevel::Info,
+            &format!("log line {i:03}"),
+        );
+    }
+    app.output.sync();
+    assert!(app.output.select_by_name(channel));
+    app.bottom_panel_tab = BottomPanelTab::Output;
+
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let bar = app.output.last_scrollbar;
+    assert!(bar.width > 0 && bar.height > 2, "OUTPUT draws a scrollbar");
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), bar.x, bar.y));
+
+    // Ctrl+Shift+M with the button still held.
+    app.set_bottom_panel_tab(BottomPanelTab::Problems);
+    term.draw(|f| app.render(f)).unwrap();
+    let problems_bar = app.problems.last_scrollbar;
+    assert!(problems_bar.width > 0, "PROBLEMS draws a scrollbar");
+    assert!(
+        matches!(
+            app.problems.hit_at(problems_bar.y),
+            Some(ProblemHit::Header(_))
+        ),
+        "PROBLEMS opens at its first file's header"
+    );
+
+    let foot = bar.y + bar.height - 1;
+    app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), bar.x, foot));
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        matches!(
+            app.problems.hit_at(problems_bar.y),
+            Some(ProblemHit::Header(_))
+        ),
+        "a drag begun on OUTPUT's bar must not scroll PROBLEMS"
+    );
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), bar.x, foot));
 }

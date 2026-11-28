@@ -354,7 +354,7 @@ fn dragging_editor_horizontal_scrollbar_pans_the_buffer() {
         modifiers: KeyModifiers::NONE,
     });
     assert!(
-        !app.editor_hscrollbar_drag,
+        app.gesture != Some(Gesture::EditorHScrollbar),
         "releasing must clear the drag flag"
     );
 }

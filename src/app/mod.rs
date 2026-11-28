@@ -1887,41 +1887,18 @@ pub struct App {
     /// scrollback. `None` whenever the pointer is inside the pane or the
     /// button is released.
     terminal_select_autoscroll: Option<TerminalSelectAutoScroll>,
-    /// Pane whose scrollbar is currently being dragged with the left mouse
-    /// button. `Pane::Terminal` is the bottom panel's PROBLEMS or OUTPUT
-    /// list, whichever tab is showing (#2848).
-    scrollbar_drag: Option<Pane>,
-    /// True while the editor's horizontal scrollbar thumb is being dragged.
-    /// Only the editor has a horizontal bar, so a bool suffices.
-    editor_hscrollbar_drag: bool,
-    /// A left press in the editor's breakpoint lane toggled a breakpoint
-    /// (#1544), so the rest of that gesture belongs to the lane: drags are
-    /// dropped until the release. Without it the first drag (some terminals
-    /// send one at the press cell) would anchor a selection at the caret and
-    /// walk the caret to the clicked line, undoing the caret-preserving
-    /// click. Cleared on the release and on the next press.
-    breakpoint_lane_press: bool,
+    /// The drag a left press started on a splitter, a scrollbar, the
+    /// minimap or the breakpoint lane, until its release. One value, so two
+    /// cannot be under way at once; a new press replaces it (#2859).
+    gesture: Option<Gesture>,
     /// The line a triple-click or a line-number press selected (#1570): a
     /// drag from it selects whole lines, from this one to the line under
     /// the pointer. Cleared on the release and on the next press.
     editor_line_drag: Option<usize>,
-    /// A left-drag is moving the OUTLINE panel's scrollbar thumb. The outline
-    /// is not a focusable `Pane`, so it gets its own drag latch rather than
-    /// riding `scrollbar_drag`.
-    outline_scrollbar_drag: bool,
     /// The secondary side bar's own view of the Outline (scroll and hit
     /// rects), swapped into `outline` around that bar's render and mouse
     /// handling so the two hosts scroll and click independently (#1326).
     secondary_outline: crate::widgets::outline::OutlineView,
-    /// The secondary Outline's scrollbar thumb is being dragged.
-    secondary_outline_scrollbar_drag: bool,
-    /// Scrollbar-thumb drag latches for the other stacked Explorer sub-views,
-    /// matching `outline_scrollbar_drag` (none is a focusable `Pane`).
-    open_editors_scrollbar_drag: bool,
-    timeline_scrollbar_drag: bool,
-    deps_scrollbar_drag: bool,
-    testing_scrollbar_drag: bool,
-    graph_scrollbar_drag: bool,
     welcome: WelcomeState,
     /// One-shot background refresh of the remote extension index. Polled in the
     /// main loop; rebuilds the Extensions panel once if the verified cache
@@ -2129,8 +2106,6 @@ pub struct App {
     /// was hidden) are dropped.
     chrome_sent: std::collections::HashMap<&'static str, u64>,
     chrome_seen: std::collections::HashSet<&'static str>,
-    /// A left-drag is panning the view via the minimap strip.
-    minimap_drag: bool,
     /// Clipboard read entrypoint. Production uses the host clipboard; tests
     /// can swap in a deterministic reader for Cmd+V routing assertions.
     clipboard_reader: fn() -> Option<String>,
@@ -2397,8 +2372,6 @@ pub struct App {
     /// default 35% split; Some = a user-specified pinned height. Stored
     /// in cells (not percent) so it doesn't drift on window resize.
     terminal_height: Option<u16>,
-    /// Active splitter drag, if any. Cleared on mouse-up.
-    splitter_drag: Option<SplitterDrag>,
     /// Last-rendered geometry of the vertical splitter column (between
     /// sidebar and editor) and the horizontal splitter row (between
     /// editor and terminal). Used by the mouse handler to hit-test cleanly
@@ -4477,18 +4450,9 @@ impl App {
             modified_click: ModifiedClickTracker::default(),
             ports_click: ClickTracker::default(),
             terminal_select_autoscroll: None,
-            scrollbar_drag: None,
-            editor_hscrollbar_drag: false,
-            breakpoint_lane_press: false,
+            gesture: None,
             editor_line_drag: None,
-            outline_scrollbar_drag: false,
             secondary_outline: Default::default(),
-            secondary_outline_scrollbar_drag: false,
-            open_editors_scrollbar_drag: false,
-            timeline_scrollbar_drag: false,
-            deps_scrollbar_drag: false,
-            testing_scrollbar_drag: false,
-            graph_scrollbar_drag: false,
             welcome,
             ext_index_refresh,
             codeql_program: PathBuf::from("codeql"),
@@ -4552,7 +4516,6 @@ impl App {
             minimap_room: true,
             chrome_sent: std::collections::HashMap::new(),
             chrome_seen: std::collections::HashSet::new(),
-            minimap_drag: false,
             clipboard_reader: read_system_clipboard,
             is_relay_session: !cfg!(test) && std::env::var_os("CROFT_RELAY_KEY").is_some(),
             remote_launch: None,
@@ -4637,7 +4600,6 @@ impl App {
             trust_local_browser: false,
             sidebar_width: SIDEBAR_WIDTH_DEFAULT,
             terminal_height: None,
-            splitter_drag: None,
             editor_seams: Vec::new(),
             editor_layout_area: Rect::default(),
             sidebar_splitter_x: None,

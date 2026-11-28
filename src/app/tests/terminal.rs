@@ -613,7 +613,7 @@ fn terminal_decoration_dot_click_is_not_hijacked_by_the_sidebar_splitter() {
     );
     app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
     assert!(
-        app.splitter_drag.is_none(),
+        !matches!(app.gesture, Some(Gesture::Splitter(_))),
         "pressing a decoration dot must not start a sidebar resize"
     );
     assert!(
@@ -3121,7 +3121,7 @@ fn dragging_terminal_splitter_resizes_terminal() {
         row: 15,
         modifiers: KeyModifiers::NONE,
     });
-    assert_eq!(app.splitter_drag, Some(SplitterDrag::Terminal));
+    assert_eq!(app.gesture, Some(Gesture::Splitter(SplitterDrag::Terminal)));
     // Drag the splitter up to row 10: terminal height = 20 - 10 = 10.
     app.handle_mouse(crossterm::event::MouseEvent {
         kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
@@ -3149,7 +3149,7 @@ fn terminal_drag_grabs_one_row_above_seam() {
         row: 14,
         modifiers: KeyModifiers::NONE,
     });
-    assert_eq!(app.splitter_drag, Some(SplitterDrag::Terminal));
+    assert_eq!(app.gesture, Some(Gesture::Splitter(SplitterDrag::Terminal)));
 }
 
 #[test]
