@@ -162,6 +162,7 @@ const BACKGROUND_PASS_CALLS: &[&str] = &[
     "crate::startup_trace::mark",
     "app.poll_dap",
     "app.poll_debug_build",
+    "app.poll_debug_setups",
     "app.test_worker.drain",
     "app.drain_pending_test_debug",
     "app.drain_pending_cargo_launch",
