@@ -1612,7 +1612,7 @@ fn terminal_find_matches_are_an_amber_tint_on_croft_loch_and_gold_when_boxed() {
     let gold = Color::Rgb(0xff, 0xd7, 0x4a);
 
     assert!(
-        crate::widgets::surface::tones(term.theme).is_some(),
+        crate::theme::tones(term.theme).is_some(),
         "Croft Loch by default"
     );
     let mut buf = Buffer::empty(area);
@@ -2603,7 +2603,7 @@ fn croft_loch_paints_a_quiet_accent_dot_and_a_hairline_top_edge() {
     }
     term.theme = crate::theme::Theme::LOCH;
     term.focused = false;
-    let t = crate::widgets::surface::tones(term.theme).unwrap();
+    let t = crate::theme::tones(term.theme).unwrap();
     let area = Rect::new(0, 0, 40, 12);
     let mut buf = Buffer::empty(area);
     (&mut term).render(area, &mut buf);
@@ -5092,7 +5092,7 @@ fn croft_loch_pins_the_sticky_command_on_the_raised_surface() {
     use crate::shell_integration::OscEvent;
     let (_tmp, mut t) = quiet_pty();
     t.theme = crate::theme::Theme::LOCH;
-    let tones = crate::widgets::surface::tones(t.theme).unwrap();
+    let tones = crate::theme::tones(t.theme).unwrap();
     let area = Rect::new(0, 0, 80, 20);
     let mut buf = Buffer::empty(area);
     (&mut t).render(area, &mut buf);

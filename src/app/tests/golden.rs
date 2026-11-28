@@ -1431,7 +1431,7 @@ fn open_scm_flyout(app: &mut App, label: &str) {
 #[test]
 fn source_control_actions_menu_in_a_plain_theme() {
     let plain = crate::theme::Theme::BLACK;
-    assert!(crate::widgets::surface::tones(plain).is_none());
+    assert!(crate::theme::tones(plain).is_none());
     let mut failures = Vec::new();
     let (_fixture, mut app) = scm_menu_app(plain);
     failures.extend(workbench_scene_result("scm-menu-plain", &mut app));
@@ -1454,7 +1454,7 @@ fn source_control_actions_menu_in_a_plain_theme() {
 #[test]
 fn source_control_actions_menu_as_a_card() {
     let card = crate::theme::Theme::default();
-    assert!(crate::widgets::surface::tones(card).is_some());
+    assert!(crate::theme::tones(card).is_some());
     let mut failures = Vec::new();
     // The pointer on the first action row lifts it.
     let (_fixture, mut app) = scm_menu_app(card);

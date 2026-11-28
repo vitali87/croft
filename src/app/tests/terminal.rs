@@ -4146,7 +4146,7 @@ fn osc_9_4_progress_paints_a_border_gauge_and_pill_percent() {
     );
     // Croft Loch keeps the gauge on its palette: the accent eased into the
     // canvas, not VS Code's blue. The focused pane's name is the strong ink.
-    if let Some(t) = crate::widgets::surface::tones(app.theme) {
+    if let Some(t) = crate::theme::tones(app.theme) {
         let buf = term.backend().buffer();
         let quiet = crate::gradient::rgb_color(crate::gradient::lerp_rgb(t.accent, t.canvas, 0.25));
         assert_eq!(buf[(inner.x, area.y + area.height - 1)].fg, quiet);

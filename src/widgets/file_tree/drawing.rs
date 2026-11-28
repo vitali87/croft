@@ -19,7 +19,7 @@ impl Widget for &mut FileTree {
         // Croft Dark keeps the historical white-on-navy chip.
         let label = format!(" {} ", crate::i18n::tr("EXPLORER"));
         let label_width = unicode_width::UnicodeWidthStr::width(label.as_str());
-        let tones = crate::widgets::surface::tones(self.theme);
+        let tones = crate::theme::tones(self.theme);
         // Croft Loch: the view title is the one label in the side bar that
         // says where focus is, so it is the strong ink while the tree has
         // the keyboard and recedes to muted otherwise. Never bold: weight

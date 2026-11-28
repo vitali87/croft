@@ -107,7 +107,7 @@ impl Widget for &SignatureHelpPopup {
             .fg(self.theme.ui(Color::Rgb(0xff, 0xff, 0xff)))
             .add_modifier(Modifier::BOLD);
         let chars: Vec<char> = sig.label.chars().collect();
-        let tones = crate::widgets::surface::tones(self.theme);
+        let tones = crate::theme::tones(self.theme);
         let spans: Vec<Span<'static>> = match (tones, sig.active_param) {
             (Some(t), active_param) => surfaces_spans(&chars, active_param, t),
             (None, active_param) => plain_spans(&chars, active_param, &sig.label, base, active),
@@ -179,7 +179,7 @@ fn plain_spans(
 fn surfaces_spans(
     chars: &[char],
     active_param: Option<(usize, usize)>,
-    t: crate::widgets::surface::Tones,
+    t: crate::theme::Tones,
 ) -> Vec<Span<'static>> {
     let name_end = chars.iter().position(|&c| c == '(').unwrap_or(chars.len());
     let (s, e) = match active_param {
@@ -326,7 +326,7 @@ mod tests {
     fn croft_loch_marks_the_active_parameter_in_the_accent_on_a_quiet_card() {
         use ratatui::buffer::Buffer;
         let theme = crate::theme::Theme::from_id("loch");
-        let t = crate::widgets::surface::tones(theme).unwrap();
+        let t = crate::theme::tones(theme).unwrap();
         let mut p = SignatureHelpPopup::new(
             vec![sig("foo(a, b)", Some((4, 5)))],
             0,
@@ -356,7 +356,7 @@ mod tests {
     fn croft_loch_hint_never_shadows_the_line_being_typed() {
         use ratatui::buffer::Buffer;
         let theme = crate::theme::Theme::from_id("loch");
-        let t = crate::widgets::surface::tones(theme).unwrap();
+        let t = crate::theme::tones(theme).unwrap();
         let mut p = SignatureHelpPopup::new(
             vec![sig("foo(a, b)", Some((4, 5)))],
             0,

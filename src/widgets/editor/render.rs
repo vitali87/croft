@@ -1266,7 +1266,7 @@ impl Editor {
         if first_row && self.is_foldable(line_idx) {
             let collapsed = self.folded.contains(&line_idx);
             let glyph = if collapsed {
-                let ink = crate::widgets::surface::tones(self.theme)
+                let ink = crate::theme::tones(self.theme)
                     .map_or_else(|| self.theme.ui(Color::Gray), |t| t.muted());
                 Some(("▸", ink))
             } else if !frame.surfaces || frame.gutter_hovered || self.is_caret_line(line_idx) {
@@ -2414,7 +2414,7 @@ pub(super) fn paint_search_highlight(
     // Croft Loch tints each matched cell's own background amber and keeps
     // its syntax ink where it stays legible ([`surface::match_style`]); a
     // boxed theme stamps the solid find style over it.
-    let tones = crate::widgets::surface::tones(theme);
+    let tones = crate::theme::tones(theme);
     let restyle = |active: bool| {
         move |s: Style| match tones {
             Some(t) => crate::widgets::surface::match_style(s, t, theme, active),
@@ -2515,7 +2515,7 @@ pub(super) fn paint_block_cursor(
     let cell = &mut buf[(text_x + col as u16, y)];
     // The glyph under the block takes the canvas on a `surfaces` theme
     // rather than the host palette's named black.
-    let fg = crate::widgets::surface::tones(theme).map_or(Color::Black, |t| t.canvas());
+    let fg = crate::theme::tones(theme).map_or(Color::Black, |t| t.canvas());
     cell.set_style(
         Style::default()
             .fg(fg)

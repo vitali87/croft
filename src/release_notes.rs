@@ -72,7 +72,7 @@ impl NoteKind {
     /// mark is not teal, since the accent means focus and selection alone
     /// and a bullet is decoration.
     pub fn marker_for(self, theme: crate::theme::Theme) -> (&'static str, Color) {
-        let Some(t) = crate::widgets::surface::tones(theme) else {
+        let Some(t) = crate::theme::tones(theme) else {
             return (self.icon(), self.color());
         };
         match self {
@@ -407,7 +407,7 @@ mod tests {
     #[test]
     fn croft_loch_marks_notes_with_a_plus_and_a_bullet() {
         let loch = crate::theme::Theme::LOCH;
-        let t = crate::widgets::surface::tones(loch).unwrap();
+        let t = crate::theme::tones(loch).unwrap();
         assert_eq!(NoteKind::Feature.marker_for(loch), ("+", t.muted()));
         assert_eq!(NoteKind::Fix.marker_for(loch), ("\u{2022}", t.muted()));
         let black = crate::theme::Theme::BLACK;

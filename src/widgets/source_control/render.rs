@@ -72,7 +72,7 @@ impl Widget for &mut SourceControlPanel {
                 .saturating_add(1);
         // Croft Loch: the view title is the strong ink while the view has
         // the keyboard and muted otherwise, never bold, as the Explorer's.
-        let tones = crate::widgets::surface::tones(self.theme);
+        let tones = crate::theme::tones(self.theme);
         let title_style = match tones {
             Some(t) => Style::default().fg(if self.focused { t.strong() } else { t.muted() }),
             None => Style::default()

@@ -362,7 +362,7 @@ pub(super) fn clip_pad_cells(text: &str, skip: usize, width: usize) -> String {
 /// not one per cell. Without tones (a boxed theme, an unchanged row) it
 /// hands every ink back untouched.
 pub(super) struct DiffInkLift {
-    tones: Option<crate::widgets::surface::Tones>,
+    tones: Option<crate::theme::Tones>,
     bg: (u8, u8, u8),
     last: Option<(Color, Color)>,
 }
@@ -370,7 +370,7 @@ pub(super) struct DiffInkLift {
 impl DiffInkLift {
     /// A lift onto fill `bg` with `legible`'s tones; `None`, or a fill
     /// that is not an RGB colour, lifts nothing.
-    pub(super) fn new(legible: Option<crate::widgets::surface::Tones>, bg: Color) -> Self {
+    pub(super) fn new(legible: Option<crate::theme::Tones>, bg: Color) -> Self {
         let (tones, bg) = match (legible, bg) {
             (Some(t), Color::Rgb(r, g, b)) => (Some(t), (r, g, b)),
             _ => (None, (0, 0, 0)),
@@ -417,7 +417,7 @@ pub(super) fn paint_intraline_range(
     (start, end): (usize, usize),
     bg: Color,
     fg: Color,
-    legible: Option<crate::widgets::surface::Tones>,
+    legible: Option<crate::theme::Tones>,
 ) {
     if start >= end || width == 0 {
         return;
@@ -532,7 +532,7 @@ pub(super) const DIFF_TINT_GREY: f32 = 0.2;
 
 /// A `surfaces` diff fill: `hue`, greyed by [`DIFF_TINT_GREY`], laid
 /// `share` of the way over the canvas.
-pub(super) fn diff_tint(t: crate::widgets::surface::Tones, hue: (u8, u8, u8), share: f32) -> Color {
+pub(super) fn diff_tint(t: crate::theme::Tones, hue: (u8, u8, u8), share: f32) -> Color {
     use crate::gradient::{lerp_rgb, rgb_color};
     let calm = lerp_rgb(hue, t.text, DIFF_TINT_GREY);
     rgb_color(lerp_rgb(t.canvas, calm, share))
@@ -541,7 +541,7 @@ pub(super) fn diff_tint(t: crate::widgets::surface::Tones, hue: (u8, u8, u8), sh
 /// The [`DiffInks`] for `theme`.
 pub(super) fn diff_inks(theme: crate::theme::Theme) -> DiffInks {
     use crate::gradient::{lerp_rgb, rgb_color};
-    let Some(t) = crate::widgets::surface::tones(theme) else {
+    let Some(t) = crate::theme::tones(theme) else {
         let removed_bg = theme.ui(Color::Rgb(0x4a, 0x1f, 0x1f));
         let removed_fg = theme.ui(Color::Rgb(0xff, 0xb3, 0xb3));
         let added_bg = theme.ui(Color::Rgb(0x1f, 0x42, 0x2a));
@@ -650,7 +650,7 @@ pub(super) fn diff_header_notes(diff: &crate::widgets::diff::DiffData) -> Vec<St
 pub(super) fn paint_surface_diff_header(
     buf: &mut Buffer,
     inner: Rect,
-    t: crate::widgets::surface::Tones,
+    t: crate::theme::Tones,
     left: &str,
     right: Option<&str>,
     notes: &[String],
@@ -739,7 +739,7 @@ pub(super) fn paint_surface_diff_header(
 pub(super) fn paint_surface_diff_footer(
     buf: &mut Buffer,
     row: Rect,
-    t: crate::widgets::surface::Tones,
+    t: crate::theme::Tones,
     position: &str,
     hints: &[(&str, &str)],
 ) {
@@ -838,7 +838,7 @@ pub(super) fn render_diff(
     let r_text_w = (inner.width - (half + 1)).saturating_sub(r_gutter + 2);
     let seam_x = inner.x + half;
     let inks = diff_inks(theme);
-    let tones = crate::widgets::surface::tones(theme);
+    let tones = crate::theme::tones(theme);
 
     let (prev_arrow, next_arrow) = if let Some(t) = tones {
         let columns = (half >= 8).then_some((l_text_x, seam_x, r_text_x));
@@ -1549,7 +1549,7 @@ pub(super) fn render_unified_deletion(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| diff.left_path.display().to_string());
     let inks = diff_inks(theme);
-    let tones = crate::widgets::surface::tones(theme);
+    let tones = crate::theme::tones(theme);
     let (prev_arrow, next_arrow) = if let Some(t) = tones {
         let note = [String::from("deleted (HEAD \u{2192} /dev/null)")];
         paint_surface_diff_header(buf, inner, t, &name, None, &note, None, pointer)

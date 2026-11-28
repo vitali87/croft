@@ -20,7 +20,7 @@ use ratatui::{
 
 use crate::gradient::{GRAD_TL, GRAD_TR, lerp_rgb, rgb_color};
 use crate::theme::Theme;
-pub use crate::theme::{Tones, tones};
+use crate::theme::{Tones, tones};
 
 /// The selected row's accent bar: a quarter-cell stripe on the row's left
 /// edge, the same mark the activity bar puts beside the active view.

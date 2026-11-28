@@ -997,7 +997,7 @@ impl App {
         // Croft Loch's title row is a chrome band over the canvas the views
         // paint on, with muted inactive titles.
         let surfaces = self.theme.surfaces();
-        let tones = crate::widgets::surface::tones(self.theme);
+        let tones = crate::theme::tones(self.theme);
         let strip_bg = surfaces.map_or(self.theme.editor_bg(), |s| s.chrome());
         frame.render_widget(Block::default().style(Style::default().bg(strip_bg)), strip);
         let brand = self.theme.gradient();
@@ -1330,7 +1330,7 @@ impl App {
             width,
             height,
         };
-        let tones = crate::widgets::surface::tones(self.theme);
+        let tones = crate::theme::tones(self.theme);
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
             .border_style(Style::default().fg(accent));

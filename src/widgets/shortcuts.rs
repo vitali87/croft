@@ -1465,7 +1465,7 @@ impl ShortcutsModal {
         // strong over a faint rule (the accent is for focus, not headings),
         // the keys in body ink and what they do muted, so the eye scans
         // down the keys column.
-        let (title, rule, keys, what) = match crate::widgets::surface::tones(theme) {
+        let (title, rule, keys, what) = match crate::theme::tones(theme) {
             Some(t) => (
                 Style::default().fg(t.strong()).add_modifier(Modifier::BOLD),
                 Style::default().fg(t.faint()),

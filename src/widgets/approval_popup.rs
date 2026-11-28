@@ -158,7 +158,7 @@ pub fn render(
     Paragraph::new(lines).render(body, buf);
     // A `surfaces` theme says "press this" with the body ink against muted
     // words; the boxed themes keep the bold amber keys.
-    let (key, dim) = match crate::widgets::surface::tones(theme) {
+    let (key, dim) = match crate::theme::tones(theme) {
         Some(t) => (
             Style::default().fg(t.text()),
             Style::default().fg(t.muted()),
@@ -226,7 +226,7 @@ const WARNING_GLYPH: char = '\u{ea6c}';
 pub fn paint_warning_card(buf: &mut Buffer, rect: Rect, theme: Theme, tint: Color) {
     use crate::gradient::rgb_color;
     use crate::widgets::surface;
-    let Some(t) = surface::tones(theme) else {
+    let Some(t) = crate::theme::tones(theme) else {
         return;
     };
     let rect = rect.intersection(buf.area);
@@ -333,7 +333,7 @@ mod tests {
     #[test]
     fn croft_loch_turns_a_boxed_confirm_into_a_tinted_card() {
         let theme = Theme::from_id("loch");
-        let t = crate::widgets::surface::tones(theme).unwrap();
+        let t = crate::theme::tones(theme).unwrap();
         let tint = Color::Rgb(0xe7, 0x70, 0x70);
         let rect = Rect::new(0, 0, 40, 6);
         let mut buf = Buffer::empty(Rect::new(0, 0, 42, 8));

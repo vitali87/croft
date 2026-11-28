@@ -4279,7 +4279,7 @@ impl App {
     pub(super) fn scm_menu_layout(&self) -> Option<ScmMenuLayout> {
         use crate::widgets::scm_menu;
         let menu = self.context_menu.as_ref()?;
-        let card = crate::widgets::surface::tones(self.theme).is_some();
+        let card = crate::theme::tones(self.theme).is_some();
         let op = match menu.look {
             MenuLook::Panel => return None,
             MenuLook::CommitActions => {

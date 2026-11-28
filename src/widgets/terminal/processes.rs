@@ -1,5 +1,5 @@
 //! The pane's processes: the shell and the foreground process, their names, command lines
-//! and working directories, and changing directory.
+//! and working directories (asked of [`crate::proc::info`]), and changing directory.
 
 use super::*;
 

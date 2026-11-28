@@ -54,7 +54,7 @@ fn croft_loch_context_menu_is_a_card_with_keycaps_and_a_selected_bar() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.theme = crate::theme::Theme::from_id("loch");
-    let t = surface::tones(app.theme).unwrap();
+    let t = crate::theme::tones(app.theme).unwrap();
     let mut menu = ContextMenu::flat(
         (10, 10),
         vec![
@@ -692,7 +692,7 @@ fn black_theme_terminal_button_hover_paints_teal_pill() {
 
 #[test]
 fn croft_loch_terminal_buttons_are_muted_until_hovered() {
-    let t = crate::widgets::surface::tones(crate::theme::Theme::LOCH).unwrap();
+    let t = crate::theme::tones(crate::theme::Theme::LOCH).unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let add = terminal_header_probe(&mut app);
@@ -793,7 +793,7 @@ fn black_theme_sidebar_titles_are_chipless_brand_headers() {
 /// bold, with the accent lip starting a cell past the title.
 #[test]
 fn croft_loch_side_bar_title_is_strong_only_while_focused() {
-    let t = crate::widgets::surface::tones(crate::theme::Theme::LOCH).unwrap();
+    let t = crate::theme::tones(crate::theme::Theme::LOCH).unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let buf = draw_buffer(&mut app, 140, 50);
@@ -814,7 +814,7 @@ fn croft_loch_side_bar_title_is_strong_only_while_focused() {
 /// section headers wear the muted codicon chevron.
 #[test]
 fn croft_loch_explorer_sections_are_divided_by_hairlines() {
-    let t = crate::widgets::surface::tones(crate::theme::Theme::LOCH).unwrap();
+    let t = crate::theme::tones(crate::theme::Theme::LOCH).unwrap();
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("a.txt"), "x\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
@@ -1007,7 +1007,7 @@ fn black_theme_remote_header_buttons_are_near_white_icons() {
 /// Control's refresh and `⋯`) rest as muted icons, not bold near-white.
 #[test]
 fn croft_loch_side_bar_header_buttons_rest_muted() {
-    let t = crate::widgets::surface::tones(crate::theme::Theme::LOCH).unwrap();
+    let t = crate::theme::tones(crate::theme::Theme::LOCH).unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.sidebar_view = SidebarView::Remote;

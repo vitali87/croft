@@ -1321,7 +1321,7 @@ impl App {
                     // down onto the pane, whose top edge stays a clean rule.
                     // Only when both fit between the last tab and the chevron;
                     // otherwise they keep the pane's top row.
-                    let header_slot = (crate::widgets::surface::tones(self.theme).is_some()
+                    let header_slot = (crate::theme::tones(self.theme).is_some()
                         && self.terminals.len() == 1
                         && !self.terminals[0].collapsed
                         && strip.height == 1
@@ -1464,7 +1464,7 @@ impl App {
                                         .fg(Color::Black)
                                         .bg(Color::Rgb(r, g, b))
                                         .add_modifier(Modifier::BOLD)
-                                } else if let Some(t) = crate::widgets::surface::tones(self.theme) {
+                                } else if let Some(t) = crate::theme::tones(self.theme) {
                                     // Croft Loch names the pane with the
                                     // keyboard in the strong ink, the rest
                                     // muted, so the labels say where focus is.

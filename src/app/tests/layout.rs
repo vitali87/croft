@@ -614,7 +614,7 @@ fn the_selected_activity_icon_is_visible_on_the_light_theme() {
 fn croft_loch_activity_icons_rest_muted_hover_to_text_and_tint_their_badge() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut app, _) = app_with_unsaved_file(tmp.path());
-    let t = crate::widgets::surface::tones(app.theme).expect("Croft Loch is the default");
+    let t = crate::theme::tones(app.theme).expect("Croft Loch is the default");
     let backend = ratatui::backend::TestBackend::new(120, 40);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|frame| app.render(frame)).unwrap();
@@ -1205,7 +1205,7 @@ fn the_active_panel_tab_is_underlined() {
 fn croft_loch_panel_tabs_step_from_muted_to_text_to_strong() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    let t = crate::widgets::surface::tones(app.theme).expect("Croft Loch is the default");
+    let t = crate::theme::tones(app.theme).expect("Croft Loch is the default");
     let backend = ratatui::backend::TestBackend::new(140, 50);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
@@ -1245,7 +1245,7 @@ fn croft_loch_panel_tabs_step_from_muted_to_text_to_strong() {
 fn croft_loch_palette_scrim_sinks_the_active_tabs_underline() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    let t = crate::widgets::surface::tones(app.theme).expect("Croft Loch is the default");
+    let t = crate::theme::tones(app.theme).expect("Croft Loch is the default");
     let backend = ratatui::backend::TestBackend::new(140, 50);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     app.open_command_palette();
@@ -1287,7 +1287,7 @@ fn croft_loch_palette_scrim_sinks_the_active_tabs_underline() {
 fn croft_loch_panel_panes_draw_a_hairline_or_the_lip_on_their_top_edge() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    let t = crate::widgets::surface::tones(app.theme).expect("Croft Loch is the default");
+    let t = crate::theme::tones(app.theme).expect("Croft Loch is the default");
     app.focus_pane(Pane::Editor);
     let backend = ratatui::backend::TestBackend::new(140, 50);
     let mut term = ratatui::Terminal::new(backend).unwrap();

@@ -44,7 +44,7 @@ mod typing;
 mod undo;
 mod viewers;
 mod wrap;
-pub(crate) use crate::ansi_text::ansi_color_to_tui;
+use crate::ansi_text::ansi_color_to_tui;
 use crate::text_edit::{
     apply_char_span_edits, char_byte, char_span_edits, map_through_span_edits,
     position_after_span_edits, view_top_after_span_edits,
@@ -163,7 +163,7 @@ struct DiffInks {
     /// lifted toward when it would fall under 4.5:1 on the row's tint or
     /// on its changed characters' ([`crate::widgets::surface::legible_ink`]).
     /// `None` on a boxed theme, whose inks are drawn exactly as they were.
-    legible: Option<crate::widgets::surface::Tones>,
+    legible: Option<crate::theme::Tones>,
 }
 
 /// Coarse classification of the most recent edit, used so consecutive

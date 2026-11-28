@@ -925,7 +925,7 @@ impl App {
         let header = match d.duration {
             Some(dur) => format!(
                 "exit {code} in {}",
-                crate::widgets::terminal::human_duration(dur)
+                crate::command_history::human_duration(dur)
             ),
             None => format!("exit {code}"),
         };

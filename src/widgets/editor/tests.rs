@@ -2157,7 +2157,7 @@ fn a_surfaces_gutter_numbers_in_the_themes_inks() {
     let mut e = ten_lines();
     e.cursor_row = 4;
     let (_, styles) = gutter_column(&mut e, 10);
-    let t = crate::widgets::surface::tones(e.theme).expect("Loch is the default");
+    let t = crate::theme::tones(e.theme).expect("Loch is the default");
     assert_eq!(styles[3].fg, Some(t.faint()));
     assert_eq!(styles[4].fg, Some(t.text()));
     let mut e = ten_lines();
@@ -12770,7 +12770,7 @@ fn croft_loch_tints_find_matches_amber_and_the_current_one_stronger() {
     use crate::widgets::surface;
     use ratatui::buffer::Buffer;
     let mut e = editor_with("alpha needle bravo needle zulu");
-    let t = surface::tones(e.theme).expect("the default theme is Croft Loch");
+    let t = crate::theme::tones(e.theme).expect("the default theme is Croft Loch");
     e.set_search_highlight(Some(String::from("needle")));
     e.active_search_match = Some((0, 19, 6));
     e.focused = true;
@@ -13459,7 +13459,7 @@ fn render_diff_in(
 #[test]
 fn croft_loch_diff_header_sits_on_chrome() {
     let theme = crate::theme::Theme::LOCH;
-    let t = crate::widgets::surface::tones(theme).unwrap();
+    let t = crate::theme::tones(theme).unwrap();
     let (buf, inner, (prev, next)) = render_diff_in(theme, None);
     for x in inner.x..inner.right() {
         assert_eq!(buf[(x, inner.y)].bg, t.chrome(), "({x}) header on chrome");
@@ -13495,7 +13495,7 @@ fn croft_loch_diff_header_sits_on_chrome() {
 #[test]
 fn croft_loch_diff_rows_are_soft_tints() {
     let theme = crate::theme::Theme::LOCH;
-    let t = crate::widgets::surface::tones(theme).unwrap();
+    let t = crate::theme::tones(theme).unwrap();
     let inks = diff_inks(theme);
     let tint = |c: Color, k: f32| {
         let Color::Rgb(r, g, b) = c else {
@@ -13565,7 +13565,7 @@ fn croft_loch_diff_tints_are_plain_at_a_glance() {
         other => panic!("an RGB colour, not {other:?}"),
     };
     let theme = crate::theme::Theme::LOCH;
-    let t = crate::widgets::surface::tones(theme).unwrap();
+    let t = crate::theme::tones(theme).unwrap();
     let inks = diff_inks(theme);
     for (side, row, change) in [
         ("removed", inks.removed_bg, inks.intraline_removed),
@@ -13625,7 +13625,7 @@ fn croft_loch_diff_lifts_code_that_would_not_read_on_a_tint() {
     let mut buf = ratatui::buffer::Buffer::empty(area);
     ratatui::widgets::Widget::render(&mut t.editors[idx], area, &mut buf);
     let ed = &t.editors[idx];
-    let tones = crate::widgets::surface::tones(ed.theme).unwrap();
+    let tones = crate::theme::tones(ed.theme).unwrap();
     let inner = ed.last_inner;
     let seam_x = inner.x + inner.width / 2;
     let r_text_x = seam_x + 1 + 2 + 2;
@@ -13697,7 +13697,7 @@ fn a_boxed_diff_keeps_its_bands_and_saturated_rows() {
 #[test]
 fn croft_loch_deleted_file_diff_is_calm() {
     let theme = crate::theme::Theme::LOCH;
-    let t = crate::widgets::surface::tones(theme).unwrap();
+    let t = crate::theme::tones(theme).unwrap();
     let inks = diff_inks(theme);
     let mut diff = crate::widgets::diff::DiffData::build_unified_deletion(
         std::path::PathBuf::from("gone.txt"),
@@ -14688,7 +14688,7 @@ fn hovering_the_close_cross_paints_a_pill_on_that_cell() {
     );
     // Croft Loch inks the glyph on its neutral pill in the strong grey,
     // not bold white.
-    let t = crate::widgets::surface::tones(theme).expect("Loch is the default");
+    let t = crate::theme::tones(theme).expect("Loch is the default");
     assert_eq!(buf[(cx, area.y)].fg, t.strong());
     assert!(!buf[(cx, area.y)].modifier.contains(Modifier::BOLD));
     assert_eq!(
@@ -14889,7 +14889,7 @@ fn loch_tab_pair(focused: bool) -> (EditorTabs, Buffer) {
 #[test]
 fn a_loch_tab_leads_with_its_icon_and_marks_the_focused_active_tab() {
     let (t, buf) = loch_tab_pair(true);
-    let s = crate::widgets::surface::tones(crate::theme::Theme::default()).unwrap();
+    let s = crate::theme::tones(crate::theme::Theme::default()).unwrap();
     let (x0, w0) = t.tab_screen_x(0).unwrap();
     let (x1, _) = t.tab_screen_x(1).unwrap();
     assert_eq!(w0, 6 + 6, "pad, icon, gap, label, gap, close, pad");
@@ -14918,7 +14918,7 @@ fn a_loch_tab_leads_with_its_icon_and_marks_the_focused_active_tab() {
 /// group takes the underline but leaves the tab its strong ink.
 #[test]
 fn a_loch_tab_wears_the_accent_only_while_its_group_has_the_keyboard() {
-    let s = crate::widgets::surface::tones(crate::theme::Theme::default()).unwrap();
+    let s = crate::theme::tones(crate::theme::Theme::default()).unwrap();
     let (t, buf) = loch_tab_pair(false);
     let label = &buf[(t.tab_screen_x(1).unwrap().0 + 3, 0)];
     assert_eq!(label.fg, s.text());
@@ -15000,7 +15000,7 @@ fn a_loch_dirty_pinned_tab_keeps_its_dot_beside_the_pin() {
 #[test]
 fn a_loch_hover_is_a_neutral_lift() {
     let theme = crate::theme::Theme::default();
-    let s = crate::widgets::surface::tones(theme).unwrap();
+    let s = crate::theme::tones(theme).unwrap();
     assert_eq!(theme.tab_hover_bg(), s.hover_on(s.chrome));
     assert_ne!(theme.tab_close_pill_bg(), theme.tab_hover_bg());
     assert_ne!(theme.tab_close_pill_bg(), theme.tab_active_bg());
@@ -15024,7 +15024,7 @@ fn a_loch_hover_is_a_neutral_lift() {
 /// its label without joining the label's hit range.
 #[test]
 fn loch_breadcrumbs_lead_to_the_last_crumb_with_icons_outside_the_hit_range() {
-    let s = crate::widgets::surface::tones(crate::theme::Theme::default()).unwrap();
+    let s = crate::theme::tones(crate::theme::Theme::default()).unwrap();
     let mut tabs = EditorTabs::new();
     tabs.breadcrumbs = vec![
         Crumb {
@@ -15087,7 +15087,7 @@ fn loch_breadcrumbs_lead_to_the_last_crumb_with_icons_outside_the_hit_range() {
 #[test]
 fn a_loch_editor_always_draws_its_top_seam_and_lights_it_with_the_keyboard() {
     let theme = crate::theme::Theme::default();
-    let s = crate::widgets::surface::tones(theme).unwrap();
+    let s = crate::theme::tones(theme).unwrap();
     let area = Rect::new(0, 0, 30, 6);
     let top = |e: &mut Editor| {
         let mut buf = Buffer::empty(area);
@@ -15109,7 +15109,7 @@ fn a_loch_editor_always_draws_its_top_seam_and_lights_it_with_the_keyboard() {
 /// collapsed fold's chevron always shows, in the muted ink.
 #[test]
 fn loch_fold_chevrons_wait_for_the_caret_or_the_pointer() {
-    let s = crate::widgets::surface::tones(crate::theme::Theme::default()).unwrap();
+    let s = crate::theme::tones(crate::theme::Theme::default()).unwrap();
     let mut e = editor_with("fn a() {\n    x\n}\nfn b() {\n    y\n}");
     e.cursor_row = 1;
     let area = Rect::new(0, 0, 30, 10);

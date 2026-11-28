@@ -2118,7 +2118,7 @@ impl App {
     /// the breadcrumbs carried across the column. The editor's rule has
     /// eased into the hairline by its far end, so the column takes that.
     pub(super) fn paint_minimap_header(&self, buf: &mut ratatui::buffer::Buffer, column: Rect) {
-        let Some(t) = crate::widgets::surface::tones(self.theme) else {
+        let Some(t) = crate::theme::tones(self.theme) else {
             return;
         };
         let column = column.intersection(buf.area);

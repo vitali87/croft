@@ -690,7 +690,7 @@ pub fn paint_column(
     marks: Marks,
     theme: crate::theme::Theme,
 ) {
-    if let Some(t) = crate::widgets::surface::tones(theme) {
+    if let Some(t) = crate::theme::tones(theme) {
         paint_card_column(buf, col, rows, marks, theme, t);
         return;
     }
@@ -760,7 +760,7 @@ fn paint_card_column(
     rows: &[Row],
     marks: Marks,
     theme: crate::theme::Theme,
-    t: crate::widgets::surface::Tones,
+    t: crate::theme::Tones,
 ) {
     Widget::render(Clear, col.rect, buf);
     fill(buf, col.rect, Style::default().bg(t.raised()));
@@ -792,7 +792,7 @@ fn paint_card_column(
 fn paint_card_row(
     buf: &mut Buffer,
     row: Rect,
-    t: crate::widgets::surface::Tones,
+    t: crate::theme::Tones,
     icon: char,
     label: &str,
     submenu: bool,
@@ -910,7 +910,7 @@ mod tests {
     /// The top column, drawn under a pill at (10, 0) on a 120×40 screen.
     fn top(theme: crate::theme::Theme, screen: Rect) -> (Vec<Row>, Column) {
         let rows = rows(&menu_for(None));
-        let card = crate::widgets::surface::tones(theme).is_some();
+        let card = crate::theme::tones(theme).is_some();
         let col = top_column(&rows, Rect::new(10, 0, 2, 1), screen, card);
         (rows, col)
     }
@@ -943,7 +943,7 @@ mod tests {
     #[test]
     fn croft_loch_draws_the_menu_as_a_card_with_a_hover_lift() {
         let theme = crate::theme::Theme::from_id("loch");
-        let t = crate::widgets::surface::tones(theme).unwrap();
+        let t = crate::theme::tones(theme).unwrap();
         let screen = Rect::new(0, 0, 120, 40);
         let (rows, col) = top(theme, screen);
         let first = col.row(0).unwrap();
@@ -993,7 +993,7 @@ mod tests {
         );
 
         let card = crate::theme::Theme::from_id("loch");
-        let t = crate::widgets::surface::tones(card).unwrap();
+        let t = crate::theme::tones(card).unwrap();
         let (rows, col) = top(card, screen);
         let marks = Marks {
             cursor: Some(push),

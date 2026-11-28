@@ -108,7 +108,7 @@ impl SourceControlPanel {
         let card_inner = card_block.inner(card_area);
         // Croft Loch: a raised card with a rim (it never takes the keyboard,
         // so no accent lip) in place of the rounded line box; same inset.
-        let tones = crate::widgets::surface::tones(self.theme);
+        let tones = crate::theme::tones(self.theme);
         match tones {
             Some(t) => {
                 buf.set_style(card_area, Style::default().bg(t.raised()));

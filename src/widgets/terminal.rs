@@ -38,11 +38,7 @@ mod shell_env;
 mod spawn;
 mod status;
 mod text;
-#[cfg(not(test))]
-pub use crate::clipboard::osc52_copy_seq;
-pub use crate::command_history::human_duration;
-use crate::proc::info::foreground_group_of;
-pub use crate::proc::info::{cwd_is_observable, cwd_of_pid, process_cmdline, process_name};
+use crate::proc::info::{cwd_of_pid, foreground_group_of};
 use backend::*;
 use captures::*;
 use clock::*;

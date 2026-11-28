@@ -640,7 +640,7 @@ fn croft_loch_welcome_is_padding_on_the_canvas_with_the_boxed_inset() {
 /// (feature) and `•` (fix) in the muted ink rather than a rocket and a bug.
 #[test]
 fn croft_loch_release_card_is_a_raised_surface_with_quiet_marks() {
-    let t = crate::widgets::surface::tones(crate::theme::Theme::LOCH).unwrap();
+    let t = crate::theme::tones(crate::theme::Theme::LOCH).unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.welcome.set_test_notes(vec![
@@ -772,7 +772,7 @@ fn croft_loch_welcome_start_list_shows_keycaps_and_runs_on_click() {
 /// either side, nothing more. "Start" is a heading in the strong ink, bold.
 #[test]
 fn croft_loch_start_keycaps_sit_in_one_column_beside_the_labels() {
-    let t = crate::widgets::surface::tones(crate::theme::Theme::LOCH).unwrap();
+    let t = crate::theme::tones(crate::theme::Theme::LOCH).unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.welcome.set_test_notes(long_test_note());

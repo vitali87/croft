@@ -681,7 +681,7 @@ impl App {
         let grad = self.popup_gradient();
         // The top-level panel; the open submenu's parent row stays highlighted.
         let top = menu.scroll_for(clipped.height.saturating_sub(2) as usize);
-        let tones = crate::widgets::surface::tones(self.theme);
+        let tones = crate::theme::tones(self.theme);
         if let Some(t) = tones {
             // The keyboard is in the submenu while one is open, so its
             // parent row keeps an unfocused band without the accent bar.
@@ -748,7 +748,7 @@ impl App {
         selected: usize,
         top: usize,
         focused: bool,
-        t: crate::widgets::surface::Tones,
+        t: crate::theme::Tones,
     ) {
         use crate::widgets::surface;
         let rect = rect.intersection(frame.area());

@@ -734,7 +734,7 @@ fn croft_loch_port_toast_is_a_raised_card() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.theme = crate::theme::Theme::from_id("loch");
-    let t = crate::widgets::surface::tones(app.theme).unwrap();
+    let t = crate::theme::tones(app.theme).unwrap();
     app.show_port_toast(3000, Some("node".into()));
     let backend = ratatui::backend::TestBackend::new(140, 50);
     let mut term = ratatui::Terminal::new(backend).unwrap();

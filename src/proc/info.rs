@@ -54,7 +54,7 @@ pub fn process_cmdline(pid: i32) -> Option<Vec<String>> {
 
 /// Live cwd of a running process by PID, or None when the platform doesn't
 /// expose one. Used by `split_terminal` so a new pane lands wherever the
-/// user has `cd`'d the active shell, and by [`PtyTerminal::local_shell_cwd`]
+/// user has `cd`'d the active shell, and by the terminal's `local_shell_cwd`
 /// as the ground truth an OSC 7 claim must match to be trusted.
 #[cfg(target_os = "linux")]
 pub fn cwd_of_pid(pid: u32) -> Option<std::path::PathBuf> {
@@ -220,7 +220,7 @@ pub(crate) fn foreground_group_of(_pid: i32) -> Option<i32> {
 /// parentheses and may hold spaces or parentheses itself, so the fields
 /// are counted from the LAST `)`.
 #[cfg(any(target_os = "linux", test))]
-pub(crate) fn parse_tpgid(stat: &str) -> Option<i32> {
+fn parse_tpgid(stat: &str) -> Option<i32> {
     let rest = &stat[stat.rfind(')')? + 1..];
     // state ppid pgrp session tty_nr tpgid
     let tpgid: i32 = rest.split_whitespace().nth(5)?.parse().ok()?;

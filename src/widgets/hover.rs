@@ -47,11 +47,11 @@ pub fn row_hover_bg(
 /// The hover lift itself, for a hovered element that is not a whole row,
 /// such as a link in the Markdown preview (#1939). Under a `surfaces` theme
 /// it is the neutral lift of the chrome surface the side bar's rows sit on
-/// ([`crate::widgets::surface::Tones::hover_on`]): a grey of the theme's
+/// ([`crate::theme::Tones::hover_on`]): a grey of the theme's
 /// own cool cast rather than a flat `#1a1a1a`, and still a lift over the
 /// darker canvas the panel rows sit on.
 pub fn hover_bg(theme: crate::theme::Theme) -> Color {
-    if let Some(t) = crate::widgets::surface::tones(theme) {
+    if let Some(t) = crate::theme::tones(theme) {
         t.hover_on(t.chrome)
     } else if theme.is_light() {
         ROW_HOVER_BG_LIGHT
@@ -113,7 +113,7 @@ mod tests {
     #[test]
     fn croft_loch_hover_is_the_chrome_surface_lifted() {
         let loch = crate::theme::Theme::LOCH;
-        let t = crate::widgets::surface::tones(loch).unwrap();
+        let t = crate::theme::tones(loch).unwrap();
         assert_eq!(
             row_hover_bg(rect(0, 0, 8, 1), Some((2, 0)), loch),
             Some(t.hover_on(t.chrome))

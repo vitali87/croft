@@ -1,0 +1,1 @@
+refactor: the code that uses a surfaces theme's tones, the process lookups, the OSC 52 copy sequence, the command-duration format and the ANSI colour lookup names their new homes, and the views no longer pass them on (#2062). Nothing changes in use.

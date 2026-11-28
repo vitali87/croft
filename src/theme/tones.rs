@@ -17,7 +17,8 @@ use crate::theme::Theme;
 /// The rules they encode: three text inks (`text`, `muted`, `faint`) and a
 /// `strong` one for the single active title in a region; the accent only
 /// for what has focus, is selected or is active; a selected row is a
-/// `band` with the [`ROW_BAR`] in the accent; a card's edge is the `rim`.
+/// `band` with the row bar (`ROW_BAR` in `widgets/surface.rs`) in the
+/// accent; a card's edge is the `rim`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Tones {
     /// The code canvas (editor and panel background).

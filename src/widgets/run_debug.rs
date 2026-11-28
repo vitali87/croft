@@ -238,7 +238,7 @@ fn console_run_style(
     st: crate::ansi_text::AnsiStyle,
     theme: crate::theme::Theme,
 ) -> Style {
-    use crate::widgets::editor::ansi_color_to_tui;
+    use crate::ansi_text::ansi_color_to_tui;
     let mut style = base;
     if let Some(c) = st.fg {
         style = style.fg(ansi_color_to_tui(c, theme));

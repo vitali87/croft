@@ -1561,7 +1561,7 @@ pub(super) struct SurfaceTab<'a> {
     close_x: u16,
     ed: &'a Editor,
     theme: crate::theme::Theme,
-    t: crate::widgets::surface::Tones,
+    t: crate::theme::Tones,
     /// The tab body's fill: canvas when active, the hover lift, or chrome.
     bg: Color,
     is_active: bool,
@@ -1744,7 +1744,7 @@ impl Widget for &mut EditorTabs {
         // never changes width as its file goes dirty), and only the active
         // tab of the group with the keyboard wears the accent, as an
         // underline. Every other theme keeps ` {label} {close} `.
-        let tones = crate::widgets::surface::tones(theme);
+        let tones = crate::theme::tones(theme);
         let group_focused = self.editors[active].focused;
         let has_keyboard = group_focused && !self.editors[active].overlay_has_keyboard;
         let icon_w: u16 = if tones.is_some() { 2 } else { 0 };
@@ -1961,7 +1961,7 @@ impl Widget for &mut EditorTabs {
             // separators, muted crumbs leading to the one you are in (the
             // last) in body text, the file and symbol crumbs led by their
             // icons.
-            let tones = crate::widgets::surface::tones(theme);
+            let tones = crate::theme::tones(theme);
             let last = self.breadcrumbs.len() - 1;
             for (i, crumb) in self.breadcrumbs.iter().enumerate() {
                 if i > 0 {

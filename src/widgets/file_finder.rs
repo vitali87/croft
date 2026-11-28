@@ -1072,7 +1072,7 @@ pub fn render_file_finder(
     center: bool,
     backdrop: bool,
 ) {
-    if let Some(t) = crate::widgets::surface::tones(theme) {
+    if let Some(t) = crate::theme::tones(theme) {
         render_finder_card(finder, area, buf, theme, t, center, backdrop);
         return;
     }
@@ -1271,7 +1271,7 @@ fn render_finder_card(
     area: Rect,
     buf: &mut Buffer,
     theme: crate::theme::Theme,
-    t: crate::widgets::surface::Tones,
+    t: crate::theme::Tones,
     center: bool,
     backdrop: bool,
 ) {
@@ -1443,7 +1443,7 @@ mod tests {
     /// selected row's accent bar on the card's left edge.
     #[test]
     fn croft_loch_finder_rows_read_like_the_explorer() {
-        let t = crate::widgets::surface::tones(crate::theme::Theme::from_id("loch")).unwrap();
+        let t = crate::theme::tones(crate::theme::Theme::from_id("loch")).unwrap();
         let (f, buf) = loch_finder(&["src/app/main.rs", "README.md"], "main");
         let rect = f.last_rect;
         let top = row_text(&buf, rect, rect.y);

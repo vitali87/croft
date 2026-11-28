@@ -635,7 +635,7 @@ fn croft_loch_problems_count_is_a_tinted_chip_without_caps() {
     use crate::lsp::manager::DiagnosticSeverity;
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    let t = crate::widgets::surface::tones(app.theme).expect("Croft Loch is the default");
+    let t = crate::theme::tones(app.theme).expect("Croft Loch is the default");
     let a = tmp.path().join("a.rs");
     let mut s1 = std::collections::HashMap::new();
     s1.insert(
