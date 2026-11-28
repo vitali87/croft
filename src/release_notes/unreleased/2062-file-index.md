@@ -1,0 +1,1 @@
+refactor: Quick Open's file index (the parallel walk, the folders croft never indexes and the index builders) moves out of the picker into its own module, `src/file_index.rs`, with its own tests; the file watcher, CodeQL and test discovery import it from there (#2062). Nothing changes in use.
