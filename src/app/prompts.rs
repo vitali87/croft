@@ -1172,7 +1172,10 @@ impl App {
                     .strip_prefix("kb:")
                     .and_then(crate::widgets::command_palette::Command::from_id)
                 {
-                    self.recording_shortcut = Some((cmd, std::time::Instant::now()));
+                    self.shortcut_capture = Some(ShortcutCapture::Recording {
+                        cmd,
+                        since: std::time::Instant::now(),
+                    });
                     self.status = format!(
                         "Press the new shortcut for \u{201c}{}\u{201d} (a function key or a chord with Cmd/Ctrl/Alt; Esc cancels)",
                         cmd.title()

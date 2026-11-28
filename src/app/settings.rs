@@ -925,7 +925,11 @@ impl App {
                 quoted_titles(&owners),
                 cmd.title()
             );
-            self.confirming_shortcut = Some((cmd, key, owners));
+            self.shortcut_capture = Some(ShortcutCapture::Confirming {
+                cmd,
+                chord: key,
+                owners,
+            });
             return;
         }
         self.write_shortcut(cmd, key, &[]);

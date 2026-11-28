@@ -885,7 +885,7 @@ fn fields(app: &App, root: &Path, read: &[String; 5], hide_ids: bool) -> Fields 
             ("minimap", on(app.minimap_visible)),
             ("minimap_left", on(app.minimap_side == MinimapSide::Left)),
             ("wrap", on(ed.wrap_enabled())),
-            ("zen", on(app.zen_mode)),
+            ("zen", on(app.zen_mode())),
             ("aux", on(app.secondary_side_bar_visible)),
             ("activity_bar", on(app.activity_bar_visible)),
             ("status_bar", on(app.status_bar_visible)),
@@ -1010,8 +1010,20 @@ fn fields(app: &App, root: &Path, read: &[String; 5], hide_ids: bool) -> Fields 
             ("signature", on(app.signature_help_popup.is_some())),
             ("comment", on(ed.comment_focus.is_some())),
             ("leader", on(app.cmd_k_leader.is_some())),
-            ("recording_shortcut", on(app.recording_shortcut.is_some())),
-            ("confirm_shortcut", on(app.confirming_shortcut.is_some())),
+            (
+                "recording_shortcut",
+                on(matches!(
+                    app.shortcut_capture,
+                    Some(ShortcutCapture::Recording { .. })
+                )),
+            ),
+            (
+                "confirm_shortcut",
+                on(matches!(
+                    app.shortcut_capture,
+                    Some(ShortcutCapture::Confirming { .. })
+                )),
+            ),
             ("scrubber", on(app.scrubber.is_some())),
             ("scrub_view", on(app.scrub_view.is_some())),
             ("tour", on(app.tour.is_some())),
