@@ -65,6 +65,9 @@ impl SourceControlPanel {
     }
 }
 
+/// Paint a chunky 3-row solid-bg button at `area`, with rounded corner
+/// glyphs that let the panel bg show through the four corner notches so
+/// the button reads as a rounded rectangle (matching the VS Code mockup).
 /// Shared between the Source Control commit button and the Run-and-Debug
 /// button — same style, same corner treatment.
 pub fn render_rounded_button(buf: &mut Buffer, area: Rect, label: &str, bg: Color, fg: Color) {

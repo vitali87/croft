@@ -63,9 +63,8 @@ impl SourceControlPanel {
     }
 }
 
-/// Paint a chunky 3-row solid-bg button at `area`, with rounded corner
-/// glyphs that let the panel bg show through the four corner notches so
-/// the button reads as a rounded rectangle (matching the VS Code mockup).
+/// Whether the cell at (x, y) lies inside `rect`: the left and top edges
+/// count, the right and bottom edges do not, and an empty rect is never hit.
 pub(super) fn rect_hit(rect: Rect, x: u16, y: u16) -> bool {
     rect.width > 0
         && rect.height > 0

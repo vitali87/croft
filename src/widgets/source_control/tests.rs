@@ -148,6 +148,21 @@ fn feedback_wrapping_splits_long_words_and_caps_the_rows() {
 }
 
 #[test]
+fn feedback_wrapping_with_no_rows_allowed_returns_nothing() {
+    assert!(wrap_feedback("one two three four", 5, 0).is_empty());
+}
+
+#[test]
+fn a_word_that_exactly_fills_whole_rows_is_counted_once() {
+    // "abcdefghij" at width 5 wraps to "abcde" / "fghij": two rows, not three.
+    assert_eq!(empty_state::paragraph_line_count("abcdefghij", 5), 2);
+    assert_eq!(empty_state::paragraph_line_count("ab abcdefghij", 5), 3);
+    // A word after it still starts a row of its own.
+    assert_eq!(empty_state::paragraph_line_count("abcdefghij x", 5), 3);
+    assert_eq!(empty_state::paragraph_line_count("abcdefghijk", 5), 3);
+}
+
+#[test]
 fn short_commit_feedback_stays_on_one_line() {
     // Negative: the usual one-line summary keeps its single row, so the
     // change list below does not move down.
