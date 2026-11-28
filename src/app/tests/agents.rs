@@ -1727,7 +1727,7 @@ fn a_navigator_note_and_a_review_comment_on_one_line_keep_a_stable_order() {
     app.open_file_at_launch(&file);
     app.navigator_notes
         .insert("a.rs".into(), vec![(1, 1, "the navigator's note".into())]);
-    app.review_boxes = Some((
+    app.review.boxes = Some((
         file.clone(),
         vec![crate::review_threads::Thread {
             id: 4_000_000_001,
