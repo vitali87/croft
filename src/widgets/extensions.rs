@@ -696,6 +696,7 @@ impl Widget for &mut ExtensionsPanel {
         self.last_uninstall_left = uninstall_x;
 
         let visible = self.visible_indices();
+        let tones = crate::widgets::surface::tones(self.theme);
         let mut prev_group: Option<u8> = None;
         for (vis_idx, &item_idx) in visible.iter().enumerate().skip(self.scroll) {
             let item = &self.items[item_idx];
@@ -735,12 +736,31 @@ impl Widget for &mut ExtensionsPanel {
                 height: ROW_H,
             };
             let row_bg = if is_selected {
-                Some(pal.selection)
+                Some(match tones {
+                    // Croft Loch: the side bar's one selected-row band,
+                    // greyed while another pane has the keyboard (#2862), as
+                    // the Explorer's and Search's rows are.
+                    Some(t) => crate::gradient::rgb_color(
+                        crate::widgets::surface::selected_row_fill(t, t.chrome, self.focused),
+                    ),
+                    None => pal.selection,
+                })
             } else {
                 crate::widgets::hover::row_hover_bg(row_rect, self.hover_pointer, self.theme)
             };
-            if let Some(bg) = row_bg {
-                buf.set_style(row_rect, Style::default().bg(bg));
+            match (is_selected, tones) {
+                (true, Some(t)) => crate::widgets::surface::paint_selected_row(
+                    buf,
+                    row_rect,
+                    t,
+                    t.chrome,
+                    self.focused,
+                ),
+                _ => {
+                    if let Some(bg) = row_bg {
+                        buf.set_style(row_rect, Style::default().bg(bg));
+                    }
+                }
             }
 
             let name_fg = if item.enabled { NAME_FG } else { DESC_FG };
@@ -1029,6 +1049,40 @@ mod tests {
             dump.push('\n');
         }
         (buf, dump)
+    }
+
+    /// Croft Loch: the selected extension wears the side bar's one
+    /// selected-row anatomy (#2862): the accent band with the bar in the
+    /// left padding while Extensions has the keyboard, and the grey band
+    /// without the bar once another pane takes it, as VS Code dims an
+    /// unfocused list's selection.
+    #[test]
+    fn the_selected_row_greys_when_another_pane_has_the_keyboard() {
+        use crate::widgets::surface::{ROW_BAR, selected_row_fill, tones};
+        let mut panel = ExtensionsPanel::new();
+        let t = tones(panel.theme).expect("the default theme is Croft Loch");
+        panel.set_items(items());
+        let row_of = |dump: &str, name: &str| {
+            dump.lines()
+                .position(|l| l.contains(name))
+                .unwrap_or_else(|| panic!("{name} drawn:\n{dump}")) as u16
+        };
+
+        panel.focused = true;
+        let (buf, dump) = render(&mut panel, 44, 16);
+        let y = row_of(&dump, "PDF Viewer");
+        assert_eq!(buf[(0, y)].symbol(), ROW_BAR, "the bar in the padding");
+        assert_eq!(buf[(0, y)].fg, t.accent());
+        let band = crate::gradient::rgb_color(selected_row_fill(t, t.chrome, true));
+        assert_eq!(buf[(10, y)].bg, band, "the focused band");
+
+        panel.focused = false;
+        let (buf, dump) = render(&mut panel, 44, 16);
+        let y = row_of(&dump, "PDF Viewer");
+        assert_ne!(buf[(0, y)].symbol(), ROW_BAR, "no bar without focus");
+        let grey = crate::gradient::rgb_color(selected_row_fill(t, t.chrome, false));
+        assert_eq!(buf[(10, y)].bg, grey, "the grey band without focus");
+        assert_eq!(buf[(10, y + 1)].bg, grey, "both of the row's lines");
     }
 
     #[test]
