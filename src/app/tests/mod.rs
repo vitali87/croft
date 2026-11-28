@@ -1682,10 +1682,10 @@ fn owner_and_pilot_on(tmp: &tempfile::TempDir, text: &str) -> (App, crate::colla
         std::thread::sleep(Duration::from_millis(10));
     }
     let mut owner = App::new(tmp.path().to_path_buf()).unwrap();
-    owner.collab_config = Some((socket.clone(), crate::collab::CollabRole::Owner));
+    owner.collab.config = Some((socket.clone(), crate::collab::CollabRole::Owner));
     owner.open_file_at_launch(&file);
     let deadline = Instant::now() + Duration::from_secs(5);
-    while owner.collab.is_none() {
+    while owner.collab.session.is_none() {
         assert!(Instant::now() < deadline, "owner never joined the relay");
         owner.poll_collab();
         std::thread::sleep(Duration::from_millis(5));

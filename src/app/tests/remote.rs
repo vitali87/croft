@@ -783,15 +783,15 @@ fn losing_the_relay_reconnects_instead_of_typing_into_the_void() {
     // A hand-rolled "relay": accepts, then hangs up on command.
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     let mut guest = App::new(tmp.path().to_path_buf()).unwrap();
-    guest.collab_config = Some((socket.clone(), crate::collab::CollabRole::Guest));
+    guest.collab.config = Some((socket.clone(), crate::collab::CollabRole::Guest));
     guest.poll_collab();
-    assert!(guest.collab.is_some(), "first connect");
+    assert!(guest.collab.session.is_some(), "first connect");
     let (peer, _) = listener.accept().unwrap();
     drop(peer); // the relay dies
 
     // Detection: the dead session is dropped.
     let deadline = Instant::now() + Duration::from_secs(3);
-    while guest.collab.is_some() {
+    while guest.collab.session.is_some() {
         assert!(
             Instant::now() < deadline,
             "the dead session was never dropped"
@@ -801,7 +801,7 @@ fn losing_the_relay_reconnects_instead_of_typing_into_the_void() {
     }
     // Recovery: a fresh session connects (the listener's backlog accepts).
     let deadline = Instant::now() + Duration::from_secs(5);
-    while guest.collab.is_none() {
+    while guest.collab.session.is_none() {
         assert!(Instant::now() < deadline, "never reconnected");
         guest.poll_collab();
         std::thread::sleep(Duration::from_millis(50));

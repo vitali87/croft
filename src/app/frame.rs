@@ -870,7 +870,7 @@ impl App {
             // tag while the caret is inside its fade window. The seated
             // navigator's caret wears its identity accent.
             self.editor.ghost_caret_labels.clear();
-            if !self.collab_carets.is_empty()
+            if !self.collab.carets.is_empty()
                 && let Some(active) = self
                     .editor
                     .path
@@ -884,7 +884,7 @@ impl App {
                     .map(|h| h.caret_sites())
                     .unwrap_or_default();
                 let now = std::time::Instant::now();
-                for (site, c) in &self.collab_carets {
+                for (site, c) in &self.collab.carets {
                     if c.file != active {
                         continue;
                     }
@@ -1837,7 +1837,7 @@ impl App {
         // AI-stream badge: a pilot is streaming an edit into a shared file;
         // orange like the persistence warning (attention, not decoration),
         // naming the cancel chord so the stop path is one glance away.
-        if let Some(stream) = &self.collab_stream {
+        if let Some(stream) = &self.collab.stream {
             spans.extend(status_pill(
                 &format!(
                     "\u{23f9} {} streaming into {} (Cmd+K X to stop)",

@@ -341,12 +341,12 @@ impl App {
 
     /// Send a changed note to the session and keep the store current.
     pub(super) fn publish_note(&mut self, note: &crate::sticky_notes::Note) {
-        let mut session = self.collab.take();
+        let mut session = self.collab.session.take();
         if let Some(s) = session.as_mut() {
             s.send_note(note);
         }
         self.save_notes(session.as_ref());
-        self.collab = session;
+        self.collab.session = session;
     }
 
     /// The owner (or a lone croft) writes the notes; a guest's copy lives

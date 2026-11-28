@@ -11,6 +11,59 @@ pub(super) enum PairLockDenial {
     Io,
 }
 
+/// A multiplayer session's own state on this side (docs/MULTIPLAYER.md):
+/// the replicated session and the relay it reaches, the merge bases kept
+/// through an outage, the peers' carets and the one this croft last sent,
+/// and an AI pilot's stream into a shared file.
+pub(super) struct CollabState {
+    /// Phase D independent-viewport collab session (docs/MULTIPLAYER.md):
+    /// per-file replicated documents over the workspace's collab relay.
+    /// None until the lazy connect in `poll_collab` succeeds.
+    pub(super) session: Option<crate::collab::CollabSession>,
+    /// The collab socket and role the launch tail exported, read once at
+    /// startup. None when this croft is not a collab participant.
+    pub(super) config: Option<(PathBuf, crate::collab::CollabRole)>,
+    /// Throttle for the lazy relay connect (the owner starts before any
+    /// guest has spawned the relay, so the first attempts fail by design).
+    pub(super) last_connect: Option<std::time::Instant>,
+    /// Per-file merge base harvested when the relay link died: the last
+    /// replicated text every participant agreed on. A reconnect bootstrap
+    /// replays only this side's offline delta against it (three-way with the
+    /// owner's snapshot), so owner edits made during the outage survive.
+    pub(super) offline_base: std::collections::HashMap<String, String>,
+    /// Peers' last-known carets by site id. Painted as ghost carets in the
+    /// peer's color when their file is active, with a name tag while the
+    /// caret is inside its fade window.
+    pub(super) carets: std::collections::HashMap<u64, CollabCaret>,
+    /// The last caret this croft broadcast, so an unmoved cursor sends
+    /// nothing on the tick.
+    pub(super) caret_sent: Option<(String, usize, usize)>,
+    /// Whether any caret name tag was inside its fade window last tick;
+    /// flipping to false is the one redraw an expiring tag needs.
+    pub(super) labels_visible: bool,
+    /// Some while an AI pilot (`croft pair`) streams an edit into a shared
+    /// file: drives the status badge and the gutter stop button; cleared by
+    /// the pilot's StreamState(inactive) broadcast.
+    pub(super) stream: Option<CollabStreamInfo>,
+}
+
+impl CollabState {
+    /// Not connected; `config` is the socket and role the launch exported,
+    /// if this croft is a participant.
+    pub(super) fn new() -> Self {
+        Self {
+            session: None,
+            config: crate::collab::CollabChannel::env_config(),
+            last_connect: None,
+            offline_base: std::collections::HashMap::new(),
+            carets: std::collections::HashMap::new(),
+            caret_sent: None,
+            labels_visible: false,
+            stream: None,
+        }
+    }
+}
+
 /// The AI navigator's own state (docs/MULTIPLAYER.md): its seat and the
 /// workspace's pair record, the single-host lock, the turn being streamed
 /// and the notes it left, and the proactive looks.
@@ -954,7 +1007,7 @@ impl App {
             if let Some(host) = self.pair.host.take() {
                 // Drop tears the seat down; its parked caret goes with it.
                 let sites = host.caret_sites();
-                self.collab_carets.retain(|s, _| !sites.contains(s));
+                self.collab.carets.retain(|s, _| !sites.contains(s));
                 self.pair.navigator_notes.clear();
                 self.pair.commentary_buf.clear();
                 self.pair.turn_origin = None;
@@ -978,7 +1031,8 @@ impl App {
             return false;
         }
         if self
-            .collab_config
+            .collab
+            .config
             .as_ref()
             .is_some_and(|(_, role)| *role == crate::collab::CollabRole::Guest)
         {
@@ -986,7 +1040,7 @@ impl App {
         }
         let record = record.expect("want implies a record");
         let mut self_appointed_now = false;
-        if self.collab_config.is_none() {
+        if self.collab.config.is_none() {
             // Only one croft may self-appoint owner per workspace: two owners
             // would both claim site id 1 and corrupt the shared buffer. Claim
             // the single-host lock first; if another croft holds it, do not
@@ -1037,8 +1091,8 @@ impl App {
                 self.pair.host_lock = None;
                 return true;
             }
-            self.collab_config = Some((self.pair.socket.clone(), crate::collab::CollabRole::Owner));
-            self.last_collab_connect = None; // connect this tick, not in 2s
+            self.collab.config = Some((self.pair.socket.clone(), crate::collab::CollabRole::Owner));
+            self.collab.last_connect = None; // connect this tick, not in 2s
             self_appointed_now = true;
         }
         let cfg = crate::pair::PairConfig {
@@ -1082,7 +1136,7 @@ impl App {
                     // the lock so another croft may claim the seat. A host
                     // whose PILOT died later keeps both — it is still the
                     // live collab owner and re-seats on re-activation.
-                    self.collab_config = None;
+                    self.collab.config = None;
                     self.pair.host_lock = None;
                 }
             }
@@ -1205,7 +1259,7 @@ impl App {
                 .take()
                 .map(|h| h.caret_sites())
                 .unwrap_or_default();
-            self.collab_carets.retain(|s, _| !sites.contains(s));
+            self.collab.carets.retain(|s, _| !sites.contains(s));
             self.pair.navigator_notes.clear();
             self.pair.commentary_buf.clear();
             self.pair.turn_origin = None;
@@ -1438,8 +1492,8 @@ impl App {
     /// invariant), then resolve inbound events against the open buffers.
     pub(super) fn poll_collab(&mut self) -> bool {
         use crate::collab::{CollabChannel, CollabEvent, CollabRole, CollabSession};
-        if self.collab.is_none() {
-            let Some((socket, role)) = self.collab_config.clone() else {
+        if self.collab.session.is_none() {
+            let Some((socket, role)) = self.collab.config.clone() else {
                 return false;
             };
             // While the link is down there is no doc to converge panes of a
@@ -1450,24 +1504,25 @@ impl App {
             // pane would be silently replaced by the attach pass.
             let mirrored = self.mirror_offline_siblings();
             let due = self
-                .last_collab_connect
+                .collab
+                .last_connect
                 .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(2));
             if !due {
                 return mirrored;
             }
-            self.last_collab_connect = Some(std::time::Instant::now());
+            self.collab.last_connect = Some(std::time::Instant::now());
             match CollabChannel::connect(&socket, role) {
                 Some(ch) => {
                     let mut session = CollabSession::new(ch, collab_display_name());
                     if session.role == CollabRole::Guest {
                         session.send_notes_request();
                     }
-                    self.collab = Some(session);
+                    self.collab.session = Some(session);
                 }
                 None => return mirrored,
             }
         }
-        let mut session = self.collab.take().expect("connected above");
+        let mut session = self.collab.session.take().expect("connected above");
         let root = self.tree.root.clone();
         let mut changed = false;
 
@@ -1542,7 +1597,8 @@ impl App {
                     // the driver can still reject it (#1207). Any other
                     // peer's edit opens none (#919).
                     let group = self
-                        .collab_stream
+                        .collab
+                        .stream
                         .as_ref()
                         .filter(|st| st.file == file && st.site == site)
                         .map(|st| st.undo_group);
@@ -1551,7 +1607,7 @@ impl App {
                 CollabEvent::Bootstrapped { file, text } => {
                     let doc_gen = session.doc_gen(&file).unwrap_or(0);
                     let owner_text = text.clone();
-                    let base = self.collab_offline_base.remove(&file);
+                    let base = self.collab.offline_base.remove(&file);
                     if let Some(kept) = self.finish_collab_bootstrap(&root, &file, text, doc_gen) {
                         // A buffer diverged while the link was down: replay
                         // the divergence as local edits so the offline work
@@ -1586,11 +1642,12 @@ impl App {
                             .and_then(|p| std::fs::read_to_string(p).ok())
                         {
                             Some(disk) => {
-                                self.collab_offline_base
+                                self.collab
+                                    .offline_base
                                     .insert(file, disk.replace("\r\n", "\n"));
                             }
                             None => {
-                                self.collab_offline_base.remove(&file);
+                                self.collab.offline_base.remove(&file);
                             }
                         }
                     }
@@ -1608,11 +1665,11 @@ impl App {
                     // (a re-broadcast of a parked caret keeps its old tag
                     // age, or the tag would never fade).
                     let name: String = name.chars().take(24).collect();
-                    let moved = self.collab_carets.get(&site).is_none_or(|c| {
+                    let moved = self.collab.carets.get(&site).is_none_or(|c| {
                         c.file != file || c.row != row || c.col != col || c.name != name
                     });
                     if moved {
-                        self.collab_carets.insert(
+                        self.collab.carets.insert(
                             site,
                             CollabCaret {
                                 file,
@@ -1634,7 +1691,7 @@ impl App {
                     // whole status row.
                     let name: String = name.chars().take(24).collect();
                     let same = |st: &CollabStreamInfo| st.file == file && st.site == site;
-                    let previous = self.collab_stream.take();
+                    let previous = self.collab.stream.take();
                     let undo_group = match &previous {
                         Some(st) if active && same(st) => st.undo_group,
                         _ => next_remote_undo_group(),
@@ -1645,7 +1702,7 @@ impl App {
                     if let Some(st) = previous.filter(|st| !(active && same(st))) {
                         self.end_collab_undo_group(&root, &st.file, st.undo_group);
                     }
-                    self.collab_stream = active.then_some(CollabStreamInfo {
+                    self.collab.stream = active.then_some(CollabStreamInfo {
                         file,
                         name,
                         site,
@@ -1722,9 +1779,9 @@ impl App {
             && session.is_live(&file)
         {
             let caret = (file, self.editor.cursor_row, self.editor.cursor_col);
-            if self.collab_caret_sent.as_ref() != Some(&caret) {
+            if self.collab.caret_sent.as_ref() != Some(&caret) {
                 session.send_caret(&caret.0, caret.1, caret.2);
-                self.collab_caret_sent = Some(caret);
+                self.collab.caret_sent = Some(caret);
             }
         }
 
@@ -1732,7 +1789,7 @@ impl App {
             self.drop_lost_collab_session(session);
             return true;
         }
-        self.collab = Some(session);
+        self.collab.session = Some(session);
         changed | self.collab_labels_dirty()
     }
 
@@ -1746,7 +1803,7 @@ impl App {
         // whole diverged buffer replays and reads the owner's concurrent
         // (unseen) edits as deletions.
         for (file, text) in session.live_texts() {
-            self.collab_offline_base.insert(file, text);
+            self.collab.offline_base.insert(file, text);
         }
         self.status = String::from("Shared session link lost; reconnecting");
     }
@@ -1757,11 +1814,12 @@ impl App {
     pub(super) fn collab_labels_dirty(&mut self) -> bool {
         let now = std::time::Instant::now();
         let any = self
-            .collab_carets
+            .collab
+            .carets
             .values()
             .any(|c| now.duration_since(c.last_moved) < CARET_LABEL_FADE);
-        let flipped = any != self.collab_labels_visible;
-        self.collab_labels_visible = any;
+        let flipped = any != self.collab.labels_visible;
+        self.collab.labels_visible = any;
         flipped
     }
 
@@ -1770,11 +1828,11 @@ impl App {
     /// when the pilot broadcasts StreamState(inactive), not optimistically —
     /// the revert is the pilot's to confirm.
     pub fn collab_cancel_stream(&mut self) {
-        let Some(stream) = &self.collab_stream else {
+        let Some(stream) = &self.collab.stream else {
             self.status = "No AI stream is active".into();
             return;
         };
-        let Some(session) = &mut self.collab else {
+        let Some(session) = &mut self.collab.session else {
             self.status = "No AI stream is active".into();
             return;
         };
@@ -1787,7 +1845,7 @@ impl App {
     /// the stream), else the top visible row so the button is always in
     /// view; None when no stream targets the active file.
     pub(super) fn stream_stop_row(&self) -> Option<usize> {
-        let stream = self.collab_stream.as_ref()?;
+        let stream = self.collab.stream.as_ref()?;
         let active = self
             .editor
             .path
@@ -1797,7 +1855,8 @@ impl App {
             return None;
         }
         Some(
-            self.collab_carets
+            self.collab
+                .carets
                 .get(&stream.site)
                 .filter(|c| c.file == stream.file)
                 .map(|c| c.row)
@@ -2022,7 +2081,7 @@ impl App {
     /// up.
     pub(super) fn is_collab_guest(&self) -> bool {
         matches!(
-            self.collab_config,
+            self.collab.config,
             Some((_, crate::collab::CollabRole::Guest))
         )
     }

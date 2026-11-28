@@ -1155,7 +1155,7 @@ fn resident_seating_never_replays_a_persisted_task() {
     app.pair.record_path = tmp.path().join("x.pair.json");
     app.pair.socket = socket.clone();
     app.pair.host_lock_path = tmp.path().join("x.pair-host.lock");
-    app.collab_config = Some((socket, crate::collab::CollabRole::Owner));
+    app.collab.config = Some((socket, crate::collab::CollabRole::Owner));
     let seen2 = seen_task.clone();
     app.pair.spawn_override = Some(Box::new(move |cfg| {
         *seen2.borrow_mut() = cfg.task.clone();
