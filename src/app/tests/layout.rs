@@ -1165,6 +1165,59 @@ fn the_output_view_renders_a_pushed_channel_line() {
     );
 }
 
+/// OUTPUT's clear empties the log on screen (#2861), not only the bus
+/// behind it: the click moves no focus, and the view used to refresh only
+/// when focus moved, so the cleared lines stayed up.
+#[test]
+fn clicking_output_clear_empties_the_shown_log() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // The bus is process-wide, so the channel carries a name no other test
+    // uses.
+    let channel = "Clear 2861";
+    for i in 0..3 {
+        crate::output::push(
+            channel,
+            crate::output::OutputLevel::Info,
+            &format!("cleared line {i}"),
+        );
+    }
+    app.output.sync();
+    assert!(app.output.select_by_name(channel));
+    app.bottom_panel_tab = BottomPanelTab::Output;
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 50)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let area = app.output.last_area;
+    let shown = |term: &ratatui::Terminal<ratatui::backend::TestBackend>| {
+        let buf = term.backend().buffer();
+        (area.y..area.bottom())
+            .flat_map(|y| (area.x..area.right()).map(move |x| (x, y)))
+            .map(|(x, y)| buf[(x, y)].symbol().to_string())
+            .collect::<String>()
+    };
+    assert!(shown(&term).contains("cleared line 2"), "{}", shown(&term));
+    // The toolbar's "clear" token, found by its cells on the header row.
+    let header: Vec<String> = {
+        let buf = term.backend().buffer();
+        (area.x..area.right())
+            .map(|x| buf[(x, area.y)].symbol().to_string())
+            .collect()
+    };
+    let at = (0..header.len().saturating_sub(5))
+        .find(|&i| header[i..i + 5].concat() == "clear")
+        .expect("the toolbar draws its clear button") as u16;
+    let (x, y) = (area.x + at + 1, area.y);
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), x, y));
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        !shown(&term).contains("cleared line"),
+        "clear empties the shown log: {}",
+        shown(&term)
+    );
+}
+
 #[test]
 fn the_active_panel_tab_is_underlined() {
     use ratatui::style::Modifier;

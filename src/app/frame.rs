@@ -1534,6 +1534,9 @@ impl App {
                         t.last_area = Rect::default();
                         t.redacted_on_screen = 0;
                     }
+                    // Drawn from the channel as it is now (#2861): the tab may
+                    // have been shown since the tick last brought it up to date.
+                    self.output.sync();
                     frame.render_widget(&mut self.output, content);
                     self.paint_panel_view_top(frame, content);
                 }
