@@ -930,7 +930,7 @@ impl App {
             // reviewer reading a PR with a navigator session open wants
             // both. Appended after, so a navigator note and a review
             // comment on one line keep a stable order.
-            if let Some((path, threads)) = &self.review_boxes
+            if let Some((path, threads)) = &self.review.boxes
                 && self.editor.path.as_deref() == Some(path.as_path())
             {
                 let lines = self.editor.lines.len();
@@ -970,8 +970,8 @@ impl App {
                 }
             }
             // Pending review comments (#366) on this file, until submitted.
-            if !self.review_pending.is_empty()
-                && let Some((root, _)) = &self.review_pr
+            if !self.review.pending.is_empty()
+                && let Some((root, _)) = &self.review.pr
                 && let Some(rel) = self.editor.path.as_deref().and_then(|p| {
                     let top = self.git_worker_for_root(root).status().repo_root.clone()?;
                     p.strip_prefix(&top).ok().map(|r| {
@@ -983,7 +983,7 @@ impl App {
                 })
             {
                 let lines = self.editor.lines.len();
-                for (i, c) in self.review_pending.iter().enumerate() {
+                for (i, c) in self.review.pending.iter().enumerate() {
                     if c.path == rel {
                         self.editor
                             .comment_boxes

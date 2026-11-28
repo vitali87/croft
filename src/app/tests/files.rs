@@ -4268,7 +4268,7 @@ fn a_read_that_began_before_a_write_settled_does_not_undo_it() {
         let tmp = tempfile::tempdir().unwrap();
         let (gh, _log) = viewed_sync_gh(tmp.path(), "  *FileAsViewed*) echo '{}' ;;");
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.review_gh = gh.display().to_string();
+        app.review.gh = gh.display().to_string();
         let pr = || {
             crate::pr_review::parse_pr(
                 r#"{"number": 42, "url": "https://github.com/x/y/pull/42", "files": [{"path": "a.rs"}]}"#,
@@ -4280,14 +4280,14 @@ fn a_read_that_began_before_a_write_settled_does_not_undo_it() {
         // Tick a.rs: its mutation is queued, then sent.
         app.handle_pr_review_key(key(KeyCode::Char(' '), KeyModifiers::NONE));
         app.poll_pr_viewed();
-        assert!(app.pr_viewed_write.is_some(), "in flight");
+        assert!(app.review.pr_viewed_write.is_some(), "in flight");
         // A refresh replaces the view and starts a read while it is.
         app.open_pr_review(pr(), String::from("x/y#42"));
         let (tx, rx) = std::sync::mpsc::channel();
-        app.pr_viewed_fetch = Some((String::from("x/y#42"), app.pr_viewed_seq, rx));
+        app.review.pr_viewed_fetch = Some((String::from("x/y#42"), app.review.pr_viewed_seq, rx));
         // The write lands and settles before the read answers ...
         settle_viewed_writes(&mut app);
-        assert!(app.pr_viewed_queue.is_empty() && app.pr_viewed_write.is_none());
+        assert!(app.review.pr_viewed_queue.is_empty() && app.review.pr_viewed_write.is_none());
         // ... with what GitHub said before it: unviewed.
         let mut states = std::collections::BTreeMap::new();
         states.insert(
@@ -4306,7 +4306,7 @@ fn a_read_that_began_before_a_write_settled_does_not_undo_it() {
         );
         // A read that begins after the write settled is trusted again.
         let (tx, rx) = std::sync::mpsc::channel();
-        app.pr_viewed_fetch = Some((String::from("x/y#42"), app.pr_viewed_seq, rx));
+        app.review.pr_viewed_fetch = Some((String::from("x/y#42"), app.review.pr_viewed_seq, rx));
         let mut states = std::collections::BTreeMap::new();
         states.insert(
             String::from("a.rs"),

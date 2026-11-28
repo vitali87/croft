@@ -4,6 +4,129 @@
 
 use super::*;
 
+/// Pull-request review's own state: the comment boxes and the review being
+/// written, the export and submit jobs, the pull request a review tab is
+/// on, and the `gh` reads and writes of its checks, viewed marks and
+/// checkout.
+pub(super) struct ReviewState {
+    /// Review threads loaded onto a file, as `(the file, its threads)` (#366).
+    ///
+    /// A SEPARATE field from `editor.comment_boxes`, which the render loop
+    /// rebuilds from `navigator_notes` on every frame — assigning review
+    /// threads there directly meant they were wiped before the user saw
+    /// one, while the status line still reported having loaded them.
+    ///
+    /// Keyed by PATH because the merge runs on every frame: keyed only by
+    /// "whatever was loaded last", one file's objections would hang off the
+    /// next file's line numbers, against unrelated code. That is the harm
+    /// `threads_are_filtered_to_the_file_being_viewed` prevents on the
+    /// filter axis, and it re-enters through the lifetime axis if the boxes
+    /// outlive the buffer they describe.
+    ///
+    /// Holds `Thread`s rather than finished `CommentBox`es so the geometry
+    /// is derived against the LIVE buffer each frame. `box_line` clamps a
+    /// box past the end back into view; computed once at load, that clamp
+    /// goes stale the moment the user edits, and the box it was protecting
+    /// becomes invisible again.
+    pub(super) boxes: Option<(PathBuf, Vec<crate::review_threads::Thread>)>,
+    /// Writing reviews (#366): comments not yet submitted and the PR they
+    /// were written on, the PR last looked up as (repo root, number), each
+    /// thread's GraphQL node id, the chosen verdict while its summary is
+    /// typed, the `gh` to run, and where finished jobs report.
+    pub(super) pending: Vec<crate::review_threads::PendingComment>,
+    pub(super) pending_pr: Option<(PathBuf, String)>,
+    /// The Submit Review or export in flight, as the `review-submit` job;
+    /// another is refused while it runs, so the same comments are never
+    /// posted twice. A job whose thread crashed no longer counts (#2578).
+    pub(super) submit: Option<crate::jobs::Job<crate::review_ops::Outcome>>,
+    /// Export to a PR (#368): the previewed comments and the navigator
+    /// notes they came from, the sticky notes it would settle, and the
+    /// prefix that marks the navigator's comments as AI-authored.
+    pub(super) export: Option<(
+        Vec<crate::review_threads::PendingComment>,
+        Vec<u64>,
+        Vec<crate::widgets::list_picker::ListRow>,
+    )>,
+    pub(super) export_sticky: Vec<String>,
+    /// The PR the export preview named: posting goes there, even if a
+    /// thread load answered for another PR in between.
+    pub(super) export_pr: Option<(PathBuf, String)>,
+    pub(super) ai_prefix: String,
+    pub(super) pr: Option<(PathBuf, String)>,
+    /// The branch checked out when `pr` was recorded: the number is
+    /// reused only while it is still the branch, or a `gh pr checkout` of
+    /// another PR sent comments to the old one.
+    pub(super) pr_branch: Option<String>,
+    pub(super) nodes: std::collections::HashMap<u64, String>,
+    pub(super) verdict: Option<crate::review_threads::ReviewEvent>,
+    pub(super) gh: String,
+    /// The review tab's `gh` call in flight (#365): what it is for, and
+    /// where its answer arrives.
+    pub(super) pr_gh: Option<(PrGhJob, std::sync::mpsc::Receiver<Result<String, String>>)>,
+    /// When the open review tab's checks were last re-read (#365).
+    pub(super) pr_checks_polled: Option<std::time::Instant>,
+    /// GitHub's viewed state being read for the review tab keyed by the
+    /// first half (#365), and [`Self::pr_viewed_seq`] when the read began.
+    pub(super) pr_viewed_fetch: Option<(String, u64, PrViewedRx)>,
+    /// Viewed marks waiting to reach GitHub, sent one at a time so two
+    /// quick toggles of one file arrive in order (#365).
+    pub(super) pr_viewed_queue: std::collections::VecDeque<PrViewedWrite>,
+    /// The viewed mutation in flight: its tab's key and file, and gh's
+    /// answer.
+    pub(super) pr_viewed_write: Option<(String, String, PrViewedWriteRx)>,
+    /// A counter stamped on every viewed write when it is queued and when
+    /// it finishes (#365).
+    pub(super) pr_viewed_seq: u64,
+    /// Each `(tab key, file)`'s latest stamp from [`Self::pr_viewed_seq`].
+    /// A viewed-state read that began before a file's write settled may
+    /// have seen GitHub before the write landed, so its answer does not
+    /// overwrite that file. Kept on the app, not the review view, so a
+    /// refresh that replaces the view keeps the protection.
+    pub(super) pr_viewed_touched: std::collections::HashMap<(String, String), u64>,
+    /// The pull request head review mode checked out (#365), removed again
+    /// when review is left with nothing in it worth keeping.
+    pub(super) pr_checkout: Option<PrCheckout>,
+    /// A checkout still fetching: the PR number, and where the worktree
+    /// path and commit (or git's refusal) arrive.
+    pub(super) pr_checkout_rx: Option<(u64, PrCheckoutRx)>,
+    pub(super) tx: std::sync::mpsc::Sender<crate::review_ops::Outcome>,
+    pub(super) rx: std::sync::mpsc::Receiver<crate::review_ops::Outcome>,
+}
+
+impl ReviewState {
+    /// No review, job or read yet; `ai_prefix` is the setting that marks an
+    /// AI-written comment (#365).
+    pub(super) fn new(ai_prefix: String) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        Self {
+            boxes: None,
+            pending: Vec::new(),
+            pending_pr: None,
+            submit: None,
+            export: None,
+            export_sticky: Vec::new(),
+            export_pr: None,
+            ai_prefix,
+            pr: None,
+            pr_branch: None,
+            nodes: std::collections::HashMap::new(),
+            verdict: None,
+            gh: String::from("gh"),
+            pr_gh: None,
+            pr_checks_polled: None,
+            pr_viewed_fetch: None,
+            pr_viewed_queue: std::collections::VecDeque::new(),
+            pr_viewed_write: None,
+            pr_viewed_seq: 0,
+            pr_viewed_touched: std::collections::HashMap::new(),
+            pr_checkout: None,
+            pr_checkout_rx: None,
+            tx,
+            rx,
+        }
+    }
+}
+
 /// How often an open review tab with running checks re-reads them (#365).
 pub(super) const PR_CHECKS_POLL: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -331,14 +454,15 @@ impl App {
         if body.is_empty() {
             return;
         }
-        let Some((root, number)) = self.review_pr.clone() else {
+        let Some((root, number)) = self.review.pr.clone() else {
             return;
         };
         if !self.pending_is_for(&root, &number) {
             return;
         }
-        self.review_pending_pr = Some((root, number));
-        self.review_pending
+        self.review.pending_pr = Some((root, number));
+        self.review
+            .pending
             .push(crate::review_threads::PendingComment {
                 path: rel.to_string_lossy().into_owned(),
                 line: self.editor.cursor_row,
@@ -346,7 +470,7 @@ impl App {
             });
         self.status = format!(
             "{} pending comment(s): Review: Submit Review sends them",
-            self.review_pending.len()
+            self.review.pending.len()
         );
     }
 
@@ -355,11 +479,11 @@ impl App {
     /// repository of the workspace) must never post here; the status says
     /// which PR they belong to.
     pub(super) fn pending_is_for(&mut self, root: &Path, number: &str) -> bool {
-        match &self.review_pending_pr {
-            Some((r, n)) if !self.review_pending.is_empty() && (r != root || n != number) => {
+        match &self.review.pending_pr {
+            Some((r, n)) if !self.review.pending.is_empty() && (r != root || n != number) => {
                 self.status = format!(
                     "{} pending comment(s) belong to PR #{n} in {}: submit or discard them there first",
-                    self.review_pending.len(),
+                    self.review.pending.len(),
                     r.display()
                 );
                 false
@@ -381,7 +505,7 @@ impl App {
         .into_iter()
         .map(|(id, label)| crate::widgets::list_picker::ListRow {
             id: id.to_string(),
-            label: format!("{label} ({} pending comment(s))", self.review_pending.len()),
+            label: format!("{label} ({} pending comment(s))", self.review.pending.len()),
         })
         .collect();
         self.open_list_picker(
@@ -396,18 +520,18 @@ impl App {
 
     pub(super) fn submit_review(&mut self, summary: String) {
         use crate::review_threads::ReviewEvent;
-        let event = self.review_verdict.take().unwrap_or(ReviewEvent::Comment);
-        let Some((root, number)) = self.review_pr.clone() else {
+        let event = self.review.verdict.take().unwrap_or(ReviewEvent::Comment);
+        let Some((root, number)) = self.review.pr.clone() else {
             return;
         };
         if !self.pending_is_for(&root, &number) {
             return;
         }
-        if self.review_submit.is_some() {
+        if self.review.submit.is_some() {
             self.status = String::from("A review is already being submitted");
             return;
         }
-        if event == ReviewEvent::Comment && summary.is_empty() && self.review_pending.is_empty() {
+        if event == ReviewEvent::Comment && summary.is_empty() && self.review.pending.is_empty() {
             self.status = String::from("Nothing to submit: add a comment or a summary");
             return;
         }
@@ -415,9 +539,9 @@ impl App {
             number,
             event,
             summary,
-            pending: self.review_pending.clone(),
+            pending: self.review.pending.clone(),
             settles: crate::review_ops::Settles {
-                pending: self.review_pending.clone(),
+                pending: self.review.pending.clone(),
                 ..Default::default()
             },
         };
@@ -427,13 +551,13 @@ impl App {
     /// Post a review as the `review-submit` job, saying `status` while it
     /// runs. Its answer comes back through [`Self::drain_review_ops`].
     fn start_review_submit(&mut self, root: PathBuf, job: crate::review_ops::Job, status: &str) {
-        let program = self.review_gh.clone();
+        let program = self.review.gh.clone();
         let submit = crate::jobs::Job::spawn("review-submit", crate::jobs::Start::Now, move || {
             crate::review_ops::run(&program, &root, job, crate::pr_review::GH_TIMEOUT)
         });
         match submit {
             Ok(submit) => {
-                self.review_submit = Some(submit);
+                self.review.submit = Some(submit);
                 self.status = String::from(status);
             }
             Err(e) => self.status = format!("Could not submit the review: {e}"),
@@ -450,7 +574,8 @@ impl App {
             .map(|f| f.id)
             .or_else(|| self.next_comment_from_caret().map(|(id, _)| id));
         let Some(thread) = id.and_then(|id| {
-            self.review_boxes
+            self.review
+                .boxes
                 .as_ref()
                 .and_then(|(_, ts)| ts.iter().find(|t| t.id == id).cloned())
         }) else {
@@ -458,22 +583,22 @@ impl App {
             return;
         };
         let (Some(node), Some((root, _))) = (
-            self.review_nodes.get(&thread.id).cloned(),
-            self.review_pr.clone(),
+            self.review.nodes.get(&thread.id).cloned(),
+            self.review.pr.clone(),
         ) else {
             self.status =
                 String::from("GitHub didn't report this thread's id; reload the comments");
             return;
         };
         crate::review_ops::spawn(
-            self.review_gh.clone(),
+            self.review.gh.clone(),
             root,
             crate::review_ops::Job::Resolve {
                 thread: thread.id,
                 node,
                 resolve: !thread.resolved,
             },
-            self.review_tx.clone(),
+            self.review.tx.clone(),
         );
     }
 
@@ -481,24 +606,25 @@ impl App {
     /// false when the focused box is not a review thread.
     pub(super) fn reply_to_review_thread(&mut self, id: u64, text: &str) -> bool {
         let is_thread = self
-            .review_boxes
+            .review
+            .boxes
             .as_ref()
             .is_some_and(|(_, ts)| ts.iter().any(|t| t.id == id));
         if !is_thread {
             return false;
         }
-        let Some((root, number)) = self.review_pr.clone() else {
+        let Some((root, number)) = self.review.pr.clone() else {
             return false;
         };
         crate::review_ops::spawn(
-            self.review_gh.clone(),
+            self.review.gh.clone(),
             root,
             crate::review_ops::Job::Reply {
                 number,
                 thread: id,
                 text: text.to_string(),
             },
-            self.review_tx.clone(),
+            self.review.tx.clone(),
         );
         self.editor.comment_focus = None;
         self.status = String::from("Replying…");
@@ -510,18 +636,18 @@ impl App {
         use crate::review_ops::Outcome;
         let mut changed = false;
         let mut outcomes: Vec<Outcome> =
-            std::iter::from_fn(|| self.review_rx.try_recv().ok()).collect();
-        match self.review_submit.as_ref().map(crate::jobs::Job::poll) {
+            std::iter::from_fn(|| self.review.rx.try_recv().ok()).collect();
+        match self.review.submit.as_ref().map(crate::jobs::Job::poll) {
             None | Some(crate::jobs::Poll::Pending) => {}
             Some(crate::jobs::Poll::Done(out)) => {
-                self.review_submit = None;
+                self.review.submit = None;
                 outcomes.push(out);
             }
             // Its thread crashed, and the crash notice said so. The comments
             // it was posting are still pending, and the next submit goes
             // ahead instead of being refused as already running (#2578).
             Some(crate::jobs::Poll::Died) => {
-                self.review_submit = None;
+                self.review.submit = None;
                 changed = true;
             }
         }
@@ -529,7 +655,7 @@ impl App {
             changed = true;
             match out {
                 Outcome::Replied { thread, text } => {
-                    if let Some((_, ts)) = &mut self.review_boxes
+                    if let Some((_, ts)) = &mut self.review.boxes
                         && let Some(t) = ts.iter_mut().find(|t| t.id == thread)
                     {
                         t.body.push_str(&format!("\n\nyou: {text}"));
@@ -537,7 +663,7 @@ impl App {
                     self.status = String::from("Reply posted");
                 }
                 Outcome::Resolved { thread, resolved } => {
-                    if let Some((_, ts)) = &mut self.review_boxes
+                    if let Some((_, ts)) = &mut self.review.boxes
                         && let Some(t) = ts.iter_mut().find(|t| t.id == thread)
                     {
                         t.resolved = resolved;
@@ -553,9 +679,9 @@ impl App {
                     folded,
                     settles,
                 } => {
-                    self.review_pending.retain(|c| !settles.pending.contains(c));
-                    if self.review_pending.is_empty() {
-                        self.review_pending_pr = None;
+                    self.review.pending.retain(|c| !settles.pending.contains(c));
+                    if self.review.pending.is_empty() {
+                        self.review.pending_pr = None;
                     }
                     // Exported navigator notes now live on GitHub; reload
                     // shows them there, as threads, rather than twice.
@@ -621,7 +747,7 @@ impl App {
     /// vanish from the buffer the user is still editing and the field holds
     /// unreachable garbage.
     pub(super) fn rename_review_boxes_path(&mut self, old: &Path, new: &Path) {
-        if let Some((p, _)) = &mut self.review_boxes
+        if let Some((p, _)) = &mut self.review.boxes
             && p == old
         {
             *p = new.to_path_buf();
@@ -654,13 +780,13 @@ impl App {
         // thread's is GitHub's own comment id, currently around 3.9e9. If
         // notes ever gain a wider allocator, this needs a tag rather than a
         // bare id.
-        if let Some((_, threads)) = &mut self.review_boxes {
+        if let Some((_, threads)) = &mut self.review.boxes {
             threads.retain(|t| t.id != id);
         }
         if let Some(i) = Self::pending_review_index(id)
-            && i < self.review_pending.len()
+            && i < self.review.pending.len()
         {
-            self.review_pending.remove(i);
+            self.review.pending.remove(i);
         }
         if self
             .editor
@@ -707,7 +833,7 @@ impl App {
             .and_then(|file| self.navigator_notes.get(&file))
             .cloned()
             .unwrap_or_default();
-        if let Some((path, threads)) = &self.review_boxes
+        if let Some((path, threads)) = &self.review.boxes
             && self.editor.path.as_deref() == Some(path.as_path())
         {
             let lines = self.editor.lines.len();
@@ -813,8 +939,8 @@ impl App {
 
     /// Remember the PR under review, with the branch it belongs to.
     pub(super) fn set_review_pr(&mut self, root: PathBuf, number: String) {
-        self.review_pr_branch = self.git_worker_for_root(&root).status().branch.clone();
-        self.review_pr = Some((root, number));
+        self.review.pr_branch = self.git_worker_for_root(&root).status().branch.clone();
+        self.review.pr = Some((root, number));
     }
 
     /// The PR number for `root`'s branch, remembered for the write side, or
@@ -824,14 +950,14 @@ impl App {
         // on the UI thread for every comment and submit, and asking GitHub
         // each time froze croft on a slow network or a gh auth prompt.
         let branch = self.git_worker_for_root(root).status().branch.clone();
-        if let Some((r, number)) = &self.review_pr
+        if let Some((r, number)) = &self.review.pr
             && r == root
             && branch.is_some()
-            && branch == self.review_pr_branch
+            && branch == self.review.pr_branch
         {
             return Some(number.clone());
         }
-        let out = crate::gh::Client::new(&self.review_gh, root, std::time::Duration::from_secs(5))
+        let out = crate::gh::Client::new(&self.review.gh, root, std::time::Duration::from_secs(5))
             .run(&["pr", "view", "--json", "number", "--jq", ".number"]);
         // Only a number is a PR to comment on: any other answer, however
         // gh came to give it, is none.
@@ -872,8 +998,8 @@ impl App {
             self.status = String::from("This folder is not inside a git repository");
             return;
         };
-        let prefix = self.review_ai_prefix.clone();
-        let mut comments = self.review_pending.clone();
+        let prefix = self.review.ai_prefix.clone();
+        let mut comments = self.review.pending.clone();
         let mut notes = Vec::new();
         for (file, list) in &self.navigator_notes {
             let Some(rel) = repo_relative(&repo_root, &self.tree.root.join(file)) else {
@@ -904,7 +1030,7 @@ impl App {
             });
             exported_notes.push(n.id.clone());
         }
-        self.review_export_sticky = exported_notes;
+        self.review.export_sticky = exported_notes;
         if comments.is_empty() {
             self.status = String::from("No comments to export");
             return;
@@ -914,10 +1040,10 @@ impl App {
         // as long as the network does: off the frame loop, the preview
         // opens when they answer.
         crate::review_ops::spawn(
-            self.review_gh.clone(),
+            self.review.gh.clone(),
             root,
             crate::review_ops::Job::ExportPreview { comments, notes },
-            self.review_tx.clone(),
+            self.review.tx.clone(),
         );
         self.status = String::from("Preparing the export\u{2026}");
     }
@@ -932,7 +1058,7 @@ impl App {
         inline: usize,
     ) {
         self.set_review_pr(root.clone(), number.clone());
-        self.review_export_pr = Some((root, number.clone()));
+        self.review.export_pr = Some((root, number.clone()));
         let mut rows = vec![crate::widgets::list_picker::ListRow {
             id: String::from("post"),
             label: format!(
@@ -951,12 +1077,12 @@ impl App {
                 ),
             }
         }));
-        self.review_export = Some((comments, notes, rows));
+        self.review.export = Some((comments, notes, rows));
         self.show_export_preview();
     }
 
     pub(super) fn show_export_preview(&mut self) {
-        let Some((_, _, rows)) = &self.review_export else {
+        let Some((_, _, rows)) = &self.review.export else {
             return;
         };
         let rows = rows.clone();
@@ -972,22 +1098,23 @@ impl App {
 
     /// Post the previewed export as a Comment review.
     pub(super) fn post_exported_comments(&mut self) {
-        let Some((comments, notes, _)) = self.review_export.take() else {
+        let Some((comments, notes, _)) = self.review.export.take() else {
             return;
         };
-        let Some((root, number)) = self.review_export_pr.take() else {
+        let Some((root, number)) = self.review.export_pr.take() else {
             return;
         };
-        let sticky = std::mem::take(&mut self.review_export_sticky);
+        let sticky = std::mem::take(&mut self.review.export_sticky);
         if !self.pending_is_for(&root, &number) {
             return;
         }
-        if self.review_submit.is_some() {
+        if self.review.submit.is_some() {
             self.status = String::from("A review is already being submitted");
             return;
         }
         let pending: Vec<_> = self
-            .review_pending
+            .review
+            .pending
             .iter()
             .filter(|c| comments.contains(c))
             .cloned()
@@ -1020,10 +1147,10 @@ impl App {
         // `gh` over the network, several calls for a big PR: off the frame
         // loop. The threads come back keyed to `path`, the file asked about.
         crate::review_ops::spawn(
-            self.review_gh.clone(),
+            self.review.gh.clone(),
             root,
             crate::review_ops::Job::LoadThreads { path, rel },
-            self.review_tx.clone(),
+            self.review.tx.clone(),
         );
         self.status = String::from("Loading review comments\u{2026}");
     }
@@ -1042,7 +1169,7 @@ impl App {
         for t in &mut threads {
             if let Some((node, resolved)) = states.get(&t.id) {
                 t.resolved = *resolved;
-                self.review_nodes.insert(t.id, node.clone());
+                self.review.nodes.insert(t.id, node.clone());
             }
         }
         if threads.is_empty() {
@@ -1058,7 +1185,7 @@ impl App {
         // `path` is the file the `gh` query was about, carried through the
         // worker, not whatever `editor.path` says now: the user may have
         // switched tabs while it ran.
-        self.review_boxes = Some((path, threads.clone()));
+        self.review.boxes = Some((path, threads.clone()));
         self.status = match outdated {
             0 => format!("{} review comments on {rel}", threads.len()),
             n => format!(
@@ -1120,7 +1247,7 @@ impl App {
     /// one still running, whose answer is then dropped.
     pub(super) fn spawn_pr_gh(&mut self, job: PrGhJob, args: Vec<String>) {
         let (tx, rx) = std::sync::mpsc::channel();
-        let gh = self.review_gh.clone();
+        let gh = self.review.gh.clone();
         let root = self.workspace_root().to_path_buf();
         std::thread::spawn(move || {
             let _ = tx.send(crate::pr_review::run_gh(
@@ -1130,7 +1257,7 @@ impl App {
                 crate::pr_review::GH_TIMEOUT,
             ));
         });
-        self.pr_gh = Some((job, rx));
+        self.review.pr_gh = Some((job, rx));
     }
 
     /// Read GitHub's viewed state for the open review tab on a worker
@@ -1147,7 +1274,7 @@ impl App {
             return;
         }
         let (tx, rx) = std::sync::mpsc::channel();
-        let gh = self.review_gh.clone();
+        let gh = self.review.gh.clone();
         let root = self.workspace_root().to_path_buf();
         std::thread::spawn(move || {
             let _ = tx.send(crate::pr_review::fetch_viewed(
@@ -1158,21 +1285,23 @@ impl App {
                 crate::pr_review::GH_TIMEOUT,
             ));
         });
-        self.pr_viewed_fetch = Some((key, self.pr_viewed_seq, rx));
+        self.review.pr_viewed_fetch = Some((key, self.review.pr_viewed_seq, rx));
     }
 
     /// Queue a viewed mark for GitHub (#365), stamping its file so a
     /// viewed-state read already under way cannot undo it.
     pub(super) fn queue_pr_viewed_write(&mut self, write: PrViewedWrite) {
         self.touch_pr_viewed(&write.key, &write.path);
-        self.pr_viewed_queue.push_back(write);
+        self.review.pr_viewed_queue.push_back(write);
     }
 
     /// Stamp `(key, path)` with the next [`Self::pr_viewed_seq`].
     pub(super) fn touch_pr_viewed(&mut self, key: &str, path: &str) {
-        self.pr_viewed_seq += 1;
-        self.pr_viewed_touched
-            .insert((key.to_string(), path.to_string()), self.pr_viewed_seq);
+        self.review.pr_viewed_seq += 1;
+        self.review.pr_viewed_touched.insert(
+            (key.to_string(), path.to_string()),
+            self.review.pr_viewed_seq,
+        );
     }
 
     /// Whether GitHub's answer from a read that began at `since` may be
@@ -1180,15 +1309,18 @@ impl App {
     /// still queued or in flight, or one that settled after the read began.
     pub(super) fn pr_viewed_fenced(&self, key: &str, path: &str, since: u64) -> bool {
         let pending = self
+            .review
             .pr_viewed_queue
             .iter()
             .any(|w| w.key == key && w.path == path)
             || self
+                .review
                 .pr_viewed_write
                 .as_ref()
                 .is_some_and(|(k, p, _)| k == key && p == path);
         pending
             || self
+                .review
                 .pr_viewed_touched
                 .get(&(key.to_string(), path.to_string()))
                 .is_some_and(|&stamp| stamp > since)
@@ -1200,11 +1332,11 @@ impl App {
     pub(super) fn poll_pr_viewed(&mut self) -> bool {
         use std::sync::mpsc::TryRecvError;
         let mut changed = false;
-        if let Some((key, since, rx)) = self.pr_viewed_fetch.as_ref() {
+        if let Some((key, since, rx)) = self.review.pr_viewed_fetch.as_ref() {
             let got = rx.try_recv();
             if !matches!(got, Err(TryRecvError::Empty)) {
                 let (key, since) = (key.clone(), *since);
-                self.pr_viewed_fetch = None;
+                self.review.pr_viewed_fetch = None;
                 // gh missing, signed out or refused: the marks stay local,
                 // exactly as before, and nothing is said about it.
                 if let Ok(Ok((pr_id, states))) = got {
@@ -1212,11 +1344,11 @@ impl App {
                 }
             }
         }
-        if let Some((key, path, rx)) = self.pr_viewed_write.as_ref() {
+        if let Some((key, path, rx)) = self.review.pr_viewed_write.as_ref() {
             let got = rx.try_recv();
             if !matches!(got, Err(TryRecvError::Empty)) {
                 let (key, path) = (key.clone(), path.clone());
-                self.pr_viewed_write = None;
+                self.review.pr_viewed_write = None;
                 // Settled after any read already under way began: that
                 // read may predate it.
                 self.touch_pr_viewed(&key, &path);
@@ -1241,12 +1373,12 @@ impl App {
                 }
             }
         }
-        if self.pr_viewed_write.is_none()
-            && let Some(write) = self.pr_viewed_queue.pop_front()
+        if self.review.pr_viewed_write.is_none()
+            && let Some(write) = self.review.pr_viewed_queue.pop_front()
         {
             let args = crate::pr_review::mark_viewed_args(&write.pr_id, &write.path, write.viewed);
             let (tx, rx) = std::sync::mpsc::channel();
-            let gh = self.review_gh.clone();
+            let gh = self.review.gh.clone();
             let root = self.workspace_root().to_path_buf();
             std::thread::spawn(move || {
                 let _ = tx.send(crate::pr_review::run_gh(
@@ -1256,7 +1388,7 @@ impl App {
                     crate::pr_review::GH_TIMEOUT,
                 ));
             });
-            self.pr_viewed_write = Some((write.key, write.path, rx));
+            self.review.pr_viewed_write = Some((write.key, write.path, rx));
         }
         changed
     }
@@ -1323,7 +1455,7 @@ impl App {
     /// (#365). Never while another review call is in flight, which it would
     /// otherwise replace.
     pub(super) fn refresh_pending_pr_checks(&mut self) {
-        if self.pr_gh.is_some() {
+        if self.review.pr_gh.is_some() {
             return;
         }
         let Some(view) = self.editor.pr_review.as_ref() else {
@@ -1333,16 +1465,16 @@ impl App {
             return;
         }
         let now = std::time::Instant::now();
-        match self.pr_checks_polled {
+        match self.review.pr_checks_polled {
             Some(at) if now.duration_since(at) < PR_CHECKS_POLL => return,
             // The first sight of a pending tab starts the clock.
             None => {
-                self.pr_checks_polled = Some(now);
+                self.review.pr_checks_polled = Some(now);
                 return;
             }
             Some(_) => {}
         }
-        self.pr_checks_polled = Some(now);
+        self.review.pr_checks_polled = Some(now);
         let url = view.pr.url.clone();
         let args = crate::pr_review::view_args(&url);
         self.spawn_pr_gh(PrGhJob::Checks { url }, args);
@@ -1353,7 +1485,7 @@ impl App {
     pub(super) fn poll_pr_gh(&mut self) -> bool {
         let synced = self.poll_pr_viewed();
         self.refresh_pending_pr_checks();
-        let Some((_, rx)) = self.pr_gh.as_ref() else {
+        let Some((_, rx)) = self.review.pr_gh.as_ref() else {
             return synced;
         };
         let result = match rx.try_recv() {
@@ -1363,7 +1495,7 @@ impl App {
                 Err(String::from("gh stopped without answering"))
             }
         };
-        let Some((job, _)) = self.pr_gh.take() else {
+        let Some((job, _)) = self.review.pr_gh.take() else {
             return synced;
         };
         match job {
@@ -1488,12 +1620,15 @@ impl App {
                         };
                         // The fields directly, as `view` still borrows the
                         // editor: what `queue_pr_viewed_write` does.
-                        self.pr_viewed_seq += 1;
-                        self.pr_viewed_touched
-                            .insert((write.key.clone(), write.path.clone()), self.pr_viewed_seq);
-                        self.pr_viewed_queue.push_back(write);
+                        self.review.pr_viewed_seq += 1;
+                        self.review.pr_viewed_touched.insert(
+                            (write.key.clone(), write.path.clone()),
+                            self.review.pr_viewed_seq,
+                        );
+                        self.review.pr_viewed_queue.push_back(write);
                     }
                     None if self
+                        .review
                         .pr_viewed_fetch
                         .as_ref()
                         .is_some_and(|(k, _, _)| *k == view.key) =>
@@ -1545,7 +1680,7 @@ impl App {
         let Some(view) = self.editor.pr_review.as_ref() else {
             return;
         };
-        if self.pr_checkout_rx.is_some() {
+        if self.review.pr_checkout_rx.is_some() {
             self.status = String::from("A pull request checkout is already fetching");
             return;
         }
@@ -1554,6 +1689,7 @@ impl App {
         // What review mode last checked out there, the one HEAD a refresh
         // may move away from without stranding commits.
         let previous = self
+            .review
             .pr_checkout
             .as_ref()
             .filter(|c| c.number == number)
@@ -1581,14 +1717,14 @@ impl App {
             .map(|wt| (path.canonicalize().unwrap_or(path), wt));
             let _ = tx.send(result);
         });
-        self.pr_checkout_rx = Some((number, rx));
+        self.review.pr_checkout_rx = Some((number, rx));
         self.status = format!("Fetching PR #{number}…");
     }
 
     /// Apply a finished pull request checkout. Returns true when it changed
     /// what is on screen.
     pub(super) fn poll_pr_checkout(&mut self) -> bool {
-        let Some((number, rx)) = self.pr_checkout_rx.as_ref() else {
+        let Some((number, rx)) = self.review.pr_checkout_rx.as_ref() else {
             return false;
         };
         let number = *number;
@@ -1599,7 +1735,7 @@ impl App {
                 Err(String::from("the checkout stopped without answering"))
             }
         };
-        self.pr_checkout_rx = None;
+        self.review.pr_checkout_rx = None;
         match result {
             Ok((path, wt)) => {
                 let mut fresh = PrCheckout {
@@ -1617,7 +1753,7 @@ impl App {
                     );
                     return true;
                 }
-                match self.pr_checkout.take() {
+                match self.review.pr_checkout.take() {
                     // A refresh of the same checkout: still review mode's
                     // if review mode made it.
                     Some(old) if old.number == number => fresh.created |= old.created,
@@ -1642,7 +1778,7 @@ impl App {
                         fresh.path.display()
                     )
                 };
-                self.pr_checkout = Some(fresh);
+                self.review.pr_checkout = Some(fresh);
             }
             Err(why) => self.status = format!("Could not check out PR #{number}: {why}"),
         }
@@ -1686,7 +1822,7 @@ impl App {
     /// its workspace folder, unless it holds work — edits, build output or
     /// new commits — which stay, with the reason in the status.
     pub(super) fn leave_pr_checkout(&mut self) {
-        let Some(checkout) = self.pr_checkout.take() else {
+        let Some(checkout) = self.review.pr_checkout.take() else {
             return;
         };
         let number = checkout.number;

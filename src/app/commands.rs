@@ -2274,9 +2274,9 @@ impl App {
             Cmd::NoteAdd => self.open_sticky_note_prompt(),
             Cmd::NoteDelete => self.delete_sticky_note_here(),
             Cmd::ReviewDiscardPending => {
-                let n = self.review_pending.len();
-                self.review_pending.clear();
-                self.review_pending_pr = None;
+                let n = self.review.pending.len();
+                self.review.pending.clear();
+                self.review.pending_pr = None;
                 self.status = format!("Discarded {n} pending comment(s)");
             }
             Cmd::ToggleSessionRecording => self.toggle_session_recording(),

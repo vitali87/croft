@@ -1112,7 +1112,7 @@ impl App {
             }
             ListPurpose::ReviewVerdict => {
                 use crate::review_threads::ReviewEvent;
-                self.review_verdict = Some(match row.id.as_str() {
+                self.review.verdict = Some(match row.id.as_str() {
                     "APPROVE" => ReviewEvent::Approve,
                     "REQUEST_CHANGES" => ReviewEvent::RequestChanges,
                     _ => ReviewEvent::Comment,

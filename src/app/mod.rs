@@ -2904,94 +2904,15 @@ pub struct App {
     /// The actions from the in-flight `textDocument/codeAction` reply, indexed
     /// by the row `id` the Quick Fix [`ListPicker`] presents.
     pending_code_actions: Vec<crate::lsp::manager::CodeActionItem>,
-    /// Review threads loaded onto a file, as `(the file, its threads)` (#366).
-    ///
-    /// A SEPARATE field from `editor.comment_boxes`, which the render loop
-    /// rebuilds from `navigator_notes` on every frame — assigning review
-    /// threads there directly meant they were wiped before the user saw
-    /// one, while the status line still reported having loaded them.
-    ///
-    /// Keyed by PATH because the merge runs on every frame: keyed only by
-    /// "whatever was loaded last", one file's objections would hang off the
-    /// next file's line numbers, against unrelated code. That is the harm
-    /// `threads_are_filtered_to_the_file_being_viewed` prevents on the
-    /// filter axis, and it re-enters through the lifetime axis if the boxes
-    /// outlive the buffer they describe.
-    ///
-    /// Holds `Thread`s rather than finished `CommentBox`es so the geometry
-    /// is derived against the LIVE buffer each frame. `box_line` clamps a
-    /// box past the end back into view; computed once at load, that clamp
-    /// goes stale the moment the user edits, and the box it was protecting
-    /// becomes invisible again.
-    review_boxes: Option<(PathBuf, Vec<crate::review_threads::Thread>)>,
-    /// Writing reviews (#366): comments not yet submitted and the PR they
-    /// were written on, the PR last looked up as (repo root, number), each
-    /// thread's GraphQL node id, the chosen verdict while its summary is
-    /// typed, the `gh` to run, and where finished jobs report.
-    review_pending: Vec<crate::review_threads::PendingComment>,
-    review_pending_pr: Option<(PathBuf, String)>,
-    /// The Submit Review or export in flight, as the `review-submit` job;
-    /// another is refused while it runs, so the same comments are never
-    /// posted twice. A job whose thread crashed no longer counts (#2578).
-    review_submit: Option<crate::jobs::Job<crate::review_ops::Outcome>>,
+    /// Pull-request review's comment boxes, jobs and `gh` reads and writes
+    /// (see [`review::ReviewState`]).
+    review: review::ReviewState,
     /// Sticky notes (#367): every note in the workspace, where the owner
     /// keeps them (`None` under test), and which box id is which note.
     notes: crate::sticky_notes::Notes,
     notes_path: Option<PathBuf>,
     note_box_ids: std::collections::HashMap<u64, String>,
     notes_shown_gen: u64,
-    /// Export to a PR (#368): the previewed comments and the navigator
-    /// notes they came from, the sticky notes it would settle, and the
-    /// prefix that marks the navigator's comments as AI-authored.
-    review_export: Option<(
-        Vec<crate::review_threads::PendingComment>,
-        Vec<u64>,
-        Vec<crate::widgets::list_picker::ListRow>,
-    )>,
-    review_export_sticky: Vec<String>,
-    /// The PR the export preview named: posting goes there, even if a
-    /// thread load answered for another PR in between.
-    review_export_pr: Option<(PathBuf, String)>,
-    review_ai_prefix: String,
-    review_pr: Option<(PathBuf, String)>,
-    /// The branch checked out when `review_pr` was recorded: the number is
-    /// reused only while it is still the branch, or a `gh pr checkout` of
-    /// another PR sent comments to the old one.
-    review_pr_branch: Option<String>,
-    review_nodes: std::collections::HashMap<u64, String>,
-    review_verdict: Option<crate::review_threads::ReviewEvent>,
-    review_gh: String,
-    /// The review tab's `gh` call in flight (#365): what it is for, and
-    /// where its answer arrives.
-    pr_gh: Option<(PrGhJob, std::sync::mpsc::Receiver<Result<String, String>>)>,
-    /// When the open review tab's checks were last re-read (#365).
-    pr_checks_polled: Option<std::time::Instant>,
-    /// GitHub's viewed state being read for the review tab keyed by the
-    /// first half (#365), and [`Self::pr_viewed_seq`] when the read began.
-    pr_viewed_fetch: Option<(String, u64, PrViewedRx)>,
-    /// Viewed marks waiting to reach GitHub, sent one at a time so two
-    /// quick toggles of one file arrive in order (#365).
-    pr_viewed_queue: std::collections::VecDeque<PrViewedWrite>,
-    /// The viewed mutation in flight: its tab's key and file, and gh's
-    /// answer.
-    pr_viewed_write: Option<(String, String, PrViewedWriteRx)>,
-    /// A counter stamped on every viewed write when it is queued and when
-    /// it finishes (#365).
-    pr_viewed_seq: u64,
-    /// Each `(tab key, file)`'s latest stamp from [`Self::pr_viewed_seq`].
-    /// A viewed-state read that began before a file's write settled may
-    /// have seen GitHub before the write landed, so its answer does not
-    /// overwrite that file. Kept on the app, not the review view, so a
-    /// refresh that replaces the view keeps the protection.
-    pr_viewed_touched: std::collections::HashMap<(String, String), u64>,
-    /// The pull request head review mode checked out (#365), removed again
-    /// when review is left with nothing in it worth keeping.
-    pr_checkout: Option<PrCheckout>,
-    /// A checkout still fetching: the PR number, and where the worktree
-    /// path and commit (or git's refusal) arrive.
-    pr_checkout_rx: Option<(u64, PrCheckoutRx)>,
-    review_tx: std::sync::mpsc::Sender<crate::review_ops::Outcome>,
-    review_rx: std::sync::mpsc::Receiver<crate::review_ops::Outcome>,
     /// An open asciicast recording (#356): the writer, the file it appends
     /// to, and when it started. `None` when nothing is being recorded.
     recording: Option<(
@@ -3983,7 +3904,6 @@ impl App {
             crate::output::push("Settings", crate::output::OutputLevel::Warn, w);
         }
         let loaded_prefs = merged_settings.prefs.clone();
-        let (review_tx, review_rx) = std::sync::mpsc::channel();
         let data_dir =
             (!cfg!(test)).then(|| user_data_dir(&croft_cache_dir(), &crate::paths::state_dir()));
         let notes_path = data_dir
@@ -4768,10 +4688,12 @@ impl App {
             code_action_pending_resolve: false,
             code_action_baseline: Vec::new(),
             pending_code_actions: Vec::new(),
-            review_boxes: None,
-            review_pending: Vec::new(),
-            review_pending_pr: None,
-            review_submit: None,
+            review: review::ReviewState::new(
+                loaded_prefs
+                    .review_ai_prefix
+                    .clone()
+                    .unwrap_or_else(|| String::from(crate::review_threads::DEFAULT_AI_PREFIX)),
+            ),
             notes: crate::startup_trace::after(
                 "sticky notes read",
                 notes_path
@@ -4782,29 +4704,6 @@ impl App {
             notes_path,
             note_box_ids: std::collections::HashMap::new(),
             notes_shown_gen: 0,
-            review_export: None,
-            review_export_sticky: Vec::new(),
-            review_export_pr: None,
-            review_ai_prefix: loaded_prefs
-                .review_ai_prefix
-                .clone()
-                .unwrap_or_else(|| String::from(crate::review_threads::DEFAULT_AI_PREFIX)),
-            review_pr: None,
-            review_pr_branch: None,
-            review_nodes: std::collections::HashMap::new(),
-            review_verdict: None,
-            review_gh: String::from("gh"),
-            pr_gh: None,
-            pr_checks_polled: None,
-            pr_viewed_fetch: None,
-            pr_viewed_queue: std::collections::VecDeque::new(),
-            pr_viewed_write: None,
-            pr_viewed_seq: 0,
-            pr_viewed_touched: std::collections::HashMap::new(),
-            pr_checkout: None,
-            pr_checkout_rx: None,
-            review_tx,
-            review_rx,
             recording: None,
             recorded_size: (0, 0),
             scrubber: None,

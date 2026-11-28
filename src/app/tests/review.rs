@@ -548,7 +548,7 @@ fn review_boxes_survive_the_render_that_rebuilds_navigator_notes() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.editor.open(&file).unwrap();
 
-    app.review_boxes = Some((
+    app.review.boxes = Some((
         file.clone(),
         vec![crate::review_threads::Thread {
             id: 77,
@@ -605,7 +605,7 @@ fn review_boxes_do_not_follow_the_user_to_another_file() {
     std::fs::write(&b, "alpha\nbeta\ngamma\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.editor.open(&a).unwrap();
-    app.review_boxes = Some((
+    app.review.boxes = Some((
         a.clone(),
         vec![crate::review_threads::Thread {
             id: 77,
@@ -653,7 +653,7 @@ fn review_box_geometry_follows_the_buffer_when_it_shrinks() {
     std::fs::write(&file, "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.editor.open(&file).unwrap();
-    app.review_boxes = Some((
+    app.review.boxes = Some((
         file.clone(),
         vec![crate::review_threads::Thread {
             id: 88,
@@ -706,7 +706,7 @@ fn ignoring_a_review_box_actually_dismisses_it() {
     std::fs::write(&file, "one\ntwo\nthree\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.editor.open(&file).unwrap();
-    app.review_boxes = Some((
+    app.review.boxes = Some((
         file.clone(),
         vec![crate::review_threads::Thread {
             id: 99,
@@ -744,7 +744,7 @@ fn the_comment_walk_reaches_review_boxes() {
     std::fs::write(&file, "one\ntwo\nthree\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.editor.open(&file).unwrap();
-    app.review_boxes = Some((
+    app.review.boxes = Some((
         file.clone(),
         vec![crate::review_threads::Thread {
             id: 55,
@@ -780,7 +780,7 @@ fn review_boxes_follow_the_open_file_through_a_rename() {
     std::fs::write(&old, "one\ntwo\nthree\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.editor.open(&old).unwrap();
-    app.review_boxes = Some((
+    app.review.boxes = Some((
         old.clone(),
         vec![crate::review_threads::Thread {
             id: 66,
@@ -1074,7 +1074,7 @@ esac
 /// An app on the review fixture, with git's view of the repo in place.
 fn review_app(root: &std::path::Path, f: &std::path::Path, gh: &std::path::Path) -> App {
     let mut app = App::new(root.to_path_buf()).unwrap();
-    app.review_gh = gh.display().to_string();
+    app.review.gh = gh.display().to_string();
     app.editor.open_pinned(f).unwrap();
     crate::test_budget::await_spawned(
         std::time::Duration::from_secs(5),
@@ -1097,12 +1097,12 @@ fn review_threads_can_be_replied_to_resolved_and_a_review_submitted() {
     app.load_review_threads();
     crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "the threads", || {
         app.drain_review_ops();
-        app.review_boxes.is_some()
+        app.review.boxes.is_some()
     });
-    let threads = app.review_boxes.as_ref().map(|(_, t)| t.clone()).unwrap();
+    let threads = app.review.boxes.as_ref().map(|(_, t)| t.clone()).unwrap();
     assert_eq!(threads.len(), 1);
     assert!(!threads[0].resolved);
-    assert_eq!(app.review_nodes.get(&5).map(String::as_str), Some("PRRT_1"));
+    assert_eq!(app.review.nodes.get(&5).map(String::as_str), Some("PRRT_1"));
 
     let wait_for = |app: &mut App, what: &str, done: &dyn Fn(&App) -> bool| {
         crate::test_budget::await_spawned(std::time::Duration::from_secs(5), what, || {
@@ -1114,12 +1114,13 @@ fn review_threads_can_be_replied_to_resolved_and_a_review_submitted() {
     app.editor.cursor_row = 0;
     app.toggle_review_thread_resolved();
     wait_for(&mut app, "the resolve", &|a| {
-        a.review_boxes.as_ref().is_some_and(|(_, t)| t[0].resolved)
+        a.review.boxes.as_ref().is_some_and(|(_, t)| t[0].resolved)
     });
 
     assert!(app.reply_to_review_thread(5, "done"));
     wait_for(&mut app, "the reply", &|a| {
-        a.review_boxes
+        a.review
+            .boxes
             .as_ref()
             .is_some_and(|(_, t)| t[0].body.ends_with("you: done"))
     });
@@ -1129,9 +1130,9 @@ fn review_threads_can_be_replied_to_resolved_and_a_review_submitted() {
     let rel = app.prompt.as_ref().unwrap().target_dir.clone();
     app.prompt = None;
     app.add_pending_review_comment("add a test", rel);
-    app.review_verdict = Some(crate::review_threads::ReviewEvent::RequestChanges);
+    app.review.verdict = Some(crate::review_threads::ReviewEvent::RequestChanges);
     app.submit_review(String::from("Close."));
-    wait_for(&mut app, "the review", &|a| a.review_pending.is_empty());
+    wait_for(&mut app, "the review", &|a| a.review.pending.is_empty());
 
     let sent: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&stdin).unwrap()).unwrap();
@@ -1157,26 +1158,28 @@ fn pending_comments_stay_with_their_pull_request() {
     app.open_review_comment_prompt();
     let rel = app.prompt.take().unwrap().target_dir;
     app.add_pending_review_comment("on seven", rel.clone());
-    assert_eq!(app.review_pending.len(), 1);
+    assert_eq!(app.review.pending.len(), 1);
 
     // The branch now has another PR.
-    app.review_pr = Some((root.clone(), String::from("8")));
+    app.review.pr = Some((root.clone(), String::from("8")));
     app.add_pending_review_comment("on eight", rel);
-    assert_eq!(app.review_pending.len(), 1, "not mixed in");
+    assert_eq!(app.review.pending.len(), 1, "not mixed in");
     assert!(app.status.contains("PR #7"), "{}", app.status);
     app.submit_review(String::from("LGTM"));
     assert!(!stdin.exists(), "nothing posted to #8");
 
     // A failed export keeps the navigator notes it carried.
-    app.review_pending.clear();
+    app.review.pending.clear();
     app.navigator_notes
         .insert(String::from("a.rs"), vec![(1, 1, String::from("n"))]);
     app.drain_review_ops();
-    app.review_tx
+    app.review
+        .tx
         .send(crate::review_ops::Outcome::Failed(String::from("nope")))
         .unwrap();
     app.drain_review_ops();
-    app.review_tx
+    app.review
+        .tx
         .send(crate::review_ops::Outcome::Submitted {
             inline: 0,
             folded: 0,
@@ -1194,27 +1197,28 @@ fn only_the_submissions_own_failure_ends_it() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let (answer_tx, answer_rx) = std::sync::mpsc::channel::<()>();
-    app.review_submit = Some(
+    app.review.submit = Some(
         crate::jobs::Job::spawn("review-submit", crate::jobs::Start::Now, move || {
             let _ = answer_rx.recv();
             crate::review_ops::Outcome::SubmitFailed(String::from("no"))
         })
         .unwrap(),
     );
-    app.review_tx
+    app.review
+        .tx
         .send(crate::review_ops::Outcome::Failed(String::from(
             "Reply failed",
         )))
         .unwrap();
     app.drain_review_ops();
-    assert!(app.review_submit.is_some());
+    assert!(app.review.submit.is_some());
     answer_tx.send(()).unwrap();
     crate::test_budget::await_spawned(
         std::time::Duration::from_secs(1),
         "the submission's own answer",
         || {
             app.drain_review_ops();
-            app.review_submit.is_none()
+            app.review.submit.is_none()
         },
     );
     assert_eq!(app.status, "no");
@@ -1234,7 +1238,8 @@ fn comments_export_to_the_pull_request_after_a_preview() {
             (2, 40, String::from("far")),
         ],
     );
-    app.review_pending
+    app.review
+        .pending
         .push(crate::review_threads::PendingComment {
             path: String::from("a.rs"),
             line: 0,
@@ -1253,7 +1258,7 @@ fn comments_export_to_the_pull_request_after_a_preview() {
     assert_eq!(picker.rows.len(), 4);
     // A thread load answering for another PR meanwhile does not redirect
     // the post away from the PR the preview named.
-    app.review_pr = Some((root.clone(), String::from("8")));
+    app.review.pr = Some((root.clone(), String::from("8")));
     app.post_exported_comments();
     crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "the post", || {
         app.drain_review_ops();
@@ -1275,7 +1280,7 @@ fn comments_export_to_the_pull_request_after_a_preview() {
             .unwrap()
             .contains("`a.rs:41`: [AI, croft navigator] far")
     );
-    assert!(app.review_pending.is_empty());
+    assert!(app.review.pending.is_empty());
     let log = std::fs::read_to_string(&log).unwrap();
     assert!(
         log.contains("pulls/7/reviews") && !log.contains("pulls/8/"),
@@ -1465,16 +1470,16 @@ fn a_submit_in_flight_keeps_new_comments_and_refuses_a_second_submit() {
     let rel = app.prompt.take().unwrap().target_dir;
     app.add_pending_review_comment("first", rel.clone());
     app.submit_review(String::from("Looks good"));
-    assert!(app.review_submit.is_some());
+    assert!(app.review.submit.is_some());
     app.editor.cursor_row = 1;
     app.add_pending_review_comment("written meanwhile", rel);
     app.submit_review(String::from("again"));
     assert!(app.status.contains("already"), "{}", app.status);
     crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "the submit", || {
         app.drain_review_ops();
-        app.review_submit.is_none()
+        app.review.submit.is_none()
     });
-    let left: Vec<_> = app.review_pending.iter().map(|c| c.body.clone()).collect();
+    let left: Vec<_> = app.review.pending.iter().map(|c| c.body.clone()).collect();
     assert_eq!(left, vec![String::from("written meanwhile")]);
 }
 
@@ -1489,7 +1494,7 @@ fn a_review_submission_whose_thread_crashed_lets_the_next_one_run() {
     app.open_review_comment_prompt();
     let rel = app.prompt.take().unwrap().target_dir;
     app.add_pending_review_comment("first", rel);
-    app.review_submit = Some(
+    app.review.submit = Some(
         crate::jobs::Job::spawn(
             "review-submit",
             crate::jobs::Start::Now,
@@ -1504,11 +1509,11 @@ fn a_review_submission_whose_thread_crashed_lets_the_next_one_run() {
         "the crashed submission to settle",
         || {
             app.drain_review_ops();
-            app.review_submit.is_none()
+            app.review.submit.is_none()
         },
     );
     assert_eq!(
-        app.review_pending.len(),
+        app.review.pending.len(),
         1,
         "its comments are still pending"
     );
@@ -1516,9 +1521,9 @@ fn a_review_submission_whose_thread_crashed_lets_the_next_one_run() {
     assert!(!app.status.contains("already"), "{}", app.status);
     crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "the next submit", || {
         app.drain_review_ops();
-        app.review_submit.is_none()
+        app.review.submit.is_none()
     });
-    assert!(app.review_pending.is_empty(), "the next submit posted them");
+    assert!(app.review.pending.is_empty(), "the next submit posted them");
 }
 
 #[test]
@@ -1627,7 +1632,7 @@ esac
         .unwrap();
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.review_gh = gh.display().to_string();
+        app.review.gh = gh.display().to_string();
 
         let started = std::time::Instant::now();
         app.submit_pr_number("https://github.com/x/y/pull/42/files");
@@ -1673,11 +1678,11 @@ fn a_pr_review_without_a_usable_gh_says_how_to_fix_it() {
         (tmp.path().join("gh"), crate::gh::MISSING),
         (signed_out, crate::gh::SIGNED_OUT),
     ] {
-        app.review_gh = gh.display().to_string();
+        app.review.gh = gh.display().to_string();
         app.submit_pr_number("42");
         crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "gh pr view", || {
             app.poll_pr_gh();
-            app.pr_gh.is_none()
+            app.review.pr_gh.is_none()
         });
         assert_eq!(app.status, format!("Could not load PR 42: {why}"));
     }
@@ -1711,7 +1716,7 @@ fn the_review_comment_pr_lookup_without_a_usable_gh_says_how_to_fix_it() {
             String::from("No PR for this branch — check it out first"),
         ),
     ] {
-        app.review_gh = gh.display().to_string();
+        app.review.gh = gh.display().to_string();
         assert_eq!(app.review_pr_number(tmp.path()), None);
         assert_eq!(app.status, status);
     }
@@ -1740,7 +1745,7 @@ fn the_review_comment_pr_lookup_waits_out_a_briefly_busy_gh() {
         std::thread::sleep(std::time::Duration::from_millis(100));
         drop(writer);
     });
-    app.review_gh = gh.display().to_string();
+    app.review.gh = gh.display().to_string();
     assert_eq!(
         app.review_pr_number(tmp.path()),
         Some(String::from("42")),
@@ -1768,8 +1773,8 @@ fn the_review_comment_pr_lookup_takes_only_a_pr_number() {
         let gh = tmp.path().join(name);
         std::fs::write(&gh, script).unwrap();
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
-        app.review_gh = gh.display().to_string();
-        app.review_pr = None;
+        app.review.gh = gh.display().to_string();
+        app.review.pr = None;
         assert_eq!(app.review_pr_number(tmp.path()), None, "{name}");
         assert_eq!(
             app.status, "No PR for this branch — check it out first",
@@ -1783,7 +1788,7 @@ fn open_synced_pr(app: &mut App) {
     app.submit_pr_number("42");
     crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "gh pr view", || {
         app.poll_pr_gh();
-        app.editor.pr_review.is_some() && app.pr_viewed_fetch.is_none()
+        app.editor.pr_review.is_some() && app.review.pr_viewed_fetch.is_none()
     });
 }
 
@@ -1822,7 +1827,7 @@ fn pr_viewed_state_syncs_with_github() {
         store.save(&store_path).unwrap();
 
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.review_gh = gh.display().to_string();
+        app.review.gh = gh.display().to_string();
         open_synced_pr(&mut app);
         let view = app.editor.pr_review.as_ref().unwrap();
         assert_eq!(view.github_id.as_deref(), Some("PR_kw42"));
@@ -1925,7 +1930,7 @@ fn pr_viewed_state_stays_local_without_github() {
         store.save(&store_path).unwrap();
 
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.review_gh = gh.display().to_string();
+        app.review.gh = gh.display().to_string();
         open_synced_pr(&mut app);
         assert_eq!(app.status, "Reviewing PR #42", "no error spam");
         let view = app.editor.pr_review.as_ref().unwrap();
@@ -1962,7 +1967,7 @@ fn a_toggle_before_github_answers_wins_and_is_sent() {
         let tmp = tempfile::tempdir().unwrap();
         let (gh, log) = viewed_sync_gh(tmp.path(), "  *FileAsViewed*) echo '{}' ;;");
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.review_gh = gh.display().to_string();
+        app.review.gh = gh.display().to_string();
         app.open_pr_review(
             crate::pr_review::parse_pr(
                 r#"{"number": 42, "url": "https://github.com/x/y/pull/42", "files": [{"path": "a.rs"}]}"#,
@@ -1972,7 +1977,7 @@ fn a_toggle_before_github_answers_wins_and_is_sent() {
         );
         // A read in flight that has not answered yet.
         let (tx, rx) = std::sync::mpsc::channel();
-        app.pr_viewed_fetch = Some((String::from("x/y#42"), app.pr_viewed_seq, rx));
+        app.review.pr_viewed_fetch = Some((String::from("x/y#42"), app.review.pr_viewed_seq, rx));
         app.handle_pr_review_key(key(KeyCode::Char(' '), KeyModifiers::NONE));
         let mut states = std::collections::BTreeMap::new();
         states.insert(
@@ -2011,7 +2016,7 @@ echo '{"number": 42, "title": "t", "url": "https://github.com/x/y/pull/42", "aut
         .unwrap();
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.review_gh = gh.display().to_string();
+        app.review.gh = gh.display().to_string();
         let mut pr = crate::pr_review::parse_pr(
             r#"{"number": 42, "title": "t", "url": "https://github.com/x/y/pull/42", "author": {"login": "a"}, "files": [], "statusCheckRollup": [{"__typename": "CheckRun", "name": "build", "status": "IN_PROGRESS", "conclusion": ""}]}"#,
         )
@@ -2021,8 +2026,9 @@ echo '{"number": 42, "title": "t", "url": "https://github.com/x/y/pull/42", "aut
         assert!(app.editor.pr_review.as_ref().unwrap().has_pending_checks());
         // The first pass only starts the clock; nothing is fetched yet.
         app.poll_pr_gh();
-        assert!(app.pr_gh.is_none());
-        app.pr_checks_polled = Some(std::time::Instant::now() - std::time::Duration::from_secs(31));
+        assert!(app.review.pr_gh.is_none());
+        app.review.pr_checks_polled =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(31));
         // A due refresh runs gh. Not asserted through `pr_gh` straight after
         // the poll: that poll also reads the answer, and under load the stub
         // can answer before it does, leaving `pr_gh` already empty again.
@@ -2043,9 +2049,10 @@ echo '{"number": 42, "title": "t", "url": "https://github.com/x/y/pull/42", "aut
             app.status
         );
         // Nothing pending: no more refreshes.
-        app.pr_checks_polled = Some(std::time::Instant::now() - std::time::Duration::from_secs(31));
+        app.review.pr_checks_polled =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(31));
         app.poll_pr_gh();
-        assert!(app.pr_gh.is_none());
+        assert!(app.review.pr_gh.is_none());
     });
 }
 
@@ -2078,7 +2085,7 @@ esac
         .unwrap();
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.review_gh = gh.display().to_string();
+        app.review.gh = gh.display().to_string();
         app.run_command(Command::ReviewPullRequest);
         crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "gh pr list", || {
             app.poll_pr_gh();
@@ -2097,7 +2104,7 @@ esac
         );
         crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "gh pr view", || {
             app.poll_pr_gh();
-            app.pr_gh.is_none()
+            app.review.pr_gh.is_none()
         });
         let args = std::fs::read_to_string(&log).unwrap();
         assert!(
@@ -2109,7 +2116,7 @@ esac
         );
 
         // gh unable to list: straight to the prompt, with the reason.
-        app.review_gh = String::from("/nonexistent/gh");
+        app.review.gh = String::from("/nonexistent/gh");
         app.run_command(Command::ReviewPullRequest);
         crate::test_budget::await_spawned(
             std::time::Duration::from_secs(5),
@@ -2161,7 +2168,7 @@ fn review_mode_checks_the_pr_out_and_leaving_removes_a_clean_checkout() {
             "PR checkout",
             || {
                 app.poll_pr_checkout();
-                app.pr_checkout_rx.is_none()
+                app.review.pr_checkout_rx.is_none()
             },
         );
         let checkout = tmp.path().join("app-pr-579").canonicalize().unwrap();
@@ -2183,7 +2190,7 @@ fn review_mode_checks_the_pr_out_and_leaving_removes_a_clean_checkout() {
         );
         assert!(!checkout.exists(), "the worktree is gone");
         assert!(!app.roots.iter().any(|r| r == checkout));
-        assert!(app.pr_checkout.is_none());
+        assert!(app.review.pr_checkout.is_none());
 
         // Leaving before the fetch lands: nobody owns the result, so it is
         // settled on arrival, never adopted.
@@ -2195,7 +2202,7 @@ fn review_mode_checks_the_pr_out_and_leaving_removes_a_clean_checkout() {
             "PR checkout",
             || {
                 app.poll_pr_checkout();
-                app.pr_checkout_rx.is_none()
+                app.review.pr_checkout_rx.is_none()
             },
         );
         assert!(
@@ -2204,7 +2211,7 @@ fn review_mode_checks_the_pr_out_and_leaving_removes_a_clean_checkout() {
             "{}",
             app.status
         );
-        assert!(app.pr_checkout.is_none() && !checkout.exists());
+        assert!(app.review.pr_checkout.is_none() && !checkout.exists());
         assert!(!app.roots.iter().any(|r| r == checkout));
 
         // An unsaved tab under the checkout keeps it.
@@ -2215,7 +2222,7 @@ fn review_mode_checks_the_pr_out_and_leaving_removes_a_clean_checkout() {
             "PR checkout",
             || {
                 app.poll_pr_checkout();
-                app.pr_checkout_rx.is_none()
+                app.review.pr_checkout_rx.is_none()
             },
         );
         let checkout = tmp.path().join("app-pr-579").canonicalize().unwrap();

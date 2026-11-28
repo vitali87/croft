@@ -2873,7 +2873,7 @@ fn settle_viewed_writes(app: &mut App) {
         "the viewed mutations",
         || {
             app.poll_pr_gh();
-            app.pr_viewed_queue.is_empty() && app.pr_viewed_write.is_none()
+            app.review.pr_viewed_queue.is_empty() && app.review.pr_viewed_write.is_none()
         },
     );
 }
