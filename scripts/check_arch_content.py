@@ -112,6 +112,7 @@ def compare(old, new, renamed=None):
     `renamed` maps a file git saw renamed (old path -> new path): its row
     under the new path is the same module's row, compared like any other."""
     before, after = tree_descriptions(old), tree_descriptions(new)
+    now_tree = set(after)
     # A module that moved from `foo.rs` into a `foo/` directory is the same
     # module, so its directory row inherits the file row's description: it is
     # compared like any other row rather than reported as dropped.
@@ -126,9 +127,14 @@ def compare(old, new, renamed=None):
         if was in before and was not in after and now in after
     }
     after = {**after, **{was: after[now] for was, now in moved.items()}}
-    # A basename carried by more than one row cannot stand in for a path.
-    seen = collections.Counter(p.rstrip("/").split("/")[-1] for p in before)
-    ambiguous = frozenset(leaf for leaf, n in seen.items() if n > 1)
+    # A basename carried by more than one row of either tree cannot stand in
+    # for a path: a row renamed beside a namesake shares its name only in the
+    # new tree.
+    def leaves(tree):
+        seen = collections.Counter(p.rstrip("/").split("/")[-1] for p in tree)
+        return {leaf for leaf, n in seen.items() if n > 1}
+
+    ambiguous = frozenset(leaves(before) | leaves(now_tree))
 
     documented = set()
     for heading in re.findall(r"^### (\S+)", new, re.M):
