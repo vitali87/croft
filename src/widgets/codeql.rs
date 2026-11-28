@@ -12,6 +12,8 @@ use ratatui::{
     widgets::Widget,
 };
 
+pub use crate::codeql_db::{LANGUAGE_IDS, LANGUAGES};
+
 /// VS Code's `ql-container` views, in its order. The Evaluator Log Viewer is
 /// canary-only there and is left out here for the same reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -136,35 +138,6 @@ pub enum Action {
     /// Show the query log of query history entry `.0`.
     HistoryLog(usize),
 }
-
-/// The languages CodeQL analyses, as VS Code's Language view lists them.
-pub const LANGUAGES: [&str; 10] = [
-    "C / C++",
-    "C#",
-    "GitHub Actions",
-    "Go",
-    "Java / Kotlin",
-    "JavaScript / TypeScript",
-    "Python",
-    "Ruby",
-    "Rust",
-    "Swift",
-];
-
-/// The extractor id behind each [`LANGUAGES`] entry, in the same order: what
-/// a pack's `extractor:` or `codeql/<id>-all` dependency says.
-pub const LANGUAGE_IDS: [&str; 10] = [
-    "cpp",
-    "csharp",
-    "actions",
-    "go",
-    "java",
-    "javascript",
-    "python",
-    "ruby",
-    "rust",
-    "swift",
-];
 
 /// One painted line of the side bar.
 #[derive(Debug, Clone, PartialEq, Eq)]

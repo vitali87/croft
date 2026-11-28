@@ -1775,12 +1775,3 @@ pub(super) fn is_binary(data: &[u8]) -> bool {
         .count();
     (nontext as f32 / sample.len() as f32) > 0.30
 }
-
-/// Fold every line-ending convention to `\n` so callers can split on it
-/// alone. Shared by the file loader and the find bar's replacement paths: a
-/// replacement carrying `\r` (VS Code's escape, or pasted CRLF text) must
-/// become a real line break, never a bare CR sitting inside a line — a CRLF
-/// buffer would then save `\r\r\n` and every line count would disagree.
-pub(crate) fn normalize_newlines(text: &str) -> String {
-    text.replace("\r\n", "\n").replace('\r', "\n")
-}
