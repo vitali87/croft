@@ -366,6 +366,38 @@ class PureMoves(unittest.TestCase):
             self.assertEqual(code, 0, out)
             self.assertIn("1 unchanged, 1 moved", out)
 
+    def test_a_file_renamed_inside_a_module_left_behind_keeps_its_reach(self):
+        """With `crate::a -> crate::c` declared, a file renamed within
+        `crate::a` did not go with the move: its `pub(super)` item still
+        reaches `crate::a`, so it is read in place, not at `crate::c`."""
+        item = "pub(super) fn find() -> u8 {\n    1\n}\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp), {"src/main.rs": "mod a;\n", "src/a.rs": "mod util;\n", "src/a/util.rs": item})
+            (Path(tmp) / "src/a/util.rs").unlink()
+            repo.commit(
+                {"src/main.rs": "mod a;\nmod c;\n", "src/a.rs": "mod renamed;\n", "src/a/renamed.rs": item, "src/c.rs": ""},
+                "move\n\npure-move-module: crate::a -> crate::c",
+            )
+            code, out = repo.check()
+            self.assertEqual(code, 0, out)
+            self.assertIn("moved    fn src/a/util.rs::find -> src/a/renamed.rs::find", out)
+
+    def test_test_only_follows_where_the_item_sits(self):
+        """An item is test-only when a module it actually sits in is under
+        `#[cfg(test)]`. A release helper in `live::tests` is not made one by
+        a guarded `tests` module elsewhere in the file, so moving it
+        privately into a test module is a change."""
+        helper = "        fn helper() -> u8 {\n            1\n        }\n"
+        live = "mod live {\n    fn keep() {}\n\n    mod tests {\n" + helper + "    }\n}\n"
+        guarded = "#[cfg(test)]\nmod tests {\n    fn other() {}\n}\n"
+        moved = "#[cfg(test)]\nmod tests {\n    fn helper() -> u8 {\n        1\n    }\n}\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp), {"src/main.rs": "mod a;\nmod b;\n", "src/a.rs": live + "\n" + guarded, "src/b.rs": ""})
+            repo.commit({"src/a.rs": "mod live {\n    fn keep() {}\n}\n\n" + guarded, "src/b.rs": moved})
+            code, out = repo.check()
+            self.assertEqual(code, 1, out)
+            self.assertNotIn("moved    fn src/a.rs::live::tests::helper", out)
+
     def test_test_only_means_compiled_only_for_tests(self):
         """A module counts as test-only when the build compiles it only for
         tests, under `#[cfg(test)]`, inline or as its own file; a module

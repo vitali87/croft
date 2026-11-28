@@ -117,6 +117,33 @@ class Gutting(unittest.TestCase):
         self.assertEqual(gate.compare(before, after)[1], ["src/a/walk.rs"])
         self.assertEqual(gate.compare(before, after, {"src/a/walk.rs": "src/b/walk.rs"}), ([], []))
 
+    def test_a_renamed_row_gutted_under_its_new_path_counts_its_new_section(self):
+        """`src/a/walk.rs` moved to `src/b/walk.rs` beside another
+        `walk.rs`, so the bare name stands for neither: a section headed by
+        the new path is the moved row's home, and with no section the shrink
+        is still reported."""
+        before = doc([
+            "src/",
+            "├── a/                   the a parts",
+            "│   └── walk.rs          " + self.LONG,
+            "├── b/                   the b parts",
+            "└── c/                   the c parts",
+            "    └── walk.rs          walks c",
+        ])
+        after = [
+            "src/",
+            "├── a/                   the a parts",
+            "├── b/                   the b parts",
+            "│   └── walk.rs          short",
+            "└── c/                   the c parts",
+            "    └── walk.rs          walks c",
+        ]
+        renamed = {"src/a/walk.rs": "src/b/walk.rs"}
+        shrunk, dropped = gate.compare(before, doc(after), renamed)
+        self.assertEqual(([n for n, _, _ in shrunk], dropped), (["src/a/walk.rs"], []))
+        self.assertEqual(gate.compare(before, doc(after, ["src/b/walk.rs"]), renamed), ([], []))
+        self.assertEqual(len(gate.compare(before, doc(after, ["walk.rs"]), renamed)[0]), 1)
+
     def test_a_file_row_gutted_on_its_way_into_a_directory_is_reported(self):
         before = doc(["src/", "└── a.rs                 " + self.LONG])
         after = doc(["src/", "└── a/                   short"])

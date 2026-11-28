@@ -505,6 +505,20 @@ def widens(old, new, old_module=None, new_module=None, moved=False):
     return a is not None and b is not None and b > a
 
 
+def follows_move(old_module, new_module):
+    """Whether an item that sat in `old_module` and now sits in
+    `new_module` went with a module the commits declare moved: it was under
+    the old path and is under the new one. A file renamed inside the module
+    left behind did not move with it, so its reach is read where it is."""
+    if old_module is None or new_module is None:
+        return False
+    for old in sorted(MOVED, key=len, reverse=True):
+        if old_module[: len(old)] == old:
+            new = MOVED[old]
+            return new_module[: len(new)] == new
+    return False
+
+
 def relocated(reach):
     """`reach` with a module the commits declare moved (`pure-move-module:`)
     read at its new path: what reached all of the old module reaches all of
@@ -574,6 +588,26 @@ def parent_files(path):
     return name, ["src/" + "/".join(up) + ".rs", "src/" + "/".join(up) + "/mod.rs"]
 
 
+def inline_chain_guarded(rev, file, text, mods, cache):
+    """Whether one of the inline modules `mods` names, each found inside the
+    one before it from the top of `text`, is declared under `#[cfg(test)]`.
+    One guarded module is enough: all it holds is test-only. A same-named
+    module elsewhere in the file says nothing about this item."""
+    key = ("glue", rev, file)
+    if key not in cache:
+        try:
+            cache[key] = parse(text, file)[1]
+        except ParseError:
+            cache[key] = []
+    headers = [g for g in cache[key] if g.kind == "header"]
+    for i, name in enumerate(mods):
+        guard = CFG_TEST + VIS_OPT + r"mod\s+" + re.escape(name) + r"\b"
+        scope = "::".join(mods[:i])
+        if any(g.scope == scope and re.search(guard, g.text) for g in headers):
+            return True
+    return False
+
+
 def test_only_at(rev, file, mods, cache):
     """Whether an item of `file`, inside its inline `mods`, is compiled only
     for tests at `rev`: an inline module it sits in, its file's module or a
@@ -584,7 +618,7 @@ def test_only_at(rev, file, mods, cache):
     answer = False
     if file.startswith("src/") and file.endswith(".rs"):
         text = shown_at(rev, file, cache)
-        answer = bool(text) and any(declares_test_mod(text, m, True) for m in mods)
+        answer = bool(text) and inline_chain_guarded(rev, file, text, mods, cache)
         path = file
         while not answer:
             up = parent_files(path)
@@ -639,7 +673,7 @@ def item_widens(o, n):
     and the test build fails if a user of one lost it."""
     if o.vis == n.vis == "" and in_tests(o) and in_tests(n):
         return True
-    moved = (o.file, o.mods) != (n.file, n.mods)
+    moved = follows_move(vis_module(o), vis_module(n))
     return widens(o.vis, n.vis, vis_module(o), vis_module(n), moved)
 
 
@@ -647,7 +681,7 @@ def same_reach(o, n):
     """Whether two items' visibilities, however spelled, reach the same
     modules: a move into a deeper file can need a new spelling for that."""
     a = scope(o.vis, vis_module(o))
-    if a is not None and (o.file, o.mods) != (n.file, n.mods):
+    if a is not None and follows_move(vis_module(o), vis_module(n)):
         a = relocated(a)
     return a is not None and a == scope(n.vis, vis_module(n))
 
