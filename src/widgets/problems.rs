@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use ratatui::{
     buffer::Buffer,
-    layout::Rect,
+    layout::{Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Paragraph, Widget},
@@ -561,20 +561,16 @@ impl ProblemsPanel {
     /// button (and was consumed); false if the caller should resolve it as a
     /// row click via [`ProblemsPanel::hit_at`].
     pub fn click(&mut self, x: u16, y: u16) -> bool {
-        if rect_has(self.filter_rect, x, y) {
+        if self.filter_rect.contains(Position::new(x, y)) {
             self.cycle_filter();
             return true;
         }
-        if rect_has(self.group_rect, x, y) {
+        if self.group_rect.contains(Position::new(x, y)) {
             self.toggle_group_by_file();
             return true;
         }
         false
     }
-}
-
-fn rect_has(r: Rect, x: u16, y: u16) -> bool {
-    x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
 }
 
 /// The diagnostic `row` stands for in `groups`, with its file: a related

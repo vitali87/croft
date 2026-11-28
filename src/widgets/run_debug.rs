@@ -1,4 +1,5 @@
 use crate::widgets::drawn_rows::follow;
+use crate::widgets::surface::put_clipped;
 use crate::widgets::view_cx::ViewCx;
 use ratatui::{
     buffer::Buffer,
@@ -104,20 +105,6 @@ impl DebugControl {
                 DebugControl::StepOver | DebugControl::StepInto | DebugControl::StepOut
             )
     }
-}
-
-/// Write `s` at `(x, y)` styled, clipped to the half-open column range
-/// `[x, right)`, and return the column just past what was drawn. Lets the
-/// renderer lay coloured segments left-to-right without overflowing the panel.
-fn put(buf: &mut Buffer, x: u16, y: u16, right: u16, s: &str, style: Style) -> u16 {
-    if x >= right {
-        return x;
-    }
-    let budget = (right - x) as usize;
-    let clipped: String = s.chars().take(budget).collect();
-    let drawn = clipped.chars().count() as u16;
-    buf.set_string(x, y, &clipped, style);
-    x + drawn
 }
 
 /// Add a background colour to `style` when `bg` is `Some` (so a selected frame's
@@ -701,7 +688,7 @@ impl RunDebugPanel {
             return;
         };
         let text_right = right.saturating_sub(3);
-        let mut x = put(
+        let mut x = put_clipped(
             buf,
             x0,
             y,
@@ -709,7 +696,7 @@ impl RunDebugPanel {
             "\u{25cf} ",
             Style::default().fg(cx.theme.ui(Color::Rgb(0xe5, 0x14, 0x00))),
         );
-        x = put(
+        x = put_clipped(
             buf,
             x,
             y,
@@ -718,7 +705,7 @@ impl RunDebugPanel {
             Style::default().fg(cx.theme.ui(DBG_NAME)),
         );
         if let Some(detail) = &bp.detail {
-            put(
+            put_clipped(
                 buf,
                 x + 1,
                 y,
@@ -733,7 +720,7 @@ impl RunDebugPanel {
         self.breakpoint_row_rects.push((y, index, key.clone()));
         if right > x0 + 2 {
             let rx = right - 2;
-            put(
+            put_clipped(
                 buf,
                 rx,
                 y,
@@ -999,7 +986,7 @@ impl RunDebugPanel {
                 x += 3;
             }
             let text = format!(" {} ", self.debug_status);
-            put(
+            put_clipped(
                 buf,
                 x + 1,
                 y,
@@ -1109,9 +1096,9 @@ impl RunDebugPanel {
                     } else {
                         Style::default().fg(cx.theme.ui(DBG_NAME))
                     };
-                    x = put(buf, x, row_y, right, name, with_bg(name_style, bg));
-                    x = put(buf, x, row_y, right, " ", with_bg(Style::default(), bg));
-                    put(
+                    x = put_clipped(buf, x, row_y, right, name, with_bg(name_style, bg));
+                    x = put_clipped(buf, x, row_y, right, " ", with_bg(Style::default(), bg));
+                    put_clipped(
                         buf,
                         x,
                         row_y,
@@ -1130,7 +1117,7 @@ impl RunDebugPanel {
                     } else {
                         Style::default().fg(cx.theme.ui(DBG_SCOPE))
                     };
-                    put(buf, inner.x + 1, row_y, right, &text, style);
+                    put_clipped(buf, inner.x + 1, row_y, right, &text, style);
                 }
                 DebugRowKind::Scope { name, open, .. } => {
                     let text = match open {
@@ -1138,7 +1125,7 @@ impl RunDebugPanel {
                         Some(false) => format!("\u{25b8} {name}"),
                         None => name.clone(),
                     };
-                    put(
+                    put_clipped(
                         buf,
                         inner.x + 1,
                         row_y,
@@ -1164,7 +1151,7 @@ impl RunDebugPanel {
                     } else {
                         "  "
                     };
-                    x = put(
+                    x = put_clipped(
                         buf,
                         x,
                         row_y,
@@ -1172,7 +1159,7 @@ impl RunDebugPanel {
                         chev,
                         Style::default().fg(cx.theme.ui(DBG_CHEV)),
                     );
-                    x = put(
+                    x = put_clipped(
                         buf,
                         x,
                         row_y,
@@ -1180,7 +1167,7 @@ impl RunDebugPanel {
                         name,
                         Style::default().fg(cx.theme.ui(DBG_NAME)),
                     );
-                    x = put(
+                    x = put_clipped(
                         buf,
                         x,
                         row_y,
@@ -1188,7 +1175,7 @@ impl RunDebugPanel {
                         " = ",
                         Style::default().fg(cx.theme.ui(DBG_EQ)),
                     );
-                    x = put(
+                    x = put_clipped(
                         buf,
                         x,
                         row_y,
@@ -1197,7 +1184,7 @@ impl RunDebugPanel {
                         Style::default().fg(value_color(type_name, cx.theme)),
                     );
                     if !type_name.is_empty() {
-                        put(
+                        put_clipped(
                             buf,
                             x,
                             row_y,
@@ -1222,7 +1209,7 @@ impl RunDebugPanel {
                     // Text clips three cells early: the remove `\u{2715}` owns
                     // the right edge, and a long value ran under it.
                     let right = right.saturating_sub(3);
-                    x = put(
+                    x = put_clipped(
                         buf,
                         x,
                         row_y,
@@ -1230,7 +1217,7 @@ impl RunDebugPanel {
                         expression,
                         Style::default().fg(cx.theme.ui(DBG_NAME)),
                     );
-                    x = put(
+                    x = put_clipped(
                         buf,
                         x,
                         row_y,
@@ -1260,14 +1247,14 @@ impl RunDebugPanel {
                             Style::default().fg(value_color("", cx.theme)),
                         )
                     };
-                    put(buf, x, row_y, right, text, style);
+                    put_clipped(buf, x, row_y, right, text, style);
                     // Per-row remove ✕ pinned at the right edge, recorded for
                     // the click map (cleared at render start — hit rects
                     // always describe the painted frame).
                     let right = right + 3;
                     if right > inner.x + 2 {
                         let rx = right - 2;
-                        put(
+                        put_clipped(
                             buf,
                             rx,
                             row_y,
@@ -1285,7 +1272,7 @@ impl RunDebugPanel {
                 }
                 DebugRowKind::WatchAdd => {
                     let indent = (row.indent as u16) * 2;
-                    put(
+                    put_clipped(
                         buf,
                         inner.x + indent,
                         row_y,
@@ -1350,7 +1337,7 @@ impl RunDebugPanel {
         }
 
         // "DEBUG CONSOLE" label above the field.
-        put(
+        put_clipped(
             buf,
             inner.x + 1,
             label_y,
@@ -1374,7 +1361,7 @@ impl RunDebugPanel {
             Style::default().bg(cx.theme.ui(DBG_FIELD_BG)),
         );
         let bg = Some(cx.theme.ui(DBG_FIELD_BG));
-        let caret_end = put(
+        let caret_end = put_clipped(
             buf,
             inner.x + 1,
             field_y,
@@ -1396,8 +1383,8 @@ impl RunDebugPanel {
         };
         if self.repl_input.is_empty() {
             // Block cursor at the insertion point, then the ghost placeholder.
-            let after_cursor = put(buf, caret_end, field_y, right, " ", caret);
-            put(
+            let after_cursor = put_clipped(buf, caret_end, field_y, right, " ", caret);
+            put_clipped(
                 buf,
                 after_cursor,
                 field_y,
@@ -1411,7 +1398,7 @@ impl RunDebugPanel {
                 ),
             );
         } else {
-            let input_end = put(
+            let input_end = put_clipped(
                 buf,
                 caret_end,
                 field_y,
@@ -1419,7 +1406,7 @@ impl RunDebugPanel {
                 &self.repl_input,
                 with_bg(Style::default().fg(cx.theme.ui(DBG_NAME)), bg),
             );
-            put(buf, input_end, field_y, right, " ", caret);
+            put_clipped(buf, input_end, field_y, right, " ", caret);
         }
     }
 
