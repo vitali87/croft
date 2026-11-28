@@ -724,7 +724,6 @@ impl App {
             self.tree.hover_pointer = panel_pointer;
             self.search.hover_pointer = panel_pointer;
             self.source_control.hover_pointer = panel_pointer;
-            self.run_debug.hover_pointer = panel_pointer;
             // Explorer stacks its toggled sub-views (Open Editors / Folders /
             // Outline / Timeline / Dependencies) inside the usable strip.
             // Every other sidebar view fills it with its single activity widget.
@@ -769,7 +768,8 @@ impl App {
                     // the condition and logpoint editors); syncing here keeps
                     // the list current without a refresh at each of them.
                     self.sync_breakpoint_list();
-                    frame.render_widget(&mut self.run_debug, usable_area)
+                    self.run_debug
+                        .draw(&side_cx, usable_area, frame.buffer_mut())
                 }
                 SidebarView::Extensions => {
                     self.extensions
@@ -779,12 +779,11 @@ impl App {
                     self.testing.draw(&side_cx, usable_area, frame.buffer_mut())
                 }
                 SidebarView::CodeQL => {
-                    self.codeql.focused = self.focus == Pane::Tree;
                     let running = self.codeql_run.as_ref().map(|(_, since)| {
                         (self.codeql_run_name.clone(), since.elapsed().as_secs())
                     });
                     self.codeql.set_running(running);
-                    frame.render_widget(&mut self.codeql, usable_area)
+                    self.codeql.draw(&side_cx, usable_area, frame.buffer_mut())
                 }
             }
         }

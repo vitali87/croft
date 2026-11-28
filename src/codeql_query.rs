@@ -1121,6 +1121,7 @@ impl HistoryEntry {
     /// A history line: "✓ query.ql · db · 12s", "✗ … · failed: why",
     /// "… running". A renamed entry keeps only the status mark before the
     /// user's label.
+    #[cfg(test)]
     pub fn label(&self) -> String {
         if let Some(custom) = &self.name {
             let mark = match self.status {

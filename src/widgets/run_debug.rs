@@ -1,4 +1,5 @@
 use crate::widgets::drawn_rows::follow;
+use crate::widgets::view_cx::ViewCx;
 use ratatui::{
     buffer::Buffer,
     layout::{Alignment, Rect},
@@ -228,6 +229,29 @@ fn wrap_console_line_tail(
     }
     rows.push_back(row);
     rows.into()
+}
+
+/// Paint one wrapped console row at (`x`, `y`), at most `width` columns,
+/// each run in `base` overlaid with its own colours.
+fn put_console_row(
+    cx: &ViewCx,
+    buf: &mut Buffer,
+    x: u16,
+    y: u16,
+    row: &ConsoleRow,
+    width: u16,
+    base: Style,
+) {
+    let right = x.saturating_add(width);
+    let mut at = x;
+    for (text, st) in row {
+        if at >= right {
+            break;
+        }
+        let style = console_run_style(base, *st, cx.theme);
+        let (end, _) = buf.set_stringn(at, y, text, (right - at) as usize, style);
+        at = end;
+    }
 }
 
 /// The style a console run paints in: `base` (the line's own colour), with
@@ -490,14 +514,6 @@ fn find_chain(
 }
 
 pub struct RunDebugPanel {
-    pub focused: bool,
-    /// Active color theme; chrome colors route through `Theme::ui` so the
-    /// panel follows light themes. Set by the app's focus/theme sync.
-    pub theme: crate::theme::Theme,
-    /// True under the Black theme: overpaint the focused outer border with the
-    /// orange→green brand gradient instead of the legacy solid blue. Set by the
-    /// app's focus/theme sync.
-    pub focus_gradient: bool,
     pub active_file: Option<PathBuf>,
     /// Whether the active file is something croft can run or debug. When false
     /// (e.g. an extensionless `.git/config`) the empty state shows a "can't run
@@ -581,18 +597,11 @@ pub struct RunDebugPanel {
     /// session's console output on screen instead of wiping straight back to the
     /// Run button, so a fast-exiting program's output/errors stay readable.
     pub session_ended: bool,
-    /// The cell under the mouse pointer this frame, fed by the app like
-    /// every other side panel's, so the Run and Debug button lifts under it
-    /// the way Source Control's buttons do (a boxed theme ignores it).
-    pub hover_pointer: Option<(u16, u16)>,
 }
 
 impl RunDebugPanel {
     pub fn new() -> Self {
         Self {
-            focused: false,
-            theme: crate::theme::Theme::default(),
-            focus_gradient: false,
             active_file: None,
             runnable: false,
             run_is_debug: false,
@@ -623,7 +632,6 @@ impl RunDebugPanel {
             feedback: None,
             feedback_is_error: false,
             session_ended: false,
-            hover_pointer: None,
         }
     }
 
@@ -680,7 +688,15 @@ impl RunDebugPanel {
 
     /// Paint one breakpoint on row `y` between `x0` and `right`, recording
     /// its click cells.
-    fn put_breakpoint(&mut self, buf: &mut Buffer, index: usize, x0: u16, y: u16, right: u16) {
+    fn put_breakpoint(
+        &mut self,
+        cx: &ViewCx,
+        buf: &mut Buffer,
+        index: usize,
+        x0: u16,
+        y: u16,
+        right: u16,
+    ) {
         let Some(bp) = self.breakpoints.get(index).cloned() else {
             return;
         };
@@ -691,7 +707,7 @@ impl RunDebugPanel {
             y,
             text_right,
             "\u{25cf} ",
-            Style::default().fg(self.theme.ui(Color::Rgb(0xe5, 0x14, 0x00))),
+            Style::default().fg(cx.theme.ui(Color::Rgb(0xe5, 0x14, 0x00))),
         );
         x = put(
             buf,
@@ -699,7 +715,7 @@ impl RunDebugPanel {
             y,
             text_right,
             &bp.label,
-            Style::default().fg(self.theme.ui(DBG_NAME)),
+            Style::default().fg(cx.theme.ui(DBG_NAME)),
         );
         if let Some(detail) = &bp.detail {
             put(
@@ -709,7 +725,7 @@ impl RunDebugPanel {
                 text_right,
                 detail,
                 Style::default()
-                    .fg(self.theme.ui(DBG_TYPE))
+                    .fg(cx.theme.ui(DBG_TYPE))
                     .add_modifier(Modifier::ITALIC),
             );
         }
@@ -723,7 +739,7 @@ impl RunDebugPanel {
                 y,
                 right,
                 "\u{2715}",
-                Style::default().fg(self.theme.ui(DBG_TYPE)),
+                Style::default().fg(cx.theme.ui(DBG_TYPE)),
             );
             self.breakpoint_remove_rects.push((y, rx, index, key));
         }
@@ -939,34 +955,11 @@ impl RunDebugPanel {
         rows
     }
 
-    /// Paint one wrapped console row at (`x`, `y`), at most `width` columns,
-    /// each run in `base` overlaid with its own colours.
-    fn put_console_row(
-        &self,
-        buf: &mut Buffer,
-        x: u16,
-        y: u16,
-        row: &ConsoleRow,
-        width: u16,
-        base: Style,
-    ) {
-        let right = x.saturating_add(width);
-        let mut at = x;
-        for (text, st) in row {
-            if at >= right {
-                break;
-            }
-            let style = console_run_style(base, *st, self.theme);
-            let (end, _) = buf.set_stringn(at, y, text, (right - at) as usize, style);
-            at = end;
-        }
-    }
-
     /// Render the paused-state tree (Variant A / Darcula): a status pill, the
     /// call-stack + variables tree with type-coloured values, then the console
     /// and a REPL bar pinned to the bottom. Records `last_debug_row_y0` /
     /// `last_debug_rows_shown` for click mapping.
-    fn render_debug_tree(&mut self, inner: Rect, buf: &mut Buffer) {
+    fn render_debug_tree(&mut self, cx: &ViewCx, inner: Rect, buf: &mut Buffer) {
         self.watch_remove_rects.clear();
         self.breakpoint_row_rects.clear();
         self.breakpoint_remove_rects.clear();
@@ -991,11 +984,11 @@ impl RunDebugPanel {
                     break;
                 }
                 let fg = if control.enabled(self.debug_paused) {
-                    self.theme.ui(DBG_PILL_FG)
+                    cx.theme.ui(DBG_PILL_FG)
                 } else {
-                    self.theme.ui(DBG_PLACEHOLDER)
+                    cx.theme.ui(DBG_PLACEHOLDER)
                 };
-                let bg = self.theme.ui(DBG_BAR_BG);
+                let bg = cx.theme.ui(DBG_BAR_BG);
                 buf.set_string(
                     x,
                     y,
@@ -1013,8 +1006,8 @@ impl RunDebugPanel {
                 right,
                 &text,
                 Style::default()
-                    .fg(self.theme.ui(DBG_PILL_FG))
-                    .bg(self.theme.ui(DBG_PILL_BG))
+                    .fg(cx.theme.ui(DBG_PILL_FG))
+                    .bg(cx.theme.ui(DBG_PILL_BG))
                     .add_modifier(Modifier::BOLD),
             );
             y += 2;
@@ -1062,7 +1055,7 @@ impl RunDebugPanel {
                             width: inner.width,
                             height: 1,
                         },
-                        Style::default().bg(self.theme.ui(DBG_BAR_BG)),
+                        Style::default().bg(cx.theme.ui(DBG_BAR_BG)),
                     );
                     let t: String = title
                         .chars()
@@ -1073,8 +1066,8 @@ impl RunDebugPanel {
                         row_y,
                         &t,
                         Style::default()
-                            .fg(self.theme.ui(DBG_BAR_FG))
-                            .bg(self.theme.ui(DBG_BAR_BG))
+                            .fg(cx.theme.ui(DBG_BAR_FG))
+                            .bg(cx.theme.ui(DBG_BAR_BG))
                             .add_modifier(Modifier::BOLD),
                     );
                 }
@@ -1092,29 +1085,29 @@ impl RunDebugPanel {
                                 width: inner.width,
                                 height: 1,
                             },
-                            Style::default().bg(self.theme.ui(DBG_FRAME_BG)),
+                            Style::default().bg(cx.theme.ui(DBG_FRAME_BG)),
                         );
                         buf.set_string(
                             inner.x,
                             row_y,
                             "▌",
                             Style::default()
-                                .fg(self.theme.ui(DBG_ACCENT))
-                                .bg(self.theme.ui(DBG_FRAME_BG)),
+                                .fg(cx.theme.ui(DBG_ACCENT))
+                                .bg(cx.theme.ui(DBG_FRAME_BG)),
                         );
                     }
                     let bg = if *selected {
-                        Some(self.theme.ui(DBG_FRAME_BG))
+                        Some(cx.theme.ui(DBG_FRAME_BG))
                     } else {
                         None
                     };
                     let mut x = inner.x + 2;
                     let name_style = if *selected {
                         Style::default()
-                            .fg(self.theme.ui(DBG_FRAME_SEL_FG))
+                            .fg(cx.theme.ui(DBG_FRAME_SEL_FG))
                             .add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(self.theme.ui(DBG_NAME))
+                        Style::default().fg(cx.theme.ui(DBG_NAME))
                     };
                     x = put(buf, x, row_y, right, name, with_bg(name_style, bg));
                     x = put(buf, x, row_y, right, " ", with_bg(Style::default(), bg));
@@ -1124,7 +1117,7 @@ impl RunDebugPanel {
                         row_y,
                         right,
                         location,
-                        with_bg(Style::default().fg(self.theme.ui(DBG_LOC)), bg),
+                        with_bg(Style::default().fg(cx.theme.ui(DBG_LOC)), bg),
                     );
                 }
                 DebugRowKind::Thread { name, selected, .. } => {
@@ -1132,10 +1125,10 @@ impl RunDebugPanel {
                     let text = format!("{} {name}", if *selected { "▾" } else { "▸" });
                     let style = if *selected {
                         Style::default()
-                            .fg(self.theme.ui(DBG_FRAME_SEL_FG))
+                            .fg(cx.theme.ui(DBG_FRAME_SEL_FG))
                             .add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(self.theme.ui(DBG_SCOPE))
+                        Style::default().fg(cx.theme.ui(DBG_SCOPE))
                     };
                     put(buf, inner.x + 1, row_y, right, &text, style);
                 }
@@ -1152,7 +1145,7 @@ impl RunDebugPanel {
                         right,
                         &text,
                         Style::default()
-                            .fg(self.theme.ui(DBG_SCOPE))
+                            .fg(cx.theme.ui(DBG_SCOPE))
                             .add_modifier(Modifier::BOLD),
                     );
                 }
@@ -1177,7 +1170,7 @@ impl RunDebugPanel {
                         row_y,
                         right,
                         chev,
-                        Style::default().fg(self.theme.ui(DBG_CHEV)),
+                        Style::default().fg(cx.theme.ui(DBG_CHEV)),
                     );
                     x = put(
                         buf,
@@ -1185,7 +1178,7 @@ impl RunDebugPanel {
                         row_y,
                         right,
                         name,
-                        Style::default().fg(self.theme.ui(DBG_NAME)),
+                        Style::default().fg(cx.theme.ui(DBG_NAME)),
                     );
                     x = put(
                         buf,
@@ -1193,7 +1186,7 @@ impl RunDebugPanel {
                         row_y,
                         right,
                         " = ",
-                        Style::default().fg(self.theme.ui(DBG_EQ)),
+                        Style::default().fg(cx.theme.ui(DBG_EQ)),
                     );
                     x = put(
                         buf,
@@ -1201,7 +1194,7 @@ impl RunDebugPanel {
                         row_y,
                         right,
                         value,
-                        Style::default().fg(value_color(type_name, self.theme)),
+                        Style::default().fg(value_color(type_name, cx.theme)),
                     );
                     if !type_name.is_empty() {
                         put(
@@ -1211,7 +1204,7 @@ impl RunDebugPanel {
                             right,
                             &format!(" : {type_name}"),
                             Style::default()
-                                .fg(self.theme.ui(DBG_TYPE))
+                                .fg(cx.theme.ui(DBG_TYPE))
                                 .add_modifier(Modifier::ITALIC),
                         );
                     }
@@ -1235,7 +1228,7 @@ impl RunDebugPanel {
                         row_y,
                         right,
                         expression,
-                        Style::default().fg(self.theme.ui(DBG_NAME)),
+                        Style::default().fg(cx.theme.ui(DBG_NAME)),
                     );
                     x = put(
                         buf,
@@ -1243,28 +1236,28 @@ impl RunDebugPanel {
                         row_y,
                         right,
                         " = ",
-                        Style::default().fg(self.theme.ui(DBG_EQ)),
+                        Style::default().fg(cx.theme.ui(DBG_EQ)),
                     );
                     let (text, style) = if *pending {
-                        ("\u{2026}", Style::default().fg(self.theme.ui(DBG_TYPE)))
+                        ("\u{2026}", Style::default().fg(cx.theme.ui(DBG_TYPE)))
                     } else if !*available {
                         (
                             "<not available>",
                             Style::default()
-                                .fg(self.theme.ui(DBG_TYPE))
+                                .fg(cx.theme.ui(DBG_TYPE))
                                 .add_modifier(Modifier::ITALIC),
                         )
                     } else if *changed {
                         (
                             value.as_str(),
                             Style::default()
-                                .fg(self.theme.ui(Color::Rgb(0xb6, 0xee, 0xc4)))
+                                .fg(cx.theme.ui(Color::Rgb(0xb6, 0xee, 0xc4)))
                                 .add_modifier(Modifier::BOLD),
                         )
                     } else {
                         (
                             value.as_str(),
-                            Style::default().fg(value_color("", self.theme)),
+                            Style::default().fg(value_color("", cx.theme)),
                         )
                     };
                     put(buf, x, row_y, right, text, style);
@@ -1280,7 +1273,7 @@ impl RunDebugPanel {
                             row_y,
                             right,
                             "\u{2715}",
-                            Style::default().fg(self.theme.ui(DBG_TYPE)),
+                            Style::default().fg(cx.theme.ui(DBG_TYPE)),
                         );
                         self.watch_remove_rects
                             .push((row_y, rx, *index, expression.clone()));
@@ -1299,7 +1292,7 @@ impl RunDebugPanel {
                         right,
                         "+ Add Expression",
                         Style::default()
-                            .fg(self.theme.ui(DBG_TYPE))
+                            .fg(cx.theme.ui(DBG_TYPE))
                             .add_modifier(Modifier::ITALIC),
                     );
                 }
@@ -1307,12 +1300,12 @@ impl RunDebugPanel {
             shown += 1;
         }
         for (index, x, row_y, right) in breakpoint_rows {
-            self.put_breakpoint(buf, index, x, row_y, right);
+            self.put_breakpoint(cx, buf, index, x, row_y, right);
         }
         self.last_debug_rows_shown = shown;
         // The keyboard's row (#2748), lit as Source Control lights its list's
         // while the panel has focus.
-        if self.focused
+        if cx.focused
             && let Some(cursor_y) = self.row_cursor_y()
         {
             buf.set_style(
@@ -1322,7 +1315,7 @@ impl RunDebugPanel {
                     width: inner.width,
                     height: 1,
                 },
-                Style::default().bg(self.theme.ui(DBG_CURSOR_BG)),
+                Style::default().bg(cx.theme.ui(DBG_CURSOR_BG)),
             );
         }
 
@@ -1341,11 +1334,12 @@ impl RunDebugPanel {
         let console_y0 = label_y.saturating_sub(console_h);
         for (i, (row, echo)) in console_rows.iter().enumerate() {
             let style = if *echo {
-                Style::default().fg(self.theme.ui(DBG_ACCENT))
+                Style::default().fg(cx.theme.ui(DBG_ACCENT))
             } else {
-                Style::default().fg(self.theme.ui(DBG_LOC))
+                Style::default().fg(cx.theme.ui(DBG_LOC))
             };
-            self.put_console_row(
+            put_console_row(
+                cx,
                 buf,
                 inner.x + 1,
                 console_y0 + i as u16,
@@ -1363,7 +1357,7 @@ impl RunDebugPanel {
             right,
             "DEBUG CONSOLE",
             Style::default()
-                .fg(self.theme.ui(DBG_LOC))
+                .fg(cx.theme.ui(DBG_LOC))
                 .add_modifier(Modifier::BOLD),
         );
 
@@ -1377,9 +1371,9 @@ impl RunDebugPanel {
                 width: inner.width,
                 height: 1,
             },
-            Style::default().bg(self.theme.ui(DBG_FIELD_BG)),
+            Style::default().bg(cx.theme.ui(DBG_FIELD_BG)),
         );
-        let bg = Some(self.theme.ui(DBG_FIELD_BG));
+        let bg = Some(cx.theme.ui(DBG_FIELD_BG));
         let caret_end = put(
             buf,
             inner.x + 1,
@@ -1388,7 +1382,7 @@ impl RunDebugPanel {
             "❯ ",
             with_bg(
                 Style::default()
-                    .fg(self.theme.ui(DBG_ACCENT))
+                    .fg(cx.theme.ui(DBG_ACCENT))
                     .add_modifier(Modifier::BOLD),
                 bg,
             ),
@@ -1396,7 +1390,7 @@ impl RunDebugPanel {
         // The block cursor marks the insertion point while the prompt has
         // the keys; while a row has them (#2748) the field shows none.
         let caret = if self.row_cursor.is_none() {
-            Style::default().bg(self.theme.ui(DBG_ACCENT))
+            Style::default().bg(cx.theme.ui(DBG_ACCENT))
         } else {
             with_bg(Style::default(), bg)
         };
@@ -1411,7 +1405,7 @@ impl RunDebugPanel {
                 "Evaluate expression",
                 with_bg(
                     Style::default()
-                        .fg(self.theme.ui(DBG_PLACEHOLDER))
+                        .fg(cx.theme.ui(DBG_PLACEHOLDER))
                         .add_modifier(Modifier::ITALIC),
                     bg,
                 ),
@@ -1423,7 +1417,7 @@ impl RunDebugPanel {
                 field_y,
                 right,
                 &self.repl_input,
-                with_bg(Style::default().fg(self.theme.ui(DBG_NAME)), bg),
+                with_bg(Style::default().fg(cx.theme.ui(DBG_NAME)), bg),
             );
             put(buf, input_end, field_y, right, " ", caret);
         }
@@ -1448,9 +1442,10 @@ impl Default for RunDebugPanel {
     }
 }
 
-impl Widget for &mut RunDebugPanel {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let border_style = if self.focused {
+impl RunDebugPanel {
+    /// Draw the view into `area` with this frame's [`ViewCx`].
+    pub fn draw(&mut self, cx: &ViewCx, area: Rect, buf: &mut Buffer) {
+        let border_style = if cx.focused {
             Style::default().fg(Color::Rgb(
                 FOCUS_BORDER_RGB.0,
                 FOCUS_BORDER_RGB.1,
@@ -1459,7 +1454,7 @@ impl Widget for &mut RunDebugPanel {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let block = crate::widgets::surface::view_block(self.theme, true, border_style);
+        let block = crate::widgets::surface::view_block(cx.theme, true, border_style);
         let inner = block.inner(area);
         block.render(area, buf);
         // Black theme: replace the solid focus border with the brand gradient.
@@ -1467,9 +1462,9 @@ impl Widget for &mut RunDebugPanel {
         crate::widgets::surface::paint_view_focus(
             buf,
             area,
-            self.theme,
-            self.focused,
-            self.focus_gradient,
+            cx.theme,
+            cx.focused,
+            cx.theme.gradient(),
         );
         self.last_area = area;
         self.last_button_area = Rect::default();
@@ -1483,7 +1478,7 @@ impl Widget for &mut RunDebugPanel {
         // Paused at a breakpoint: render the call-stack + variables tree instead
         // of the empty-state Run button.
         if self.debug_active {
-            self.render_debug_tree(inner, buf);
+            self.render_debug_tree(cx, inner, buf);
             return;
         }
 
@@ -1635,15 +1630,15 @@ impl Widget for &mut RunDebugPanel {
         // Black theme: brand-teal button fill; Croft Dark keeps VS Code blue;
         // Croft Loch draws the shared pill, lifted under the pointer.
         let (button_bg, button_fg) =
-            crate::widgets::source_control::primary_button_colors(self.theme, self.focus_gradient);
+            crate::widgets::source_control::primary_button_colors(cx.theme, cx.theme.gradient());
         crate::widgets::source_control::render_button(
             buf,
             button_area,
             label.as_str(),
             button_bg,
             button_fg,
-            self.theme,
-            crate::widgets::hover::contains(button_area, self.hover_pointer),
+            cx.theme,
+            crate::widgets::hover::contains(button_area, cx.pointer),
         );
 
         let mut next_y = button_area.y + button_area.height + 1;
@@ -1658,7 +1653,7 @@ impl Widget for &mut RunDebugPanel {
                 .collect();
             let w = shown.chars().count() as u16;
             let x = inner.x + inner.width.saturating_sub(w) / 2;
-            let style = Style::default().fg(self.theme.ui(Color::Rgb(0x8f, 0xd9, 0xcf)));
+            let style = Style::default().fg(cx.theme.ui(Color::Rgb(0x8f, 0xd9, 0xcf)));
             buf.set_string(x, next_y, &shown, style);
             self.last_config_area = Rect {
                 x,
@@ -1672,9 +1667,9 @@ impl Widget for &mut RunDebugPanel {
             && next_y < inner.y + inner.height
         {
             let style = if self.feedback_is_error {
-                Style::default().fg(self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70)))
+                Style::default().fg(cx.theme.ui(Color::Rgb(0xe7, 0x70, 0x70)))
             } else {
-                Style::default().fg(self.theme.ui(Color::Rgb(0xa3, 0xbe, 0x8c)))
+                Style::default().fg(cx.theme.ui(Color::Rgb(0xa3, 0xbe, 0x8c)))
             };
             let room = inner.width.saturating_sub(2) as usize;
             for row in wrap_feedback(msg, room) {
@@ -1703,7 +1698,7 @@ impl Widget for &mut RunDebugPanel {
                 if next_y >= inner.y + inner.height {
                     break;
                 }
-                self.put_breakpoint(buf, i, inner.x + 2, next_y, right);
+                self.put_breakpoint(cx, buf, i, inner.x + 2, next_y, right);
                 next_y = next_y.saturating_add(1);
             }
         }
@@ -1723,9 +1718,9 @@ impl Widget for &mut RunDebugPanel {
             let bottom = inner.y + inner.height;
             let avail = bottom.saturating_sub(next_y) as usize;
             let max_w = inner.width.saturating_sub(2) as usize;
-            let line_style = Style::default().fg(self.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4)));
+            let line_style = Style::default().fg(cx.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4)));
             for (row, _) in self.console_rows(max_w, avail) {
-                self.put_console_row(buf, inner.x + 1, next_y, &row, max_w as u16, line_style);
+                put_console_row(cx, buf, inner.x + 1, next_y, &row, max_w as u16, line_style);
                 next_y = next_y.saturating_add(1);
             }
         }
@@ -2078,7 +2073,7 @@ mod tests {
             height: 24,
         };
         let mut buf = Buffer::empty(area);
-        Widget::render(&mut panel, area, &mut buf);
+        panel.draw(&ViewCx::default(), area, &mut buf);
         let dump = buffer_to_string(&buf);
         assert!(dump.contains("CALL STACK"), "call stack header:\n{dump}");
         assert!(dump.contains("VARIABLES"), "variables header:\n{dump}");
@@ -2163,7 +2158,7 @@ mod tests {
             height: 24,
         };
         let mut buf = Buffer::empty(area);
-        Widget::render(&mut panel, area, &mut buf);
+        panel.draw(&ViewCx::default(), area, &mut buf);
         let dump = buffer_to_string(&buf);
         assert!(
             dump.contains("hello from program"),
@@ -2211,7 +2206,7 @@ mod tests {
             height: 24,
         };
         let mut buf = Buffer::empty(area);
-        Widget::render(&mut panel, area, &mut buf);
+        panel.draw(&ViewCx::default(), area, &mut buf);
         let find = |text: &str| {
             (0..area.height)
                 .find_map(|y| {
@@ -2221,14 +2216,14 @@ mod tests {
                 .unwrap_or_else(|| panic!("{text:?} on screen:\n{}", buffer_to_string(&buf)))
         };
         let ansi = |i: usize| {
-            let (r, g, b) = panel.theme.ansi()[i];
+            let (r, g, b) = crate::theme::Theme::default().ansi()[i];
             Color::Rgb(r, g, b)
         };
         let (x, y) = find("FAILED");
         assert_eq!(buf[(x, y)].fg, ansi(1), "red");
         assert_eq!(
             buf[(x + 7, y)].fg,
-            panel.theme.ui(DBG_LOC),
+            crate::theme::Theme::default().ui(DBG_LOC),
             "back to the console's own"
         );
         let (x, y) = find("green");
@@ -2266,7 +2261,7 @@ mod tests {
             height: 24,
         };
         let mut buf = Buffer::empty(area);
-        Widget::render(&mut panel, area, &mut buf);
+        panel.draw(&ViewCx::default(), area, &mut buf);
         let cells = |y: u16, from: u16, to: u16| -> String {
             (from..to).map(|x| buf[(x, y)].symbol()).collect::<String>()
         };
@@ -2299,7 +2294,7 @@ mod tests {
             height: 30,
         };
         let mut buf = Buffer::empty(area);
-        Widget::render(&mut panel, area, &mut buf);
+        panel.draw(&ViewCx::default(), area, &mut buf);
         let dump = buffer_to_string(&buf);
         assert!(
             dump.contains("END"),
@@ -2390,7 +2385,7 @@ mod tests {
             height: 24,
         };
         let mut buf = Buffer::empty(area);
-        Widget::render(&mut panel, area, &mut buf);
+        panel.draw(&ViewCx::default(), area, &mut buf);
         let dump = buffer_to_string(&buf);
         assert!(
             dump.contains("Evaluate expression"),
@@ -2466,7 +2461,7 @@ mod tests {
             height: 24,
         };
         let mut buf = Buffer::empty(area);
-        Widget::render(&mut panel, area, &mut buf);
+        panel.draw(&ViewCx::default(), area, &mut buf);
         let b = panel.last_button_area;
         assert!(b.width > 0 && b.height > 0, "button area must be laid out");
         assert!(b.x >= area.x && b.x + b.width <= area.x + area.width);
@@ -2487,7 +2482,7 @@ mod tests {
             height: 24,
         };
         let mut buf = Buffer::empty(area);
-        Widget::render(&mut panel, area, &mut buf);
+        panel.draw(&ViewCx::default(), area, &mut buf);
         assert_eq!(
             panel.last_button_area,
             Rect::default(),
@@ -2541,7 +2536,7 @@ mod tests {
             height: 16,
         };
         let mut buf = Buffer::empty(area);
-        Widget::render(&mut panel, area, &mut buf);
+        panel.draw(&ViewCx::default(), area, &mut buf);
         let shown = panel.last_debug_rows_shown;
         assert!(
             shown > 1 && shown < panel.debug_rows.len(),
@@ -2606,7 +2601,7 @@ mod tests {
             width: 40,
             height: 16,
         };
-        Widget::render(&mut panel, area, &mut Buffer::empty(area));
+        panel.draw(&ViewCx::default(), area, &mut Buffer::empty(area));
         let y = (panel.last_debug_row_y0..area.height)
             .find(|&y| name_at(&panel, y).as_deref() == Some("v2"))
             .expect("v2 is drawn");
@@ -2646,7 +2641,7 @@ mod tests {
             height: 24,
         };
         let mut buf = Buffer::empty(area);
-        Widget::render(&mut panel, area, &mut buf);
+        panel.draw(&ViewCx::default(), area, &mut buf);
         let dump = buffer_to_string(&buf);
         assert!(
             dump.contains("RUN AND DEBUG"),
@@ -2693,7 +2688,7 @@ mod tests {
             height: 24,
         };
         let mut buf = Buffer::empty(area);
-        Widget::render(&mut panel, area, &mut buf);
+        panel.draw(&ViewCx::default(), area, &mut buf);
         let (ix, iy) = panel
             .last_icon_cell
             .expect("icon overlay cell must be reserved on a tall enough panel");
@@ -2711,10 +2706,11 @@ mod tests {
 
     #[test]
     fn run_and_debug_button_uses_rounded_border_corners() {
+        let mut cx = ViewCx::default();
         // The line-art corners are the boxed themes'; Croft Loch's soft
         // slab is checked below.
         let mut panel = RunDebugPanel::new();
-        panel.theme = crate::theme::Theme::BLACK;
+        cx.theme = crate::theme::Theme::BLACK;
         let area = Rect {
             x: 0,
             y: 0,
@@ -2722,7 +2718,7 @@ mod tests {
             height: 24,
         };
         let mut buf = Buffer::empty(area);
-        Widget::render(&mut panel, area, &mut buf);
+        panel.draw(&cx, area, &mut buf);
         let b = panel.last_button_area;
         assert!(b.height >= 3 && b.width >= 4, "button must be laid out");
         let tl = buf[(b.x, b.y)].symbol().to_string();
@@ -2755,11 +2751,12 @@ mod tests {
     /// on the chrome; the pointer anywhere on its three-row target lifts it.
     #[test]
     fn croft_loch_run_and_debug_button_is_a_one_row_pill() {
+        let mut cx = ViewCx::default();
         let mut panel = RunDebugPanel::new();
-        panel.theme = crate::theme::Theme::LOCH;
+        cx.theme = crate::theme::Theme::LOCH;
         let area = Rect::new(0, 0, 36, 24);
         let mut buf = Buffer::empty(area);
-        Widget::render(&mut panel, area, &mut buf);
+        panel.draw(&cx, area, &mut buf);
         let b = panel.last_button_area;
         assert!(b.height == 3 && b.width >= 4, "button must be laid out");
         let teal = crate::gradient::rgb_color(crate::gradient::PRIMARY_BTN_BG);
@@ -2774,9 +2771,9 @@ mod tests {
                 assert_ne!(buf[(x, y)].bg, teal, "no slab at ({x}, {y})");
             }
         }
-        panel.hover_pointer = Some((b.x + 1, b.y));
+        cx.pointer = Some((b.x + 1, b.y));
         let mut buf = Buffer::empty(area);
-        Widget::render(&mut panel, area, &mut buf);
+        panel.draw(&cx, area, &mut buf);
         assert_ne!(buf[(b.x + b.width / 2, face_y)].bg, teal, "the face lifts");
     }
 
@@ -2803,7 +2800,7 @@ mod tests {
                     continue;
                 }
                 let mut buf = Buffer::empty(area);
-                Widget::render(&mut panel, area, &mut buf);
+                panel.draw(&ViewCx::default(), area, &mut buf);
             }
         }
     }
@@ -2831,7 +2828,7 @@ mod tests {
             width: 60,
             ..panel_area
         });
-        Widget::render(&mut panel, panel_area, &mut buf);
+        panel.draw(&ViewCx::default(), panel_area, &mut buf);
         let row_text = |y: u16, xs: std::ops::Range<u16>| -> String {
             xs.map(|x| buf[(x, y)].symbol().to_string()).collect()
         };
@@ -2874,7 +2871,7 @@ mod tests {
             height: 12,
         };
         let mut buf = Buffer::empty(area);
-        Widget::render(&mut panel, area, &mut buf);
+        panel.draw(&ViewCx::default(), area, &mut buf);
         assert!(
             panel.last_button_area.height >= 3,
             "button must remain laid out when the panel collapses the icon block"
@@ -2906,7 +2903,7 @@ mod tests {
             height: 30,
         };
         let mut buf = Buffer::empty(area);
-        Widget::render(&mut panel, area, &mut buf);
+        panel.draw(&ViewCx::default(), area, &mut buf);
         let dump = buffer_to_string(&buf);
         assert!(dump.contains("BREAKPOINTS"), "header:\n{dump}");
         assert!(dump.contains("a.rs:3"), "first row:\n{dump}");
@@ -2977,7 +2974,7 @@ mod tests {
             height: 20,
         };
         let mut buf = Buffer::empty(area);
-        Widget::render(&mut panel, area, &mut buf);
+        panel.draw(&ViewCx::default(), area, &mut buf);
         let dump = buffer_to_string(&buf);
         assert!(dump.contains("WATCH"), "watch header:\n{dump}");
         assert!(dump.contains("t = 9.99"), "watched value:\n{dump}");
@@ -3005,7 +3002,7 @@ mod tests {
         // the wrong expression (#113 review).
         panel.debug_scroll = 2;
         let mut buf = Buffer::empty(area);
-        Widget::render(&mut panel, area, &mut buf);
+        panel.draw(&ViewCx::default(), area, &mut buf);
         let (y, x, idx, _) = panel.watch_remove_rects[0].clone();
         assert_eq!(
             idx, 1,
@@ -3039,7 +3036,7 @@ mod tests {
             width: 44,
             height: 20,
         };
-        Widget::render(&mut panel, area, &mut Buffer::empty(area));
+        panel.draw(&ViewCx::default(), area, &mut Buffer::empty(area));
         let cell = |i: usize| {
             let (y, x, ..) = panel.watch_remove_rects[i];
             (x, y)
