@@ -285,14 +285,7 @@ pub fn detect_backend() -> Option<PdfBackend> {
 }
 
 fn which(cmd: &str) -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(cmd);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    crate::proc::find::on_path(cmd)
 }
 
 /// Total pages in `pdf`. Returns None when no detector is available so the
@@ -563,7 +556,7 @@ fn last_settle() -> String {
     }
 }
 
-/// Test-only: the next `rasterize_page` call for exactly this (path, page)
+/// Test-only: the next `rasterize_page_while_wanted` call for exactly this (path, page)
 /// fails once, simulating a transient rasteriser failure (a spawn refused
 /// under load, an OOM-killed child). Keyed on the full path so parallel
 /// tests rendering the same page number of their own tempdir files never
@@ -576,7 +569,17 @@ pub static FAIL_RASTERIZE_ONCE_FOR_TEST: std::sync::Mutex<Option<(PathBuf, u32)>
 /// the encoded PNG. The caller is responsible for cleaning up no temp
 /// files — every backend writes to a per-call temp path that we delete
 /// before returning.
-pub fn rasterize_page(pdf: &Path, page: u32, backend: PdfBackend) -> std::io::Result<Vec<u8>> {
+///
+/// The renderer is stopped once `unwanted` is set: a page the reader has
+/// left, or a tab now showing another file, does not keep it running to the
+/// end of its budget. The `sips` path renders in one call and runs to its
+/// end.
+pub fn rasterize_page_while_wanted(
+    pdf: &Path,
+    page: u32,
+    backend: PdfBackend,
+    unwanted: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<Vec<u8>> {
     #[cfg(test)]
     {
         let mut fail = FAIL_RASTERIZE_ONCE_FOR_TEST.lock().unwrap();
@@ -586,7 +589,7 @@ pub fn rasterize_page(pdf: &Path, page: u32, backend: PdfBackend) -> std::io::Re
         }
     }
     match backend {
-        PdfBackend::PdftoppmCli => rasterize_with_pdftoppm(pdf, page),
+        PdfBackend::PdftoppmCli => rasterize_with_pdftoppm(pdf, page, unwanted),
         PdfBackend::SipsCli => {
             if page != 1 {
                 return Err(std::io::Error::other("sips backend can only render page 1"));
@@ -596,8 +599,18 @@ pub fn rasterize_page(pdf: &Path, page: u32, backend: PdfBackend) -> std::io::Re
     }
 }
 
-fn rasterize_with_pdftoppm(pdf: &Path, page: u32) -> std::io::Result<Vec<u8>> {
-    run_pdftoppm(Path::new("pdftoppm"), pdf, page, PDF_RENDER_BUDGET)
+fn rasterize_with_pdftoppm(
+    pdf: &Path,
+    page: u32,
+    unwanted: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<Vec<u8>> {
+    run_pdftoppm(
+        Path::new("pdftoppm"),
+        pdf,
+        page,
+        PDF_RENDER_BUDGET,
+        unwanted,
+    )
 }
 
 /// Render `page` of `pdf` with the pdftoppm at `program` (a parameter so a
@@ -620,6 +633,7 @@ fn run_pdftoppm(
     pdf: &Path,
     page: u32,
     budget: std::time::Duration,
+    unwanted: &std::sync::atomic::AtomicBool,
 ) -> std::io::Result<Vec<u8>> {
     use std::process::Stdio;
     let dir = unique_temp_dir("croft-pdf")?;
@@ -648,6 +662,8 @@ fn run_pdftoppm(
         // the renderer forked and not only the renderer itself.
         cmd.process_group(0);
     }
+    // Waited on below: never during a key press, click or frame (#2827).
+    crate::proc::about_to_wait(program.as_os_str());
     let mut child = cmd.spawn()?;
     let mut stderr_pipe = child.stderr.take();
     // Non-blocking, and read from ONE place: this thread (#553).
@@ -680,6 +696,13 @@ fn run_pdftoppm(
         }
         match child.try_wait() {
             Ok(Some(status)) => break status,
+            Ok(None) if unwanted.load(std::sync::atomic::Ordering::Relaxed) => {
+                kill_group(child, guard);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    format!("page {page} is no longer wanted; its render was stopped"),
+                ));
+            }
             Ok(None) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(EXIT_POLL_TICK);
             }
@@ -862,6 +885,8 @@ fn rasterize_with_sips(pdf: &Path) -> std::io::Result<Vec<u8>> {
     let dir = unique_temp_dir("croft-pdf")?;
     let _guard = TempDirGuard(dir.clone());
     let out = dir.join("page.png");
+    // Waited on below: never during a key press, click or frame (#2827).
+    crate::proc::about_to_wait(std::ffi::OsStr::new("sips"));
     let status = Command::new("sips")
         .args(["-s", "format", "png"])
         .arg(pdf)
@@ -908,6 +933,7 @@ impl Drop for TempDirGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
 
     /// A wait handed to a spawned process, scaled for a loaded host as the
     /// repo's spawn waits are (CONTRIBUTING: never a fresh fixed constant).
@@ -927,6 +953,56 @@ mod tests {
         script
     }
 
+    /// #2827: the renderer tells the UI-turn check before it waits, so a
+    /// render during a key press, click or frame fails a test.
+    #[cfg(unix)]
+    #[test]
+    fn the_renderer_may_not_wait_during_a_ui_turn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = fake_pdftoppm(tmp.path(), "exit 0");
+        let pdf = tmp.path().join("doc.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        let turn = crate::proc::UiTurn::enter();
+        let waited = std::panic::catch_unwind(|| {
+            run_pdftoppm(&script, &pdf, 1, budget(5_000), &AtomicBool::new(false))
+        });
+        drop(turn);
+        assert!(
+            waited.is_err(),
+            "a render during a UI turn must fail the test"
+        );
+        let _ = run_pdftoppm(&script, &pdf, 1, budget(5_000), &AtomicBool::new(false));
+    }
+
+    /// A render nobody wants any more (the reader left the page, or the tab
+    /// moved on to another file) is stopped, instead of running to the end
+    /// of its budget beside the renders that replaced it (#2829 review).
+    #[cfg(unix)]
+    #[test]
+    fn an_unwanted_render_is_stopped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let timeout = budget(5_000);
+        let script = fake_pdftoppm(tmp.path(), &format!("sleep {}", timeout.as_secs() * 4));
+        let pdf = tmp.path().join("doc.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        let unwanted = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = unwanted.clone();
+        let started = std::time::Instant::now();
+        let render = std::thread::spawn(move || run_pdftoppm(&script, &pdf, 1, timeout, &flag));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        unwanted.store(true, std::sync::atomic::Ordering::Relaxed);
+        let err = render
+            .join()
+            .unwrap()
+            .expect_err("an unwanted render is not a page");
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted, "{err}");
+        assert!(
+            started.elapsed() < timeout,
+            "stopped once unwanted, not at the budget: {:?}",
+            started.elapsed()
+        );
+    }
+
     /// #493: a renderer that hangs is killed at the budget and the open
     /// reports it, instead of parking the frame loop for as long as the
     /// child cares to run.
@@ -944,7 +1020,7 @@ mod tests {
         let pdf = tmp.path().join("doc.pdf");
         std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
         let started = std::time::Instant::now();
-        let err = run_pdftoppm(&script, &pdf, 1, timeout)
+        let err = run_pdftoppm(&script, &pdf, 1, timeout, &AtomicBool::new(false))
             .expect_err("an overrunning renderer is a failure, not a wait");
         let elapsed = started.elapsed();
         assert!(
@@ -977,12 +1053,13 @@ mod tests {
         let pdf = tmp.path().join("doc.pdf");
         std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
         let started = std::time::Instant::now();
-        let bytes = run_pdftoppm(&script, &pdf, 1, timeout).unwrap_or_else(|e| {
-            // This failed once on CI and the `expect` said only that it should
-            // not have, which left nothing to tell a timeout apart from a
-            // missing page (#548). The error names which.
-            panic!("the page was written; a lingering descendant is not a failure: {e}")
-        });
+        let bytes = run_pdftoppm(&script, &pdf, 1, timeout, &AtomicBool::new(false))
+            .unwrap_or_else(|e| {
+                // This failed once on CI and the `expect` said only that it should
+                // not have, which left nothing to tell a timeout apart from a
+                // missing page (#548). The error names which.
+                panic!("the page was written; a lingering descendant is not a failure: {e}")
+            });
         let elapsed = started.elapsed();
         assert_eq!(bytes, b"x");
         assert!(
@@ -1001,7 +1078,7 @@ mod tests {
         let script = fake_pdftoppm(tmp.path(), r#"echo "Syntax Error: no trailer" >&2; exit 1"#);
         let pdf = tmp.path().join("doc.pdf");
         std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
-        let err = run_pdftoppm(&script, &pdf, 1, budget(5_000))
+        let err = run_pdftoppm(&script, &pdf, 1, budget(5_000), &AtomicBool::new(false))
             .expect_err("a non-zero exit is a failure");
         let text = err.to_string();
         assert!(
@@ -1023,7 +1100,7 @@ mod tests {
         );
         let pdf = tmp.path().join("doc.pdf");
         std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
-        let err = run_pdftoppm(&script, &pdf, 1, budget(5_000))
+        let err = run_pdftoppm(&script, &pdf, 1, budget(5_000), &AtomicBool::new(false))
             .expect_err("a non-zero exit is a failure");
         let text = err.to_string();
         assert!(
@@ -1062,7 +1139,7 @@ mod tests {
         std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
         // Once, not five times: the repeat existed to shake out the flaky
         // second-burst assertion, and what is left is deterministic.
-        let err = run_pdftoppm(&script, &pdf, 1, budget(5_000))
+        let err = run_pdftoppm(&script, &pdf, 1, budget(5_000), &AtomicBool::new(false))
             .expect_err("a non-zero exit is a failure");
         let text = err.to_string();
         assert!(
@@ -1157,7 +1234,7 @@ mod tests {
         let pdf = tmp.path().join("doc.pdf");
         std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
         for _ in 0..5 {
-            let err = run_pdftoppm(&script, &pdf, 1, budget(5_000))
+            let err = run_pdftoppm(&script, &pdf, 1, budget(5_000), &AtomicBool::new(false))
                 .expect_err("a non-zero exit is a failure");
             let text = err.to_string();
             assert!(
@@ -1229,7 +1306,7 @@ mod tests {
         let script = fake_pdftoppm(tmp.path(), "exit 3");
         let pdf = tmp.path().join("doc.pdf");
         std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
-        let err = run_pdftoppm(&script, &pdf, 1, budget(5_000))
+        let err = run_pdftoppm(&script, &pdf, 1, budget(5_000), &AtomicBool::new(false))
             .expect_err("a non-zero exit is a failure");
         assert!(err.to_string().contains("exited with"), "{err}");
     }
@@ -1259,7 +1336,8 @@ mod tests {
         );
         let pdf = tmp.path().join("doc.pdf");
         std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
-        run_pdftoppm(&script, &pdf, 1, timeout).expect_err("an overrun is a failure");
+        run_pdftoppm(&script, &pdf, 1, timeout, &AtomicBool::new(false))
+            .expect_err("an overrun is a failure");
         std::thread::sleep(std::time::Duration::from_secs_f64(helper_delay * 2.0));
         assert!(
             !marker.exists(),
@@ -1280,7 +1358,7 @@ mod tests {
         );
         let pdf = tmp.path().join("doc.pdf");
         std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
-        let bytes = run_pdftoppm(&script, &pdf, 1, budget(5_000))
+        let bytes = run_pdftoppm(&script, &pdf, 1, budget(5_000), &AtomicBool::new(false))
             .expect("a renderer that finishes is not a failure");
         assert_eq!(bytes, b"x");
     }
@@ -1316,7 +1394,7 @@ mod tests {
         let dir = unique_temp_dir("croft-pdf-test-stderr").unwrap();
         let truncated = dir.join("half-written.pdf");
         std::fs::write(&truncated, b"%PDF-1.7\ntruncated mid-write, no xref").unwrap();
-        let err = rasterize_with_pdftoppm(&truncated, 1).unwrap_err();
+        let err = rasterize_with_pdftoppm(&truncated, 1, &AtomicBool::new(false)).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("Syntax Error") || msg.contains("trailer"),

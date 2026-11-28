@@ -1,0 +1,1 @@
+fix: a Go installed where its installer puts it (`/usr/local/go/bin`) or by Homebrew, but not on croft's `PATH`, is now found by the Go language server and the Go debugger as it already was by the Testing view: opening a `.go` file installs gopls with it, and Debug: Install Go Debugger installs delve with it, where both said Go was not installed (#2807).

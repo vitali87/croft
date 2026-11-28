@@ -53,6 +53,19 @@ pub enum Poll<T> {
 /// One piece of background work and the result it will hand back.
 pub struct Job<T> {
     rx: Receiver<T>,
+    /// Set when the job is let go of, for work started with
+    /// [`Job::spawn_stoppable`].
+    unwanted: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl<T> Drop for Job<T> {
+    /// Letting go of a job does not stop its thread; it tells work that
+    /// asked to be told, which can then stop early.
+    fn drop(&mut self) {
+        if let Some(unwanted) = &self.unwanted {
+            unwanted.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 impl<T: Send + 'static> Job<T> {
@@ -74,7 +87,23 @@ impl<T: Send + 'static> Job<T> {
                 }
                 let _ = tx.send(work());
             })?;
-        Ok(Self { rx })
+        Ok(Self { rx, unwanted: None })
+    }
+
+    /// [`Job::spawn`] for work that can stop early: `work` is handed a flag
+    /// that is set once nobody wants the result, when the job is let go of,
+    /// so it can stop what it waits on (a renderer for a page the reader has
+    /// left) instead of running on for nothing.
+    pub fn spawn_stoppable(
+        name: &str,
+        start: Start,
+        work: impl FnOnce(&std::sync::atomic::AtomicBool) -> T + Send + 'static,
+    ) -> std::io::Result<Self> {
+        let unwanted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = unwanted.clone();
+        let mut job = Self::spawn(name, start, move || work(&flag))?;
+        job.unwanted = Some(unwanted);
+        Ok(job)
     }
 
     /// A job that has already finished with `value`: for work that failed
@@ -83,7 +112,7 @@ impl<T: Send + 'static> Job<T> {
     pub fn finished(value: T) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
         let _ = tx.send(value);
-        Self { rx }
+        Self { rx, unwanted: None }
     }
 }
 
@@ -516,6 +545,28 @@ mod tests {
             Poll::Done(name) => assert_eq!(name.as_deref(), Some("check-project")),
             _ => panic!("the job died"),
         }
+    }
+
+    /// Letting go of a stoppable job tells its work, which can then stop;
+    /// a job that is kept never hears it.
+    #[test]
+    fn a_stoppable_job_hears_when_it_is_let_go_of() {
+        let (heard_tx, heard_rx) = std::sync::mpsc::channel();
+        let job: Job<()> = Job::spawn_stoppable("a-stoppable-job", Start::Now, move |unwanted| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !unwanted.load(std::sync::atomic::Ordering::Relaxed) && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let _ = heard_tx.send(unwanted.load(std::sync::atomic::Ordering::Relaxed));
+        })
+        .unwrap();
+        assert!(heard_rx.try_recv().is_err(), "a kept job is still wanted");
+        drop(job);
+        let heard = heard_rx
+            .recv_timeout(crate::test_budget::spawn_budget(Duration::from_secs(5)))
+            .expect("the work ends");
+        assert!(heard, "the work heard it was no longer wanted");
     }
 
     /// #2562: a job whose work panics reads as dead, not as still running.
