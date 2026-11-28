@@ -62,11 +62,12 @@ grep "croft-$arch-$os.tar.gz" SHA256SUMS | sha256sum -c -
 # macOS: grep "croft-$arch-$os.tar.gz" SHA256SUMS | shasum -a 256 -c -
 ```
 
-`SHA256SUMS` is itself signed with [Sigstore](https://www.sigstore.dev/) by the
-release workflow, keyless, so the signature proves the file came from this
-repository's `release.yml` run for that tag. Check it with
-[cosign](https://docs.sigstore.dev/cosign/system_config/installation/) before
-trusting the sums, then install the archive you verified:
+`SHA256SUMS` is itself signed, keyless, with [Sigstore](https://www.sigstore.dev/)
+by the release workflow. The signature proves the file came from this
+repository's `release.yml` run for that tag.
+
+Check it with [cosign](https://docs.sigstore.dev/cosign/system_config/installation/)
+before trusting the sums, then install the archive you verified:
 
 ```bash
 cosign verify-blob \
