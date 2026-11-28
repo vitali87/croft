@@ -1874,9 +1874,6 @@ fn testing_view_follows_the_theme_and_shows_focus() {
         app.set_sidebar_view(SidebarView::Search);
         let search = draw_buffer(&mut app, 100, 30);
         app.set_sidebar_view(SidebarView::Testing);
-        assert_eq!(app.testing.theme, theme);
-        assert_eq!(app.testing.focus_gradient, theme.gradient());
-        assert!(app.testing.focused, "opening Testing focuses it");
         let testing = draw_buffer(&mut app, 100, 30);
         let area = app.testing.last_area;
         assert!(area.width > 2 && area.height > 2, "Testing drawn: {area:?}");
@@ -1894,7 +1891,19 @@ fn testing_view_follows_the_theme_and_shows_focus() {
                 "{theme:?}: the Testing view's frame at ({x}, {y}) matches the Search view's"
             );
         }
+        // Without focus too, the frame is the Search view's.
         app.focus_pane(Pane::Editor);
-        assert!(!app.testing.focused, "focus left the side bar");
+        let testing = draw_buffer(&mut app, 100, 30);
+        app.set_sidebar_view(SidebarView::Search);
+        app.focus_pane(Pane::Editor);
+        let search = draw_buffer(&mut app, 100, 30);
+        for (x, y) in [(area.x, area.y), (right, area.y)] {
+            let (t, s) = (&testing[(x, y)], &search[(x, y)]);
+            assert_eq!(
+                (t.symbol(), t.fg, t.bg),
+                (s.symbol(), s.fg, s.bg),
+                "{theme:?}: unfocused, the Testing view's frame at ({x}, {y}) matches the Search view's"
+            );
+        }
     }
 }

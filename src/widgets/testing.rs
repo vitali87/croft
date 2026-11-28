@@ -5,6 +5,7 @@
 //! count that drives the beaker activity-icon badge. A run is kicked off from
 //! the Command Palette ("Testing: Run All Tests") or the panel's Enter key.
 
+use crate::widgets::view_cx::ViewCx;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -135,11 +136,6 @@ pub struct TestingPanel {
     scope_filter: Option<String>,
     scroll: usize,
 
-    pub focus_gradient: bool,
-    pub theme: Theme,
-    pub focused: bool,
-    pub hover_pointer: Option<(u16, u16)>,
-
     pub last_area: Rect,
     pub last_scrollbar: Rect,
     rows: Vec<RenderRow>,
@@ -176,10 +172,6 @@ impl TestingPanel {
             last_stop: Rect::default(),
             prerun: Vec::new(),
             scroll: 0,
-            focus_gradient: false,
-            theme: Theme::default(),
-            focused: false,
-            hover_pointer: None,
             last_area: Rect::default(),
             last_scrollbar: Rect::default(),
             rows: Vec::new(),
@@ -611,10 +603,6 @@ impl TestingPanel {
         std::mem::take(&mut self.stopped)
     }
 
-    pub fn is_running(&self) -> bool {
-        self.activity == Activity::Running
-    }
-
     /// Whether a run or discovery is in flight (used to suppress overlapping
     /// kicks — the test binary compile is expensive, so never double-spawn).
     pub fn is_busy(&self) -> bool {
@@ -800,9 +788,10 @@ impl Default for TestingPanel {
     }
 }
 
-impl Widget for &mut TestingPanel {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let border_style = if self.focused {
+impl TestingPanel {
+    /// Draw the view into `area` with this frame's [`ViewCx`].
+    pub fn draw(&mut self, cx: &ViewCx, area: Rect, buf: &mut Buffer) {
+        let border_style = if cx.focused {
             Style::default().fg(Color::Rgb(
                 FOCUS_BORDER_RGB.0,
                 FOCUS_BORDER_RGB.1,
@@ -811,15 +800,15 @@ impl Widget for &mut TestingPanel {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let block = crate::widgets::surface::view_block(self.theme, true, border_style);
+        let block = crate::widgets::surface::view_block(cx.theme, true, border_style);
         let inner = block.inner(area);
         block.render(area, buf);
         crate::widgets::surface::paint_view_focus(
             buf,
             area,
-            self.theme,
-            self.focused,
-            self.focus_gradient,
+            cx.theme,
+            cx.focused,
+            cx.theme.gradient(),
         );
         self.last_area = area;
         self.last_output_hint = Rect::default();
@@ -834,7 +823,7 @@ impl Widget for &mut TestingPanel {
             inner.y,
             "TESTING",
             Style::default()
-                .fg(self.theme.ui(COLOR_HEADER))
+                .fg(cx.theme.ui(COLOR_HEADER))
                 .add_modifier(Modifier::BOLD),
         );
 
@@ -851,8 +840,8 @@ impl Widget for &mut TestingPanel {
         let avail = |start_x: u16| watch_col.saturating_sub(start_x + 1) as usize;
         // Tree names stop short of the coverage glyphs too.
         let row_avail = |start_x: u16| cover_col.saturating_sub(start_x + 1) as usize;
-        let dim = Style::default().fg(self.theme.ui(COLOR_DIM));
-        let theme = self.theme;
+        let dim = Style::default().fg(cx.theme.ui(COLOR_DIM));
+        let theme = cx.theme;
         let eye = move |watched: bool| {
             let color = if watched {
                 theme.accent()
@@ -893,7 +882,7 @@ impl Widget for &mut TestingPanel {
                 summary_y,
                 label,
                 avail(inner.x + 1),
-                Style::default().fg(self.theme.accent()),
+                Style::default().fg(cx.theme.accent()),
             );
             // The Stop control (#1534): a click, `s`, or Testing: Cancel
             // Test Run ends a run that hangs.
@@ -905,7 +894,7 @@ impl Widget for &mut TestingPanel {
                     stop_x,
                     summary_y,
                     stop,
-                    Style::default().fg(self.theme.git_deleted()),
+                    Style::default().fg(cx.theme.git_deleted()),
                 );
                 self.last_stop = Rect {
                     x: stop_x,
@@ -919,11 +908,11 @@ impl Widget for &mut TestingPanel {
             // error on a full run, a collection error) must not hide behind
             // the kickoff hint.
             let (text, color) = if self.discovery_failed {
-                ("Discovery failed", self.theme.git_deleted())
+                ("Discovery failed", cx.theme.git_deleted())
             } else if self.last_run_ok == Some(false) {
-                ("Run failed", self.theme.git_deleted())
+                ("Run failed", cx.theme.git_deleted())
             } else {
-                ("Run All Tests (Enter)", self.theme.ui(COLOR_DIM))
+                ("Run All Tests (Enter)", cx.theme.ui(COLOR_DIM))
             };
             buf.set_stringn(
                 inner.x + 1,
@@ -950,9 +939,9 @@ impl Widget for &mut TestingPanel {
                 tally
             };
             let color = if failed > 0 || run_failed || self.discovery_failed {
-                self.theme.git_deleted()
+                cx.theme.git_deleted()
             } else {
-                self.theme.git_added()
+                cx.theme.git_added()
             };
             buf.set_stringn(
                 inner.x + 1,
@@ -979,7 +968,7 @@ impl Widget for &mut TestingPanel {
                 body_y0,
                 hint,
                 room,
-                Style::default().fg(self.theme.accent()),
+                Style::default().fg(cx.theme.accent()),
             );
             self.last_output_hint = Rect {
                 x: inner.x + 1,
@@ -1003,7 +992,7 @@ impl Widget for &mut TestingPanel {
                 body_y0,
                 p,
                 avail(inner.x + 1),
-                Style::default().fg(self.theme.ui(COLOR_DIM)),
+                Style::default().fg(cx.theme.ui(COLOR_DIM)),
             );
         }
         self.first_row_y = body_y0;
@@ -1030,7 +1019,7 @@ impl Widget for &mut TestingPanel {
                         inner.x + 1,
                         y,
                         GLYPH_PLAY.to_string(),
-                        Style::default().fg(self.theme.ui(COLOR_DIM)),
+                        Style::default().fg(cx.theme.ui(COLOR_DIM)),
                     );
                     // The suite's own file's coverage, right-aligned before
                     // its coverage glyph, when the last report has it.
@@ -1047,7 +1036,7 @@ impl Widget for &mut TestingPanel {
                         suite,
                         name_room,
                         Style::default()
-                            .fg(self.theme.ui(COLOR_HEADER))
+                            .fg(cx.theme.ui(COLOR_HEADER))
                             .add_modifier(Modifier::BOLD),
                     );
                     if let Some(pct) = pct
@@ -1063,7 +1052,7 @@ impl Widget for &mut TestingPanel {
                 RenderRow::Case(case_idx) => {
                     let case = &self.cases[*case_idx];
                     let (_, leaf) = case.suite_and_leaf();
-                    let (glyph, color) = status_glyph(case.status, self.theme);
+                    let (glyph, color) = status_glyph(case.status, cx.theme);
                     buf.set_string(
                         inner.x + 2,
                         y,
@@ -1075,7 +1064,7 @@ impl Widget for &mut TestingPanel {
                         y,
                         leaf,
                         row_avail(inner.x + 4),
-                        Style::default().fg(self.theme.ui(COLOR_CASE)),
+                        Style::default().fg(cx.theme.ui(COLOR_CASE)),
                     );
                     buf.set_string(cover_col, y, GLYPH_COVERAGE.to_string(), dim);
                     let scope = crate::testing::watch::WatchScope::Test(case.name.clone());
@@ -1095,7 +1084,7 @@ impl Widget for &mut TestingPanel {
             scrollbar::vertical_metrics(lane, self.rows.len(), body_h as usize, self.scroll)
         {
             self.last_scrollbar = lane;
-            scrollbar::render_vertical(buf, metrics, self.focused, self.theme);
+            scrollbar::render_vertical(buf, metrics, cx.focused, cx.theme);
         } else {
             self.last_scrollbar = Rect::default();
         }
@@ -1528,7 +1517,7 @@ mod tests {
 
         let area = Rect::new(0, 0, 40, 10);
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         let summary: String = (0..40).map(|x| buf[(x, 2)].symbol()).collect();
         assert!(
             summary.contains("run failed"),
@@ -1577,7 +1566,7 @@ mod tests {
         let area = Rect::new(0, 0, 40, 10);
         let summary = |p: &mut TestingPanel| {
             let mut buf = Buffer::empty(area);
-            p.render(area, &mut buf);
+            p.draw(&ViewCx::default(), area, &mut buf);
             (0..40).map(|x| buf[(x, 2)].symbol()).collect::<String>()
         };
         let idle = summary(&mut p);
@@ -1616,7 +1605,7 @@ mod tests {
 
         let area = Rect::new(0, 0, 40, 10);
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         let summary: String = (0..40).map(|x| buf[(x, 2)].symbol()).collect();
         assert!(
             summary.contains("run failed"),
@@ -1629,9 +1618,10 @@ mod tests {
     /// overwrite the scrollbar lane and the panel's right border.
     #[test]
     fn wide_characters_never_bleed_past_the_scrollbar_lane() {
+        let mut cx = ViewCx::default();
         let mut p = TestingPanel::new();
         // Boxed, so the right border is there to survive.
-        p.theme = Theme::BLACK;
+        cx.theme = Theme::BLACK;
         p.on_busy_started(Activity::Running);
         p.apply_case(TestCase {
             name: "套件::测试用例的名字很长很长很长很长很长".into(),
@@ -1643,7 +1633,7 @@ mod tests {
         // clips at the frame edge, so the panel must clip itself.
         let area = Rect::new(0, 0, 20, 10);
         let mut buf = Buffer::empty(Rect::new(0, 0, 40, 10));
-        (&mut p).render(area, &mut buf);
+        p.draw(&cx, area, &mut buf);
         for y in 1..9 {
             assert_eq!(
                 buf[(19, y)].symbol(),
@@ -1734,7 +1724,7 @@ mod tests {
         }
         let area = Rect::new(0, 0, 30, 10);
         let mut buf = Buffer::empty(area);
-        (&mut panel).render(area, &mut buf);
+        panel.draw(&ViewCx::default(), area, &mut buf);
         let eye = area.width - 3;
         let body = panel.first_row_y;
         assert_eq!(
@@ -1754,9 +1744,9 @@ mod tests {
         // A watched row's eye is drawn in the accent colour.
         panel.watch.toggle(WatchScope::Test("parse::a".into()));
         let mut buf = Buffer::empty(area);
-        (&mut panel).render(area, &mut buf);
-        assert_eq!(buf[(eye, body + 1)].fg, panel.theme.accent());
-        assert_ne!(buf[(eye, body + 2)].fg, panel.theme.accent());
+        panel.draw(&ViewCx::default(), area, &mut buf);
+        assert_eq!(buf[(eye, body + 1)].fg, ViewCx::default().theme.accent());
+        assert_ne!(buf[(eye, body + 2)].fg, ViewCx::default().theme.accent());
     }
 
     #[test]
@@ -1776,7 +1766,7 @@ mod tests {
             (0..area.width).map(|x| buf[(x, y)].symbol()).collect()
         };
         let mut buf = Buffer::empty(area);
-        (&mut panel).render(area, &mut buf);
+        panel.draw(&ViewCx::default(), area, &mut buf);
         let cover = area.width - 5;
         let body = panel.first_row_y;
         assert_eq!(
@@ -1799,7 +1789,7 @@ mod tests {
             std::path::Path::new("/w"),
         )));
         let mut buf = Buffer::empty(area);
-        (&mut panel).render(area, &mut buf);
+        panel.draw(&ViewCx::default(), area, &mut buf);
         let header = row_text(&buf, body);
         let cells: String = (cover - 4..cover)
             .map(|x| buf[(x, body)].symbol())
@@ -1823,7 +1813,7 @@ mod tests {
         p.on_busy_started(Activity::Discovering);
         p.on_finished(Some(false));
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         assert!(
             row(&buf, 2).contains("Discovery failed"),
             "{:?}",
@@ -1852,7 +1842,7 @@ mod tests {
         });
         p.on_finished(Some(false));
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         assert!(
             row(&buf, 2).contains("discovery failed"),
             "{:?}",
@@ -1865,7 +1855,7 @@ mod tests {
         p.on_busy_started(Activity::Discovering);
         p.on_finished(Some(true));
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         assert!(row(&buf, 2).contains("Run All Tests (Enter)"));
         assert_eq!(p.last_output_hint, Rect::default());
         assert_eq!(p.take_finished(), Some(None));
@@ -1874,13 +1864,13 @@ mod tests {
         p.on_busy_started(Activity::Running);
         p.on_finished(Some(false));
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         assert!(row(&buf, 2).contains("Run failed"), "{:?}", row(&buf, 2));
         assert!(row(&buf, 3).contains("see OUTPUT › Test Runner"));
         // ...but not while the next one is in flight.
         p.start_single("m::a");
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         assert_eq!(p.last_output_hint, Rect::default());
     }
 
@@ -2002,7 +1992,7 @@ mod tests {
         });
         p.on_finished(Some(false));
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         let screen: String = (0..area.height)
             .flat_map(|y| (0..area.width).map(move |x| (x, y)))
             .map(|(x, y)| buf[(x, y)].symbol().to_string())
@@ -2024,7 +2014,7 @@ mod tests {
         p.on_busy_started(Activity::Discovering);
         p.on_finished(Some(false));
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         let hint = p.last_output_hint;
         let drawn: String = (hint.x..hint.x + hint.width)
             .map(|x| buf[(x, hint.y)].symbol())

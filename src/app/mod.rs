@@ -5513,13 +5513,8 @@ impl App {
         self.search.focused = self.focus == Pane::Tree && self.sidebar_view == SidebarView::Search;
         self.source_control.focused =
             self.focus == Pane::Tree && self.sidebar_view == SidebarView::SourceControl;
-        self.remote.focused = self.focus == Pane::Tree && self.sidebar_view == SidebarView::Remote;
         self.run_debug.focused =
             self.focus == Pane::Tree && self.sidebar_view == SidebarView::RunDebug;
-        self.extensions.focused =
-            self.focus == Pane::Tree && self.sidebar_view == SidebarView::Extensions;
-        self.testing.focused =
-            self.focus == Pane::Tree && self.sidebar_view == SidebarView::Testing;
         self.editor.focused = self.focus == Pane::Editor;
         // Inactive groups are by definition NOT the focused editor group, so
         // their borders never light up even while the editor pane holds focus.
@@ -5566,15 +5561,6 @@ impl App {
         self.run_debug.theme = self.theme;
         self.codeql.focus_gradient = gradient;
         self.codeql.theme = self.theme;
-        self.testing.focus_gradient = gradient;
-        self.testing.theme = self.theme;
-        self.commit_graph.focus_gradient = gradient;
-        self.commit_graph.theme = self.theme;
-        self.commit_graph.focused =
-            self.focus == Pane::Tree && self.sidebar_view == SidebarView::SourceControl;
-        self.remote.focus_gradient = gradient;
-        self.remote.theme = self.theme;
-        self.extensions.theme = self.theme;
         self.problems.fix_glyph = match self.problems_fix_started {
             Some(t) => update_spinner_frame(t.elapsed().as_millis()),
             None => "",

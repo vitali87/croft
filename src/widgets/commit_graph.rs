@@ -15,8 +15,8 @@ use ratatui::{
 
 use crate::git::GraphCommit;
 use crate::git::GraphRow;
-use crate::theme::Theme;
 use crate::widgets::scrollbar;
+use crate::widgets::view_cx::ViewCx;
 
 const COLOR_DIM: Color = Color::Rgb(0x60, 0x68, 0x78);
 const COLOR_SUMMARY: Color = Color::Rgb(0xCC, 0xCC, 0xCC);
@@ -47,9 +47,6 @@ pub struct CommitGraphPanel {
     /// show "No commits" instead of spinning on "Loading".
     loaded: bool,
     scroll: usize,
-    pub focus_gradient: bool,
-    pub theme: Theme,
-    pub focused: bool,
     /// COMMITS has the keys (#871): set before each draw from Source
     /// Control's key stop, which holds it. Its selected row then shows the
     /// focused band.
@@ -57,7 +54,6 @@ pub struct CommitGraphPanel {
     /// The row the keyboard or a click picked, kept on screen and kept
     /// across a refresh by its commit.
     selected: Option<usize>,
-    pub hover_pointer: Option<(u16, u16)>,
 
     pub last_area: Rect,
     pub last_scrollbar: Rect,
@@ -78,12 +74,8 @@ impl CommitGraphPanel {
             rows: Vec::new(),
             loaded: false,
             scroll: 0,
-            focus_gradient: false,
-            theme: Theme::default(),
-            focused: false,
             has_keys: false,
             selected: None,
-            hover_pointer: None,
             last_area: Rect::default(),
             last_scrollbar: Rect::default(),
             last_header_row: 0,
@@ -177,6 +169,7 @@ impl CommitGraphPanel {
 
     /// Whether a fetched graph has landed since the last [`Self::clear`]
     /// (false = the section still says "Loading").
+    #[cfg(test)]
     pub fn is_loaded(&self) -> bool {
         self.loaded
     }
@@ -272,12 +265,13 @@ fn badge_of(decoration: &str) -> (&str, bool, bool) {
     }
 }
 
-impl Widget for &mut CommitGraphPanel {
-    fn render(self, area: Rect, buf: &mut Buffer) {
+impl CommitGraphPanel {
+    /// Draw the view into `area` with this frame's [`ViewCx`].
+    pub fn draw(&mut self, cx: &ViewCx, area: Rect, buf: &mut Buffer) {
         let block = crate::widgets::surface::section_block(
-            self.theme,
+            cx.theme,
             Borders::TOP,
-            Style::default().fg(self.theme.ui(COLOR_DIM)),
+            Style::default().fg(cx.theme.ui(COLOR_DIM)),
         );
         let inner = block.inner(area);
         block.render(area, buf);
@@ -303,12 +297,12 @@ impl Widget for &mut CommitGraphPanel {
         crate::widgets::surface::paint_section_header(
             buf,
             header_row,
-            self.theme,
+            cx.theme,
             !self.collapsed,
             "COMMITS",
             Vec::new(),
             // With the keys but no row to pick, the header shows them.
-            crate::widgets::hover::contains(header_row, self.hover_pointer)
+            crate::widgets::hover::contains(header_row, cx.pointer)
                 || (self.has_keys && (self.collapsed || self.rows.is_empty())),
         );
         self.last_header_row = header_y;
@@ -328,7 +322,7 @@ impl Widget for &mut CommitGraphPanel {
             let msg = if self.loaded { "No commits" } else { "Loading" };
             Paragraph::new(Line::from(Span::styled(
                 msg,
-                Style::default().fg(self.theme.ui(COLOR_DIM)),
+                Style::default().fg(cx.theme.ui(COLOR_DIM)),
             )))
             .render(
                 Rect {
@@ -382,7 +376,7 @@ impl Widget for &mut CommitGraphPanel {
             // band (greyed while COMMITS has not the keys) on a card, the
             // list blue on a plain panel.
             let picked = self.selected == Some(self.scroll + row);
-            let tones = crate::theme::tones(self.theme);
+            let tones = crate::theme::tones(cx.theme);
             if picked {
                 match tones {
                     Some(t) => crate::widgets::surface::paint_selected_row(
@@ -394,15 +388,15 @@ impl Widget for &mut CommitGraphPanel {
                         },
                         t,
                         t.chrome,
-                        self.focused && self.has_keys,
+                        cx.focused && self.has_keys,
                     ),
                     None => buf.set_style(
                         row_rect,
-                        Style::default().bg(self.theme.ui(Color::Rgb(0x26, 0x4f, 0x78))),
+                        Style::default().bg(cx.theme.ui(Color::Rgb(0x26, 0x4f, 0x78))),
                     ),
                 }
             } else if let Some(bg) =
-                crate::widgets::hover::row_hover_bg(row_rect, self.hover_pointer, self.theme)
+                crate::widgets::hover::row_hover_bg(row_rect, cx.pointer, cx.theme)
             {
                 buf.set_style(row_rect, Style::default().bg(bg));
             }
@@ -419,9 +413,9 @@ impl Widget for &mut CommitGraphPanel {
             for decoration in &graph_row.commit.refs {
                 let (name, is_tag, is_head) = badge_of(decoration);
                 let color = if is_tag {
-                    self.theme.ui(COLOR_TAG)
+                    cx.theme.ui(COLOR_TAG)
                 } else {
-                    self.theme.accent()
+                    cx.theme.accent()
                 };
                 let mut style = Style::default().fg(color);
                 if is_head {
@@ -431,7 +425,7 @@ impl Widget for &mut CommitGraphPanel {
             }
             spans.push(Span::styled(
                 graph_row.commit.summary.clone(),
-                Style::default().fg(self.theme.ui(COLOR_SUMMARY)),
+                Style::default().fg(cx.theme.ui(COLOR_SUMMARY)),
             ));
             // Right-aligned dim age, clipped away first when width is tight.
             let age = crate::git::humanize_age(graph_row.commit.age_secs);
@@ -442,7 +436,7 @@ impl Widget for &mut CommitGraphPanel {
                 spans.push(Span::raw(" ".repeat(pad)));
                 spans.push(Span::styled(
                     age,
-                    Style::default().fg(self.theme.ui(COLOR_DIM)),
+                    Style::default().fg(cx.theme.ui(COLOR_DIM)),
                 ));
             }
             Paragraph::new(Line::from(spans)).render(row_rect, buf);
@@ -450,7 +444,7 @@ impl Widget for &mut CommitGraphPanel {
 
         if let Some(metrics) = bar {
             self.last_scrollbar = metrics.area;
-            scrollbar::render_vertical_on_chrome(buf, metrics, self.focused, self.theme);
+            scrollbar::render_vertical_on_chrome(buf, metrics, cx.focused, cx.theme);
         }
     }
 }
@@ -493,7 +487,7 @@ mod tests {
             height: 6,
         };
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         let mut text = String::new();
         for y in 0..area.height {
             for x in 0..area.width {
@@ -529,7 +523,7 @@ mod tests {
             height: 12,
         };
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         p.scroll_down(5);
         assert_eq!(p.scroll, 5);
         p.set_rows(layout_graph(many));

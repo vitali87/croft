@@ -1,6 +1,7 @@
 use crate::remote::{RemoteTarget, SshConfigState, discover_ssh_targets, ssh_config_state};
 use crate::widgets::drawn_rows::DrawnRows;
 use crate::widgets::scrollbar;
+use crate::widgets::view_cx::ViewCx;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -13,14 +14,6 @@ pub struct RemotePanel {
     pub targets: Vec<RemoteTarget>,
     pub selected: usize,
     pub scroll: usize,
-    pub focused: bool,
-    /// True under the Black theme: overpaint the focused outer border with the
-    /// orange→green brand gradient instead of the legacy solid blue. Set by the
-    /// app's focus/theme sync.
-    pub focus_gradient: bool,
-    /// Active color theme; drives the scrollbar track/thumb colors. Set by the
-    /// app's theme sync.
-    pub theme: crate::theme::Theme,
     pub collapsed: bool,
     pub filter: String,
     pub last_area: Rect,
@@ -43,9 +36,6 @@ pub struct RemotePanel {
     /// recent render. Lets the post-draw flush detect when a chrome tooltip
     /// lands on the image (whose OSC-1337 layer would hide the tooltip text).
     pub last_image_area: Rect,
-    /// Render-time pointer cell, fed from `App::pointer_cell` each frame so a
-    /// hovered host row and the header action pills (+ / refresh) can lift.
-    pub hover_pointer: Option<(u16, u16)>,
     visible: Vec<usize>,
     ssh_config_state: SshConfigState,
 }
@@ -57,9 +47,6 @@ impl RemotePanel {
             targets: discover_ssh_targets(),
             selected: 0,
             scroll: 0,
-            focused: false,
-            focus_gradient: false,
-            theme: crate::theme::Theme::default(),
             collapsed: false,
             filter: String::new(),
             last_area: Rect::default(),
@@ -75,7 +62,6 @@ impl RemotePanel {
             empty_learn_link: Rect::default(),
             last_image_cell: None,
             last_image_area: Rect::default(),
-            hover_pointer: None,
             visible: Vec::new(),
             ssh_config_state,
         }
@@ -152,6 +138,7 @@ impl RemotePanel {
         true
     }
 
+    #[cfg(test)]
     pub fn visible_indices(&self) -> &[usize] {
         &self.visible
     }
@@ -273,9 +260,9 @@ pub const SSH_EMPTY_STATE_CELLS_H: u16 = 8;
 // keep using `crate::widgets::remote::REFRESH_GLYPH`.
 pub use crate::widgets::header_pill::{ADD_GLYPH, REFRESH_GLYPH};
 
-fn render_section_header(panel: &mut RemotePanel, buf: &mut Buffer, inner: Rect) {
+fn render_section_header(panel: &mut RemotePanel, cx: &ViewCx, buf: &mut Buffer, inner: Rect) {
     let header_style = Style::default()
-        .fg(panel.theme.ui(Color::Rgb(0xcc, 0xcc, 0xcc)))
+        .fg(cx.theme.ui(Color::Rgb(0xcc, 0xcc, 0xcc)))
         .add_modifier(Modifier::BOLD);
     let chevron = if panel.collapsed { '▸' } else { '▾' };
     buf.set_line(
@@ -284,7 +271,7 @@ fn render_section_header(panel: &mut RemotePanel, buf: &mut Buffer, inner: Rect)
         &Line::from(vec![
             Span::styled(
                 format!("{chevron} "),
-                Style::default().fg(panel.theme.ui(Color::Gray)),
+                Style::default().fg(cx.theme.ui(Color::Gray)),
             ),
             Span::styled("SSH", header_style),
         ]),
@@ -303,7 +290,7 @@ fn render_section_header(panel: &mut RemotePanel, buf: &mut Buffer, inner: Rect)
     let right = inner.x + inner.width;
     let refresh_x = right.saturating_sub(pill_w + 1);
     let add_x = refresh_x.saturating_sub(pill_w + 1);
-    let pointer = panel.hover_pointer;
+    let pointer = cx.pointer;
     if add_x > inner.x + 5 {
         let rect = Rect {
             x: add_x,
@@ -313,7 +300,7 @@ fn render_section_header(panel: &mut RemotePanel, buf: &mut Buffer, inner: Rect)
         };
         panel.header_add_btn = rect;
         let hovered = crate::widgets::hover::contains(rect, pointer);
-        crate::widgets::header_pill::render(buf, add_x, inner.y, ADD_GLYPH, panel.theme, hovered);
+        crate::widgets::header_pill::render(buf, add_x, inner.y, ADD_GLYPH, cx.theme, hovered);
     }
     if refresh_x > inner.x + 5 {
         let rect = Rect {
@@ -329,7 +316,7 @@ fn render_section_header(panel: &mut RemotePanel, buf: &mut Buffer, inner: Rect)
             refresh_x,
             inner.y,
             REFRESH_GLYPH,
-            panel.theme,
+            cx.theme,
             hovered,
         );
     }
@@ -362,7 +349,7 @@ fn render_filter_row(buf: &mut Buffer, area: Rect, filter: &str, theme: crate::t
     );
 }
 
-fn render_empty_state(panel: &mut RemotePanel, buf: &mut Buffer, area: Rect) {
+fn render_empty_state(panel: &mut RemotePanel, cx: &ViewCx, buf: &mut Buffer, area: Rect) {
     panel.last_image_cell = None;
     panel.last_image_area = Rect::default();
     if area.height < 14 || area.width < 22 {
@@ -381,7 +368,7 @@ fn render_empty_state(panel: &mut RemotePanel, buf: &mut Buffer, area: Rect) {
     let card_block = Block::default()
         .borders(Borders::ALL)
         .border_type(ratatui::widgets::BorderType::Rounded)
-        .border_style(Style::default().fg(panel.theme.ui(CARD_BORDER)));
+        .border_style(Style::default().fg(cx.theme.ui(CARD_BORDER)));
     let card_inner = card_block.inner(card_rect);
     card_block.render(card_rect, buf);
 
@@ -421,14 +408,14 @@ fn render_empty_state(panel: &mut RemotePanel, buf: &mut Buffer, area: Rect) {
             y,
             title,
             Style::default()
-                .fg(panel.theme.ui(Color::White))
+                .fg(cx.theme.ui(Color::White))
                 .add_modifier(Modifier::BOLD),
         );
         y += 2;
     }
 
     let body_lines = wrap_body(content_w as usize);
-    let body_fg = Style::default().fg(panel.theme.ui(BODY_FG));
+    let body_fg = Style::default().fg(cx.theme.ui(BODY_FG));
     for line in body_lines.iter() {
         if y >= content_end_y {
             break;
@@ -450,14 +437,14 @@ fn render_empty_state(panel: &mut RemotePanel, buf: &mut Buffer, area: Rect) {
             y,
             btn_width,
             "+  Add New Host",
-            panel.theme.ui(PRIMARY_BG),
+            cx.theme.ui(PRIMARY_BG),
         );
         y += 4;
     }
 
     if y + 3 <= content_end_y {
         panel.empty_secondary_btn =
-            render_outlined_button(buf, btn_x, y, btn_width, "Open SSH Config", panel.theme);
+            render_outlined_button(buf, btn_x, y, btn_width, "Open SSH Config", cx.theme);
         y += 4;
     }
 
@@ -479,7 +466,7 @@ fn render_empty_state(panel: &mut RemotePanel, buf: &mut Buffer, area: Rect) {
                 y,
                 link,
                 Style::default()
-                    .fg(panel.theme.ui(LINK_FG))
+                    .fg(cx.theme.ui(LINK_FG))
                     .add_modifier(Modifier::UNDERLINED),
             );
             panel.empty_learn_link = Rect {
@@ -600,16 +587,17 @@ fn render_outlined_button(
     }
 }
 
-impl Widget for &mut RemotePanel {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let block_style = if self.focused {
-            Style::default().fg(self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff)))
+impl RemotePanel {
+    /// Draw the view into `area` with this frame's [`ViewCx`].
+    pub fn draw(&mut self, cx: &ViewCx, area: Rect, buf: &mut Buffer) {
+        let block_style = if cx.focused {
+            Style::default().fg(cx.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff)))
         } else {
             Style::default().fg(Color::DarkGray)
         };
         // Black theme: chipless brand header (panelTitle.activeForeground);
         // Croft Dark keeps the historical white-on-navy chip.
-        let title = if self.focus_gradient {
+        let title = if cx.theme.gradient() {
             Span::styled(
                 " REMOTE EXPLORER ",
                 Style::default()
@@ -621,12 +609,12 @@ impl Widget for &mut RemotePanel {
                 " REMOTE EXPLORER ",
                 Style::default()
                     .fg(Color::White)
-                    .bg(self.theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e)))
+                    .bg(cx.theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e)))
                     .add_modifier(Modifier::BOLD),
             )
         };
         let block =
-            crate::widgets::surface::view_block(self.theme, true, block_style).title(title.clone());
+            crate::widgets::surface::view_block(cx.theme, true, block_style).title(title.clone());
         let inner = block.inner(area);
         block.render(area, buf);
         // Black theme: replace the solid focus border with the brand gradient,
@@ -634,9 +622,9 @@ impl Widget for &mut RemotePanel {
         if crate::widgets::surface::paint_view_focus(
             buf,
             area,
-            self.theme,
-            self.focused,
-            self.focus_gradient,
+            cx.theme,
+            cx.focused,
+            cx.theme.gradient(),
         ) {
             buf.set_span(area.x + 1, area.y, &title, title.width() as u16);
         }
@@ -655,7 +643,7 @@ impl Widget for &mut RemotePanel {
             return;
         }
 
-        render_section_header(self, buf, inner);
+        render_section_header(self, cx, buf, inner);
 
         if self.collapsed {
             self.last_list_area = Rect {
@@ -681,7 +669,7 @@ impl Widget for &mut RemotePanel {
                     height: 1,
                 },
                 &self.filter,
-                self.theme,
+                cx.theme,
             );
             body_y = body_y.saturating_add(1);
         }
@@ -694,17 +682,17 @@ impl Widget for &mut RemotePanel {
 
         if self.visible.is_empty() {
             if self.targets.is_empty() {
-                render_empty_state(self, buf, self.last_list_area);
+                render_empty_state(self, cx, buf, self.last_list_area);
             } else if !self.filter.is_empty() && self.last_list_area.height > 0 {
                 let msg = format!("No hosts match \"{}\"", self.filter);
                 let w = msg.chars().count() as u16;
-                let cx = inner.x + inner.width.saturating_sub(w) / 2;
+                let x = inner.x + inner.width.saturating_sub(w) / 2;
                 buf.set_string(
-                    cx,
+                    x,
                     self.last_list_area.y,
                     &msg,
                     Style::default()
-                        .fg(self.theme.ui(BODY_FG))
+                        .fg(cx.theme.ui(BODY_FG))
                         .add_modifier(Modifier::ITALIC),
                 );
             }
@@ -742,12 +730,12 @@ impl Widget for &mut RemotePanel {
             .width
             .saturating_sub(u16::from(scrollbar_metrics.is_some()));
 
-        let sel_bg = if self.focus_gradient {
+        let sel_bg = if cx.theme.gradient() {
             crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG)
         } else {
-            self.theme.ui(Color::Rgb(0x09, 0x4d, 0x77))
+            cx.theme.ui(Color::Rgb(0x09, 0x4d, 0x77))
         };
-        let pointer = self.hover_pointer;
+        let pointer = cx.pointer;
         let end = (self.scroll + viewport).min(self.visible.len());
         self.drawn.record(
             (self.scroll..end).map(|at| (at, self.targets[self.visible[at]].alias.clone())),
@@ -766,7 +754,7 @@ impl Widget for &mut RemotePanel {
             let style = if selected {
                 Style::default().bg(sel_bg)
             } else if let Some(bg) =
-                crate::widgets::hover::row_hover_bg(row_rect, pointer, self.theme)
+                crate::widgets::hover::row_hover_bg(row_rect, pointer, cx.theme)
             {
                 Style::default().bg(bg)
             } else {
@@ -778,12 +766,12 @@ impl Widget for &mut RemotePanel {
                 Span::raw("  "),
                 Span::styled(
                     "\u{f108} ",
-                    Style::default().fg(self.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4))),
+                    Style::default().fg(cx.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4))),
                 ),
                 Span::styled(
                     target.alias.as_str(),
                     Style::default()
-                        .fg(self.theme.ui(Color::White))
+                        .fg(cx.theme.ui(Color::White))
                         .add_modifier(Modifier::BOLD),
                 ),
             ];
@@ -794,7 +782,7 @@ impl Widget for &mut RemotePanel {
             buf.set_line(self.last_list_area.x, y, &Line::from(spans), row_width);
         }
         if let Some(metrics) = scrollbar_metrics {
-            scrollbar::render_vertical(buf, metrics, self.focused, self.theme);
+            scrollbar::render_vertical(buf, metrics, cx.focused, cx.theme);
         }
     }
 }
@@ -847,7 +835,7 @@ mod tests {
             height: 10,
         };
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         let header_y = p.header_refresh_btn.y;
         let mut header_row = String::new();
         for x in area.left()..area.right() {
@@ -865,9 +853,9 @@ mod tests {
 
     #[test]
     fn header_add_pill_brightens_under_the_pointer() {
+        let mut cx = ViewCx::default();
         let mut p = populated_panel(&["a", "b"]);
-        p.focus_gradient = false; // Croft Dark navy pill
-        p.theme = crate::theme::Theme::DARK_BLUE;
+        cx.theme = crate::theme::Theme::DARK_BLUE;
         let area = Rect {
             x: 0,
             y: 0,
@@ -875,14 +863,14 @@ mod tests {
             height: 10,
         };
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(&cx, area, &mut buf);
         let add = p.header_add_btn;
         let refresh = p.header_refresh_btn;
         assert!(add.width > 0, "the + pill must have rendered");
         // Rest the pointer on the + pill and re-render.
-        p.hover_pointer = Some((add.x, add.y));
+        cx.pointer = Some((add.x, add.y));
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(&cx, area, &mut buf);
         assert_eq!(
             buf[(add.x, add.y)].bg,
             crate::widgets::header_pill::HEADER_BTN_HOVER_BG,
@@ -897,9 +885,9 @@ mod tests {
 
     #[test]
     fn hovering_an_unselected_host_row_lifts_it() {
+        let mut cx = ViewCx::default();
         let mut p = populated_panel(&["a", "b", "c"]);
-        p.focus_gradient = false; // Croft Dark
-        p.theme = crate::theme::Theme::DARK_BLUE;
+        cx.theme = crate::theme::Theme::DARK_BLUE;
         p.selected = 0; // row 0 is selected
         let area = Rect {
             x: 0,
@@ -908,11 +896,11 @@ mod tests {
             height: 10,
         };
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(&cx, area, &mut buf);
         let row_y = p.last_list_area.y + 1; // second host, unselected
-        p.hover_pointer = Some((p.last_list_area.x, row_y));
+        cx.pointer = Some((p.last_list_area.x, row_y));
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(&cx, area, &mut buf);
         assert_eq!(
             buf[(p.last_list_area.x, row_y)].bg,
             Color::Rgb(0x2b, 0x31, 0x42),
@@ -922,9 +910,9 @@ mod tests {
 
     #[test]
     fn black_theme_selected_host_uses_muted_brand_teal_not_legacy_blue() {
+        let cx = ViewCx::default();
         use crate::gradient::{POPUP_SEL_BG, rgb_color};
         let mut p = populated_panel(&["a", "b"]);
-        p.focus_gradient = true;
         let area = Rect {
             x: 0,
             y: 0,
@@ -932,7 +920,7 @@ mod tests {
             height: 10,
         };
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(&cx, area, &mut buf);
         let sel_y = p.last_list_area.y; // selected defaults to row 0
         assert_eq!(
             buf[(p.last_list_area.x, sel_y)].bg,
@@ -948,9 +936,9 @@ mod tests {
 
     #[test]
     fn croft_dark_selected_host_keeps_solid_blue_highlight() {
+        let mut cx = ViewCx::default();
         let mut p = populated_panel(&["a", "b"]);
-        p.theme = crate::theme::Theme::DARK_BLUE;
-        p.focus_gradient = false;
+        cx.theme = crate::theme::Theme::DARK_BLUE;
         let area = Rect {
             x: 0,
             y: 0,
@@ -958,7 +946,7 @@ mod tests {
             height: 10,
         };
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(&cx, area, &mut buf);
         let sel_y = p.last_list_area.y;
         assert_eq!(
             buf[(p.last_list_area.x, sel_y)].bg,
@@ -977,7 +965,7 @@ mod tests {
             height: 10,
         };
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         assert_eq!(
             p.header_add_btn.width, 2,
             "header + pill must be 2 cells wide — the 3-cell version felt oversized next to the SSH label per user feedback on 2026-05-18"
@@ -1000,7 +988,7 @@ mod tests {
             height: 10,
         };
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         assert!(
             p.header_chevron_btn.width > 0,
             "chevron must register a hit rect so clicking the ▾ collapses the SSH section"
@@ -1019,7 +1007,7 @@ mod tests {
         };
         let mut buf = Buffer::empty(area);
         p.toggle_collapsed();
-        (&mut p).render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         assert!(p.collapsed);
         assert_eq!(
             p.last_list_area.height, 0,
@@ -1081,7 +1069,7 @@ mod tests {
         };
         let mut buf = Buffer::empty(area);
         p.push_filter_char('b');
-        (&mut p).render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         let first_row_y = p.last_list_area.y;
         let idx = p
             .target_at_y(first_row_y)
@@ -1107,7 +1095,7 @@ mod tests {
             height: 10,
         };
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         let y = p.last_list_area.y + 1;
         let drawn = p.target_at_y(y);
         assert!(drawn.is_some(), "a row is drawn there");
@@ -1139,7 +1127,7 @@ mod tests {
         let mut p = populated_panel(&aliases);
         p.selected = 10;
         p.scroll = 10;
-        (&mut p).render(area, &mut Buffer::empty(area));
+        p.draw(&ViewCx::default(), area, &mut Buffer::empty(area));
         let top = p.last_list_area.y;
         assert_eq!(
             alias_at(&p, top).as_deref(),
@@ -1154,7 +1142,7 @@ mod tests {
         );
 
         let mut p = populated_panel(&aliases);
-        (&mut p).render(area, &mut Buffer::empty(area));
+        p.draw(&ViewCx::default(), area, &mut Buffer::empty(area));
         assert_eq!(
             alias_at(&p, top).as_deref(),
             Some("a00"),
@@ -1187,7 +1175,7 @@ mod tests {
             height: 40,
         };
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         assert!(p.header_add_btn.width > 0);
         assert!(p.header_refresh_btn.width > 0);
         assert!(p.empty_primary_btn.width > 0);
@@ -1205,7 +1193,7 @@ mod tests {
             height: 40,
         };
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         assert_eq!(p.empty_primary_btn, Rect::default());
         assert_eq!(p.empty_secondary_btn, Rect::default());
         assert_eq!(p.empty_learn_link, Rect::default());
@@ -1222,7 +1210,7 @@ mod tests {
                 height: 40,
             };
             let mut buf = Buffer::empty(area);
-            (&mut p).render(area, &mut buf);
+            p.draw(&ViewCx::default(), area, &mut buf);
             for y in area.top()..area.bottom() {
                 let mut row = String::new();
                 for x in area.left()..area.right() {
@@ -1257,7 +1245,7 @@ mod tests {
             height: 40,
         };
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         assert_eq!(p.empty_primary_btn.height, 3);
         assert_eq!(p.empty_secondary_btn.height, 3);
     }
@@ -1272,7 +1260,7 @@ mod tests {
             height: 40,
         };
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         assert!(p.last_image_cell.is_some());
     }
 
@@ -1286,7 +1274,7 @@ mod tests {
             height: 40,
         };
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         let mut joined = String::new();
         for y in area.top()..area.bottom() {
             for x in area.left()..area.right() {
