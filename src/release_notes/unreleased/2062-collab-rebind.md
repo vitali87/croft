@@ -1,0 +1,1 @@
+refactor: A workspace switch starts the multiplayer session's state over in one call instead of resetting its fields one by one, so a field added later has to say whether a switch keeps it (#2062). Nothing changes in use.

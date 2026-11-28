@@ -52,8 +52,16 @@ impl CollabState {
     /// if this croft is a participant.
     pub(super) fn new() -> Self {
         Self {
-            session: None,
             config: crate::collab::CollabChannel::env_config(),
+            ..Self::detached()
+        }
+    }
+
+    /// No session, socket, merge base, caret or stream.
+    fn detached() -> Self {
+        Self {
+            session: None,
+            config: None,
             last_connect: None,
             offline_base: std::collections::HashMap::new(),
             carets: std::collections::HashMap::new(),
@@ -61,6 +69,47 @@ impl CollabState {
             labels_visible: false,
             stream: None,
         }
+    }
+
+    /// Start this side over for a workspace switch. A session this window
+    /// started as the navigator's host (`session_ends`: the switch released
+    /// the old root's host lock) ends with that lock, with its socket and
+    /// any AI stream it carried; the stream comes back so the switch can
+    /// close its undo step, as the pilot's "stream ended" would have
+    /// (#2891). A session croft was launched into stays connected, with
+    /// its stream. Either way the old root's merge bases and the peers'
+    /// carets go: both are keyed by root-relative file, so a same-named
+    /// file under the new root must neither merge with nor wear them; a
+    /// live session repopulates its carets on the next poll. The connect
+    /// throttle, the last caret sent and whether a name tag shows carry
+    /// over.
+    pub(super) fn rebind(&mut self, session_ends: bool) -> Option<CollabStreamInfo> {
+        let Self {
+            session,
+            config,
+            last_connect,
+            offline_base: _,
+            carets: _,
+            caret_sent,
+            labels_visible,
+            stream,
+        } = std::mem::replace(self, Self::detached());
+        let (session, config, stream, ended) = if session_ends {
+            drop(session);
+            (None, None, None, stream)
+        } else {
+            (session, config, stream, None)
+        };
+        *self = Self {
+            session,
+            config,
+            last_connect,
+            caret_sent,
+            labels_visible,
+            stream,
+            ..Self::detached()
+        };
+        ended
     }
 }
 
