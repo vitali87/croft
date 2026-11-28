@@ -734,7 +734,7 @@ impl App {
         // Esc Esc leaves Zen Mode (#1585), counting only Escapes in the
         // editor that closed or cleared nothing: one that dismisses a popup
         // or a selection is that, not half of the pair.
-        let zen_esc = self.zen_mode
+        let zen_esc = self.zen_mode()
             && self.focus == Pane::Editor
             && key.code == KeyCode::Esc
             && key.modifiers.is_empty()
@@ -814,28 +814,35 @@ impl App {
         // Keyboard Shortcuts editor (#612): the next key is the new chord.
         // Only the key that answers the prompt: once the user has clicked
         // away or let it sit, a later Cmd+S must save, not become a binding.
-        if let Some((cmd, at)) = self.recording_shortcut.take()
-            && at.elapsed() < SHORTCUT_RECORD_WINDOW
-        {
-            self.record_shortcut(cmd, key);
-            return Ok(());
-        }
-        // A chord that was taken (#1482): Enter reassigns it, any other key
-        // keeps both shortcuts as they were. The recorded chord's own key
-        // repeat, from holding it a moment too long, is not an answer.
-        if let Some((cmd, chord, owners)) = self.confirming_shortcut.take() {
-            if key.kind == KeyEventKind::Repeat
-                && crate::keymap::Chord::from_event(key) == crate::keymap::Chord::from_event(chord)
+        match self.shortcut_capture.take() {
+            Some(ShortcutCapture::Recording { cmd, since })
+                if since.elapsed() < SHORTCUT_RECORD_WINDOW =>
             {
-                self.confirming_shortcut = Some((cmd, chord, owners));
+                self.record_shortcut(cmd, key);
                 return Ok(());
             }
-            if key.code == KeyCode::Enter && key.modifiers.is_empty() {
-                self.write_shortcut(cmd, chord, &owners);
-            } else {
-                self.status = String::from("Shortcut unchanged");
+            // A chord that was taken (#1482): Enter reassigns it, any other
+            // key keeps both shortcuts as they were. The recorded chord's own
+            // key repeat, from holding it a moment too long, is not an answer.
+            Some(ShortcutCapture::Confirming { cmd, chord, owners }) => {
+                if key.kind == KeyEventKind::Repeat
+                    && crate::keymap::Chord::from_event(key)
+                        == crate::keymap::Chord::from_event(chord)
+                {
+                    self.shortcut_capture =
+                        Some(ShortcutCapture::Confirming { cmd, chord, owners });
+                    return Ok(());
+                }
+                if key.code == KeyCode::Enter && key.modifiers.is_empty() {
+                    self.write_shortcut(cmd, chord, &owners);
+                } else {
+                    self.status = String::from("Shortcut unchanged");
+                }
+                return Ok(());
             }
-            return Ok(());
+            // A recording left to sit past its window is dropped, and this
+            // key does what it would anyway.
+            Some(ShortcutCapture::Recording { .. }) | None => {}
         }
         self.hover_popup = None;
         self.hover_diagnostic = None;

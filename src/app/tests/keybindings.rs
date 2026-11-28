@@ -3420,7 +3420,10 @@ fn recording_a_shortcut_writes_it_and_takes_effect_at_once() {
     app.keybindings_file = tmp.path().join("keybindings.json");
     app.open_keyboard_shortcuts();
     let cmd = crate::widgets::command_palette::Command::ToggleLiveRun;
-    app.recording_shortcut = Some((cmd, std::time::Instant::now()));
+    app.shortcut_capture = Some(ShortcutCapture::Recording {
+        cmd,
+        since: std::time::Instant::now(),
+    });
     // Plain typing is refused and ends the recording.
     app.handle_key(key(KeyCode::Char('j'), KeyModifiers::NONE))
         .unwrap();
@@ -3430,7 +3433,10 @@ fn recording_a_shortcut_writes_it_and_takes_effect_at_once() {
         app.status
     );
     assert!(!app.keybindings_file.exists());
-    app.recording_shortcut = Some((cmd, std::time::Instant::now()));
+    app.shortcut_capture = Some(ShortcutCapture::Recording {
+        cmd,
+        since: std::time::Instant::now(),
+    });
     app.handle_key(key(
         KeyCode::Char('j'),
         KeyModifiers::CONTROL | KeyModifiers::ALT,
@@ -3451,10 +3457,10 @@ fn escape_leaves_the_shortcut_unchanged() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.keybindings_file = tmp.path().join("keybindings.json");
-    app.recording_shortcut = Some((
-        crate::widgets::command_palette::Command::ToggleLiveRun,
-        std::time::Instant::now(),
-    ));
+    app.shortcut_capture = Some(ShortcutCapture::Recording {
+        cmd: crate::widgets::command_palette::Command::ToggleLiveRun,
+        since: std::time::Instant::now(),
+    });
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
     assert_eq!(app.status, "Shortcut unchanged");
@@ -3468,14 +3474,20 @@ fn a_stale_or_clicked_away_shortcut_prompt_records_nothing() {
     app.keybindings_file = tmp.path().join("keybindings.json");
     let cmd = crate::widgets::command_palette::Command::ToggleLiveRun;
     let long_ago = std::time::Instant::now() - std::time::Duration::from_secs(60);
-    app.recording_shortcut = Some((cmd, long_ago));
+    app.shortcut_capture = Some(ShortcutCapture::Recording {
+        cmd,
+        since: long_ago,
+    });
     app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL))
         .unwrap();
     assert!(
         !app.keybindings_file.exists(),
         "a late chord is not recorded"
     );
-    app.recording_shortcut = Some((cmd, std::time::Instant::now()));
+    app.shortcut_capture = Some(ShortcutCapture::Recording {
+        cmd,
+        since: std::time::Instant::now(),
+    });
     app.handle_mouse(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
         column: 1,
@@ -3483,7 +3495,10 @@ fn a_stale_or_clicked_away_shortcut_prompt_records_nothing() {
         modifiers: KeyModifiers::NONE,
     });
     assert!(
-        app.recording_shortcut.is_none(),
+        !matches!(
+            app.shortcut_capture,
+            Some(ShortcutCapture::Recording { .. })
+        ),
         "a click cancels the prompt"
     );
 }
@@ -3501,7 +3516,10 @@ fn mod_key_1482() -> KeyModifiers {
 fn recording_1482(tmp: &std::path::Path, cmd: crate::widgets::command_palette::Command) -> App {
     let mut app = App::new(tmp.to_path_buf()).unwrap();
     app.keybindings_file = tmp.join("keybindings.json");
-    app.recording_shortcut = Some((cmd, std::time::Instant::now()));
+    app.shortcut_capture = Some(ShortcutCapture::Recording {
+        cmd,
+        since: std::time::Instant::now(),
+    });
     app
 }
 
@@ -3615,7 +3633,10 @@ fn a_free_chord_or_the_commands_own_chord_applies_at_once() {
         KeyModifiers::CONTROL | KeyModifiers::ALT,
     ))
     .unwrap();
-    assert!(app.confirming_shortcut.is_none());
+    assert!(!matches!(
+        app.shortcut_capture,
+        Some(ShortcutCapture::Confirming { .. })
+    ));
     assert_eq!(
         app.status,
         "ctrl+alt+j now runs \u{201c}Transform to Uppercase\u{201d}"
@@ -3624,7 +3645,14 @@ fn a_free_chord_or_the_commands_own_chord_applies_at_once() {
     let mut app = comment;
     app.handle_key(key(KeyCode::Char('/'), mod_key_1482()))
         .unwrap();
-    assert!(app.confirming_shortcut.is_none(), "{}", app.status);
+    assert!(
+        !matches!(
+            app.shortcut_capture,
+            Some(ShortcutCapture::Confirming { .. })
+        ),
+        "{}",
+        app.status
+    );
     assert_eq!(
         app.keymap
             .command_for(key(KeyCode::Char('/'), mod_key_1482())),
@@ -3645,7 +3673,10 @@ fn a_users_own_chord_asks_too_and_a_click_cancels() {
     );
     app.handle_key(chord).unwrap();
     let before = std::fs::read_to_string(&app.keybindings_file).unwrap();
-    app.recording_shortcut = Some((Command::TransformUpper, std::time::Instant::now()));
+    app.shortcut_capture = Some(ShortcutCapture::Recording {
+        cmd: Command::TransformUpper,
+        since: std::time::Instant::now(),
+    });
     app.handle_key(chord).unwrap();
     assert!(
         app.status
@@ -3659,7 +3690,10 @@ fn a_users_own_chord_asks_too_and_a_click_cancels() {
         row: 1,
         modifiers: KeyModifiers::NONE,
     });
-    assert!(app.confirming_shortcut.is_none());
+    assert!(!matches!(
+        app.shortcut_capture,
+        Some(ShortcutCapture::Confirming { .. })
+    ));
     assert_eq!(app.status, "Shortcut unchanged");
     assert_eq!(
         std::fs::read_to_string(&app.keybindings_file).unwrap(),
@@ -3681,7 +3715,14 @@ fn a_repeat_of_the_recorded_chord_keeps_the_question_open() {
     repeat.kind = KeyEventKind::Repeat;
     app.handle_key(repeat).unwrap();
     app.handle_key(repeat).unwrap();
-    assert!(app.confirming_shortcut.is_some(), "{}", app.status);
+    assert!(
+        matches!(
+            app.shortcut_capture,
+            Some(ShortcutCapture::Confirming { .. })
+        ),
+        "{}",
+        app.status
+    );
     assert!(!app.keybindings_file.exists());
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();

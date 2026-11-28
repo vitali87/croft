@@ -1167,7 +1167,7 @@ fn closing_a_popup_with_esc_is_not_half_of_zen_esc_esc() {
         app.editor.open(&file).unwrap();
         app.focus_pane(Pane::Editor);
         app.toggle_zen_mode();
-        assert!(app.zen_mode, "setup: Zen Mode is on");
+        assert!(app.zen_mode(), "setup: Zen Mode is on");
         let _hook = open(&mut app, p);
         app.focus = Pane::Editor;
         app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
@@ -1178,7 +1178,7 @@ fn closing_a_popup_with_esc_is_not_half_of_zen_esc_esc() {
         }
         app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
             .unwrap();
-        if !app.zen_mode {
+        if !app.zen_mode() {
             left.push(format!("{p:?}"));
         }
     }

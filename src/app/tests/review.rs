@@ -60,7 +60,7 @@ fn an_esc_leaving_a_comment_box_or_insert_mode_is_not_half_of_esc_esc() {
     );
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
-    assert!(app.zen_mode, "the Esc that left the box did not count");
+    assert!(app.zen_mode(), "the Esc that left the box did not count");
 
     app.zen_esc_at = None;
     app.vim.enabled = true;
@@ -70,7 +70,10 @@ fn an_esc_leaving_a_comment_box_or_insert_mode_is_not_half_of_esc_esc() {
     assert_eq!(app.vim.mode(), crate::vim::VimMode::Normal);
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
-    assert!(app.zen_mode, "the Esc that left Insert mode did not count");
+    assert!(
+        app.zen_mode(),
+        "the Esc that left Insert mode did not count"
+    );
 }
 
 #[test]

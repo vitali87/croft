@@ -2181,7 +2181,7 @@ fn zen_mode_hides_all_chrome_then_restores_the_snapshot() {
     app.status_bar_visible = true;
 
     app.toggle_zen_mode();
-    assert!(app.zen_mode, "zen on");
+    assert!(app.zen_mode(), "zen on");
     assert!(!app.activity_bar_visible);
     assert!(!app.status_bar_visible);
     assert!(!app.show_tree);
@@ -2189,7 +2189,7 @@ fn zen_mode_hides_all_chrome_then_restores_the_snapshot() {
     assert!(!app.show_terminal);
 
     app.toggle_zen_mode();
-    assert!(!app.zen_mode, "zen off");
+    assert!(!app.zen_mode(), "zen off");
     assert!(app.show_tree, "restored prior side bar");
     assert!(!app.show_terminal, "restored prior (hidden) panel");
     assert!(
@@ -2304,16 +2304,16 @@ fn esc_esc_leaves_zen_mode_and_restores_the_chrome() {
     app.toggle_zen_mode();
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
-    assert!(app.zen_mode, "one Esc is not enough");
+    assert!(app.zen_mode(), "one Esc is not enough");
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
-    assert!(!app.zen_mode, "Esc Esc leaves Zen");
+    assert!(!app.zen_mode(), "Esc Esc leaves Zen");
     assert!(app.show_tree && app.status_bar_visible);
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
-    assert!(!app.zen_mode, "Esc Esc never enters Zen");
+    assert!(!app.zen_mode(), "Esc Esc never enters Zen");
 }
 
 /// #1585: Zen hides the status bar, so entering it shows how to leave for
@@ -2861,9 +2861,9 @@ fn auto_hide_is_suppressed_while_dragging_prompting_or_in_zen_mode() {
     app.gesture = None;
 
     // Zen Mode already owns chrome visibility and wins, as it does today.
-    app.zen_mode = true;
+    app.pre_zen = Some(PreZenLayout::default());
     assert!(!app.sidebar_auto_hide_allowed(), "zen mode wins");
-    app.zen_mode = false;
+    app.pre_zen = None;
 
     // Off by default: a user who never opted in never loses their sidebar.
     app.sidebar_auto_hide = false;
@@ -3324,7 +3324,7 @@ fn a_reveal_under_zen_mode_banks_no_pin() {
 
     // Back to a hidden sidebar, now under Zen Mode.
     app.toggle_side_bar();
-    app.zen_mode = true;
+    app.pre_zen = Some(PreZenLayout::default());
     app.activity_bar_visible = false;
 
     app.toggle_side_bar();
@@ -3640,7 +3640,7 @@ fn disabling_auto_hide_drops_a_pin_banked_before_it_was_turned_off() {
 
 /// #302: Zen entry must drop the reveal pin as well as the dwell. Zen sets
 /// BOTH structural conditions — `activity_bar_visible = false` and
-/// `zen_mode = true` — so `toggle_side_bar`'s reason for refusing to bank a
+/// Zen Mode on (`zen_mode()`) — so `toggle_side_bar`'s reason for refusing to bank a
 /// pin there ("no collapse can fire for as long as it lasts") applies in full
 /// to a pin already held.
 ///
@@ -3664,7 +3664,7 @@ fn entering_zen_mode_drops_the_reveal_pin_as_well_as_the_dwell() {
     );
 
     app.toggle_zen_mode();
-    assert!(app.zen_mode, "precondition: Zen is on");
+    assert!(app.zen_mode(), "precondition: Zen is on");
     assert!(
         !app.sidebar_pinned_open,
         "Zen entry drops the pin: no collapse can fire while Zen owns the \
@@ -3676,7 +3676,7 @@ fn entering_zen_mode_drops_the_reveal_pin_as_well_as_the_dwell() {
     // collapses as expected rather than being silently exempted.
     app.toggle_zen_mode();
     assert!(
-        !app.zen_mode && app.show_tree,
+        !app.zen_mode() && app.show_tree,
         "precondition: Zen off, sidebar back"
     );
     assert!(
@@ -3712,12 +3712,12 @@ fn entering_zen_mode_cancels_a_pending_collapse_rather_than_deferring_it() {
 
     // Zen takes over the chrome while the collapse is still pending.
     app.toggle_zen_mode();
-    assert!(app.zen_mode, "precondition: Zen is on");
+    assert!(app.zen_mode(), "precondition: Zen is on");
     assert!(!app.show_tree, "precondition: Zen hid the sidebar");
 
     // The user works in Zen for a long time, then leaves.
     app.toggle_zen_mode();
-    assert!(!app.zen_mode, "precondition: Zen is off");
+    assert!(!app.zen_mode(), "precondition: Zen is off");
     assert!(
         app.show_tree,
         "precondition: leaving Zen restored the sidebar"
@@ -3762,7 +3762,7 @@ fn arming_inside_zen_mode_does_not_collapse_the_sidebar_when_zen_exits() {
 
     // Into Zen FIRST, so there is no pending dwell for Zen entry to cancel.
     app.toggle_zen_mode();
-    assert!(app.zen_mode, "precondition: Zen is on");
+    assert!(app.zen_mode(), "precondition: Zen is on");
     assert!(
         !app.sidebar_auto_hide_allowed(),
         "precondition: Zen structurally suppresses the collapse"
@@ -3807,7 +3807,7 @@ fn arming_inside_zen_mode_does_not_collapse_the_sidebar_when_zen_exits() {
     // it, then check that no stale collapse from the in-Zen focus move is still
     // pending to fire on the next tick.
     app.toggle_zen_mode();
-    assert!(!app.zen_mode, "precondition: Zen is off again");
+    assert!(!app.zen_mode(), "precondition: Zen is off again");
     app.show_tree = true;
     assert!(
         app.sidebar_auto_hide_allowed(),
@@ -4454,7 +4454,7 @@ fn every_customize_layout_row_has_a_palette_command_that_does_the_same() {
             app.side_bar_position,
             app.panel_alignment,
             app.quick_input_position,
-            app.zen_mode,
+            app.zen_mode(),
             app.centered_layout,
         )
     };

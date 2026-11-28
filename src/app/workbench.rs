@@ -924,7 +924,7 @@ impl App {
             ),
             MenuEntry::Separator,
             MenuEntry::item(
-                format!("{}Zen Mode", check(self.zen_mode)),
+                format!("{}Zen Mode", check(self.zen_mode())),
                 MenuAction::ToggleZenMode,
             ),
             MenuEntry::item(
@@ -1127,8 +1127,10 @@ impl App {
         // "sits unconsumed and silently eats a later collapse" case this line
         // already guards against for `!sidebar_auto_hide` — same bug, same
         // answer: refuse to bank it rather than hold it indefinitely.
-        self.sidebar_pinned_open =
-            self.show_tree && self.sidebar_auto_hide && self.activity_bar_visible && !self.zen_mode;
+        self.sidebar_pinned_open = self.show_tree
+            && self.sidebar_auto_hide
+            && self.activity_bar_visible
+            && !self.zen_mode();
         // A deliberate toggle supersedes any pending automatic collapse: the
         // dwell was armed against a sidebar state the user has since changed by
         // hand. Leaving it armed lets a later idle tick fire against the NEW
@@ -1161,6 +1163,11 @@ impl App {
         self.persist_layout();
     }
 
+    /// Whether Zen Mode is on: it is while the chrome it hid is kept.
+    pub(super) fn zen_mode(&self) -> bool {
+        self.pre_zen.is_some()
+    }
+
     /// Toggle Zen Mode: hide the activity bar, both side bars, the panel, and
     /// the status bar; toggling off restores the pre-Zen snapshot. Mirrors VS
     /// Code's ⌘K Z.
@@ -1171,7 +1178,6 @@ impl App {
             self.show_tree = prev.side_bar;
             self.secondary_side_bar_visible = prev.secondary_side_bar;
             self.show_terminal = prev.panel;
-            self.zen_mode = false;
             self.zen_esc_at = None;
             self.zen_hint_until = None;
             self.status = String::from("Zen Mode off");
@@ -1202,7 +1208,6 @@ impl App {
             self.sidebar_pinned_open = false;
             self.secondary_side_bar_visible = false;
             self.show_terminal = false;
-            self.zen_mode = true;
             self.zen_centered = self.zen_center_layout;
             self.zen_esc_at = None;
             self.zen_hint_until = Some(std::time::Instant::now() + ZEN_HINT_FOR);
@@ -1214,7 +1219,7 @@ impl App {
     /// Whether the editor is centred this frame (#1585): Toggle Centered
     /// Layout, or a Zen session that started centred.
     pub(super) fn centered_layout_active(&self) -> bool {
-        self.centered_layout || (self.zen_mode && self.zen_centered)
+        self.centered_layout || (self.zen_mode() && self.zen_centered)
     }
 
     /// View: Toggle Centered Layout (#1585). Off turns off both the setting
@@ -1254,7 +1259,7 @@ impl App {
         (
             (
                 self.focus,
-                self.zen_mode,
+                self.zen_mode(),
                 self.open_popups(),
                 self.context_menu.is_some(),
                 self.peek_popup.is_some(),
@@ -1322,7 +1327,7 @@ impl App {
             return;
         }
         let mut area = main_area;
-        if self.zen_mode
+        if self.zen_mode()
             && self
                 .zen_hint_until
                 .is_some_and(|until| std::time::Instant::now() < until)
@@ -1776,7 +1781,7 @@ impl App {
     /// an hour ago. Cancelling at the ARM site instead would make the retry
     /// unreachable, which is the recovery path for the transient case.
     pub(super) fn sidebar_structurally_suppressed(&self) -> bool {
-        !self.activity_bar_visible || self.zen_mode
+        !self.activity_bar_visible || self.zen_mode()
     }
 
     /// Whether auto-hide may collapse the sidebar RIGHT NOW. Every reason to
@@ -1821,7 +1826,7 @@ impl App {
             return false;
         }
         // Zen Mode already owns chrome visibility; it wins, as it does today.
-        if self.zen_mode {
+        if self.zen_mode() {
             return false;
         }
         true
@@ -1996,7 +2001,7 @@ impl App {
     /// Zen Mode hides the status bar, so for a few seconds after entering
     /// it a box at the bottom says how to leave (#1585).
     pub(super) fn render_zen_hint(&self, frame: &mut ratatui::Frame) {
-        if !self.zen_mode
+        if !self.zen_mode()
             || !self
                 .zen_hint_until
                 .is_some_and(|until| std::time::Instant::now() < until)

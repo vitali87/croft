@@ -714,10 +714,7 @@ impl App {
             self.status_wide = false;
         }
         // A click means the user moved on from a pending shortcut prompt.
-        if matches!(m.kind, MouseEventKind::Down(_))
-            && (self.recording_shortcut.take().is_some()
-                | self.confirming_shortcut.take().is_some())
-        {
+        if matches!(m.kind, MouseEventKind::Down(_)) && self.shortcut_capture.take().is_some() {
             self.status = String::from("Shortcut unchanged");
         }
         // On-screen keyboard taps outrank every other gate - including the

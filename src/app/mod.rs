@@ -190,9 +190,30 @@ struct BookmarkTarget {
     line: usize,
 }
 
+/// Recording a new shortcut in the Keyboard Shortcuts editor (#612): one
+/// value for both phases, so the second replaces the first and the two can
+/// never be pending at once.
+#[derive(Clone, Debug)]
+enum ShortcutCapture {
+    /// The next keystroke is `cmd`'s new chord, if it comes within
+    /// [`SHORTCUT_RECORD_WINDOW`] of `since`.
+    Recording {
+        cmd: crate::widgets::command_palette::Command,
+        since: std::time::Instant,
+    },
+    /// The recorded chord is taken (#1482): Enter gives it to `cmd`, taking
+    /// it from every command in `owners` (a built-in chord can be shared by
+    /// several); any other key keeps both shortcuts as they were.
+    Confirming {
+        cmd: crate::widgets::command_palette::Command,
+        chord: KeyEvent,
+        owners: Vec<crate::widgets::command_palette::Command>,
+    },
+}
+
 /// Pre-Zen visibility snapshot, restored verbatim when Zen Mode is toggled
 /// off so the workspace returns to exactly the chrome it had before.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct PreZenLayout {
     activity_bar: bool,
     status_bar: bool,
@@ -1761,9 +1782,6 @@ pub struct App {
     /// Layout: where the quick input (command palette / Go to File) anchors.
     /// Persisted.
     quick_input_position: QuickInputPosition,
-    /// Layout: Zen Mode hides the activity bar, both side bars, the panel,
-    /// and the status bar; toggling off restores `pre_zen`.
-    zen_mode: bool,
     /// View: Toggle Centered Layout (#1585), persisted: the editor keeps
     /// `centered_layout_width` columns in the middle of its column.
     centered_layout: bool,
@@ -1800,7 +1818,10 @@ pub struct App {
     /// it (#302), so a click passing through the panel does not take it away
     /// under the pointer.
     sidebar_dwell: SidebarDwell,
-    /// Pre-Zen visibility snapshot; `None` whenever not in Zen Mode.
+    /// Zen Mode (hides the activity bar, both side bars, the panel and the
+    /// status bar): the chrome it hid, to restore when it ends. Zen is on
+    /// exactly while this is `Some` (`zen_mode()`), so the two cannot
+    /// disagree.
     pre_zen: Option<PreZenLayout>,
     /// Hit-test rects for the top-right layout-control icons.
     layout_icon_areas: LayoutIconAreas,
@@ -2661,16 +2682,9 @@ pub struct App {
     /// this frame as (pane index, the text Right arrow would type).
     term_suggest_enabled: bool,
     term_suggestion: Option<(usize, String, String)>,
-    /// The command whose new shortcut the next keystroke records (#612).
-    recording_shortcut: Option<(crate::widgets::command_palette::Command, std::time::Instant)>,
-    /// A recorded chord another command already has (#1482), waiting for
-    /// Enter to reassign it: the command, the chord, and every command it
-    /// runs now (a built-in chord can be shared by several).
-    confirming_shortcut: Option<(
-        crate::widgets::command_palette::Command,
-        KeyEvent,
-        Vec<crate::widgets::command_palette::Command>,
-    )>,
+    /// A new shortcut being recorded in the Keyboard Shortcuts editor
+    /// (#612), in whichever of its two phases it is.
+    shortcut_capture: Option<ShortcutCapture>,
     /// Inline AI suggestions (#607): off until the user turns them on, since
     /// they send code to a model. The worker, the backend it was started
     /// for, the request in flight (id plus what it answers for), and the
@@ -4398,7 +4412,6 @@ impl App {
             secondary_side_bar_visible: layout_prefs.secondary_side_bar,
             panel_alignment: layout_prefs.panel_alignment,
             quick_input_position: layout_prefs.quick_input_position,
-            zen_mode: false,
             centered_layout: layout_prefs.centered_layout,
             zen_center_layout: layout_prefs.zen_center_layout,
             zen_centered: false,
@@ -4686,8 +4699,7 @@ impl App {
             debug_pause_reason: None,
             term_suggest_enabled: true,
             term_suggestion: None,
-            recording_shortcut: None,
-            confirming_shortcut: None,
+            shortcut_capture: None,
             inline_enabled: false,
             inline_worker: None,
             inline_config: None,

@@ -868,7 +868,7 @@ fn an_esc_that_did_something_is_not_half_of_esc_esc() {
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
     assert!(
-        app.zen_mode,
+        app.zen_mode(),
         "the Esc that cleared the selection did not count"
     );
 
@@ -879,13 +879,13 @@ fn an_esc_that_did_something_is_not_half_of_esc_esc() {
         .unwrap();
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
-    assert!(app.zen_mode, "a key between the Escapes breaks the pair");
+    assert!(app.zen_mode(), "a key between the Escapes breaks the pair");
 
     app.zen_esc_at = None;
     let t = std::time::Instant::now();
     app.note_idle_zen_esc(t);
     app.note_idle_zen_esc(t + ZEN_ESC_WINDOW + std::time::Duration::from_millis(1));
-    assert!(app.zen_mode, "too far apart");
+    assert!(app.zen_mode(), "too far apart");
 
     app.zen_esc_at = None;
     app.focus = Pane::Terminal;
@@ -893,7 +893,10 @@ fn an_esc_that_did_something_is_not_half_of_esc_esc() {
         .unwrap();
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
-    assert!(app.zen_mode, "Escapes for a terminal program stay its own");
+    assert!(
+        app.zen_mode(),
+        "Escapes for a terminal program stay its own"
+    );
 }
 
 /// Clicking an annotated span pops its note, but that branch used to
