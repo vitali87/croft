@@ -2336,6 +2336,18 @@ impl App {
         if host_lock.is_some() {
             self.collab = None;
             self.collab_config = None;
+            // With the session gone, the pilot's "stream ended" message can
+            // never arrive, so the stream ends here, as that message would
+            // end it: its undo step closes and its badge goes (#2891).
+            if let Some(stream) = self.collab_stream.take() {
+                for ed in self
+                    .editor_layout
+                    .all_groups_mut(&mut self.editor)
+                    .flat_map(|g| g.editors.iter_mut())
+                {
+                    ed.end_remote_undo_group(stream.undo_group);
+                }
+            }
         }
         drop(host_lock);
         // Old-root merge bases are keyed by root-relative file, like the

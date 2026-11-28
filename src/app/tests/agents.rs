@@ -945,6 +945,37 @@ fn a_workspace_switch_announces_the_new_workspaces_host_refusal() {
     );
 }
 
+/// #2891: a workspace switch that drops the session this window hosted ends
+/// the AI stream it carried: the pilot's "stream ended" message can no
+/// longer arrive, and the badge stayed in the status bar for good.
+#[test]
+fn a_workspace_switch_that_drops_this_windows_session_ends_its_stream() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let locks = tempfile::tempdir().unwrap();
+    let mut app = App::new(a.path().to_path_buf()).unwrap();
+    // This window hosts the navigator, and its pilot is streaming.
+    app.pair.host_lock =
+        Some(crate::session::try_acquire_pair_host_lock(&locks.path().join("a.lock")).unwrap());
+    app.collab_stream = Some(crate::app::CollabStreamInfo {
+        file: String::from("a.rs"),
+        name: String::from("nav"),
+        site: 2,
+        undo_group: 77,
+    });
+
+    app.change_workspace_root(b.path().to_path_buf());
+
+    assert!(
+        app.collab.is_none(),
+        "the session this window hosted is gone"
+    );
+    assert!(
+        app.collab_stream.is_none(),
+        "and so is the stream it carried, badge and all"
+    );
+}
+
 /// #2062: after a workspace switch the navigator's state is a fresh one for
 /// the new root, apart from what `PairState::rebind` says it keeps. The
 /// pattern names every field, so a field added later has to say here
