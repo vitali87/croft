@@ -134,12 +134,16 @@ def compare(old, new, renamed=None):
     for heading in re.findall(r"^### (\S+)", new, re.M):
         documented |= section_keys(heading, ambiguous)
 
+    # A moved row's prose section may be headed by its old path or its new.
     shrunk = [
         (name, len(desc), len(after[name]))
         for name, desc in before.items()
         if name in after
         and len(desc) - len(after[name]) > SHRINK_THRESHOLD
-        and not (section_keys(name, ambiguous) & documented)
+        and not (
+            (section_keys(name, ambiguous) | section_keys(moved.get(name, name), ambiguous))
+            & documented
+        )
     ]
     return sorted(shrunk, key=lambda r: r[2] - r[1]), sorted(set(before) - set(after))
 
