@@ -1307,6 +1307,10 @@ impl App {
             }
         }
 
+        // The sections share the Explorer's focus, as VS Code dims them
+        // together when the side bar loses the keyboard.
+        let cx =
+            self.view_cx(self.focus == Pane::Tree && self.sidebar_view == SidebarView::Explorer);
         let mut y = area.y;
         for (v, h) in heights {
             if h == 0 {
@@ -1343,8 +1347,8 @@ impl App {
                 }
                 ExplorerView::OpenEditors => frame.render_widget(&mut self.open_editors, rect),
                 ExplorerView::Outline => frame.render_widget(&mut self.outline, rect),
-                ExplorerView::Timeline => frame.render_widget(&mut self.timeline, rect),
-                ExplorerView::Dependencies => frame.render_widget(&mut self.dependencies, rect),
+                ExplorerView::Timeline => self.timeline.draw(&cx, rect, frame.buffer_mut()),
+                ExplorerView::Dependencies => self.dependencies.draw(&cx, rect, frame.buffer_mut()),
                 ExplorerView::AgentLane => frame.render_widget(&mut self.agent_lane_panel, rect),
             }
         }

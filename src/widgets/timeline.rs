@@ -16,8 +16,8 @@ use ratatui::{
 };
 
 use crate::git::FileHistoryEntry;
-use crate::theme::Theme;
 use crate::widgets::scrollbar;
+use crate::widgets::view_cx::ViewCx;
 
 const COLOR_DIM: Color = Color::Rgb(0x60, 0x68, 0x78);
 const COLOR_SUMMARY: Color = Color::Rgb(0xCC, 0xCC, 0xCC);
@@ -47,10 +47,6 @@ pub struct TimelinePanel {
     /// "No history" or the failure instead of spinning on "Loading".
     listing: Listing,
     scroll: usize,
-    pub focus_gradient: bool,
-    pub theme: Theme,
-    pub focused: bool,
-    pub hover_pointer: Option<(u16, u16)>,
 
     pub last_area: Rect,
     pub last_scrollbar: Rect,
@@ -71,10 +67,6 @@ impl TimelinePanel {
             entries: Vec::new(),
             listing: Listing::Loading,
             scroll: 0,
-            focus_gradient: false,
-            theme: Theme::default(),
-            focused: false,
-            hover_pointer: None,
             last_area: Rect::default(),
             last_scrollbar: Rect::default(),
             last_header_row: 0,
@@ -127,11 +119,6 @@ impl TimelinePanel {
         self.entries.clear();
         self.listing = Listing::Loading;
         self.scroll = 0;
-    }
-
-    /// The file the panel currently tracks, for the app's fetch bookkeeping.
-    pub fn tracked_path(&self) -> Option<&PathBuf> {
-        self.path.as_ref()
     }
 
     pub fn toggle_collapse(&mut self) {
@@ -225,12 +212,13 @@ impl Default for TimelinePanel {
     }
 }
 
-impl Widget for &mut TimelinePanel {
-    fn render(self, area: Rect, buf: &mut Buffer) {
+impl TimelinePanel {
+    /// Draw the section into `area` with this frame's [`ViewCx`].
+    pub fn draw(&mut self, cx: &ViewCx, area: Rect, buf: &mut Buffer) {
         let block = crate::widgets::surface::section_block(
-            self.theme,
+            cx.theme,
             Borders::BOTTOM,
-            Style::default().fg(self.theme.ui(COLOR_DIM)),
+            Style::default().fg(cx.theme.ui(COLOR_DIM)),
         );
         let inner = block.inner(area);
         block.render(area, buf);
@@ -256,11 +244,11 @@ impl Widget for &mut TimelinePanel {
         crate::widgets::surface::paint_section_header(
             buf,
             header_row,
-            self.theme,
+            cx.theme,
             !self.collapsed,
             &crate::i18n::tr("TIMELINE"),
             Vec::new(),
-            crate::widgets::hover::contains(header_row, self.hover_pointer),
+            crate::widgets::hover::contains(header_row, cx.pointer),
         );
         self.last_header_row = header_y;
         self.last_header_x = inner.x;
@@ -284,7 +272,7 @@ impl Widget for &mut TimelinePanel {
             };
             Paragraph::new(Line::from(Span::styled(
                 msg,
-                Style::default().fg(self.theme.ui(COLOR_DIM)),
+                Style::default().fg(cx.theme.ui(COLOR_DIM)),
             )))
             .render(
                 Rect {
@@ -333,13 +321,13 @@ impl Widget for &mut TimelinePanel {
                 height: 1,
             };
             if let Some(bg) =
-                crate::widgets::hover::row_hover_bg(summary_rect, self.hover_pointer, self.theme)
+                crate::widgets::hover::row_hover_bg(summary_rect, cx.pointer, cx.theme)
             {
                 buf.set_style(summary_rect, Style::default().bg(bg));
             }
             Paragraph::new(Line::from(Span::styled(
                 entry.summary.clone(),
-                Style::default().fg(self.theme.ui(COLOR_SUMMARY)),
+                Style::default().fg(cx.theme.ui(COLOR_SUMMARY)),
             )))
             .render(summary_rect, buf);
 
@@ -352,7 +340,7 @@ impl Widget for &mut TimelinePanel {
                 );
                 Paragraph::new(Line::from(Span::styled(
                     meta,
-                    Style::default().fg(self.theme.ui(COLOR_DIM)),
+                    Style::default().fg(cx.theme.ui(COLOR_DIM)),
                 )))
                 .render(
                     Rect {
@@ -368,7 +356,7 @@ impl Widget for &mut TimelinePanel {
 
         if let Some(metrics) = bar {
             self.last_scrollbar = metrics.area;
-            scrollbar::render_vertical_on_chrome(buf, metrics, self.focused, self.theme);
+            scrollbar::render_vertical_on_chrome(buf, metrics, cx.focused, cx.theme);
         }
     }
 }
@@ -444,7 +432,7 @@ mod tests {
             height: 8,
         };
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         // header at y=0; commit 0 at rows 1-2, commit 1 at rows 3-4.
         assert_eq!(p.row_at(0), None, "header is not a commit");
         assert_eq!(p.row_at(1), Some(0));
@@ -465,7 +453,7 @@ mod tests {
             height,
         };
         let mut buf = Buffer::empty(area);
-        p.render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         let mut out = String::new();
         for y in 0..height {
             for x in 0..width {
