@@ -138,15 +138,29 @@ pub struct PdfJobs {
 /// A page and the job reading something from it.
 type PageJob<T> = (u32, crate::jobs::Job<Result<T, String>>);
 
-/// Render `page` of `source` on a job.
+/// Render `page` of `source` on a job, stopped once the job is let go of:
+/// a page the reader has left, or a tab showing another file now, does not
+/// keep its renderer running (#2829 review).
 fn pdf_render_job(
     source: PathBuf,
     page: u32,
     backend: crate::pdf::PdfBackend,
 ) -> std::io::Result<crate::jobs::Job<Result<Vec<u8>, String>>> {
-    crate::jobs::Job::spawn("pdf-page", crate::jobs::Start::Now, move || {
-        crate::pdf::rasterize_page(&source, page, backend).map_err(|e| e.to_string())
+    crate::jobs::Job::spawn_stoppable("pdf-page", crate::jobs::Start::Now, move |unwanted| {
+        crate::pdf::rasterize_page_while_wanted(&source, page, backend, unwanted)
+            .map_err(|e| e.to_string())
+            .and_then(readable_page)
     })
+}
+
+/// A render that ran to its end but left nothing croft can read (an empty
+/// or damaged picture) is a failed render, as the open that waited for it
+/// once said, not a page that shows nothing (#2829 review).
+pub(super) fn readable_page(bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+    match image_dimensions_of(&bytes) {
+        Some(_) => Ok(bytes),
+        None => Err(String::from("the rendered page could not be read")),
+    }
 }
 
 impl PdfJobs {

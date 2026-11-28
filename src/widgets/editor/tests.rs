@@ -3541,6 +3541,20 @@ fn a_sniffed_pdf_that_will_not_render_lands_in_hex_saying_why() {
     );
 }
 
+/// A render that ran to its end but left nothing readable is a failed
+/// render, as the open that waited for it said, not a page that shows
+/// nothing for good (#2829 review).
+#[test]
+fn a_render_that_left_nothing_readable_is_a_failed_render() {
+    assert!(super::viewers::readable_page(Vec::new()).is_err());
+    assert!(super::viewers::readable_page(b"not a picture".to_vec()).is_err());
+    let mut png = Vec::new();
+    image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 0, 255]))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    assert_eq!(super::viewers::readable_page(png.clone()), Ok(png));
+}
+
 /// A `.pdf` whose first page will not render keeps its tab, which says the
 /// page is not rendered, and asking for a page asks again (#2827).
 #[test]
