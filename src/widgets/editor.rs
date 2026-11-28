@@ -53,6 +53,7 @@ use brackets::*;
 use comments::*;
 pub use diff_view::diff_hit_test;
 use diff_view::*;
+pub use disk::ExternalReloadReport;
 pub use disk::LineEnding;
 pub use disk::SCRATCH_SAVE_REFUSAL;
 pub use disk::SaveCleanup;
@@ -1007,6 +1008,9 @@ pub struct Editor {
     /// reader back to page 1 (#72). Set by `reload_from_disk`, consumed
     /// (or cleared) by the `open` it wraps.
     pdf_restore_page: Option<u32>,
+    /// The PDF preview's work running off the UI thread (#2824): a page
+    /// being rendered, the page count, a page's links for a waiting click.
+    pub pdf_jobs: PdfJobs,
     /// Read-only spreadsheet preview for `.csv` / `.tsv` / `.xlsx` / etc.
     /// Mutually exclusive with `image` and the text path; none of the
     /// editor's text fields are populated when this is `Some`.
@@ -1296,6 +1300,7 @@ impl Editor {
             md_outputs: crate::markdown::BlockOutputs::new(),
             image: None,
             pdf_restore_page: None,
+            pdf_jobs: PdfJobs::default(),
             sheet: None,
             diff: None,
             hex: None,

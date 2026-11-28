@@ -157,14 +157,14 @@ impl Drop for KernelSession {
 /// (where a project's kernel and its dependencies live), the active venv,
 /// then whatever `python3` is on PATH.
 pub fn python_candidates(workspace: &Path, virtual_env: Option<&Path>) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = [".venv", "venv"]
+    let mut out: Vec<PathBuf> = crate::python_env::VENV_NAMES
         .iter()
         .map(|d| workspace.join(d).join("bin").join("python"))
-        .filter(|p| p.exists())
+        .filter(|p| crate::proc::find::runnable(p))
         .collect();
     if let Some(v) = virtual_env {
         let p = v.join("bin").join("python");
-        if p.exists() && !out.contains(&p) {
+        if crate::proc::find::runnable(&p) && !out.contains(&p) {
             out.push(p);
         }
     }
@@ -706,6 +706,7 @@ fn render(doc: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     const NB: &str = "{\n \"cells\": [\n  {\n   \"cell_type\": \"markdown\",\n   \"metadata\": {},\n   \"source\": [\n    \"# t\"\n   ]\n  },\n  {\n   \"cell_type\": \"code\",\n   \"execution_count\": 7,\n   \"id\": \"c-a\",\n   \"metadata\": {},\n   \"outputs\": [\n    {\n     \"name\": \"stdout\",\n     \"output_type\": \"stream\",\n     \"text\": [\n      \"old\\n\"\n     ]\n    }\n   ],\n   \"source\": [\n    \"print(1+1)\\n\",\n    \"40+2\"\n   ]\n  }\n ],\n \"metadata\": {\n  \"kernelspec\": {\n   \"display_name\": \"Python 3\",\n   \"language\": \"python\",\n   \"name\": \"python3\"\n  }\n },\n \"nbformat\": 4,\n \"nbformat_minor\": 5\n}\n";
 
@@ -774,6 +775,23 @@ mod tests {
         let py = dir.path().join(".venv/bin/python");
         std::fs::create_dir_all(py.parent().unwrap()).unwrap();
         std::fs::write(&py, "").unwrap();
+        std::fs::set_permissions(&py, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let c = python_candidates(dir.path(), None);
+        assert_eq!(c, vec![py, PathBuf::from("python3")]);
+    }
+
+    /// #2810: a workspace venv named `.env` is a candidate too, as it is
+    /// for Run, Debug and the tests; a `python` that cannot run is not.
+    #[test]
+    fn candidates_take_an_env_venv_and_skip_what_cannot_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let stray = dir.path().join(".venv/bin/python");
+        std::fs::create_dir_all(stray.parent().unwrap()).unwrap();
+        std::fs::write(&stray, "").unwrap();
+        let py = dir.path().join(".env/bin/python");
+        std::fs::create_dir_all(py.parent().unwrap()).unwrap();
+        std::fs::write(&py, "").unwrap();
+        std::fs::set_permissions(&py, std::fs::Permissions::from_mode(0o755)).unwrap();
         let c = python_candidates(dir.path(), None);
         assert_eq!(c, vec![py, PathBuf::from("python3")]);
     }

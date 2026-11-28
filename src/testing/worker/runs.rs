@@ -134,7 +134,12 @@ pub(super) fn run_one_case_seen(root: &Path, tx: &EpochTx, runner: Runner, name:
 pub(super) fn run_one_case(root: &Path, tx: &EpochTx, runner: Runner, name: &str) -> bool {
     match runner {
         Runner::Pytest => {
-            let cmd = pytest_cmd(root, &[PYTEST_RUN_VERBOSITY, "--color=no", name]);
+            let file = pytest_node_file(root, name);
+            let cmd = pytest_cmd_in(
+                root,
+                file.as_deref(),
+                &[PYTEST_RUN_VERBOSITY, "--color=no", name],
+            );
             run_streaming(tx, cmd, one(parse_pytest_line))
         }
         Runner::Vitest => run_vitest(tx, root, &vitest_one_args(name)),
@@ -185,10 +190,20 @@ pub(super) fn run_filter_in(
         Runner::Pytest => {
             // A suite is always a node-ID prefix; the `.py` sniff keeps a
             // node-ID handed to a plain filter run positional too.
+            // Under the venv nearest the file the tests are in (#2810).
             let cmd = if suite || pattern.contains(".py") {
-                pytest_cmd(root, &[PYTEST_RUN_VERBOSITY, "--color=no", pattern])
+                let named = pytest_node_file(root, pattern);
+                pytest_cmd_in(
+                    root,
+                    named.as_deref().or(file),
+                    &[PYTEST_RUN_VERBOSITY, "--color=no", pattern],
+                )
             } else {
-                pytest_cmd(root, &[PYTEST_RUN_VERBOSITY, "--color=no", "-k", pattern])
+                pytest_cmd_in(
+                    root,
+                    file,
+                    &[PYTEST_RUN_VERBOSITY, "--color=no", "-k", pattern],
+                )
             };
             run_streaming(tx, cmd, one(parse_pytest_line))
         }

@@ -8,32 +8,33 @@ use super::*;
 /// config resolvable), then `PATH`, then the usual global dirs — absolute for
 /// the same GUI-stripped-PATH reason as [`cargo_cmd`].
 pub(super) fn js_binary(root: &Path, name: &str) -> PathBuf {
-    let local = root.join("node_modules").join(".bin").join(name);
-    if local.is_file() {
-        return local;
-    }
-    if let Some(path_var) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                return candidate;
-            }
-        }
-    }
-    for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
-        let candidate = PathBuf::from(dir).join(name);
-        if candidate.is_file() {
-            return candidate;
-        }
-    }
-    PathBuf::from(name)
+    let path_dirs = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let dirs = std::iter::once(root.join("node_modules").join(".bin"))
+        .chain(path_dirs)
+        .chain(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from));
+    crate::proc::find::first_in(name, dirs).unwrap_or_else(|| PathBuf::from(name))
 }
 
 /// `<vitest|jest> <args>` rooted at the workspace, with piped stdio.
 /// `NO_COLOR` strips ANSI from the parsed stream and `CI` keeps vitest out of
 /// watch/interactive mode.
 pub(super) fn js_cmd<S: AsRef<std::ffi::OsStr>>(root: &Path, runner: &str, args: &[S]) -> Command {
+    js_cmd_for(root, runner, args, crate::node::dir().as_deref())
+}
+
+/// [`js_cmd`] under the node in `node`, the folder [`crate::node::dir`]
+/// found off croft's `PATH`: the runner's script starts with
+/// `#!/usr/bin/env node`, so that folder goes first on its `PATH` (#2809).
+pub(super) fn js_cmd_for<S: AsRef<std::ffi::OsStr>>(
+    root: &Path,
+    runner: &str,
+    args: &[S],
+    node: Option<&Path>,
+) -> Command {
     let mut cmd = Command::new(js_binary(root, runner));
+    crate::node::put(&mut cmd, node);
     cmd.args(args)
         .current_dir(root)
         .env("NO_COLOR", "1")
