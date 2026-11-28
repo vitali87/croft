@@ -2196,6 +2196,14 @@ impl App {
                         }
                         return;
                     }
+                    // The change list's scrollbar jumps on a press and
+                    // follows a drag, as the COMMITS graph's does (#2860).
+                    if rect_contains(self.source_control.last_scrollbar, m.column, m.row) {
+                        self.source_control.scroll_to_bar_y(m.row);
+                        self.scrollbar_drag = Some(Pane::Tree);
+                        self.tree_click.clear();
+                        return;
+                    }
                     if let Some(root) = self.source_control.click_repository(m.column, m.row) {
                         // Pin the panel to the clicked repository (#161);
                         // the next cross-folder focus releases it. Its row
