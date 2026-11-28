@@ -784,7 +784,7 @@ pub(super) fn render_diff(
     theme: crate::theme::Theme,
     pointer: Option<(u16, u16)>,
 ) -> (Rect, Rect) {
-    use crate::widgets::diff::DiffRow;
+    use crate::diff::DiffRow;
     // Background fill so the diff sits on a clean canvas (see [`canvas_bg`]).
     let bg_style = Style::default().bg(bg);
     for y in inner.y..inner.y + inner.height {
@@ -1044,7 +1044,7 @@ pub(super) fn render_diff(
         }
         // The changed characters of a replaced line (#1351), on both sides.
         let intraline = match row {
-            DiffRow::Replaced { .. } => crate::widgets::diff::changed_char_ranges(&l_text, &r_text),
+            DiffRow::Replaced { .. } => crate::diff::changed_char_ranges(&l_text, &r_text),
             _ => None,
         };
         if let Some((range, _)) = intraline {
@@ -1453,7 +1453,8 @@ pub(super) fn diff_side_line(
     row_idx: usize,
     side: crate::widgets::diff::DiffSide,
 ) -> &str {
-    use crate::widgets::diff::{DiffRow, DiffSide};
+    use crate::diff::DiffRow;
+    use crate::widgets::diff::DiffSide;
     let (left, right) = match diff.rows.get(row_idx) {
         Some(DiffRow::Equal { left, right } | DiffRow::Replaced { left, right }) => {
             (Some(*left), Some(*right))
@@ -1541,7 +1542,7 @@ pub(super) fn render_unified_deletion(
     theme: crate::theme::Theme,
     pointer: Option<(u16, u16)>,
 ) -> (Rect, Rect) {
-    use crate::widgets::diff::DiffRow;
+    use crate::diff::DiffRow;
     let name = diff
         .left_path
         .file_name()

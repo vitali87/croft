@@ -179,7 +179,7 @@ fn click_on_a_deleted_source_control_entry_opens_unified_diff_with_head_lines_al
     assert!(
         diff.rows
             .iter()
-            .all(|r| matches!(r, crate::widgets::diff::DiffRow::Removed { .. })),
+            .all(|r| matches!(r, crate::diff::DiffRow::Removed { .. })),
         "every visible row must be Removed so the whole pane paints red"
     );
 }
@@ -7973,7 +7973,7 @@ fn a_windows_1252_file_opens_its_source_control_diff() {
     let changed = diff
         .rows
         .iter()
-        .filter(|r| !matches!(r, crate::widgets::diff::DiffRow::Equal { .. }))
+        .filter(|r| !matches!(r, crate::diff::DiffRow::Equal { .. }))
         .count();
     assert_eq!(changed, 1, "only the added line differs");
 }

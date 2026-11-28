@@ -801,7 +801,7 @@ impl Editor {
     /// buffer has changed since they were last built. Cheap no-op when the
     /// `edit_seq` is unchanged, so the render loop can call it every frame.
     pub(super) fn refresh_git_marks(&mut self) {
-        use crate::widgets::diff::DiffRow;
+        use crate::diff::DiffRow;
         if self.git_marks_seq == self.edit_seq {
             return;
         }
@@ -814,7 +814,7 @@ impl Editor {
         // a bare `Removed` run is a real deletion: attach a `Deleted` marker to
         // the next surviving line (the gutter's deletion boundary, VS Code-style).
         let head: Vec<&str> = head.iter().collect();
-        let rows = crate::widgets::diff::build_diff_rows(&head, &self.lines);
+        let rows = crate::diff::build_diff_rows(&head, &self.lines);
         let mut pending_delete = false;
         for row in &rows {
             match *row {

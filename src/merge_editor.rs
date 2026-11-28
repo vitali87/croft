@@ -10,8 +10,8 @@
 //! only tracks where each conflict region lives inside it and what state
 //! the region is in.
 
+use crate::diff::{DIFF_DEADLINE, DiffRow, build_diff_rows, build_diff_rows_within};
 use crate::merge::ConflictBlock;
-use crate::widgets::diff::{DIFF_DEADLINE, DiffRow, build_diff_rows, build_diff_rows_within};
 
 /// What the user decided for one conflict region.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

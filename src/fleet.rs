@@ -414,7 +414,7 @@ pub fn target_command(target: &str, command: &str) -> (String, Vec<String>) {
 /// for a reference line the host's output is missing. Both sides, so a
 /// host that dropped a line says which one, not only that it differs.
 pub fn differing_lines(reference: &str, output: &str) -> Vec<String> {
-    use crate::widgets::diff::{DiffRow, build_diff_rows};
+    use crate::diff::{DiffRow, build_diff_rows};
     let old: Vec<String> = reference.lines().map(str::to_string).collect();
     let new: Vec<String> = output.lines().map(str::to_string).collect();
     let mut out = Vec::new();

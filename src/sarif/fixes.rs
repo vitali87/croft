@@ -361,7 +361,7 @@ pub fn apply_diff(
 
 /// A short line diff of what a fix does, for the Fix tab.
 pub fn preview(edits: &[FileEdit]) -> Vec<String> {
-    use crate::widgets::diff::{DiffRow, build_diff_rows};
+    use crate::diff::{DiffRow, build_diff_rows};
     let mut out = Vec::new();
     for e in edits {
         out.push(
