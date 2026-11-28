@@ -126,6 +126,9 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests;
 
+#[cfg(all(test, target_os = "linux"))]
+mod recorded_calls;
+
 mod config_repush;
 #[cfg(test)]
 mod offer_tests;
