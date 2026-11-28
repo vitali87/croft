@@ -33,7 +33,7 @@ pub(in crate::app) fn lldb_dap_rank(name: &str) -> Option<i64> {
 /// none is installed.
 pub(in crate::app) fn lldb_dap_path() -> Option<String> {
     let xcode = "/Library/Developer/CommandLineTools/usr/bin/lldb-dap";
-    if std::path::Path::new(xcode).is_file() {
+    if crate::proc::find::runnable(Path::new(xcode)) {
         return Some(xcode.to_string());
     }
     let path_var = std::env::var_os("PATH")?;
@@ -50,7 +50,7 @@ pub(in crate::app) fn lldb_dap_path() -> Option<String> {
                 continue;
             };
             let full = entry.path();
-            if is_executable_file(&full) && best.as_ref().is_none_or(|(r, _)| rank > *r) {
+            if crate::proc::find::runnable(&full) && best.as_ref().is_none_or(|(r, _)| rank > *r) {
                 best = Some((rank, full.to_string_lossy().into_owned()));
             }
         }
@@ -69,31 +69,22 @@ pub(in crate::app) fn lldb_dap_missing_message() -> String {
     format!("lldb-dap not found ({hint})")
 }
 
-/// Whether `path` is a regular file with the executable bit set — i.e. a
-/// compiled binary or script croft can run directly (`./file`) and debug via
-/// lldb-dap without a build step. The honest signal for "directly executable",
-/// since such files usually have no extension.
-pub(in crate::app) fn is_executable_file(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
 impl App {
     /// Debug: Install Go Debugger (delve) (#264). Runs `go install` in a
     /// terminal pane, where the user sees the command and its output: that
     /// visible run is the consent, as for a coverage tool. Without Go there
     /// is nothing to run it with, so it says that instead.
     pub(in crate::app) fn install_delve(&mut self) {
-        if !crate::dap::install::go_on_path() {
+        let Some(go) = crate::proc::find::go() else {
             self.status = crate::dap::install::dlv_missing_message(false);
             return;
-        }
+        };
         match crate::widgets::terminal::PtyTerminal::new(self.roots.primary()) {
             Ok(mut term) => {
                 term.set_manual_name(Some(String::from("delve install")));
-                term.write_input(format!("{}\r", crate::dap::install::DLV_INSTALL).as_bytes());
+                term.write_input(
+                    format!("{}\r", crate::dap::install::dlv_install_command(&go)).as_bytes(),
+                );
                 self.insert_terminal(term);
                 self.show_terminal = true;
                 self.focus_pane(Pane::Terminal);

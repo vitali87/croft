@@ -440,6 +440,23 @@ impl App {
         if report.is_empty() {
             return settled;
         }
+        self.announce_external_changes(report);
+        // Keep the watcher's active-file baseline aligned with the reload so
+        // a just-applied change doesn't re-trigger on the next poll.
+        self.sync_open_file_poll_mtime();
+        true
+    }
+
+    /// Say what a sweep found: a conflict asks, a deletion or a failed
+    /// reload is said in the status line, a reload says what was reloaded.
+    /// Also for a PDF rebuild that lands on a job after its sweep (#2827),
+    /// which is why the watcher's baselines are left to the sweep: moved
+    /// here, a landing would take in writes to other files that no sweep
+    /// had looked at, and they would never reload.
+    pub(super) fn announce_external_changes(
+        &mut self,
+        report: crate::widgets::editor::ExternalReloadReport,
+    ) {
         // The active file changed on disk under a clean buffer: its coverage
         // marks describe the old text now, so they dim like an edit's (#263).
         if let Some(active) = self.editor.path.as_ref()
@@ -509,10 +526,6 @@ impl App {
                 self.status = format!("Reloaded {n} files changed on disk");
             }
         }
-        // Keep the watcher's active-file baseline aligned with the reload so
-        // a just-applied change doesn't re-trigger on the next poll.
-        self.sync_open_file_poll_mtime();
-        true
     }
 
     /// A dirty buffer collided with an external write. Surface it unmissably
@@ -2288,6 +2301,9 @@ impl App {
         // refusing NEW debug builds until the stale compile finished.
         self.disarm_failure_breakpoint();
         self.pending_test_debug = None;
+        // A launch waiting for its debugger was asked for in the old
+        // workspace: a Debug Test there would run in this one (#2803).
+        self.forget_parked_setup_launches();
         if self.sidebar_view == SidebarView::Testing {
             self.discover_tests();
         }

@@ -1,0 +1,1 @@
+fix: opening a PDF no longer freezes croft while its first page renders: the tab opens at once saying it is rendering, and the page shows when it is ready. A file that only looks like a PDF and will not render lands in the hex viewer saying why, as before; a `.pdf` that will not render yet keeps its tab, and turning to a page tries again (#2827).
