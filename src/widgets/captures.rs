@@ -16,7 +16,7 @@ use ratatui::{
     widgets::{Paragraph, Widget},
 };
 
-use crate::theme::Theme;
+use crate::widgets::view_cx::ViewCx;
 
 const COLOR_DIM: Color = Color::Rgb(0x80, 0x88, 0x98);
 const COLOR_HEAD: Color = Color::Rgb(0x8b, 0x93, 0xa1);
@@ -107,11 +107,6 @@ pub struct CapturesPanel {
     entries: Vec<CapturedLine>,
     selected: usize,
 
-    pub focus_gradient: bool,
-    pub theme: Theme,
-    pub focused: bool,
-    pub hover_pointer: Option<(u16, u16)>,
-
     pub last_area: Rect,
     /// Body-row hit rects (index into `entries`), recomputed each render.
     row_rects: Vec<(Rect, usize)>,
@@ -122,15 +117,12 @@ impl CapturesPanel {
         Self {
             entries: Vec::new(),
             selected: 0,
-            focus_gradient: false,
-            theme: Theme::default(),
-            focused: false,
-            hover_pointer: None,
             last_area: Rect::default(),
             row_rects: Vec::new(),
         }
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -204,24 +196,25 @@ impl CapturesPanel {
     }
 }
 
-impl Widget for &mut CapturesPanel {
-    fn render(self, area: Rect, buf: &mut Buffer) {
+impl CapturesPanel {
+    /// Draw the view into `area` with this frame's [`ViewCx`].
+    pub fn draw(&mut self, cx: &ViewCx, area: Rect, buf: &mut Buffer) {
         self.last_area = area;
         self.row_rects.clear();
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let accent = if self.focus_gradient {
+        let accent = if cx.theme.gradient() {
             crate::gradient::rgb_color(crate::gradient::PANEL_TITLE_FG)
         } else {
-            self.theme.ui(Color::White)
+            cx.theme.ui(Color::White)
         };
-        buf.set_style(area, Style::default().bg(self.theme.editor_bg()));
+        buf.set_style(area, Style::default().bg(cx.theme.editor_bg()));
 
         if self.entries.is_empty() {
             Paragraph::new(Line::from(Span::styled(
                 "No captured output yet. Add a trigger with \"action\": \"capture\" to triggers.json (Preferences: Open Terminal Triggers) and matching lines collect here.",
-                Style::default().fg(self.theme.ui(COLOR_DIM)),
+                Style::default().fg(cx.theme.ui(COLOR_DIM)),
             )))
             .render(area, buf);
             return;
@@ -233,7 +226,7 @@ impl Widget for &mut CapturesPanel {
             area.y,
             format!("{:<12}{:<28}{}", "PANE", "MATCH", "LINE"),
             Style::default()
-                .fg(self.theme.ui(COLOR_HEAD))
+                .fg(cx.theme.ui(COLOR_HEAD))
                 .add_modifier(Modifier::BOLD),
         );
 
@@ -256,8 +249,7 @@ impl Widget for &mut CapturesPanel {
             };
             self.row_rects.push((r, idx));
             let selected = idx == self.selected;
-            let hovered =
-                crate::widgets::hover::row_hover_bg(r, self.hover_pointer, self.theme).is_some();
+            let hovered = crate::widgets::hover::row_hover_bg(r, cx.pointer, cx.theme).is_some();
             if selected || hovered {
                 buf.set_style(
                     r,
@@ -275,12 +267,12 @@ impl Widget for &mut CapturesPanel {
                 Span::styled(
                     format!("{msg:<28}"),
                     Style::default()
-                        .fg(self.theme.ui(COLOR_MSG))
+                        .fg(cx.theme.ui(COLOR_MSG))
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     entry.line.clone(),
-                    Style::default().fg(self.theme.ui(COLOR_DIM)),
+                    Style::default().fg(cx.theme.ui(COLOR_DIM)),
                 ),
             ];
             Paragraph::new(Line::from(spans)).render(
@@ -300,7 +292,7 @@ impl Widget for &mut CapturesPanel {
                 area.y + area.height - 1,
                 "  ⏎ jump to line   ·   n ask navigator   ·   x remove   ·   c clear all",
                 area.width as usize,
-                Style::default().fg(self.theme.ui(COLOR_DIM)),
+                Style::default().fg(cx.theme.ui(COLOR_DIM)),
             );
         }
     }

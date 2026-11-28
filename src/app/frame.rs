@@ -1214,14 +1214,10 @@ impl App {
                 area
             };
             self.paint_panel_tabs(frame, strip);
-            // The render-time pointer cell, fed to the panel's views as it is
-            // to the side bar's above, so the row under the mouse lights up on
-            // every move and goes dark when the pointer leaves (#2068).
-            let panel_pointer = self.pointer_cell;
-            self.problems.hover_pointer = panel_pointer;
-            self.output.hover_pointer = panel_pointer;
-            self.ports.hover_pointer = panel_pointer;
-            self.captures.hover_pointer = panel_pointer;
+            // The panel's views draw with this frame's pointer, so the row
+            // under the mouse lights up on every move and goes dark when the
+            // pointer leaves (#2068), and with the panel's focus.
+            let panel_cx = self.view_cx(self.focus == Pane::Terminal);
             match self.bottom_panel_tab {
                 BottomPanelTab::Terminal => {
                     let n = self.terminals.len().max(1);
@@ -1522,7 +1518,7 @@ impl App {
                         t.last_area = Rect::default();
                         t.redacted_on_screen = 0;
                     }
-                    frame.render_widget(&mut self.problems, content);
+                    self.problems.draw(&panel_cx, content, frame.buffer_mut());
                     self.paint_panel_view_top(frame, content);
                 }
                 BottomPanelTab::Output => {
@@ -1539,7 +1535,7 @@ impl App {
                         t.last_area = Rect::default();
                         t.redacted_on_screen = 0;
                     }
-                    frame.render_widget(&mut self.output, content);
+                    self.output.draw(&panel_cx, content, frame.buffer_mut());
                     self.paint_panel_view_top(frame, content);
                 }
                 BottomPanelTab::Ports => {
@@ -1556,7 +1552,7 @@ impl App {
                         t.last_area = Rect::default();
                         t.redacted_on_screen = 0;
                     }
-                    frame.render_widget(&mut self.ports, content);
+                    self.ports.draw(&panel_cx, content, frame.buffer_mut());
                     self.paint_panel_view_top(frame, content);
                 }
                 BottomPanelTab::Captures => {
@@ -1572,7 +1568,7 @@ impl App {
                         t.last_area = Rect::default();
                         t.redacted_on_screen = 0;
                     }
-                    frame.render_widget(&mut self.captures, content);
+                    self.captures.draw(&panel_cx, content, frame.buffer_mut());
                     self.paint_panel_view_top(frame, content);
                 }
             }
