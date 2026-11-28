@@ -108,6 +108,15 @@ class Gutting(unittest.TestCase):
         after = doc(["src/", "└── a/                   does a thing, one file per area"])
         self.assertEqual(gate.compare(before, after), ([], []))
 
+    def test_a_row_whose_file_git_saw_renamed_is_not_dropped(self):
+        """`src/a/walk.rs` moved to `src/b/walk.rs`: git sees the rename, so
+        the row under the new folder is the same module's. Without the
+        rename the old row is reported as dropped."""
+        before = doc(["src/", "├── a/                   the a parts", "│   └── walk.rs          walks the tree", "└── b/                   the b parts"])
+        after = doc(["src/", "├── a/                   the a parts", "└── b/                   the b parts", "    └── walk.rs          walks the tree"])
+        self.assertEqual(gate.compare(before, after)[1], ["src/a/walk.rs"])
+        self.assertEqual(gate.compare(before, after, {"src/a/walk.rs": "src/b/walk.rs"}), ([], []))
+
     def test_a_file_row_gutted_on_its_way_into_a_directory_is_reported(self):
         before = doc(["src/", "└── a.rs                 " + self.LONG])
         after = doc(["src/", "└── a/                   short"])
