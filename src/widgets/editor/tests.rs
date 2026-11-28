@@ -2577,6 +2577,7 @@ fn the_svg_header_shows_the_drawings_size_not_the_rasters() {
     let mut buf = ratatui::buffer::Buffer::empty(area);
     render_image_placeholder(
         img,
+        false,
         Some(&p),
         area,
         &mut buf,
@@ -3487,6 +3488,14 @@ fn extensionless_pdf_and_plain_zip_never_dead_end() {
         e.image.as_ref().is_some_and(|i| i.pdf.is_some()) || e.hex.is_some(),
         "a sniffed PDF opens in the reader or falls to hex, never errors"
     );
+    // Its first page renders on a job (#2827): one that will not render
+    // lands in hex then, saying why.
+    settle_pdf_jobs(&mut e);
+    assert!(
+        e.pdf_page_shown() || e.hex.is_some(),
+        "a sniffed PDF that would not render falls to hex; status: {}",
+        e.status
+    );
 
     // A zip that is NOT a workbook: the xlsx attempt fails, the hex
     // fallback catches it.
@@ -3506,6 +3515,68 @@ fn extensionless_pdf_and_plain_zip_never_dead_end() {
         "a non-workbook zip lands in the archive browser (#179)"
     );
     assert!(e.sheet.is_none() && e.hex.is_none());
+}
+
+/// A file sniffed as a PDF whose first page will not render goes to the hex
+/// viewer saying why (#2827): the render is on a job now, and its failure
+/// lands where the open's used to.
+#[test]
+fn a_sniffed_pdf_that_will_not_render_lands_in_hex_saying_why() {
+    if crate::pdf::detect_backend().is_none() {
+        eprintln!("skipping: no PDF rasteriser installed");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let pdf = tmp.path().join("notes");
+    std::fs::write(&pdf, b"%PDF-1.4\nnot really a pdf\n\x00\x01").unwrap();
+    let mut e = Editor::new();
+    e.open(&pdf).unwrap();
+    settle_pdf_jobs(&mut e);
+    assert!(e.hex.is_some(), "status: {}", e.status);
+    assert!(
+        e.hex_routed_because()
+            .is_some_and(|why| why.contains("PDF viewer could not render")),
+        "{:?}",
+        e.hex_routed_because()
+    );
+}
+
+/// A render that ran to its end but left nothing readable is a failed
+/// render, as the open that waited for it said, not a page that shows
+/// nothing for good (#2829 review).
+#[test]
+fn a_render_that_left_nothing_readable_is_a_failed_render() {
+    assert!(super::viewers::readable_page(Vec::new()).is_err());
+    assert!(super::viewers::readable_page(b"not a picture".to_vec()).is_err());
+    let mut png = Vec::new();
+    image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 0, 255]))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    assert_eq!(super::viewers::readable_page(png.clone()), Ok(png));
+}
+
+/// A `.pdf` whose first page will not render keeps its tab, which says the
+/// page is not rendered, and asking for a page asks again (#2827).
+#[test]
+fn a_pdf_whose_first_page_will_not_render_keeps_its_tab_and_asks_again() {
+    if crate::pdf::detect_backend().is_none() {
+        eprintln!("skipping: no PDF rasteriser installed");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let pdf = tmp.path().join("half-written.pdf");
+    std::fs::write(&pdf, b"%PDF-1.4\nnot really a pdf\n").unwrap();
+    let mut e = Editor::new();
+    e.open(&pdf).unwrap();
+    settle_pdf_jobs(&mut e);
+    assert!(e.image.as_ref().is_some_and(|i| i.pdf.is_some()));
+    assert!(!e.pdf_page_shown());
+    assert!(e.status.contains("failed"), "{}", e.status);
+    e.set_pdf_page(1);
+    assert!(
+        e.pdf_jobs.rendering(),
+        "page 1 is asked for again, though it is the current page"
+    );
 }
 
 fn gzip_to(path: &Path, data: &[u8]) {
@@ -11120,6 +11191,7 @@ fn open_pdf_tab_keeps_last_good_page_through_a_mid_write_sweep() {
     std::fs::write(&path, one_page_pdf).unwrap();
     let mut tabs = EditorTabs::new();
     tabs.open_pinned(&path).unwrap();
+    settle_pdf_jobs(&mut tabs);
     let good_bytes = {
         let tab = tabs.iter_tabs().next().unwrap();
         tab.image
@@ -11140,6 +11212,19 @@ fn open_pdf_tab_keeps_last_good_page_through_a_mid_write_sweep() {
         report.conflicts.is_empty(),
         "a clean tab is never a conflict"
     );
+    settle_pdf_jobs(&mut tabs);
+    assert_eq!(
+        tabs.take_landed_reloads().failed,
+        vec![path.clone()],
+        "the failed rebuild is said once it lands (#2827)"
+    );
+    // A sweep with nothing new on disk tries again, quietly.
+    tabs.reload_externally_changed_tabs(&|_| false);
+    settle_pdf_jobs(&mut tabs);
+    assert!(
+        tabs.take_landed_reloads().is_empty(),
+        "the same failed version is said only once"
+    );
     let tab = tabs.iter_tabs().next().unwrap();
     assert_eq!(
         tab.image
@@ -11152,10 +11237,73 @@ fn open_pdf_tab_keeps_last_good_page_through_a_mid_write_sweep() {
     // The write completes; the next sweep picks it up.
     std::fs::write(&path, one_page_pdf).unwrap();
     bump_mtime(&path, 4);
-    let report = tabs.reload_externally_changed_tabs(&|_| false);
-    assert_eq!(report.reloaded, vec![path.clone()]);
+    tabs.reload_externally_changed_tabs(&|_| false);
+    settle_pdf_jobs(&mut tabs);
+    assert_eq!(tabs.take_landed_reloads().reloaded, vec![path.clone()]);
     let tab = tabs.iter_tabs().next().unwrap();
     assert!(tab.image.is_some(), "completed write renders again");
+}
+
+/// Let a PDF tab's work that runs off the UI thread land (#2824).
+fn settle_pdf_jobs(ed: &mut Editor) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while ed.pdf_jobs.busy() {
+        ed.poll_pdf_jobs();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the PDF work must land; status: {}",
+            ed.status
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// A page that lands after its tab moved on to another file is dropped
+/// (#2824): it must never replace the picture now on screen.
+#[test]
+fn a_pdf_page_landing_after_the_tab_moved_on_is_dropped() {
+    if crate::pdf::detect_backend().is_none() {
+        eprintln!("skipping: no PDF rasteriser installed");
+        return;
+    }
+    let two_page_pdf = concat!(
+        "%PDF-1.4\n",
+        "1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n",
+        "2 0 obj<</Type/Pages/Kids[3 0 R 5 0 R]/Count 2>>endobj\n",
+        "3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]/Contents 4 0 R>>endobj\n",
+        "4 0 obj<</Length 27>>stream\n0 0 1 rg 10 10 100 100 re f\nendstream endobj\n",
+        "5 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]/Contents 6 0 R>>endobj\n",
+        "6 0 obj<</Length 27>>stream\n1 0 0 rg 10 10 100 100 re f\nendstream endobj\n",
+        "trailer<</Root 1 0 R/Size 7>>\n%%EOF\n",
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let pdf = dir.path().join("deck.pdf");
+    std::fs::write(&pdf, two_page_pdf).unwrap();
+    let png = dir.path().join("shot.png");
+    let mut bytes = Vec::new();
+    image::RgbaImage::from_pixel(4, 4, image::Rgba([1, 2, 3, 255]))
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    std::fs::write(&png, &bytes).unwrap();
+    let mut e = Editor::new();
+    e.open(&pdf).unwrap();
+    settle_pdf_jobs(&mut e);
+    e.change_pdf_page(1);
+    assert!(e.pdf_jobs.busy(), "page 2 renders on a job");
+    e.open(&png).unwrap();
+    let shown = e.image.as_ref().unwrap().bytes.clone();
+    // Whatever is still running lands now (none is, once the view is
+    // cleared).
+    settle_pdf_jobs(&mut e);
+    assert!(
+        e.image
+            .as_ref()
+            .is_some_and(|i| i.pdf.is_none() && i.bytes == shown),
+        "the picture now on screen must stay"
+    );
 }
 
 /// Reading page 2 of a deck while pdflatex rebuilds the file: the
@@ -11182,7 +11330,9 @@ fn pdf_reload_keeps_the_current_page() {
     std::fs::write(&path, two_page_pdf).unwrap();
     let mut tabs = EditorTabs::new();
     tabs.open_pinned(&path).unwrap();
-    assert!(tabs.change_pdf_page(1), "two pages, so page 2 renders");
+    settle_pdf_jobs(&mut tabs);
+    tabs.change_pdf_page(1);
+    settle_pdf_jobs(&mut tabs);
     assert_eq!(tabs.pdf_page(), Some(2));
     // pdflatex rewrites the file (same content is enough; only the
     // disk stamp needs to move).
@@ -11194,14 +11344,112 @@ fn pdf_reload_keeps_the_current_page() {
         .unwrap()
         .set_modified(newer)
         .unwrap();
+    let shown = tabs
+        .iter_tabs()
+        .next()
+        .unwrap()
+        .image
+        .as_ref()
+        .unwrap()
+        .generation;
     let report = tabs.reload_externally_changed_tabs(&|_| false);
-    assert_eq!(report.reloaded, vec![path.clone()]);
+    // The rebuild renders on a job (#2827): the sweep returns at once, with
+    // the page on screen as it was, and the reload is said when it lands.
+    assert!(
+        report.reloaded.is_empty(),
+        "the sweep must not wait for the render"
+    );
+    assert_eq!(
+        tabs.iter_tabs()
+            .next()
+            .unwrap()
+            .image
+            .as_ref()
+            .unwrap()
+            .generation,
+        shown,
+        "the page on screen stays until the rebuild lands"
+    );
+    settle_pdf_jobs(&mut tabs);
+    assert_eq!(tabs.take_landed_reloads().reloaded, vec![path.clone()]);
+    assert_ne!(
+        tabs.iter_tabs()
+            .next()
+            .unwrap()
+            .image
+            .as_ref()
+            .unwrap()
+            .generation,
+        shown,
+        "the rebuild is shown once it lands"
+    );
     assert_eq!(
         tabs.pdf_page(),
         Some(2),
         "an external rebuild must not move the reader back to page 1; status: {:?}",
         tabs.iter_tabs().next().unwrap().status
     );
+}
+
+/// A PDF rebuilt again while its last rebuild still renders waits for it
+/// (#2827): one reload renders at a time, and the sweep after it lands
+/// renders the newer file, instead of a renderer per write piling up. A
+/// rebuild that fails after the file has moved on is not said: the newer
+/// one renders next.
+#[test]
+fn a_pdf_rebuilt_again_mid_reload_waits_for_the_reload_rendering() {
+    if crate::pdf::detect_backend().is_none() {
+        eprintln!("skipping: no PDF rasteriser installed");
+        return;
+    }
+    let one_page_pdf = concat!(
+        "%PDF-1.4\n",
+        "1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n",
+        "2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n",
+        "3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]/Contents 4 0 R>>endobj\n",
+        "4 0 obj<</Length 27>>stream\n0 0 1 rg 10 10 100 100 re f\nendstream endobj\n",
+        "trailer<</Root 1 0 R/Size 5>>\n%%EOF\n",
+    );
+    let rewrite = |path: &Path, secs: u64| {
+        std::fs::write(path, one_page_pdf).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(secs))
+            .unwrap();
+        Editor::disk_stamp_of(path)
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("deck.pdf");
+    std::fs::write(&path, one_page_pdf).unwrap();
+    let mut tabs = EditorTabs::new();
+    tabs.open_pinned(&path).unwrap();
+    settle_pdf_jobs(&mut tabs);
+    let first = rewrite(&path, 2);
+    *crate::pdf::FAIL_RASTERIZE_ONCE_FOR_TEST.lock().unwrap() = Some((path.clone(), 1));
+    tabs.reload_externally_changed_tabs(&|_| false);
+    assert!(tabs.pdf_jobs.reloading());
+    let second = rewrite(&path, 4);
+    assert_ne!(first, second);
+    tabs.reload_externally_changed_tabs(&|_| false);
+    assert_eq!(
+        tabs.disk_stamp, first,
+        "the second rebuild waits: the reload rendering is still the first"
+    );
+    settle_pdf_jobs(&mut tabs);
+    assert!(
+        tabs.take_landed_reloads().is_empty(),
+        "a rebuild that failed after the file moved on is not said"
+    );
+    tabs.reload_externally_changed_tabs(&|_| false);
+    assert!(
+        tabs.pdf_jobs.reloading(),
+        "the sweep after it lands renders the newer file"
+    );
+    assert_eq!(tabs.disk_stamp, second);
+    settle_pdf_jobs(&mut tabs);
+    assert_eq!(tabs.take_landed_reloads().reloaded, vec![path.clone()]);
 }
 
 /// The transient arm of the rebuild race (#72): the reader is on page 2,
@@ -11239,7 +11487,8 @@ fn a_transient_page_render_failure_during_reload_keeps_the_readers_place() {
     std::fs::write(&path, two_page_pdf).unwrap();
     let mut tabs = EditorTabs::new();
     tabs.open_pinned(&path).unwrap();
-    assert!(tabs.change_pdf_page(1), "two pages, so page 2 renders");
+    tabs.change_pdf_page(1);
+    settle_pdf_jobs(&mut tabs);
     let good_bytes = tabs
         .iter_tabs()
         .next()
@@ -11253,10 +11502,13 @@ fn a_transient_page_render_failure_during_reload_keeps_the_readers_place() {
     bump_mtime(&path, 2);
     *crate::pdf::FAIL_RASTERIZE_ONCE_FOR_TEST.lock().unwrap() = Some((path.clone(), 2));
     let report = tabs.reload_externally_changed_tabs(&|_| false);
+    assert!(report.reloaded.is_empty());
+    settle_pdf_jobs(&mut tabs);
+    let landed = tabs.take_landed_reloads();
     assert!(
-        report.reloaded.is_empty(),
+        landed.reloaded.is_empty() && landed.failed == vec![path.clone()],
         "a reload that cannot restore the reader's page is a failed \
-             reload, not a successful one that lost their place"
+             reload, not a successful one that lost their place: {landed:?}"
     );
     assert_eq!(
         tabs.pdf_page(),
@@ -11278,8 +11530,9 @@ fn a_transient_page_render_failure_during_reload_keeps_the_readers_place() {
     // The failure was transient: the next sweep reloads and the reader
     // is still on their page.
     bump_mtime(&path, 4);
-    let report = tabs.reload_externally_changed_tabs(&|_| false);
-    assert_eq!(report.reloaded, vec![path.clone()]);
+    tabs.reload_externally_changed_tabs(&|_| false);
+    settle_pdf_jobs(&mut tabs);
+    assert_eq!(tabs.take_landed_reloads().reloaded, vec![path.clone()]);
     assert_eq!(
         tabs.pdf_page(),
         Some(2),
@@ -13918,6 +14171,7 @@ fn non_iterm2_canvases_paint_the_theme_background_not_reset() {
     let mut buf = ratatui::buffer::Buffer::empty(area);
     render_image_placeholder(
         e.image.as_ref().unwrap(),
+        false,
         None,
         area,
         &mut buf,
@@ -13985,6 +14239,7 @@ fn the_kitty_image_canvas_keeps_the_default_bg_so_the_deep_z_preview_shows() {
     let mut buf = ratatui::buffer::Buffer::empty(area);
     render_image_placeholder(
         &image,
+        false,
         None,
         area,
         &mut buf,

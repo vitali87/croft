@@ -193,7 +193,9 @@ impl Bounded {
     /// What it kept is what the program wrote before it exited: a helper it
     /// leaves running may hold a stream open and write on, and croft does
     /// not wait for that.
+    #[track_caller]
     pub(crate) fn run(self, cmd: &mut Command) -> Result<Ran, RunError> {
+        super::about_to_wait(cmd.get_program());
         self.run_with(cmd, None)
     }
 
@@ -201,7 +203,9 @@ impl Bounded {
     /// once all of it is written. A program that exits or closes its stdin
     /// before reading it all is not an error: what it did with its input is
     /// its own answer, given by its exit status and output.
+    #[track_caller]
     pub(crate) fn run_fed(self, cmd: &mut Command, input: &[u8]) -> Result<Ran, RunError> {
+        super::about_to_wait(cmd.get_program());
         self.run_with(cmd, Some(input))
     }
 

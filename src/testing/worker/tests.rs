@@ -2032,7 +2032,7 @@ fn pytest_runs_as_a_module_of_the_project_venvs_python() {
         fake_venv(root, venv, "exit 0");
         let python = root.join(venv).join("bin").join("python");
         assert_eq!(
-            pytest_launch(root),
+            pytest_launch_on(root, std::env::var_os("PATH").as_deref()),
             (python.clone(), &["-m", "pytest"][..]),
             "{venv}"
         );
@@ -2057,7 +2057,10 @@ fn pytest_runs_as_a_module_of_the_project_venvs_python() {
     let bin = tmp.path().join(".venv").join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     std::fs::write(bin.join("python"), "").unwrap();
-    assert_ne!(pytest_launch(tmp.path()).0, bin.join("python"));
+    assert_ne!(
+        pytest_launch_on(tmp.path(), std::env::var_os("PATH").as_deref()).0,
+        bin.join("python")
+    );
 }
 
 /// #845 guard: only exit 0 and pytest's 5 ("no tests were collected")
@@ -2194,11 +2197,13 @@ fn a_venv_whose_python_imports_pytest_runs_it_without_the_script() {
 #[cfg(unix)]
 #[test]
 fn a_venv_is_probed_only_without_the_script_and_skipped_when_it_lacks_pytest() {
+    use std::os::unix::fs::PermissionsExt;
     let tmp = tempfile::tempdir().unwrap();
     let with_script = tmp.path().join("a");
     let python = scriptless_venv(&with_script, 0);
     let script = python.with_file_name("pytest");
     std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(pytest_launch_on(&with_script, None).0, python);
     assert!(
         !python.with_file_name("python.log").exists(),
@@ -2219,6 +2224,30 @@ fn a_venv_is_probed_only_without_the_script_and_skipped_when_it_lacks_pytest() {
         "-c import pytest\n",
         "its python was asked once"
     );
+}
+
+/// #2809: a project's vitest, a `#!/usr/bin/env node` script, runs under the
+/// node croft found off its own `PATH` (nvm's, here), not only under one on
+/// croft's `PATH`.
+#[cfg(unix)]
+#[test]
+fn a_js_runner_runs_under_the_node_croft_found() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let found = tmp.path().join(".nvm/versions/node/v22.1.0/bin");
+    std::fs::create_dir_all(&found).unwrap();
+    let node = found.join("node");
+    std::fs::write(&node, "#!/bin/sh\nprintf 'the found node'\n").unwrap();
+    std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let root = tmp.path().join("proj");
+    let bin = root.join("node_modules/.bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("vitest"), "#!/usr/bin/env node\n").unwrap();
+    std::fs::set_permissions(bin.join("vitest"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = js_cmd_for(&root, "vitest", &["run"], Some(&found))
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "the found node");
 }
 
 /// #845 guard: a project venv with pytest still wins over a `python3`
@@ -2560,4 +2589,75 @@ fn a_js_title_with_a_double_colon_still_runs_exactly() {
     for other in ["server connects to ::12", "server connects to"] {
         assert!(!filter.is_match(other), "{other} must not run");
     }
+}
+
+/// #2808: a `python3` or `pytest` on PATH that cannot run is passed over
+/// for the next folder's, as a shell passes it over; taken, it failed to
+/// start with "permission denied".
+#[cfg(unix)]
+#[test]
+fn a_python3_or_pytest_that_cannot_run_is_passed_over() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let (first, second) = (tmp.path().join("a"), tmp.path().join("b"));
+    for name in ["python3", "pytest"] {
+        for (dir, mode) in [(&first, 0o644), (&second, 0o755)] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join(name), "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(dir.join(name), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+        }
+    }
+    let path = std::env::join_paths([&first, &second]).unwrap();
+    assert_eq!(python3_program(Some(&path)), second.join("python3"));
+    assert_eq!(pytest_script(Some(&path)), Some(second.join("pytest")));
+}
+
+/// A venv at `dir/<name>` whose `python` and `pytest` can run.
+#[cfg(unix)]
+fn venv_with_pytest(dir: &Path, name: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let bin = dir.join(name).join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for exe in ["python", "pytest"] {
+        std::fs::write(bin.join(exe), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(bin.join(exe), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    bin.join("python")
+}
+
+/// #2810: a workspace venv named `.env`, which F5 and Debug Test run
+/// under, runs the tests too.
+#[cfg(unix)]
+#[test]
+fn a_workspace_venv_named_env_runs_the_tests() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    let python = venv_with_pytest(&root, ".env");
+    let empty = std::ffi::OsString::new();
+    assert_eq!(
+        pytest_launch_on(&root, Some(&empty)),
+        (python, &["-m", "pytest"][..])
+    );
+}
+
+/// #2810: a run of the tests in one file goes under the venv nearest that
+/// file, the interpreter Debug Test runs the same test under (#864); the
+/// workspace-wide run keeps the workspace's.
+#[cfg(unix)]
+#[test]
+fn a_run_of_one_file_uses_the_venv_nearest_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    let svc = root.join("svc");
+    let python = venv_with_pytest(&svc, "venv");
+    let file = pytest_node_file(&root, "svc/test_app.py::test_ok").unwrap();
+    assert_eq!(file, svc.join("test_app.py"));
+    let empty = std::ffi::OsString::new();
+    assert_eq!(
+        pytest_launch_for(&root, Some(&file), Some(&empty)).0,
+        python
+    );
+    assert_ne!(pytest_launch_for(&root, None, Some(&empty)).0, python);
+    assert_eq!(pytest_node_file(&root, "test_ok"), None);
 }

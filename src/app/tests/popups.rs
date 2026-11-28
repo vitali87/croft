@@ -509,6 +509,41 @@ fn a_terminal_picture_waits_for_the_find_bar_drawn_over_it() {
     );
 }
 
+/// A PDF opened in the tab of a picture shows nothing until its first page
+/// lands, never the picture it replaced under the PDF's name (#2829
+/// review): the bake had nothing to draw and kept the old one.
+#[test]
+fn a_pdf_opened_over_a_picture_never_shows_the_old_picture() {
+    require_pdf_backend();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = picture_app(tmp.path());
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 45)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        app.editor_image_payload(0).is_some(),
+        "staging: the picture bakes"
+    );
+    let pdf = tmp.path().join("doc.pdf");
+    write_three_page_pdf(&pdf);
+    app.editor.open(&pdf).unwrap();
+    assert!(
+        !app.editor.pdf_page_shown(),
+        "staging: page 1 is still rendering"
+    );
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        app.editor_image_payload(0).is_none(),
+        "the old picture must not be sent for the PDF"
+    );
+    settle_pdf(&mut app);
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        app.editor_image_payload(0)
+            .is_some_and(|(_, l)| l.path == pdf),
+        "page 1 is sent once it lands"
+    );
+}
+
 /// #2663: a tooltip under the editor's title-bar buttons lands on an image
 /// open in the editor; the picture waits. One elsewhere leaves it alone.
 #[test]
