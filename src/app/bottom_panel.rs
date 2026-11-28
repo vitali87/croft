@@ -1248,6 +1248,16 @@ impl App {
         self.focus_pane(Pane::Terminal);
     }
 
+    /// OUTPUT follows its channel while it is on screen (#2861): a line
+    /// written there, or a Clear, shows on the next frame rather than when
+    /// focus next moves. Says whether what the view shows changed, for the
+    /// redraw; a hidden view is left to catch up when it is drawn.
+    pub(super) fn sync_output_panel(&mut self) -> bool {
+        self.bottom_panel_tab == BottomPanelTab::Output
+            && self.output.last_area.width > 0
+            && self.output.sync()
+    }
+
     /// The OUTPUT tab on the Messages channel (#1609): every status message
     /// croft has shown, in full, newest last.
     pub(super) fn show_status_messages(&mut self) {

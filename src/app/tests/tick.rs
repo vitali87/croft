@@ -71,6 +71,7 @@ const BACKGROUND_PASS_CALLS: &[&str] = &[
     "app.flush_terminal_session",
     "app.tick_auto_save",
     "app.tick_hot_exit",
+    "app.sync_output_panel",
     "crate::startup_trace::mark",
     "app.poll_highlights",
     "app.poll_chrome_bake",
@@ -251,6 +252,27 @@ fn the_background_pass_keeps_its_order() {
     pretty_assertions::assert_eq!(background_pass_calls(), expected);
 }
 
+/// Run passes until startup's own background work has landed. Each lands in
+/// a pass that asks for a redraw: the file watcher's install, Go to File's
+/// index, and the terminal pane's first label lookup, which starts one label
+/// interval (1.5 s) after startup. A single quiet pass is not enough to say
+/// it has all landed: the label lookup comes well after the others.
+fn let_startup_land(app: &mut App) {
+    let started = app.last_label_refresh;
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(5),
+        "startup's background work to land",
+        || {
+            let quiet = !tick_background(app).changed;
+            quiet
+                && !app.fs_watch.installing()
+                && app.file_finder_index.is_some()
+                && app.last_label_refresh > started
+                && app.label_pass.is_none()
+        },
+    );
+}
+
 /// An idle croft draws nothing: once startup's background work has landed, a
 /// pass that finds nothing new asks for no redraw. A poll that reported a
 /// change on every pass would redraw the whole screen on every tick, 125
@@ -263,24 +285,7 @@ fn an_idle_background_pass_asks_for_no_redraw() {
     let _slot = crash_slot_lock();
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    // Startup's own background work lands first, each in a pass that asks for
-    // a redraw: the file watcher's install, Go to File's index, and the
-    // terminal pane's first label lookup, which starts one label interval
-    // (1.5 s) after startup. A single quiet pass is not enough to say it has
-    // all landed: the label lookup comes well after the others.
-    let started = app.last_label_refresh;
-    crate::test_budget::await_spawned(
-        std::time::Duration::from_secs(5),
-        "startup's background work to land",
-        || {
-            let quiet = !tick_background(&mut app).changed;
-            quiet
-                && !app.fs_watch.installing()
-                && app.file_finder_index.is_some()
-                && app.last_label_refresh > started
-                && app.label_pass.is_none()
-        },
-    );
+    let_startup_land(&mut app);
     for pass in 1..=20 {
         std::thread::sleep(std::time::Duration::from_millis(8));
         assert!(
@@ -288,4 +293,54 @@ fn an_idle_background_pass_asks_for_no_redraw() {
             "idle pass {pass} asked for a redraw"
         );
     }
+}
+
+/// OUTPUT follows its channel while it is on screen (#2861): a line written
+/// there asks the next pass for a redraw, and that frame shows it. The view
+/// used to refresh only when focus moved, so a log being written stood still
+/// on screen until the next click elsewhere. A push to a channel the view is
+/// not showing asks for nothing: other tests write to the process-wide bus
+/// all the while, and the idle passes above stay quiet.
+#[test]
+fn a_line_written_to_the_shown_output_channel_redraws_with_it() {
+    use crate::output::OutputLevel;
+    let _slot = crash_slot_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let channel = "Live Follow 2861";
+    crate::output::push(channel, OutputLevel::Info, "the first line");
+    app.output.sync();
+    assert!(app.output.select_by_name(channel));
+    app.bottom_panel_tab = BottomPanelTab::Output;
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 50)).unwrap();
+    let screen = |term: &mut ratatui::Terminal<ratatui::backend::TestBackend>, app: &mut App| {
+        term.draw(|f| app.render(f)).unwrap();
+        let buf = term.backend().buffer();
+        let area = buf.area;
+        (area.y..area.bottom())
+            .flat_map(|y| (area.x..area.right()).map(move |x| (x, y)))
+            .map(|(x, y)| buf[(x, y)].symbol().to_string())
+            .collect::<String>()
+    };
+    assert!(screen(&mut term, &mut app).contains("the first line"));
+    let_startup_land(&mut app);
+
+    crate::output::push(
+        "Live Follow 2861 (elsewhere)",
+        OutputLevel::Info,
+        "not shown",
+    );
+    assert!(
+        !tick_background(&mut app).changed,
+        "a line in a channel OUTPUT is not showing asks for no redraw"
+    );
+    crate::output::push(channel, OutputLevel::Info, "the second line");
+    assert!(
+        tick_background(&mut app).changed,
+        "a line written to the channel OUTPUT shows asks for a redraw"
+    );
+    assert!(
+        screen(&mut term, &mut app).contains("the second line"),
+        "the redrawn OUTPUT shows the line"
+    );
 }

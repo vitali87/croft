@@ -15,7 +15,7 @@ use ratatui::{
     widgets::{Clear, Paragraph, Widget},
 };
 
-use crate::output::{OutputLevel, OutputLine};
+use crate::output::{OutputLevel, OutputLine, ReadMark, Since};
 use crate::theme::Theme;
 use crate::widgets::scrollbar;
 
@@ -46,8 +46,11 @@ pub struct OutputPanel {
     channels: Vec<String>,
     /// Index into `channels` of the selected channel.
     selected: usize,
-    /// Lines of the selected channel, snapshotted from the bus.
+    /// Lines of the selected channel, mirrored from the bus.
     lines: Vec<OutputLine>,
+    /// The channel `lines` mirrors and how far it has read it, so a refresh
+    /// copies only the lines pushed since (#2861).
+    mark: Option<(String, ReadMark)>,
     /// Last bus generation we synced against, so an unchanged bus is a no-op.
     last_gen: u64,
     /// Minimum level shown; lines below it are filtered out (VS Code per-channel
@@ -93,6 +96,7 @@ impl OutputPanel {
             channels: Vec::new(),
             selected: 0,
             lines: Vec::new(),
+            mark: None,
             last_gen: 0,
             min_level: OutputLevel::Trace,
             scroll: 0,
@@ -120,8 +124,10 @@ impl OutputPanel {
     /// Pull the latest channel set and selected channel's lines from the bus,
     /// but only when its generation advanced (one relaxed atomic load otherwise).
     /// Preserves the selected channel across list changes by name. Returns
-    /// whether anything changed, so the caller forces a redraw only on a real
-    /// update.
+    /// whether what the view shows changed: the selected channel's lines, the
+    /// channel it shows, or the channel list while the dropdown lists it. A
+    /// push to a channel the view isn't showing changes none of them, so the
+    /// caller redraws only on a real update (#2861).
     pub fn sync(&mut self) -> bool {
         let cur_gen = crate::output::generation();
         if cur_gen == self.last_gen && !self.channels.is_empty() {
@@ -130,27 +136,55 @@ impl OutputPanel {
         self.last_gen = cur_gen;
         let prev = self.selected_name();
         let names = crate::output::channel_names();
-        if names == self.channels && prev.is_some() {
-            // Only the line contents of an existing channel changed.
-            self.refresh_lines();
-            return true;
+        let list_changed = names != self.channels;
+        if list_changed {
+            self.channels = names;
+            self.selected = prev
+                .as_ref()
+                .and_then(|name| self.channels.iter().position(|c| c == name))
+                .unwrap_or(0);
+            if self.selected >= self.channels.len() {
+                self.selected = self.channels.len().saturating_sub(1);
+            }
         }
-        self.channels = names;
-        self.selected = prev
-            .and_then(|name| self.channels.iter().position(|c| *c == name))
-            .unwrap_or(0);
-        if self.selected >= self.channels.len() {
-            self.selected = self.channels.len().saturating_sub(1);
-        }
-        self.refresh_lines();
-        true
+        let lines_changed = self.refresh_lines();
+        lines_changed || (list_changed && (self.dropdown_open || self.selected_name() != prev))
     }
 
-    fn refresh_lines(&mut self) {
-        self.lines = self
-            .selected_name()
-            .and_then(|c| crate::output::snapshot(&c))
-            .unwrap_or_default();
+    /// Bring `lines` up to the selected channel's. Only the lines pushed since
+    /// the last refresh are copied; the whole channel only when it was
+    /// cleared, another channel is shown, or more lines arrived than it keeps
+    /// (#2861). Returns whether `lines` changed.
+    fn refresh_lines(&mut self) -> bool {
+        let read = self.selected_name().and_then(|name| {
+            let mark = self
+                .mark
+                .as_ref()
+                .filter(|(shown, _)| *shown == name)
+                .map(|(_, mark)| *mark);
+            crate::output::read_since(&name, mark).map(|read| (name, read))
+        });
+        let Some((name, (mark, since))) = read else {
+            self.mark = None;
+            let had_lines = !self.lines.is_empty();
+            self.lines.clear();
+            return had_lines;
+        };
+        self.mark = Some((name, mark));
+        match since {
+            Since::Appended(new) if new.is_empty() => false,
+            Since::Appended(new) => {
+                self.lines.extend(new);
+                // The channel dropped the same lines off its front.
+                let over = self.lines.len().saturating_sub(crate::output::MAX_LINES);
+                self.lines.drain(..over);
+                true
+            }
+            Since::Replaced(all) => {
+                self.lines = all;
+                true
+            }
+        }
     }
 
     pub fn selected_name(&self) -> Option<String> {

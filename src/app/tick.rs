@@ -162,8 +162,15 @@ fn tick_panes_and_saves(app: &mut App, symbol_views_settled: bool) -> bool {
     app.flush_terminal_session();
     let auto_save_changed = app.tick_auto_save();
     app.tick_hot_exit(std::time::Instant::now());
+    // OUTPUT follows its channel while on screen (#2861).
+    let output_changed = app.sync_output_panel();
     crate::startup_trace::mark("terminal panes and saves ticked");
-    symbol_views_changed || bells_changed || captures_changed || labels_changed || auto_save_changed
+    symbol_views_changed
+        || bells_changed
+        || captures_changed
+        || labels_changed
+        || auto_save_changed
+        || output_changed
 }
 
 /// Highlighting, pictures baked off the UI thread, and the bookmarks of

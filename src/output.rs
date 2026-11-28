@@ -73,7 +73,7 @@ pub struct OutputLine {
 /// Per-channel ring-buffer cap. Same order of magnitude as the terminal
 /// scrollback; the oldest line drops off the front so a chatty server can't
 /// grow the buffer without bound.
-const MAX_LINES: usize = 5000;
+pub const MAX_LINES: usize = 5000;
 
 /// Per-line cap. `MAX_LINES` alone bounded the count, not the size: with RPC
 /// tracing on, every JSON-RPC body is one line, and a semantic-tokens or
@@ -93,8 +93,52 @@ fn capped_line(text: &str) -> String {
     format!("{}… ({} more bytes)", &text[..end], text.len() - end)
 }
 
+/// One channel's lines, with a count of every line pushed into it since it
+/// was created or last cleared, so a reader can take only the lines it has
+/// not seen yet (#2861).
+#[derive(Default)]
+struct Channel {
+    lines: VecDeque<OutputLine>,
+    /// Lines pushed since the channel was created or last cleared, the ones
+    /// trimmed off the front included.
+    pushed: u64,
+    /// How many times the channel was cleared, so a reader's count from
+    /// before a clear is never taken for one after it.
+    cleared: u64,
+}
+
+impl Channel {
+    fn mark(&self) -> ReadMark {
+        ReadMark {
+            cleared: self.cleared,
+            pushed: self.pushed,
+        }
+    }
+}
+
 struct Registry {
-    channels: BTreeMap<String, VecDeque<OutputLine>>,
+    channels: BTreeMap<String, Channel>,
+}
+
+/// How far a reader of one channel has read: the channel's counts when the
+/// reader last took its lines. Opaque; only [`read_since`] makes and reads one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadMark {
+    cleared: u64,
+    pushed: u64,
+}
+
+/// What a channel holds beyond a reader's [`ReadMark`].
+#[derive(Debug, PartialEq)]
+pub enum Since {
+    /// The lines pushed since the mark, oldest first. The reader appends them
+    /// and then drops lines off its front past [`MAX_LINES`], as the channel
+    /// did. Empty when nothing was pushed.
+    Appended(Vec<OutputLine>),
+    /// The reader's lines are no longer the front of the channel's (it was
+    /// cleared, or more lines arrived than the channel keeps, or the reader
+    /// had none): these are all the channel's lines, to keep instead.
+    Replaced(Vec<OutputLine>),
 }
 
 fn registry() -> &'static Mutex<Registry> {
@@ -140,14 +184,15 @@ pub fn push(channel: &str, level: OutputLevel, text: &str) {
     let Ok(mut reg) = registry().lock() else {
         return;
     };
-    let buf = reg.channels.entry(channel.to_string()).or_default();
-    buf.push_back(OutputLine {
+    let ch = reg.channels.entry(channel.to_string()).or_default();
+    ch.lines.push_back(OutputLine {
         ts: now(),
         level,
         text: capped_line(text),
     });
-    while buf.len() > MAX_LINES {
-        buf.pop_front();
+    ch.pushed += 1;
+    while ch.lines.len() > MAX_LINES {
+        ch.lines.pop_front();
     }
     GENERATION.fetch_add(1, Ordering::Relaxed);
 }
@@ -168,9 +213,9 @@ pub fn channel_sizes() -> Vec<(String, usize, usize)> {
         .map(|r| {
             r.channels
                 .iter()
-                .map(|(name, buf)| {
-                    let bytes = buf.iter().map(|l| l.text.len()).sum();
-                    (name.clone(), buf.len(), bytes)
+                .map(|(name, ch)| {
+                    let bytes = ch.lines.iter().map(|l| l.text.len()).sum();
+                    (name.clone(), ch.lines.len(), bytes)
                 })
                 .collect()
         })
@@ -182,16 +227,38 @@ pub fn snapshot(channel: &str) -> Option<Vec<OutputLine>> {
     let reg = registry().lock().ok()?;
     reg.channels
         .get(channel)
-        .map(|b| b.iter().cloned().collect())
+        .map(|ch| ch.lines.iter().cloned().collect())
+}
+
+/// A channel's lines beyond `mark`, with the mark that reads to its end now.
+/// `None` if the channel doesn't exist. A reader that keeps the mark and
+/// applies each answer holds exactly the channel's lines, and copies each
+/// line once rather than the whole channel on every change (#2861): a
+/// channel keeps up to [`MAX_LINES`] lines of up to 16 KB each.
+pub fn read_since(channel: &str, mark: Option<ReadMark>) -> Option<(ReadMark, Since)> {
+    let reg = registry().lock().ok()?;
+    let ch = reg.channels.get(channel)?;
+    let unseen = mark
+        .filter(|m| m.cleared == ch.cleared && m.pushed <= ch.pushed)
+        .map(|m| ch.pushed - m.pushed)
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|&n| n <= ch.lines.len());
+    let since = match unseen {
+        Some(n) => Since::Appended(ch.lines.range(ch.lines.len() - n..).cloned().collect()),
+        None => Since::Replaced(ch.lines.iter().cloned().collect()),
+    };
+    Some((ch.mark(), since))
 }
 
 /// Clear one channel's lines, keeping the channel in the list (VS Code's clear
 /// action). Bumps the generation so the view refreshes.
 pub fn clear(channel: &str) {
     if let Ok(mut reg) = registry().lock()
-        && let Some(buf) = reg.channels.get_mut(channel)
+        && let Some(ch) = reg.channels.get_mut(channel)
     {
-        buf.clear();
+        ch.lines.clear();
+        ch.pushed = 0;
+        ch.cleared += 1;
         GENERATION.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -287,5 +354,96 @@ mod tests {
         assert!(trace_enabled());
         set_trace_enabled(false);
         assert!(!trace_enabled());
+    }
+
+    fn texts(lines: &[OutputLine]) -> Vec<&str> {
+        lines.iter().map(|l| l.text.as_str()).collect()
+    }
+
+    #[test]
+    fn read_since_hands_a_reader_only_the_lines_it_has_not_seen() {
+        let ch = "test-read-since-appends";
+        push(ch, OutputLevel::Info, "one");
+        push(ch, OutputLevel::Info, "two");
+        let (mark, first) = read_since(ch, None).expect("channel exists");
+        assert_eq!(
+            first,
+            Since::Replaced(snapshot(ch).unwrap()),
+            "a reader with no mark takes every line"
+        );
+        let (same, nothing) = read_since(ch, Some(mark)).unwrap();
+        assert_eq!((same, nothing), (mark, Since::Appended(Vec::new())));
+        push(ch, OutputLevel::Warn, "three");
+        let (_, more) = read_since(ch, Some(mark)).unwrap();
+        let Since::Appended(lines) = more else {
+            panic!("a push since the mark is an append: {more:?}");
+        };
+        assert_eq!(texts(&lines), ["three"]);
+        assert!(read_since("test-read-since-no-such-channel", None).is_none());
+    }
+
+    #[test]
+    fn read_since_replaces_after_a_clear_even_when_the_counts_line_up() {
+        let ch = "test-read-since-clear";
+        push(ch, OutputLevel::Info, "old");
+        let (mark, _) = read_since(ch, None).unwrap();
+        // Cleared and refilled to the same count: the reader's "old" must
+        // still go, so the mark has to tell this channel from the one it read.
+        clear(ch);
+        push(ch, OutputLevel::Info, "new");
+        let (_, after) = read_since(ch, Some(mark)).unwrap();
+        let Since::Replaced(lines) = after else {
+            panic!("a clear since the mark replaces: {after:?}");
+        };
+        assert_eq!(texts(&lines), ["new"]);
+    }
+
+    #[test]
+    fn read_since_replaces_once_a_reader_falls_further_behind_than_the_cap() {
+        let ch = "test-read-since-behind";
+        push(ch, OutputLevel::Info, "first");
+        let (mark, _) = read_since(ch, None).unwrap();
+        for i in 0..MAX_LINES + 1 {
+            push(ch, OutputLevel::Info, &format!("line {i}"));
+        }
+        let (_, after) = read_since(ch, Some(mark)).unwrap();
+        let Since::Replaced(lines) = after else {
+            panic!("more unseen lines than the channel keeps replaces: {after:?}");
+        };
+        assert_eq!(lines.len(), MAX_LINES);
+        assert_eq!(lines.last().unwrap().text, format!("line {MAX_LINES}"));
+    }
+
+    #[test]
+    fn a_reader_that_applies_each_answer_holds_the_channels_lines() {
+        let ch = "test-read-since-mirror";
+        let mut mine: Vec<OutputLine> = Vec::new();
+        let mut mark = None;
+        let mut step = |mine: &mut Vec<OutputLine>| {
+            let (m, since) = read_since(ch, mark).unwrap();
+            mark = Some(m);
+            match since {
+                Since::Appended(new) => mine.extend(new),
+                Since::Replaced(all) => *mine = all,
+            }
+            let over = mine.len().saturating_sub(MAX_LINES);
+            mine.drain(..over);
+        };
+        push(ch, OutputLevel::Info, "a");
+        step(&mut mine);
+        // Past the cap the channel drops lines off its front; the reader's
+        // trim must drop the same ones.
+        for i in 0..MAX_LINES + 7 {
+            push(ch, OutputLevel::Info, &format!("n{i}"));
+            if i % 1000 == 0 {
+                step(&mut mine);
+            }
+        }
+        step(&mut mine);
+        assert_eq!(mine, snapshot(ch).unwrap());
+        clear(ch);
+        push(ch, OutputLevel::Error, "z");
+        step(&mut mine);
+        assert_eq!(mine, snapshot(ch).unwrap());
     }
 }
