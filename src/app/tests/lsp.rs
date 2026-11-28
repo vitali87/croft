@@ -4357,6 +4357,44 @@ fn a_server_question_is_answered_with_the_picked_action() {
     assert_eq!(app.status, "gopls: Ignore");
 }
 
+/// #2880: a workspace switch drops the questions the old workspace's
+/// servers asked, and closes the picker showing one: those servers are shut
+/// down with the workspace, so an answer picked afterwards went nowhere while
+/// the status bar said it was sent.
+#[test]
+fn a_workspace_switch_drops_the_old_servers_questions() {
+    use tokio::sync::oneshot::error::TryRecvError;
+    let tmp = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let mut shown = go_mod_question(&mut app);
+    let mut queued = go_mod_question(&mut app);
+    app.drain_lsp_progress();
+    assert!(
+        app.list_picker
+            .as_ref()
+            .is_some_and(|p| p.purpose == crate::widgets::list_picker::ListPurpose::ServerQuestion),
+        "the first question is asked"
+    );
+
+    app.change_workspace_root(other.path().to_path_buf());
+
+    assert!(
+        app.list_picker
+            .as_ref()
+            .is_none_or(|p| p.purpose != crate::widgets::list_picker::ListPurpose::ServerQuestion),
+        "the old server's question is no longer asked"
+    );
+    assert!(app.lsp.question.is_none());
+    assert!(app.lsp.questions.is_empty(), "nor waits to be");
+    for answer in [&mut shown, &mut queued] {
+        assert!(
+            matches!(answer.try_recv(), Err(TryRecvError::Closed)),
+            "each is answered with no action"
+        );
+    }
+}
+
 #[test]
 fn escape_answers_a_server_question_with_no_action() {
     let tmp = tempfile::tempdir().unwrap();
