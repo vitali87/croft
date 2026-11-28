@@ -126,6 +126,18 @@ pub fn last_copy() -> Option<String> {
     }
 }
 
+/// Build the OSC 52 escape sequence that asks the host terminal to put
+/// `text` on the system clipboard.
+pub fn osc52_copy_seq(text: &str) -> Vec<u8> {
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let mut out = Vec::with_capacity(encoded.len() + 8);
+    out.extend_from_slice(b"\x1b]52;c;");
+    out.extend_from_slice(encoded.as_bytes());
+    out.push(0x07);
+    out
+}
+
 /// Copy `text` by OSC 52: escape bytes on stdout that ask the terminal croft
 /// draws in to set the clipboard of the machine that terminal runs on. Best
 /// effort, since whether the terminal acts on them is its choice. Under test
@@ -986,5 +998,36 @@ mod other_os_backend_tests {
             None,
             "without a native backend, read_string must yield None rather than panic"
         );
+    }
+}
+
+/// The OSC 52 sequence, on every platform; the backends' tests above are
+/// each for one platform.
+#[cfg(test)]
+mod osc52_tests {
+    use super::*;
+
+    #[test]
+    fn osc52_copy_seq_wraps_with_correct_envelope() {
+        let bytes = osc52_copy_seq("hello");
+        assert_eq!(bytes, b"\x1b]52;c;aGVsbG8=\x07");
+    }
+
+    #[test]
+    fn osc52_copy_seq_handles_empty() {
+        assert_eq!(osc52_copy_seq(""), b"\x1b]52;c;\x07");
+    }
+
+    #[test]
+    fn osc52_copy_seq_handles_unicode() {
+        let bytes = osc52_copy_seq("héllo");
+        assert!(bytes.starts_with(b"\x1b]52;c;"));
+        assert_eq!(*bytes.last().unwrap(), 0x07);
+        let body = &bytes[7..bytes.len() - 1];
+        use base64::Engine;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(body)
+            .unwrap();
+        assert_eq!(decoded, "héllo".as_bytes());
     }
 }

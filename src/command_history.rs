@@ -265,6 +265,18 @@ impl CommandHistory {
     }
 }
 
+/// Compact human form of a command duration: "480ms", "3.4s", "2m 05s".
+pub fn human_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs_f64();
+    if secs < 1.0 {
+        format!("{}ms", d.as_millis())
+    } else if secs < 60.0 {
+        format!("{secs:.1}s")
+    } else {
+        format!("{}m {:02}s", d.as_secs() / 60, d.as_secs() % 60)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,5 +481,14 @@ mod tests {
             "compaction must rewrite the file down to the in-memory entries, got {lines} lines"
         );
         assert_eq!(h.disk_lines, h.entries.len());
+    }
+
+    #[test]
+    fn human_duration_formats_ms_seconds_minutes() {
+        let d = std::time::Duration::from_millis;
+        assert_eq!(human_duration(d(480)), "480ms");
+        assert_eq!(human_duration(d(3400)), "3.4s");
+        assert_eq!(human_duration(d(59_940)), "59.9s");
+        assert_eq!(human_duration(d(125_000)), "2m 05s");
     }
 }

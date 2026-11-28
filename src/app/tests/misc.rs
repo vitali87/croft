@@ -301,26 +301,6 @@ fn the_gh_client_counts_a_busy_program_against_its_limit() {
 }
 
 #[test]
-fn cwd_of_pid_on_self_returns_a_directory_under_tempdir() {
-    // The harness runs each test from the crate root by default, but
-    // we don't depend on that — we just need cwd_of_pid to round-trip
-    // *some* directory for the current process. lsof / /proc gives us
-    // the live cwd of the shell that started the test runner.
-    let pid = std::process::id();
-    match cwd_of_pid(pid) {
-        Some(p) => assert!(
-            p.is_dir(),
-            "cwd lookup must return a real directory, got {p:?}"
-        ),
-        None => {
-            // Acceptable on platforms where neither /proc nor lsof
-            // resolve the cwd in the sandbox. The fallback in
-            // split_terminal handles that case; nothing to assert here.
-        }
-    }
-}
-
-#[test]
 fn cmd_active_treats_super_as_command_everywhere() {
     // Super is the command modifier on every platform, Termux or not.
     assert!(cmd_active(KeyModifiers::SUPER, false));

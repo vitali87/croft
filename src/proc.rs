@@ -11,12 +11,16 @@
 //! how long it may take. A key press, click, paste, command or frame is a
 //! [`UiTurn`], which in a test may not wait on one. A program croft looks for, on `PATH` or in a list
 //! of folders, is found through [`find`], by one rule for what can run.
+//!
+//! [`info`] reads what the operating system says about a process that is
+//! already running.
 
 use std::ffi::OsString;
 use std::process::{Command, Stdio};
 
 mod bounded;
 pub(crate) mod find;
+pub mod info;
 #[cfg(test)]
 pub(crate) mod record;
 #[cfg(test)]

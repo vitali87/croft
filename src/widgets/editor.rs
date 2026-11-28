@@ -44,6 +44,7 @@ mod typing;
 mod undo;
 mod viewers;
 mod wrap;
+pub(crate) use crate::ansi_text::ansi_color_to_tui;
 use crate::text_edit::{
     apply_char_span_edits, char_byte, char_span_edits, map_through_span_edits,
     position_after_span_edits, view_top_after_span_edits,
@@ -91,7 +92,6 @@ pub use transforms::CaseTransform;
 use transforms::*;
 use typing::*;
 use undo::*;
-pub(crate) use viewers::ansi_color_to_tui;
 pub use viewers::delete_own_gunzip_copies;
 pub(crate) use viewers::format_bytes_human;
 pub use viewers::sqlite_wal_path;
