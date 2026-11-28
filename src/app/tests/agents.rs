@@ -890,6 +890,61 @@ fn a_workspace_switch_mid_turn_resets_the_turn_note_counters() {
     assert!(app.pair.noted_files.is_empty());
 }
 
+/// #2879: the "hosted by another croft window" notice is said once per
+/// workspace, not once per window: after a switch into a workspace whose
+/// navigator another window hosts too, the window says so again. The
+/// latched refusal used to survive the switch and keep it silent.
+#[test]
+fn a_workspace_switch_announces_the_new_workspaces_host_refusal() {
+    let cache = tempfile::tempdir().unwrap();
+    let _cache = crate::session_state::CacheDirForThisTestThread::set(cache.path());
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let record = crate::session::PairRecord {
+        model: None,
+        name: "nav".into(),
+        enabled: true,
+        task: None,
+        provider: None,
+        base_url: None,
+    };
+    // Another croft window hosts each workspace's navigator.
+    std::fs::create_dir_all(crate::session::sessions_dir()).unwrap();
+    let _first_host = crate::session::try_acquire_pair_host_lock(
+        &crate::session::pair_host_lock_path(first.path()),
+    )
+    .unwrap();
+    let _second_host = crate::session::try_acquire_pair_host_lock(
+        &crate::session::pair_host_lock_path(second.path()),
+    )
+    .unwrap();
+    for root in [first.path(), second.path()] {
+        crate::session::write_pair_record(&crate::session::pair_record_path(root), &record)
+            .unwrap();
+    }
+
+    let mut app = App::new(first.path().to_path_buf()).unwrap();
+    app.pair.spawn_override = Some(Box::new(|_| panic!("this window must never host")));
+    app.pair.last_check = None;
+    app.maybe_seat_navigator();
+    assert!(
+        app.status.contains("another croft window"),
+        "the first workspace's refusal is said: {}",
+        app.status
+    );
+
+    app.change_workspace_root(second.path().to_path_buf());
+    app.status = String::from("Saved src/foo.rs");
+    app.pair.last_check = None;
+    app.maybe_seat_navigator();
+    assert!(app.pair.host.is_none());
+    assert!(
+        app.status.contains("another croft window"),
+        "the second workspace's refusal is said too: {}",
+        app.status
+    );
+}
+
 /// Re-running `croft pair` after a failed seat must retry: the CLI promises
 /// "a running croft seats it within a second", but an enabled→enabled
 /// rewrite has no transition for the death latch to observe. The record's

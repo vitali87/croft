@@ -2368,6 +2368,9 @@ impl App {
         self.pair.socket = crate::session::collab_socket_path(&new_root);
         self.pair.host_lock_path = crate::session::pair_host_lock_path(&new_root);
         self.pair.navigator_down = false; // the death latch belonged to the old root
+        // So did the host-lock refusal already said: the new root's is said
+        // afresh, even when it is for the same reason (#2879).
+        self.pair.lock_denied = None;
         self.pair.last_check = None; // read the new record this tick, not in 1s
         // Old-workspace carets are keyed by root-relative file, so a
         // same-named file under the new root would wear a departed peer's
