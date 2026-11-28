@@ -108,6 +108,69 @@ class Gutting(unittest.TestCase):
         after = doc(["src/", "└── a/                   does a thing, one file per area"])
         self.assertEqual(gate.compare(before, after), ([], []))
 
+    def test_a_row_whose_file_git_saw_renamed_is_not_dropped(self):
+        """`src/a/walk.rs` moved to `src/b/walk.rs`: git sees the rename, so
+        the row under the new folder is the same module's. Without the
+        rename the old row is reported as dropped."""
+        before = doc(["src/", "├── a/                   the a parts", "│   └── walk.rs          walks the tree", "└── b/                   the b parts"])
+        after = doc(["src/", "├── a/                   the a parts", "└── b/                   the b parts", "    └── walk.rs          walks the tree"])
+        self.assertEqual(gate.compare(before, after)[1], ["src/a/walk.rs"])
+        self.assertEqual(gate.compare(before, after, {"src/a/walk.rs": "src/b/walk.rs"}), ([], []))
+
+    def test_a_renamed_row_gutted_under_its_new_path_counts_its_new_section(self):
+        """`src/a/walk.rs` moved to `src/b/walk.rs` beside another
+        `walk.rs`, so the bare name stands for neither: a section headed by
+        the new path is the moved row's home, and with no section the shrink
+        is still reported."""
+        before = doc([
+            "src/",
+            "├── a/                   the a parts",
+            "│   └── walk.rs          " + self.LONG,
+            "├── b/                   the b parts",
+            "└── c/                   the c parts",
+            "    └── walk.rs          walks c",
+        ])
+        after = [
+            "src/",
+            "├── a/                   the a parts",
+            "├── b/                   the b parts",
+            "│   └── walk.rs          short",
+            "└── c/                   the c parts",
+            "    └── walk.rs          walks c",
+        ]
+        renamed = {"src/a/walk.rs": "src/b/walk.rs"}
+        shrunk, dropped = gate.compare(before, doc(after), renamed)
+        self.assertEqual(([n for n, _, _ in shrunk], dropped), (["src/a/walk.rs"], []))
+        self.assertEqual(gate.compare(before, doc(after, ["src/b/walk.rs"]), renamed), ([], []))
+        self.assertEqual(len(gate.compare(before, doc(after, ["walk.rs"]), renamed)[0]), 1)
+
+    def test_a_renamed_row_cannot_borrow_a_section_through_a_name_the_new_tree_shares(self):
+        """`src/a/walk.rs` became `src/b/parse.rs` beside an existing
+        `src/c/parse.rs`. Only the new tree has two `parse.rs`, and that is
+        enough: the bare name stands for neither, so `### src/c/parse.rs`
+        is not the moved row's section, while `### src/b/parse.rs` is."""
+        before = doc([
+            "src/",
+            "├── a/                   the a parts",
+            "│   └── walk.rs          " + self.LONG,
+            "├── b/                   the b parts",
+            "└── c/                   the c parts",
+            "    └── parse.rs         parses c",
+        ])
+        after = [
+            "src/",
+            "├── a/                   the a parts",
+            "├── b/                   the b parts",
+            "│   └── parse.rs         short",
+            "└── c/                   the c parts",
+            "    └── parse.rs         parses c",
+        ]
+        renamed = {"src/a/walk.rs": "src/b/parse.rs"}
+        shrunk, dropped = gate.compare(before, doc(after, ["src/c/parse.rs"]), renamed)
+        self.assertEqual(([n for n, _, _ in shrunk], dropped), (["src/a/walk.rs"], []))
+        self.assertEqual(gate.compare(before, doc(after, ["src/b/parse.rs"]), renamed), ([], []))
+        self.assertEqual(len(gate.compare(before, doc(after, ["parse.rs"]), renamed)[0]), 1)
+
     def test_a_file_row_gutted_on_its_way_into_a_directory_is_reported(self):
         before = doc(["src/", "└── a.rs                 " + self.LONG])
         after = doc(["src/", "└── a/                   short"])

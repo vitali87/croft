@@ -299,6 +299,209 @@ class PureMoves(unittest.TestCase):
             code, out = repo.check()
             self.assertIn("0 visibility widened, 1 respelled to the same reach", out)
 
+    def test_a_private_test_moved_to_another_test_module_is_a_move(self):
+        """A test moved beside the code it tests changes module, so its
+        private reach differs; but only test code can name it, and the test
+        build fails if a user of it lost it. A helper both sides still use is
+        copied and says so. Outside test modules both stay changes."""
+        test = "    #[test]\n    fn adds() {\n        assert_eq!(1 + 1, 2);\n    }\n"
+        helper = "    fn lines() -> u8 {\n        1\n    }\n"
+        a_with = "#[cfg(test)]\nmod tests {\n" + test + "\n" + helper + "}\n"
+        a_without = "#[cfg(test)]\nmod tests {\n" + helper + "}\n"
+        b = "#[cfg(test)]\nmod tests {\n" + test + "\n" + helper + "}\n"
+        repo = self.repo({"src/main.rs": "mod a;\n", "src/a.rs": a_with})
+        repo.commit({"src/main.rs": "mod a;\nmod b;\n", "src/a.rs": a_without, "src/b.rs": b})
+        code, out = repo.check()
+        self.assertEqual(code, 0, out)
+        self.assertIn("moved    fn src/a.rs::tests::adds -> src/b.rs::tests::adds", out)
+        self.assertIn("copied   fn src/b.rs::tests::lines", out)
+        self.assertIn("1 copied", out)
+        plain = "fn helper() -> u8 {\n    1\n}\n"
+        for after, says in [
+            ({"src/a.rs": "", "src/b.rs": plain}, "visibility narrowed or not comparable"),
+            ({"src/b.rs": plain}, "ADDED    fn src/b.rs::helper"),
+        ]:
+            with self.subTest(after=sorted(after)), tempfile.TemporaryDirectory() as tmp:
+                repo = Repo(Path(tmp), {"src/main.rs": "mod a;\nmod b;\n", "src/a.rs": plain})
+                repo.commit(after)
+                code, out = repo.check()
+                self.assertEqual(code, 1, out)
+                self.assertIn(says, out)
+
+    def test_a_declared_module_move_keeps_its_items_reach(self):
+        """A module moved as a whole, declared with `pure-move-module:`,
+        keeps the meaning of its own `pub(super)` items: what reached all of
+        `crate::a` now reaches all of `crate::c`. Undeclared, the two reach
+        different modules and do not compare."""
+        item = "pub(super) fn find() -> u8 {\n    1\n}\n"
+        for message, want in [
+            ("move\n\npure-move-module: crate::a -> crate::c", 0),
+            ("move", 1),
+        ]:
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as tmp:
+                repo = Repo(Path(tmp), {"src/main.rs": "mod a;\n", "src/a.rs": "mod walk;\n", "src/a/walk.rs": item})
+                (Path(tmp) / "src/a/walk.rs").unlink()
+                repo.commit(
+                    {"src/main.rs": "mod a;\nmod c;\n", "src/a.rs": "", "src/c.rs": "mod walk;\n", "src/c/walk.rs": item},
+                    message,
+                )
+                code, out = repo.check()
+                self.assertEqual(code, want, out)
+                if want == 0:
+                    self.assertIn("module moved: crate::a -> crate::c", out)
+                    self.assertIn("moved    fn src/a/walk.rs::find -> src/c/walk.rs::find", out)
+        # Only what moved is read at the new path: an item that stays in the
+        # old module, beside the declaration, is unchanged.
+        stays = "pub(super) fn draw() {}\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp), {
+                "src/main.rs": "mod a;\n", "src/a.rs": "mod walk;\n\n" + stays, "src/a/walk.rs": item,
+            })
+            (Path(tmp) / "src/a/walk.rs").unlink()
+            repo.commit(
+                {"src/main.rs": "mod a;\nmod c;\n", "src/a.rs": stays, "src/c.rs": "mod walk;\n", "src/c/walk.rs": item},
+                "move\n\npure-move-module: crate::a -> crate::c",
+            )
+            code, out = repo.check()
+            self.assertEqual(code, 0, out)
+            self.assertIn("1 unchanged, 1 moved", out)
+
+    def test_a_file_renamed_inside_a_module_left_behind_keeps_its_reach(self):
+        """With `crate::a -> crate::c` declared, a file renamed within
+        `crate::a` did not go with the move: its `pub(super)` item still
+        reaches `crate::a`, so it is read in place, not at `crate::c`."""
+        item = "pub(super) fn find() -> u8 {\n    1\n}\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp), {"src/main.rs": "mod a;\n", "src/a.rs": "mod util;\n", "src/a/util.rs": item})
+            (Path(tmp) / "src/a/util.rs").unlink()
+            repo.commit(
+                {"src/main.rs": "mod a;\nmod c;\n", "src/a.rs": "mod renamed;\n", "src/a/renamed.rs": item, "src/c.rs": ""},
+                "move\n\npure-move-module: crate::a -> crate::c",
+            )
+            code, out = repo.check()
+            self.assertEqual(code, 0, out)
+            self.assertIn("moved    fn src/a/util.rs::find -> src/a/renamed.rs::find", out)
+
+    def test_an_item_that_stays_does_not_take_a_declared_move_up(self):
+        """With `crate::a::inner -> crate::a` declared, an item still in
+        `src/a/inner/util.rs` did not move: its `pub(super)` reach is
+        `crate::a::inner` before and after, so a blank line beside it is
+        not a change. One that does move up to `src/a/util.rs` is read at
+        the new path."""
+        item = "pub(super) fn find() -> u8 {\n    1\n}\n"
+        start = {
+            "src/main.rs": "mod a;\n",
+            "src/a.rs": "mod inner;\n",
+            "src/a/inner.rs": "mod util;\n",
+            "src/a/inner/util.rs": item,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp), dict(start))
+            repo.commit(
+                {"src/a/inner/util.rs": item + "\n"},
+                "move\n\npure-move-module: crate::a::inner -> crate::a",
+            )
+            code, out = repo.check()
+            self.assertEqual(code, 0, out)
+            self.assertNotIn("CHANGED", out)
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp), dict(start))
+            (Path(tmp) / "src/a/inner/util.rs").unlink()
+            (Path(tmp) / "src/a/inner.rs").unlink()
+            repo.commit(
+                {"src/a.rs": "mod util;\n", "src/a/util.rs": item},
+                "move\n\npure-move-module: crate::a::inner -> crate::a",
+            )
+            code, out = repo.check()
+            self.assertEqual(code, 0, out)
+            self.assertIn("moved    fn src/a/inner/util.rs::find -> src/a/util.rs::find", out)
+
+    def test_test_only_follows_where_the_item_sits(self):
+        """An item is test-only when a module it actually sits in is under
+        `#[cfg(test)]`. A release helper in `live::tests` is not made one by
+        a guarded `tests` module elsewhere in the file, so moving it
+        privately into a test module is a change."""
+        helper = "        fn helper() -> u8 {\n            1\n        }\n"
+        live = "mod live {\n    fn keep() {}\n\n    mod tests {\n" + helper + "    }\n}\n"
+        guarded = "#[cfg(test)]\nmod tests {\n    fn other() {}\n}\n"
+        moved = "#[cfg(test)]\nmod tests {\n    fn helper() -> u8 {\n        1\n    }\n}\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp), {"src/main.rs": "mod a;\nmod b;\n", "src/a.rs": live + "\n" + guarded, "src/b.rs": ""})
+            repo.commit({"src/a.rs": "mod live {\n    fn keep() {}\n}\n\n" + guarded, "src/b.rs": moved})
+            code, out = repo.check()
+            self.assertEqual(code, 1, out)
+            self.assertNotIn("moved    fn src/a.rs::live::tests::helper", out)
+
+    def test_test_only_means_compiled_only_for_tests(self):
+        """A module counts as test-only when the build compiles it only for
+        tests, under `#[cfg(test)]`, inline or as its own file; a module
+        merely named like one does not, since its items are in the release
+        build."""
+        helper = "fn helper() -> u8 {\n    1\n}\n"
+        indent = "".join("    " + ln + "\n" for ln in helper.strip().split("\n"))
+        guarded = "#[cfg(test)]\nmod tests {\n" + indent + "}\n"
+        named = "mod release_tests {\n" + indent + "}\n"
+        cases = [
+            # an inline cfg(test) module into a file module the parent declares cfg(test)
+            ({"src/main.rs": "mod a;\nmod c;\n", "src/a.rs": guarded, "src/c.rs": "#[cfg(test)]\nmod tests;\n"},
+             {"src/a.rs": "", "src/c/tests.rs": helper}, 0),
+            # a module only named like a test module, in the release build
+            ({"src/main.rs": "mod a;\nmod b;\n", "src/a.rs": named, "src/b.rs": ""},
+             {"src/a.rs": "", "src/b.rs": named}, 1),
+        ]
+        for base, after, want in cases:
+            with self.subTest(after=sorted(after)), tempfile.TemporaryDirectory() as tmp:
+                repo = Repo(Path(tmp), base)
+                repo.commit(after)
+                code, out = repo.check()
+                self.assertEqual(code, want, out)
+
+    def test_only_a_helper_is_ever_a_copy(self):
+        """A helper copied into a second test module is a copy, also from a
+        file the change does not touch; a copied `#[test]` is a second test
+        that runs twice, so it is an addition."""
+        def tests_mod(*items):
+            body = "\n".join("".join("    " + ln + "\n" for ln in it.strip().split("\n")) for it in items)
+            return "#[cfg(test)]\nmod tests {\n" + body + "}\n"
+        helper = "fn lines() -> u8 {\n    1\n}\n"
+        test = "#[test]\nfn adds() {\n    assert_eq!(lines(), 1);\n}\n"
+        other = "#[test]\nfn other() {\n    assert!(true);\n}\n"
+        cases = [
+            # the helper copied from an unchanged file: a copy
+            ({"src/main.rs": "mod a;\nmod b;\n", "src/a.rs": tests_mod(helper, test), "src/b.rs": tests_mod(other)},
+             {"src/b.rs": tests_mod(other, helper)}, 0, "copied   fn src/b.rs::tests::lines"),
+            # a test copied: an addition
+            ({"src/main.rs": "mod a;\nmod b;\n", "src/a.rs": tests_mod(helper, test), "src/b.rs": tests_mod(other, helper)},
+             {"src/b.rs": tests_mod(other, helper, test)}, 1, "ADDED    fn src/b.rs::tests::adds"),
+        ]
+        for base, after, want, says in cases:
+            with self.subTest(says=says), tempfile.TemporaryDirectory() as tmp:
+                repo = Repo(Path(tmp), base)
+                repo.commit(after)
+                code, out = repo.check()
+                self.assertEqual(code, want, out)
+                self.assertIn(says, out)
+
+    def test_declared_module_moves_compose_in_commit_order(self):
+        """`crate::a -> crate::b` and then `crate::b -> crate::c` take what was
+        under `crate::a` at the base to `crate::c`."""
+        item = "pub(super) fn find() -> u8 {\n    1\n}\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp), {"src/main.rs": "mod a;\n", "src/a.rs": "mod walk;\n", "src/a/walk.rs": item})
+            (Path(tmp) / "src/a/walk.rs").unlink()
+            repo.commit(
+                {"src/main.rs": "mod a;\nmod b;\n", "src/a.rs": "", "src/b.rs": "mod walk;\n", "src/b/walk.rs": item},
+                "move\n\npure-move-module: crate::a -> crate::b",
+            )
+            (Path(tmp) / "src/b/walk.rs").unlink()
+            repo.commit(
+                {"src/main.rs": "mod a;\nmod b;\nmod c;\n", "src/b.rs": "", "src/c.rs": "mod walk;\n", "src/c/walk.rs": item},
+                "move again\n\npure-move-module: crate::b -> crate::c",
+            )
+            code, out = repo.check()
+            self.assertEqual(code, 0, out)
+            self.assertIn("moved    fn src/a/walk.rs::find -> src/c/walk.rs::find", out)
+
     def test_module_scopes_read_every_spelling(self):
         app = pm.module_of("src/app/codeql.rs")
         self.assertEqual(app, ("crate", "app", "codeql"))

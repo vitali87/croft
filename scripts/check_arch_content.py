@@ -107,9 +107,12 @@ def section_keys(name, ambiguous=frozenset()):
     return keys
 
 
-def compare(old, new):
-    """(shrunk-with-no-section, dropped-rows) between two versions of the doc."""
+def compare(old, new, renamed=None):
+    """(shrunk-with-no-section, dropped-rows) between two versions of the doc.
+    `renamed` maps a file git saw renamed (old path -> new path): its row
+    under the new path is the same module's row, compared like any other."""
     before, after = tree_descriptions(old), tree_descriptions(new)
+    now_tree = set(after)
     # A module that moved from `foo.rs` into a `foo/` directory is the same
     # module, so its directory row inherits the file row's description: it is
     # compared like any other row rather than reported as dropped.
@@ -118,29 +121,61 @@ def compare(old, new):
         for name in before
         if name.endswith(".rs") and name not in after and name[: -len(".rs")] in after
     }
+    moved |= {
+        was: now
+        for was, now in (renamed or {}).items()
+        if was in before and was not in after and now in after
+    }
     after = {**after, **{was: after[now] for was, now in moved.items()}}
-    # A basename carried by more than one row cannot stand in for a path.
-    seen = collections.Counter(p.rstrip("/").split("/")[-1] for p in before)
-    ambiguous = frozenset(leaf for leaf, n in seen.items() if n > 1)
+    # A basename carried by more than one row of either tree cannot stand in
+    # for a path: a row renamed beside a namesake shares its name only in the
+    # new tree.
+    def leaves(tree):
+        seen = collections.Counter(p.rstrip("/").split("/")[-1] for p in tree)
+        return {leaf for leaf, n in seen.items() if n > 1}
+
+    ambiguous = frozenset(leaves(before) | leaves(now_tree))
 
     documented = set()
     for heading in re.findall(r"^### (\S+)", new, re.M):
         documented |= section_keys(heading, ambiguous)
 
+    # A moved row's prose section may be headed by its old path or its new.
     shrunk = [
         (name, len(desc), len(after[name]))
         for name, desc in before.items()
         if name in after
         and len(desc) - len(after[name]) > SHRINK_THRESHOLD
-        and not (section_keys(name, ambiguous) & documented)
+        and not (
+            (section_keys(name, ambiguous) | section_keys(moved.get(name, name), ambiguous))
+            & documented
+        )
     ]
     return sorted(shrunk, key=lambda r: r[2] - r[1]), sorted(set(before) - set(after))
+
+
+def renamed_files(base):
+    """Old path -> new path for each file git sees renamed between `base` and
+    the working tree: a module moved to another folder keeps its row."""
+    out = subprocess.check_output(
+        ["git", "diff", "-M", "--name-status", "-z", base, "--"], text=True
+    ).split("\0")
+    renamed, i = {}, 0
+    while i < len(out) - 1:
+        status = out[i]
+        if status.startswith("R") or status.startswith("C"):
+            if status.startswith("R"):
+                renamed[out[i + 1]] = out[i + 2]
+            i += 3
+        else:
+            i += 2
+    return renamed
 
 
 def main():
     base = sys.argv[1] if len(sys.argv) > 1 else "origin/main"
     old = subprocess.check_output(["git", "show", f"{base}:{PATH}"], text=True)
-    gutted, dropped = compare(old, open(PATH).read())
+    gutted, dropped = compare(old, open(PATH).read(), renamed_files(base))
 
     for name, was, now in gutted:
         print(f"{name}: {was} -> {now} chars, with no `### {name}` section")
