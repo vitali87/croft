@@ -1266,7 +1266,7 @@ fn a_rebuild_queued_behind_a_crashed_index_build_still_runs() {
         crate::jobs::Job::spawn(
             "file-index",
             crate::jobs::Start::Now,
-            || -> Vec<crate::widgets::file_finder::FileEntry> {
+            || -> Vec<crate::file_index::FileEntry> {
                 panic!("the index build crashed (on purpose, in a test)")
             },
         )

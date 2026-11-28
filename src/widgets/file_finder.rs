@@ -1,7 +1,4 @@
-pub use crate::file_index::{
-    FileEntry, build_file_index, build_multi_file_index, has_noise_path_run, is_noise_dir,
-    is_noise_path_under_root,
-};
+use crate::file_index::{FileEntry, build_file_index};
 use crate::widgets::picker_colours;
 use crate::widgets::picker_query;
 use ratatui::{

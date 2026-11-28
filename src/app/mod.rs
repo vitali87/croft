@@ -3755,13 +3755,13 @@ pub struct App {
     pending_replace_all: Option<(usize, usize, usize)>,
     /// Cached workspace file index. Built lazily on first Cmd+P and
     /// shared across reopens so repeated invocations are instant.
-    file_finder_index: Option<std::sync::Arc<Vec<crate::widgets::file_finder::FileEntry>>>,
+    file_finder_index: Option<std::sync::Arc<Vec<crate::file_index::FileEntry>>>,
     /// The background build of that index: App::new starts one that walks
     /// the workspace, so Cmd+P opens against the hot index instead of
     /// walking on the UI thread, and file changes start rebuilds. None once
     /// the index has landed, or the build's thread died (#2618), or no build
     /// was started.
-    file_finder_index_job: Option<crate::jobs::Job<Vec<crate::widgets::file_finder::FileEntry>>>,
+    file_finder_index_job: Option<crate::jobs::Job<Vec<crate::file_index::FileEntry>>>,
     /// Set when a rebuild was requested while one was already in flight.
     /// poll_file_finder_index starts it once that one ends, landed or
     /// crashed (#2618), so a long-running rebuild (multi-GB monorepo) can
@@ -4229,7 +4229,7 @@ impl App {
         let file_finder_index_job = crate::jobs::Job::spawn(
             FILE_INDEX_THREAD,
             crate::jobs::Start::AfterFirstFrame,
-            move || crate::widgets::file_finder::build_file_index(&index_root),
+            move || crate::file_index::build_file_index(&index_root),
         )
         .ok();
         let fs_watch = FsWatch::spawn(&root, &tree);

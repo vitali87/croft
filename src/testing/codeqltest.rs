@@ -49,7 +49,7 @@ fn walk(dir: &Path, max_depth: Option<usize>) -> impl Iterator<Item = PathBuf> {
         .filter_entry(|e| {
             e.depth() == 0
                 || !e.file_type().is_some_and(|t| t.is_dir())
-                || !(crate::widgets::file_finder::is_noise_dir(e.file_name())
+                || !(crate::file_index::is_noise_dir(e.file_name())
                     || e.file_name().to_string_lossy().ends_with(".testproj")
                     || e.file_name() == ".git")
         })
