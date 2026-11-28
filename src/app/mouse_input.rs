@@ -1827,6 +1827,17 @@ impl App {
                 if self.bottom_panel_tab == BottomPanelTab::Output
                     && rect_contains(self.output.last_area, m.column, m.row)
                 {
+                    // The log's scrollbar jumps on a press and follows a
+                    // drag (#2848). An open channel list can cover the
+                    // bar's column, and then the press is the list's.
+                    if !self.output.dropdown_open()
+                        && rect_contains(self.output.last_scrollbar, m.column, m.row)
+                    {
+                        self.focus_pane(Pane::Terminal);
+                        self.output.scroll_to_bar_y(m.row);
+                        self.scrollbar_drag = Some(Pane::Terminal);
+                        return;
+                    }
                     if !self.output.click(m.column, m.row) {
                         self.focus_pane(Pane::Terminal);
                     }
@@ -1840,6 +1851,14 @@ impl App {
                     && rect_contains(self.problems.last_area, m.column, m.row)
                 {
                     use crate::widgets::problems::ProblemHit;
+                    // The list's scrollbar jumps on a press and follows a
+                    // drag (#2848).
+                    if rect_contains(self.problems.last_scrollbar, m.column, m.row) {
+                        self.focus_pane(Pane::Terminal);
+                        self.problems.scroll_to_bar_y(m.row);
+                        self.scrollbar_drag = Some(Pane::Terminal);
+                        return;
+                    }
                     // Toolbar buttons (severity filter / group toggle) consume
                     // the click before it resolves to a row.
                     if self.problems.click(m.column, m.row) {
@@ -3115,7 +3134,19 @@ impl App {
                             self.editor.scroll_to_bar_y(m.row);
                             self.poke_cursor();
                         }
-                        Pane::Terminal => {}
+                        // In the bottom panel a press latches only PROBLEMS'
+                        // and OUTPUT's scrollbars (#2848).
+                        Pane::Terminal => match self.bottom_panel_tab {
+                            BottomPanelTab::Problems => {
+                                self.problems.scroll_to_bar_y(m.row);
+                            }
+                            BottomPanelTab::Output => {
+                                self.output.scroll_to_bar_y(m.row);
+                            }
+                            BottomPanelTab::Terminal
+                            | BottomPanelTab::Ports
+                            | BottomPanelTab::Captures => {}
+                        },
                     }
                     return;
                 }

@@ -4155,6 +4155,147 @@ fn output_select_channel_picks_a_channel_from_the_keyboard() {
     assert_eq!(app.output.selected_name().as_deref(), Some(channel));
 }
 
+/// #2848: OUTPUT draws a scrollbar once its log outgrows the panel, and the
+/// bar answers the mouse as every other one does: a press on the track
+/// jumps the log there, and dragging the thumb keeps it under the pointer.
+#[test]
+fn pressing_and_dragging_the_output_scrollbar_scrolls_the_log() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // The bus is process-wide, so the channel carries a name no other test
+    // uses.
+    let channel = "Scrollbar Drag 2848";
+    for i in 0..200 {
+        crate::output::push(
+            channel,
+            crate::output::OutputLevel::Info,
+            &format!("log line {i:03}"),
+        );
+    }
+    app.output.sync();
+    assert!(app.output.select_by_name(channel));
+    app.bottom_panel_tab = BottomPanelTab::Output;
+
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let bar = app.output.last_scrollbar;
+    assert!(
+        bar.width > 0 && bar.height > 2,
+        "200 log lines in the panel must draw a scrollbar"
+    );
+    let left = app.output.last_area.x;
+    let top_row = |term: &ratatui::Terminal<ratatui::backend::TestBackend>| {
+        let buf = term.backend().buffer();
+        (left..bar.x)
+            .map(|x| buf[(x, bar.y)].symbol())
+            .collect::<String>()
+    };
+    // The log follows its tail, so it opens on its last lines.
+    let opened = top_row(&term);
+    assert!(
+        opened.contains("log line") && !opened.contains("log line 000"),
+        "the log opens on its tail: {opened:?}"
+    );
+
+    // A press at the track's top jumps the log to its first line.
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), bar.x, bar.y));
+    term.draw(|f| app.render(f)).unwrap();
+    let jumped = top_row(&term);
+    assert!(
+        jumped.contains("log line 000"),
+        "a press on the scrollbar's top must jump the log to its start: {jumped:?}"
+    );
+
+    // Dragging the thumb to the track's foot follows the pointer back down.
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        bar.x,
+        bar.y + bar.height - 1,
+    ));
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(
+        top_row(&term),
+        opened,
+        "dragging the thumb to the track's foot must bring the tail back"
+    );
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        bar.x,
+        bar.y + bar.height - 1,
+    ));
+    assert!(app.scrollbar_drag.is_none(), "the release ends the drag");
+}
+
+/// #2848: the channel list OUTPUT opens over its log can reach the
+/// scrollbar's column, so while the list is open a press there is the
+/// list's (it closes, or picks the row under it), never a scrollbar drag.
+#[test]
+fn a_press_on_the_output_scrollbar_with_the_channel_list_open_is_the_lists() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // The bus is process-wide, so the channel carries a name no other test
+    // uses.
+    let channel = "Scrollbar Under List 2848";
+    for i in 0..200 {
+        crate::output::push(
+            channel,
+            crate::output::OutputLevel::Info,
+            &format!("log line {i:03}"),
+        );
+    }
+    app.output.sync();
+    assert!(app.output.select_by_name(channel));
+    app.bottom_panel_tab = BottomPanelTab::Output;
+
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let bar = app.output.last_scrollbar;
+    assert!(bar.width > 0 && bar.height > 2, "the log draws a scrollbar");
+    // The toolbar's channel button shows the channel's name; a click on it
+    // opens the list.
+    let area = app.output.last_area;
+    let toolbar: String = {
+        let buf = term.backend().buffer();
+        (area.x..area.x + area.width)
+            .map(|x| buf[(x, area.y)].symbol())
+            .collect()
+    };
+    let at = toolbar
+        .find(channel)
+        .expect("the toolbar names the shown channel");
+    let button_x = area.x + toolbar[..at].chars().count() as u16;
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        button_x,
+        area.y,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        button_x,
+        area.y,
+    ));
+    assert!(
+        app.output.dropdown_open(),
+        "the channel button opens the list"
+    );
+    term.draw(|f| app.render(f)).unwrap();
+
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), bar.x, bar.y));
+    assert!(
+        !app.output.dropdown_open(),
+        "a press on the bar's column while the list is open is the list's"
+    );
+    assert!(
+        app.scrollbar_drag.is_none(),
+        "and does not start a scrollbar drag"
+    );
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), bar.x, bar.y));
+}
+
 /// #852 regression, driven by keys alone: from the editor with the panel
 /// hidden, `Ctrl+Shift+M` shows PROBLEMS, `Ctrl+Shift+U` shows OUTPUT and
 /// `Cmd+Shift+T` brings TERMINAL back over them, each time with the panel

@@ -1887,7 +1887,9 @@ pub struct App {
     /// scrollback. `None` whenever the pointer is inside the pane or the
     /// button is released.
     terminal_select_autoscroll: Option<TerminalSelectAutoScroll>,
-    /// Pane whose scrollbar is currently being dragged with the left mouse button.
+    /// Pane whose scrollbar is currently being dragged with the left mouse
+    /// button. `Pane::Terminal` is the bottom panel's PROBLEMS or OUTPUT
+    /// list, whichever tab is showing (#2848).
     scrollbar_drag: Option<Pane>,
     /// True while the editor's horizontal scrollbar thumb is being dragged.
     /// Only the editor has a horizontal bar, so a bool suffices.
