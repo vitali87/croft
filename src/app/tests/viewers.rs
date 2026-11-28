@@ -1784,7 +1784,7 @@ fn a_press_after_a_lost_release_ends_a_markdown_preview_selection() {
     assert!(begun.is_some(), "the press starts a preview selection");
     // That press's release never arrives. The next press is on the status
     // bar's problem counts.
-    let diag = app.status_diag_rect;
+    let diag = app.status_hits.diagnostics;
     assert!(!diag.is_empty(), "the status bar shows the problem counts");
     app.handle_mouse(mouse(
         MouseEventKind::Down(MouseButton::Left),
