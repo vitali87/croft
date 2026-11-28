@@ -684,6 +684,12 @@ impl PtyTerminal {
                             let mut lt = line_times_for_thread.lock().unwrap();
                             stamp_chunk(&mut t, &mut clock, &mut lt, &mut prev_stamp_id, now_ms);
                         }
+                        // Done with the screen. What follows reads only this
+                        // read's own lines, so painting and typing go on
+                        // while the problem matchers run.
+                        drop(t);
+                        #[cfg(test)]
+                        super::lock_probe::after_screen_work(&term_for_thread);
                         // Matcher ownership changed since the last chunk
                         // (matchers.json reload, task (re)assignment):
                         // drop any half-open window, or its next `ends`
@@ -730,7 +736,6 @@ impl PtyTerminal {
                         for h in trigger_hits.drain(..) {
                             let _ = trigger_tx.send(h);
                         }
-                        drop(t);
                         pty_pending_bytes_for_thread.fetch_add(n, Ordering::Relaxed);
                         last_output_ms_for_thread.store(
                             std::time::SystemTime::now()
