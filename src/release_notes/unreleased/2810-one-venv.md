@@ -1,0 +1,1 @@
+fix: Run Test now runs a test under the same Python as Debug Test: a project venv named `.env` is used, and running one test or one file uses the venv nearest it, where Run Test used the workspace's `python3` or `pytest` and the same test could import under one and fail under the other. Python tasks and notebooks use a `.env` venv too (#2810).

@@ -115,12 +115,7 @@ pub fn resolve(
             source: Source::Settings,
         };
     }
-    let on_path = path_env
-        .map(|p| std::env::split_paths(p).collect::<Vec<_>>())
-        .unwrap_or_default()
-        .into_iter()
-        .map(|dir| dir.join(exe_name()))
-        .find(|p| p.is_file());
+    let on_path = crate::proc::find::on_path_in(exe_name(), path_env);
     if let Some(program) = on_path {
         return Resolved {
             program,
@@ -354,9 +349,34 @@ pub fn write_test_archive(zip: &Path, launcher: &str) {
 mod tests {
     use super::*;
 
+    /// An empty program at `path` that can run.
     fn touch(path: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, "").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// #2808: a `codeql` on PATH that cannot run is passed over for the
+    /// next one, as a shell passes it over.
+    #[test]
+    fn a_codeql_on_path_that_cannot_run_is_passed_over() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let (first, second) = (tmp.path().join("a"), tmp.path().join("b"));
+        touch(&first.join(exe_name()));
+        std::fs::set_permissions(
+            first.join(exe_name()),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        touch(&second.join(exe_name()));
+        let path = std::env::join_paths([&first, &second]).unwrap();
+        let r = resolve(None, None, Some(&path), &tmp.path().join("cache"));
+        assert_eq!(
+            (r.program, r.source),
+            (second.join(exe_name()), Source::Path)
+        );
     }
 
     #[test]

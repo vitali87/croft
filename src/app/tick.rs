@@ -171,8 +171,10 @@ fn tick_panes_and_saves(app: &mut App, symbol_views_settled: bool) -> bool {
 fn tick_highlights_and_pictures(app: &mut App) -> bool {
     let highlights_changed = app.poll_highlights();
     // Pictures baked off the UI thread (#1973) go up as they land.
-    let images_changed =
-        app.poll_chrome_bake() | app.poll_welcome_bake() | app.poll_saved_session();
+    let images_changed = app.poll_chrome_bake()
+        | app.poll_welcome_bake()
+        | app.poll_saved_session()
+        | app.poll_pdf_previews();
     // A closed tab's bookmarks are kept, and come back with its file.
     let bookmarks_changed = app.settle_bookmarks();
     crate::startup_trace::mark("highlights and pictures polled");
@@ -326,7 +328,7 @@ fn tick_language_server_replies(app: &mut App) -> bool {
 /// The debugger, the test runner and its coverage and watch, and the
 /// notice of a red test run.
 fn tick_debugger_and_tests(app: &mut App) -> bool {
-    let dap_changed = app.poll_dap() | app.poll_debug_build();
+    let dap_changed = app.poll_dap() | app.poll_debug_build() | app.poll_debug_setups();
     let tests_changed = app.test_worker.drain(&mut app.testing)
         | app.drain_pending_test_debug()
         | app.drain_pending_cargo_launch();

@@ -383,6 +383,68 @@ fn markdown_preview_computes_image_anchor_frame_truth() {
     );
 }
 
+/// Whether poppler can render pages and read their links here; says why
+/// not when it cannot.
+fn pdf_links_readable() -> bool {
+    let readable = crate::pdf::detect_backend() == Some(crate::pdf::PdfBackend::PdftoppmCli)
+        && !crate::pdf::page_links(std::path::Path::new("/nonexistent"), 1)
+            .err()
+            .is_some_and(|e| e.to_string().contains("install poppler"));
+    if !readable {
+        eprintln!("skipping: poppler (pdftoppm + pdftohtml) not installed");
+    }
+    readable
+}
+
+/// A click that waits for its page's links acts on the preview in front
+/// (#2824): one made just before the user left the tab is dropped, and never
+/// turns the page behind their back or when they come back.
+#[test]
+fn a_pdf_link_click_is_dropped_when_its_tab_is_left_before_the_links_are_in() {
+    if !pdf_links_readable() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let pdf = tmp.path().join("linked.pdf");
+    std::fs::write(&pdf, two_page_pdf_with_internal_link()).unwrap();
+    let notes = tmp.path().join("notes.txt");
+    std::fs::write(&notes, "notes\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&pdf).unwrap();
+    settle_pdf(&mut app);
+    // Over "go to two" (x 30..103 of 300, y 62..79 of 150 in pdftohtml's
+    // space).
+    let on_the_link = (0.2, 0.45, 0.25, 0.5);
+
+    app.editor.read_pdf_links_for(on_the_link);
+    settle_pdf(&mut app);
+    assert_eq!(
+        app.editor.pdf_page(),
+        Some(2),
+        "a click on the link in front acts once the links are in; status: {}",
+        app.status
+    );
+
+    app.jump_pdf_page(1);
+    settle_pdf(&mut app);
+    app.editor.read_pdf_links_for(on_the_link);
+    app.editor.open_pinned(&notes).unwrap();
+    settle_pdf(&mut app);
+    let pdf_tab = app
+        .editor
+        .editors
+        .iter()
+        .position(|ed| ed.pdf_page().is_some())
+        .expect("the PDF tab stays open");
+    app.editor.select(pdf_tab);
+    settle_pdf(&mut app);
+    assert_eq!(
+        app.editor.pdf_page(),
+        Some(1),
+        "a click left behind on a tab must not act when the user returns"
+    );
+}
+
 /// A minimal two-page PDF whose page 1 carries the text "go to two" under a
 /// GoTo link annotation targeting page 2. Hand-assembled (correct xref
 /// offsets included) so the test needs no pdflatex, only poppler to read it.
@@ -445,12 +507,7 @@ fn two_page_pdf_with_internal_link() -> Vec<u8> {
 #[test]
 fn clicking_an_internal_pdf_link_flips_to_its_page() {
     use crossterm::event::{MouseButton, MouseEventKind};
-    if crate::pdf::detect_backend() != Some(crate::pdf::PdfBackend::PdftoppmCli)
-        || crate::pdf::page_links(std::path::Path::new("/nonexistent"), 1)
-            .err()
-            .is_some_and(|e| e.to_string().contains("install poppler"))
-    {
-        eprintln!("skipping: poppler (pdftoppm + pdftohtml) not installed");
+    if !pdf_links_readable() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -462,6 +519,7 @@ fn clicking_an_internal_pdf_link_flips_to_its_page() {
     app.cell_pixel = Some((10, 20));
     app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::Kitty;
     app.editor.open_pinned(&pdf).unwrap();
+    settle_pdf(&mut app);
     let backend = ratatui::backend::TestBackend::new(120, 40);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|frame| app.render(frame)).unwrap();
@@ -496,6 +554,14 @@ fn clicking_an_internal_pdf_link_flips_to_its_page() {
     assert!(col > 0, "some cell must cover the link's page position");
     assert_eq!(app.editor.pdf_page(), Some(1));
     app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    // The page's links are read on a job (#2824): the click returns at once
+    // and acts when they are in.
+    assert_eq!(
+        app.editor.pdf_page(),
+        Some(1),
+        "the click must not wait for the links"
+    );
+    settle_pdf(&mut app);
     assert_eq!(
         app.editor.pdf_page(),
         Some(2),
@@ -2027,7 +2093,9 @@ fn editor_image_preview_sits_below_text_so_popups_paint_over_it() {
     );
 }
 
-fn current_pdf_page(app: &App) -> u32 {
+/// The page the focused PDF preview shows once its work has landed.
+fn current_pdf_page(app: &mut App) -> u32 {
+    settle_pdf(app);
     app.editor
         .image
         .as_ref()
@@ -2058,27 +2126,315 @@ fn arrow_keys_page_through_an_open_pdf() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.editor.open(&path).unwrap();
     app.focus_pane(Pane::Editor);
-    assert_eq!(current_pdf_page(&app), 1);
+    assert_eq!(current_pdf_page(&mut app), 1);
 
     app.handle_key(key(KeyCode::Right, KeyModifiers::NONE))
         .unwrap();
-    assert_eq!(current_pdf_page(&app), 2, "Right must go to the next page");
+    assert_eq!(
+        current_pdf_page(&mut app),
+        2,
+        "Right must go to the next page"
+    );
 
     app.handle_key(key(KeyCode::Left, KeyModifiers::NONE))
         .unwrap();
-    assert_eq!(current_pdf_page(&app), 1, "Left must go back a page");
+    assert_eq!(current_pdf_page(&mut app), 1, "Left must go back a page");
 
     app.handle_key(key(KeyCode::PageDown, KeyModifiers::NONE))
         .unwrap();
-    assert_eq!(current_pdf_page(&app), 2, "PageDown pages forward");
+    assert_eq!(current_pdf_page(&mut app), 2, "PageDown pages forward");
 
     app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
         .unwrap();
-    assert_eq!(current_pdf_page(&app), 3, "End jumps to the last page");
+    assert_eq!(current_pdf_page(&mut app), 3, "End jumps to the last page");
 
     app.handle_key(key(KeyCode::Home, KeyModifiers::NONE))
         .unwrap();
-    assert_eq!(current_pdf_page(&app), 1, "Home jumps back to page 1");
+    assert_eq!(current_pdf_page(&mut app), 1, "Home jumps back to page 1");
+}
+
+/// A page turn returns at once (#2824): the page renders on a job, the one
+/// on screen stays until it lands, and a second press while the first
+/// renders moves on from the page asked for.
+#[test]
+fn a_pdf_page_turn_does_not_wait_for_the_render() {
+    require_pdf_backend();
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("doc.pdf");
+    write_three_page_pdf(&path);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&path).unwrap();
+    app.focus_pane(Pane::Editor);
+    settle_pdf(&mut app);
+    let page_one = app.editor.image.as_ref().unwrap().bytes.clone();
+
+    app.handle_key(key(KeyCode::Right, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.pdf_page(),
+        Some(1),
+        "the key press must not wait for page 2 to render"
+    );
+    assert!(
+        app.editor.image.as_ref().unwrap().bytes == page_one,
+        "page 1 stays on screen until page 2 lands"
+    );
+    assert_eq!(app.editor.pdf_target_page(), Some(2));
+    app.handle_key(key(KeyCode::Right, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.pdf_target_page(),
+        Some(3),
+        "a second press moves on from the page asked for"
+    );
+    assert_eq!(current_pdf_page(&mut app), 3);
+}
+
+/// Holding a page key renders one page at a time (#2824 review): the page
+/// asked for last waits for the one rendering, instead of a renderer per key
+/// repeat piling up.
+#[test]
+fn holding_a_pdf_page_key_renders_one_page_at_a_time() {
+    require_pdf_backend();
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("doc.pdf");
+    write_three_page_pdf(&path);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&path).unwrap();
+    app.focus_pane(Pane::Editor);
+    settle_pdf(&mut app);
+    for _ in 0..2 {
+        app.handle_key(key(KeyCode::Right, KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(
+        app.editor.pdf_jobs.rendering_page(),
+        Some(2),
+        "the first press's page is the only one rendering"
+    );
+    assert_eq!(app.editor.pdf_target_page(), Some(3));
+    assert_eq!(
+        current_pdf_page(&mut app),
+        3,
+        "the last page asked for lands"
+    );
+}
+
+/// End pressed before the page count is in, then Home: Home is the newer
+/// wish and wins (#2824 review).
+#[test]
+fn home_after_an_early_end_stays_on_the_first_pdf_page() {
+    require_pdf_backend();
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("doc.pdf");
+    write_three_page_pdf(&path);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&path).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Home, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(current_pdf_page(&mut app), 1, "Home came after End");
+}
+
+/// Opening a PDF from the Explorer returns at once (#2827): the tab comes
+/// up saying page 1 is rendering, and the page shows when it lands.
+#[test]
+fn opening_a_pdf_does_not_wait_for_its_first_page() {
+    require_pdf_backend();
+    let tmp = tempfile::tempdir().unwrap();
+    write_three_page_pdf(&tmp.path().join("doc.pdf"));
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    open_from_explorer(&mut app, "doc.pdf");
+    assert!(
+        app.editor.image.as_ref().is_some_and(|i| i.pdf.is_some()),
+        "the PDF tab is open at once"
+    );
+    assert!(
+        !app.editor.pdf_page_shown(),
+        "the open must not wait for page 1 to render"
+    );
+    assert!(app.editor.pdf_jobs.rendering());
+    settle_pdf(&mut app);
+    assert!(app.editor.pdf_page_shown(), "page 1 shows once it lands");
+    assert_eq!(app.editor.pdf_page(), Some(1));
+}
+
+/// A PDF whose first page fails in the background says so in the status
+/// line, as the open that waited for it did: a `.pdf` names the failure, and
+/// a file only sniffed as a PDF says why it went to the hex viewer (#2829
+/// review). The open had said "Opened …" long before.
+#[test]
+fn a_pdf_whose_first_page_fails_says_why_once_it_lands() {
+    require_pdf_backend();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("half.pdf"), b"%PDF-1.4\nnot really a pdf\n").unwrap();
+    std::fs::write(tmp.path().join("broken"), b"%PDF-1.4\nnot really a pdf\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    open_from_explorer(&mut app, "half.pdf");
+    settle_pdf(&mut app);
+    assert!(
+        app.status.contains("PDF page 1 failed"),
+        "the failure is said: {}",
+        app.status
+    );
+    open_from_explorer(&mut app, "broken");
+    settle_pdf(&mut app);
+    assert!(app.editor.hex.is_some(), "status: {}", app.status);
+    assert!(
+        app.status.contains("in the hex viewer") && app.status.contains("could not render"),
+        "why it went to hex is said: {}",
+        app.status
+    );
+}
+
+/// A PDF rebuilt on disk reloads without the sweep waiting for the render,
+/// and the status says so once it lands (#2827).
+#[test]
+fn a_pdf_rebuilt_on_disk_reloads_without_waiting_and_says_so() {
+    require_pdf_backend();
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("doc.pdf");
+    write_three_page_pdf(&path);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&path).unwrap();
+    settle_pdf(&mut app);
+    write_three_page_pdf(&path);
+    let newer = std::time::SystemTime::now() + std::time::Duration::from_secs(2);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(newer)
+        .unwrap();
+    app.status.clear();
+    app.reload_open_file_after_external_change();
+    assert!(
+        app.editor.pdf_jobs.reloading(),
+        "the rebuild renders on a job, not in the sweep"
+    );
+    assert!(!app.status.contains("Reloaded"), "{}", app.status);
+    settle_pdf(&mut app);
+    assert!(
+        app.status.contains("Reloaded") && app.status.contains("doc.pdf"),
+        "the reload is said once it lands: {}",
+        app.status
+    );
+}
+
+/// Push `path`'s modified time `secs` into the future, so the next look at
+/// it sees a new version whatever the clock's resolution.
+fn bump_mtime(path: &std::path::Path, secs: u64) {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(secs))
+        .unwrap();
+}
+
+/// A PDF written again while its rebuild renders shows the newer file once
+/// that rebuild lands, with nothing else changing on disk: the sweeps
+/// meanwhile leave it alone, one rebuild at a time, so the landing has to
+/// look again (#2830 review). The first rebuild is made to fail, so it
+/// cannot happen to read the newer file itself.
+#[test]
+fn a_pdf_written_again_while_its_rebuild_renders_shows_the_newer_file() {
+    require_pdf_backend();
+    let one_page = concat!(
+        "%PDF-1.4\n",
+        "1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n",
+        "2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n",
+        "3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]/Contents 4 0 R>>endobj\n",
+        "4 0 obj<</Length 27>>stream\n0 0 1 rg 10 10 100 100 re f\nendstream endobj\n",
+        "trailer<</Root 1 0 R/Size 5>>\n%%EOF\n",
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("doc.pdf");
+    write_three_page_pdf(&path);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&path).unwrap();
+    settle_pdf(&mut app);
+    write_three_page_pdf(&path);
+    bump_mtime(&path, 2);
+    *crate::pdf::FAIL_RASTERIZE_ONCE_FOR_TEST.lock().unwrap() = Some((path.clone(), 1));
+    app.reload_open_file_after_external_change();
+    assert!(app.editor.pdf_jobs.reloading());
+    std::fs::write(&path, one_page).unwrap();
+    bump_mtime(&path, 4);
+    // The watcher's sweep meanwhile: it leaves the rebuild rendering alone.
+    app.reload_open_file_after_external_change();
+    settle_pdf(&mut app);
+    let count = app
+        .editor
+        .image
+        .as_ref()
+        .and_then(|i| i.pdf.as_ref())
+        .and_then(|pdf| pdf.page_count);
+    assert_eq!(count, Some(1), "the newer file is shown: {}", app.status);
+}
+
+/// A file in another tab written while a PDF rebuild renders reloads when
+/// the rebuild lands (#2830 review): the landing took in every open file's
+/// new version without looking at any of them, so that write was never
+/// noticed.
+#[test]
+fn a_file_written_while_a_pdf_rebuild_renders_still_reloads() {
+    require_pdf_backend();
+    let tmp = tempfile::tempdir().unwrap();
+    let notes = tmp.path().join("notes.txt");
+    std::fs::write(&notes, "old\n").unwrap();
+    let pdf = tmp.path().join("doc.pdf");
+    write_three_page_pdf(&pdf);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&notes).unwrap();
+    app.editor.open_pinned(&pdf).unwrap();
+    settle_pdf(&mut app);
+    write_three_page_pdf(&pdf);
+    bump_mtime(&pdf, 2);
+    app.reload_open_file_after_external_change();
+    assert!(app.editor.pdf_jobs.reloading());
+    std::fs::write(&notes, "new\n").unwrap();
+    bump_mtime(&notes, 2);
+    settle_pdf(&mut app);
+    let tab = app
+        .editor
+        .iter_tabs()
+        .find(|t| t.path.as_deref() == Some(notes.as_path()))
+        .expect("the notes tab");
+    assert_eq!(
+        tab.lines.first().map(String::as_str),
+        Some("new"),
+        "{}",
+        app.status
+    );
+}
+
+/// End pressed right after the open, before the page count is in, goes to
+/// the last page once it is: the count is read on a job (#2824).
+#[test]
+fn end_before_the_pdf_page_count_is_in_goes_to_the_last_page() {
+    require_pdf_backend();
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("doc.pdf");
+    write_three_page_pdf(&path);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&path).unwrap();
+    app.focus_pane(Pane::Editor);
+    let count = |app: &App| {
+        app.editor
+            .image
+            .as_ref()
+            .and_then(|i| i.pdf.as_ref())
+            .and_then(|pdf| pdf.page_count)
+    };
+    assert_eq!(count(&app), None, "the open must not wait for the count");
+
+    app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(current_pdf_page(&mut app), 3, "End lands on the last page");
+    assert_eq!(count(&app), Some(3));
 }
 
 #[test]
@@ -2097,7 +2453,7 @@ fn a_pdf_opened_from_the_explorer_pages_with_the_arrow_keys() {
     app.handle_key(key(KeyCode::Right, KeyModifiers::NONE))
         .unwrap();
     assert_eq!(
-        current_pdf_page(&app),
+        current_pdf_page(&mut app),
         2,
         "a PDF opened from the Explorer must page with Right"
     );
@@ -2115,16 +2471,15 @@ fn the_wheel_pages_a_pdf_under_the_pointer() {
     let (col, row) = place_editor_pane(&mut app);
 
     wheel(&mut app, MouseEventKind::ScrollDown, col, row);
-    assert_eq!(current_pdf_page(&app), 2, "wheel down pages forward");
+    assert_eq!(current_pdf_page(&mut app), 2, "wheel down pages forward");
     wheel(&mut app, MouseEventKind::ScrollUp, col, row);
-    assert_eq!(current_pdf_page(&app), 1, "wheel up pages back");
+    assert_eq!(current_pdf_page(&mut app), 1, "wheel up pages back");
 }
 
-/// A momentum flick delivers a burst of same-direction wheel events, and
-/// every PDF page step is a synchronous rasteriser run on the UI thread: the
-/// burst must coalesce (rate-limited per direction) instead of queueing
-/// dozens of blocking renders. A reversal is deliberate and passes through
-/// immediately (the paging test above depends on that).
+/// A momentum flick delivers a burst of same-direction wheel events: the
+/// burst must coalesce (rate-limited per direction) into one page step
+/// instead of racing through a page per event. A reversal is deliberate and
+/// passes through immediately (the paging test above depends on that).
 #[test]
 fn a_wheel_flick_over_a_pdf_coalesces_to_one_page_step() {
     require_pdf_backend();
@@ -2138,7 +2493,7 @@ fn a_wheel_flick_over_a_pdf_coalesces_to_one_page_step() {
     wheel(&mut app, MouseEventKind::ScrollDown, col, row);
     wheel(&mut app, MouseEventKind::ScrollDown, col, row);
     assert_eq!(
-        current_pdf_page(&app),
+        current_pdf_page(&mut app),
         2,
         "a same-direction burst steps one page, not one per event"
     );
@@ -2158,14 +2513,14 @@ fn the_wheel_does_not_wrap_a_pdf_at_its_ends() {
     let (col, row) = place_editor_pane(&mut app);
     wheel(&mut app, MouseEventKind::ScrollUp, col, row);
     assert_eq!(
-        current_pdf_page(&app),
+        current_pdf_page(&mut app),
         1,
         "wheel up on page 1 must not wrap"
     );
     app.jump_pdf_page(3);
     wheel(&mut app, MouseEventKind::ScrollDown, col, row);
     assert_eq!(
-        current_pdf_page(&app),
+        current_pdf_page(&mut app),
         3,
         "wheel down on the last page must not wrap"
     );
@@ -2186,7 +2541,7 @@ fn the_wheel_cooldown_does_not_leak_across_pdf_documents() {
     app.editor.open(&a).unwrap();
     let (col, row) = place_editor_pane(&mut app);
     wheel(&mut app, MouseEventKind::ScrollDown, col, row);
-    assert_eq!(current_pdf_page(&app), 2);
+    assert_eq!(current_pdf_page(&mut app), 2);
     app.editor.open(&b).unwrap();
     let (col, row) = place_editor_pane(&mut app);
     // Pin the cooldown stamp to "just now, same direction, other document"
@@ -2195,7 +2550,7 @@ fn the_wheel_cooldown_does_not_leak_across_pdf_documents() {
     app.last_pdf_wheel = Some((std::time::Instant::now(), 1, Some(a.clone())));
     wheel(&mut app, MouseEventKind::ScrollDown, col, row);
     assert_eq!(
-        current_pdf_page(&app),
+        current_pdf_page(&mut app),
         2,
         "the second document's first wheel tick must not be dropped"
     );
@@ -2326,6 +2681,7 @@ fn turning_a_pdf_page_rebakes_the_inline_image_overlay() {
     app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::Kitty;
     app.cell_pixel = Some((8, 16));
     app.editor.open(&path).unwrap();
+    settle_pdf(&mut app);
     let area = Rect {
         x: 0,
         y: 0,
@@ -2338,7 +2694,8 @@ fn turning_a_pdf_page_rebakes_the_inline_image_overlay() {
         .map(|(osc, _)| osc.to_string())
         .expect("page 1 must bake");
 
-    assert!(app.editor.change_pdf_page(1));
+    app.editor.change_pdf_page(1);
+    settle_pdf(&mut app);
     app.update_editor_image_overlay(0, area);
     let page2 = app
         .editor_image_payload(0)
@@ -2362,7 +2719,7 @@ fn a_pdf_opened_with_one_click_in_the_explorer_pages_with_the_arrow_keys() {
 
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     click_open_in_explorer(&mut app, "doc.pdf");
-    assert_eq!(current_pdf_page(&app), 1, "the click must open the PDF");
+    assert_eq!(current_pdf_page(&mut app), 1, "the click must open the PDF");
     assert!(
         matches!(app.focus, Pane::Editor),
         "one click on a file must hand the keyboard to the editor, as VS Code does"
@@ -2370,10 +2727,10 @@ fn a_pdf_opened_with_one_click_in_the_explorer_pages_with_the_arrow_keys() {
 
     app.handle_key(key(KeyCode::Right, KeyModifiers::NONE))
         .unwrap();
-    assert_eq!(current_pdf_page(&app), 2, "Right must turn the page");
+    assert_eq!(current_pdf_page(&mut app), 2, "Right must turn the page");
     app.handle_key(key(KeyCode::Char(' '), KeyModifiers::NONE))
         .unwrap();
-    assert_eq!(current_pdf_page(&app), 3, "Space must turn the page");
+    assert_eq!(current_pdf_page(&mut app), 3, "Space must turn the page");
 }
 
 /// A click on a spreadsheet must leave the arrow keys scrolling the grid, not
@@ -2450,7 +2807,7 @@ fn a_pdf_opened_over_a_markdown_preview_pages_with_the_keys() {
 
     app.handle_key(key(KeyCode::PageDown, KeyModifiers::NONE))
         .unwrap();
-    assert_eq!(current_pdf_page(&app), 2, "PageDown must turn the page");
+    assert_eq!(current_pdf_page(&mut app), 2, "PageDown must turn the page");
     app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
         .unwrap();
     assert!(app.editor.image.is_none(), "Cmd+W must close the PDF tab");
