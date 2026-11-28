@@ -5568,16 +5568,6 @@ impl App {
         self.codeql.theme = self.theme;
         self.testing.focus_gradient = gradient;
         self.testing.theme = self.theme;
-        let explorer_focused =
-            self.focus == Pane::Tree && self.sidebar_view == SidebarView::Explorer;
-        self.outline.focus_gradient = gradient;
-        self.outline.theme = self.theme;
-        self.outline.focused = explorer_focused;
-        self.open_editors.focus_gradient = gradient;
-        self.open_editors.theme = self.theme;
-        self.open_editors.focused = explorer_focused;
-        self.agent_lane_panel.theme = self.theme;
-        self.agent_lane_panel.focused = explorer_focused;
         self.commit_graph.focus_gradient = gradient;
         self.commit_graph.theme = self.theme;
         self.commit_graph.focused =

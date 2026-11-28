@@ -18,8 +18,8 @@ use ratatui::{
 
 use crate::icons;
 use crate::lsp::manager::OutlineSymbol;
-use crate::theme::Theme;
 use crate::widgets::scrollbar;
+use crate::widgets::view_cx::ViewCx;
 
 const COLOR_DIM: Color = Color::Rgb(0x60, 0x68, 0x78);
 const COLOR_NAME: Color = Color::Rgb(0xCC, 0xCC, 0xCC);
@@ -47,18 +47,6 @@ pub struct OutlinePanel {
     /// The outline could not be read: its parse crashed or never started
     /// (#2587). The panel says so instead of "Loading".
     failed: bool,
-    /// Black theme: highlight rows with the brand's dark-teal instead of the
-    /// legacy blue. Mirrors `FileTree::focus_gradient`, set by the app.
-    pub focus_gradient: bool,
-    /// Active color theme, driving the scrollbar track/thumb colours so the
-    /// outline's lane matches the file tree's directly above it. Set by the app.
-    pub theme: Theme,
-    /// Whether the Explorer/tree has focus, for the brighter scrollbar thumb.
-    /// Mirrors `FileTree::focused`; set by the app at each focus change.
-    pub focused: bool,
-    /// Render-time pointer cell so the row under the cursor lights up, fed by
-    /// the app each frame exactly like the other side panels.
-    pub hover_pointer: Option<(u16, u16)>,
 
     // Hit-test rects, refreshed every render.
     pub last_area: Rect,
@@ -138,10 +126,6 @@ impl OutlinePanel {
             scroll: 0,
             loaded: false,
             failed: false,
-            focus_gradient: false,
-            theme: Theme::default(),
-            focused: false,
-            hover_pointer: None,
             last_area: Rect::default(),
             last_scrollbar: Rect::default(),
             last_header_row: 0,
@@ -299,6 +283,7 @@ impl OutlinePanel {
 
     /// Whether a reply (even an empty one) has been applied for the current
     /// file, so the panel can show "No symbols" instead of "Loading".
+    #[cfg(test)]
     pub fn loaded(&self) -> bool {
         self.loaded
     }
@@ -427,12 +412,13 @@ impl Default for OutlinePanel {
     }
 }
 
-impl Widget for &mut OutlinePanel {
-    fn render(self, area: Rect, buf: &mut Buffer) {
+impl OutlinePanel {
+    /// Draw the section into `area` with this frame's [`ViewCx`].
+    pub fn draw(&mut self, cx: &ViewCx, area: Rect, buf: &mut Buffer) {
         let block = crate::widgets::surface::section_block(
-            self.theme,
+            cx.theme,
             Borders::BOTTOM,
-            Style::default().fg(self.theme.ui(COLOR_DIM)),
+            Style::default().fg(cx.theme.ui(COLOR_DIM)),
         );
         let inner = block.inner(area);
         block.render(area, buf);
@@ -459,11 +445,11 @@ impl Widget for &mut OutlinePanel {
         crate::widgets::surface::paint_section_header(
             buf,
             header_row,
-            self.theme,
+            cx.theme,
             !self.collapsed,
             &crate::i18n::tr("OUTLINE"),
             Vec::new(),
-            crate::widgets::hover::contains(header_row, self.hover_pointer),
+            crate::widgets::hover::contains(header_row, cx.pointer),
         );
         self.last_header_row = header_y;
         self.last_header_x = inner.x;
@@ -492,7 +478,7 @@ impl Widget for &mut OutlinePanel {
             };
             Paragraph::new(Line::from(Span::styled(
                 msg,
-                Style::default().fg(self.theme.ui(COLOR_DIM)),
+                Style::default().fg(cx.theme.ui(COLOR_DIM)),
             )))
             .render(
                 Rect {
@@ -528,11 +514,11 @@ impl Widget for &mut OutlinePanel {
         let visible = (body_h as usize).min(self.symbols.len().saturating_sub(self.scroll));
         self.visible_rows = visible as u16;
         self.last_scroll = self.scroll;
-        let brand = self.focus_gradient;
+        let brand = cx.theme.gradient();
         let sel_bg = if brand {
             crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG)
         } else {
-            self.theme.ui(Color::Rgb(0x09, 0x4d, 0x77))
+            cx.theme.ui(Color::Rgb(0x09, 0x4d, 0x77))
         };
 
         for row in 0..visible {
@@ -554,25 +540,25 @@ impl Widget for &mut OutlinePanel {
             spans.push(Span::raw("  ".repeat(depth)));
             spans.push(Span::styled(
                 format!("{} ", icon.glyph),
-                Style::default().fg(self.theme.ui(icon.color)),
+                Style::default().fg(cx.theme.ui(icon.color)),
             ));
             spans.push(Span::styled(
                 sym.name.clone(),
-                Style::default().fg(self.theme.ui(COLOR_NAME)),
+                Style::default().fg(cx.theme.ui(COLOR_NAME)),
             ));
             if let Some(detail) = &sym.detail
                 && !detail.is_empty()
             {
                 spans.push(Span::styled(
                     format!(" {detail}"),
-                    Style::default().fg(self.theme.ui(COLOR_DIM)),
+                    Style::default().fg(cx.theme.ui(COLOR_DIM)),
                 ));
             }
 
             let style = if self.current == Some(idx) {
                 Style::default().bg(sel_bg)
             } else if let Some(bg) =
-                crate::widgets::hover::row_hover_bg(row_rect, self.hover_pointer, self.theme)
+                crate::widgets::hover::row_hover_bg(row_rect, cx.pointer, cx.theme)
             {
                 Style::default().bg(bg)
             } else {
@@ -584,7 +570,7 @@ impl Widget for &mut OutlinePanel {
 
         if let Some(metrics) = bar {
             self.last_scrollbar = metrics.area;
-            scrollbar::render_vertical_on_chrome(buf, metrics, self.focused, self.theme);
+            scrollbar::render_vertical_on_chrome(buf, metrics, cx.focused, cx.theme);
         }
     }
 }
@@ -659,7 +645,7 @@ mod tests {
             height: 10,
         };
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         p.scroll_up(3);
         assert_eq!(p.scroll, 0, "cannot scroll above the first symbol");
         p.scroll_down(1000);
@@ -703,7 +689,7 @@ mod tests {
     fn render_rows(p: &mut OutlinePanel, height: u16) {
         let area = Rect::new(0, 0, 30, height);
         let mut buf = Buffer::empty(area);
-        p.render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
     }
 
     /// #2751: a wheel step and a click read in the same burst: the click
@@ -807,7 +793,7 @@ mod tests {
             height: 6,
         };
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         // header at y=0, first symbol row at y=1.
         assert_eq!(p.row_at(0), None, "header row is not a symbol");
         assert_eq!(p.row_at(1), Some(0));
@@ -823,7 +809,7 @@ mod tests {
             height,
         };
         let mut buf = Buffer::empty(area);
-        p.render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         let mut out = String::new();
         for y in 0..height {
             for x in 0..width {
@@ -889,7 +875,7 @@ mod tests {
         let mut p = OutlinePanel::new();
         p.set_symbols("a.rs".into(), many(3));
         p.toggle_collapse();
-        (&mut p).render(area, &mut Buffer::empty(area));
+        p.draw(&ViewCx::default(), area, &mut Buffer::empty(area));
         assert_eq!(
             p.last_scrollbar,
             Rect::default(),
@@ -901,7 +887,7 @@ mod tests {
         let mut p = OutlinePanel::new();
         p.set_symbols("a.rs".into(), many(50));
         p.toggle_collapse();
-        (&mut p).render(area, &mut Buffer::empty(area));
+        p.draw(&ViewCx::default(), area, &mut Buffer::empty(area));
         assert_ne!(p.last_scrollbar, Rect::default(), "scrollbar on overflow");
         assert_eq!(p.last_scrollbar.width, 1);
         assert_eq!(
@@ -922,7 +908,7 @@ mod tests {
         let mut p = OutlinePanel::new();
         p.set_symbols("a.rs".into(), many(100));
         p.toggle_collapse();
-        (&mut p).render(area, &mut Buffer::empty(area));
+        p.draw(&ViewCx::default(), area, &mut Buffer::empty(area));
         let bar = p.last_scrollbar;
         assert!(bar.height > 0, "bar must have rendered");
         p.scroll_to_bar_y(bar.y + bar.height - 1);

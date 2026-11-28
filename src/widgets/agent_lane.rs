@@ -15,7 +15,7 @@ use ratatui::{
     widgets::{Borders, Paragraph, Widget},
 };
 
-use crate::theme::Theme;
+use crate::widgets::view_cx::ViewCx;
 
 const COLOR_DIM: Color = Color::Rgb(0x60, 0x68, 0x78);
 const COLOR_FILE: Color = Color::Rgb(0xCC, 0xCC, 0xCC);
@@ -52,9 +52,6 @@ pub struct AgentLanePanel {
     /// Agents whose files are folded away under their row (#345).
     collapsed_agents: std::collections::BTreeSet<String>,
     scroll: usize,
-    pub theme: Theme,
-    pub focused: bool,
-    pub hover_pointer: Option<(u16, u16)>,
 
     pub last_area: Rect,
     last_header_row: u16,
@@ -73,9 +70,6 @@ impl AgentLanePanel {
             rows: Vec::new(),
             collapsed_agents: std::collections::BTreeSet::new(),
             scroll: 0,
-            theme: Theme::default(),
-            focused: false,
-            hover_pointer: None,
             last_area: Rect::default(),
             last_header_row: 0,
             last_header_x: 0,
@@ -117,14 +111,6 @@ impl AgentLanePanel {
 
     pub fn toggle_collapse(&mut self) {
         self.collapsed = !self.collapsed;
-    }
-
-    pub fn scroll_down(&mut self, n: usize) {
-        self.scroll = (self.scroll + n).min(self.shown().len().saturating_sub(1));
-    }
-
-    pub fn scroll_up(&mut self, n: usize) {
-        self.scroll = self.scroll.saturating_sub(n);
     }
 
     /// Header plus bottom separator when collapsed; one row per item (or a
@@ -182,12 +168,13 @@ impl Default for AgentLanePanel {
     }
 }
 
-impl Widget for &mut AgentLanePanel {
-    fn render(self, area: Rect, buf: &mut Buffer) {
+impl AgentLanePanel {
+    /// Draw the section into `area` with this frame's [`ViewCx`].
+    pub fn draw(&mut self, cx: &ViewCx, area: Rect, buf: &mut Buffer) {
         let block = crate::widgets::surface::section_block(
-            self.theme,
+            cx.theme,
             Borders::BOTTOM,
-            Style::default().fg(self.theme.ui(COLOR_DIM)),
+            Style::default().fg(cx.theme.ui(COLOR_DIM)),
         );
         let inner = block.inner(area);
         block.render(area, buf);
@@ -215,7 +202,7 @@ impl Widget for &mut AgentLanePanel {
         if total > 0 {
             tail.push(Span::styled(
                 format!("  {total}"),
-                Style::default().fg(self.theme.ui(COLOR_DOT)),
+                Style::default().fg(cx.theme.ui(COLOR_DOT)),
             ));
         }
         let header_row = Rect {
@@ -227,11 +214,11 @@ impl Widget for &mut AgentLanePanel {
         crate::widgets::surface::paint_section_header(
             buf,
             header_row,
-            self.theme,
+            cx.theme,
             !self.collapsed,
             "AGENT LANE",
             tail,
-            crate::widgets::hover::contains(header_row, self.hover_pointer),
+            crate::widgets::hover::contains(header_row, cx.pointer),
         );
         self.last_header_row = inner.y;
         self.last_header_x = inner.x;
@@ -246,7 +233,7 @@ impl Widget for &mut AgentLanePanel {
         if self.rows.is_empty() {
             Paragraph::new(Line::from(Span::styled(
                 "No agent has changed a file",
-                Style::default().fg(self.theme.ui(COLOR_DIM)),
+                Style::default().fg(cx.theme.ui(COLOR_DIM)),
             )))
             .render(
                 Rect {
@@ -271,27 +258,25 @@ impl Widget for &mut AgentLanePanel {
                 width: inner.width,
                 height: 1,
             };
-            if let Some(bg) =
-                crate::widgets::hover::row_hover_bg(rect, self.hover_pointer, self.theme)
-            {
+            if let Some(bg) = crate::widgets::hover::row_hover_bg(rect, cx.pointer, cx.theme) {
                 buf.set_style(rect, Style::default().bg(bg));
             }
             let line = match &rows[self.scroll + i] {
                 LaneRow::Agent { name, unreviewed } => {
                     let fold = crate::widgets::surface::chevron(
-                        self.theme,
+                        cx.theme,
                         !self.collapsed_agents.contains(name),
                     );
                     let mut spans = vec![Span::styled(
                         format!("{fold} \u{25c6} {name}"),
                         Style::default()
-                            .fg(self.theme.ui(COLOR_AGENT))
+                            .fg(cx.theme.ui(COLOR_AGENT))
                             .add_modifier(Modifier::BOLD),
                     )];
                     if *unreviewed > 0 {
                         spans.push(Span::styled(
                             format!("  {unreviewed} to review"),
-                            Style::default().fg(self.theme.ui(COLOR_DIM)),
+                            Style::default().fg(cx.theme.ui(COLOR_DIM)),
                         ));
                     }
                     Line::from(spans)
@@ -309,18 +294,18 @@ impl Widget for &mut AgentLanePanel {
                     };
                     let mut spans = vec![
                         Span::raw("  "),
-                        Span::styled(dot, Style::default().fg(self.theme.ui(COLOR_DOT))),
-                        Span::styled(label.clone(), Style::default().fg(self.theme.ui(fg))),
+                        Span::styled(dot, Style::default().fg(cx.theme.ui(COLOR_DOT))),
+                        Span::styled(label.clone(), Style::default().fg(cx.theme.ui(fg))),
                     ];
                     // Nothing to say for a row that matches its review.
                     if let Some((added, removed)) = changes.filter(|&(a, r)| a + r > 0) {
                         spans.push(Span::styled(
                             format!("  +{added}"),
-                            Style::default().fg(self.theme.ui(COLOR_ADDED)),
+                            Style::default().fg(cx.theme.ui(COLOR_ADDED)),
                         ));
                         spans.push(Span::styled(
                             format!(" \u{2212}{removed}"),
-                            Style::default().fg(self.theme.ui(COLOR_REMOVED)),
+                            Style::default().fg(cx.theme.ui(COLOR_REMOVED)),
                         ));
                     }
                     Line::from(spans)
@@ -377,7 +362,7 @@ mod tests {
         p.set_rows(rows());
         let area = Rect::new(0, 0, 40, 8);
         let mut buf = Buffer::empty(area);
-        Widget::render(&mut p, area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         let text = dump(&buf);
         assert!(text.contains("AGENT LANE  1"), "{text}");
         assert!(text.contains("claude  1 to review"), "{text}");
@@ -402,7 +387,7 @@ mod tests {
         assert_eq!(p.desired_height(40), 2);
         let area = Rect::new(0, 0, 40, 2);
         let mut buf = Buffer::empty(area);
-        Widget::render(&mut p, area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         assert_eq!(p.row_at(1), None);
         p.toggle_collapse();
         assert_eq!(p.desired_height(40), 5, "header, three rows, border");
@@ -430,7 +415,7 @@ mod tests {
         let area = Rect::new(0, 0, 40, 12);
         let render = |p: &mut AgentLanePanel| {
             let mut buf = Buffer::empty(area);
-            p.render(area, &mut buf);
+            p.draw(&ViewCx::default(), area, &mut buf);
         };
         render(&mut p);
         let first = p.first_row_y;

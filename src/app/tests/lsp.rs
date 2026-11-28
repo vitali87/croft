@@ -2010,7 +2010,8 @@ fn outline_text(app: &mut App) -> String {
     app.outline.collapsed = false;
     let area = ratatui::layout::Rect::new(0, 0, 40, 6);
     let mut buf = ratatui::buffer::Buffer::empty(area);
-    ratatui::widgets::Widget::render(&mut app.outline, area, &mut buf);
+    let cx = app.view_cx(app.focus == Pane::Tree && app.sidebar_view == SidebarView::Explorer);
+    app.outline.draw(&cx, area, &mut buf);
     (0..area.height)
         .map(|y| {
             (0..area.width)
