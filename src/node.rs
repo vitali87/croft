@@ -14,7 +14,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 /// The folder to put at the front of `PATH` so a program croft starts finds
 /// `node` and `npm`, or `None` when they are on croft's `PATH` already
@@ -81,23 +81,69 @@ pub(crate) fn path_with(dir: &Path) -> OsString {
     std::env::join_paths(dirs).unwrap_or(current)
 }
 
-/// What [`dir`] keeps between calls: the node directory once
-/// found, and the login shell's one answer. Reading the on-disk layouts costs
-/// a few file checks, so after a miss they are read again, and a node
-/// installed while croft runs is found without a restart (#2806). Asking the
-/// shell can take 15 s and runs where the caller is, the UI thread among
-/// them, so it is asked once per process.
+/// What [`dir`] keeps between calls: the node directory once found, and the
+/// login shell's answer. Reading the on-disk layouts costs a few file
+/// checks, so after a miss they are read again, and a node installed while
+/// croft runs is found without a restart (#2806). Asking the shell can take
+/// 15 s, so a miss there is its answer for the process; a folder it named
+/// that has since gone (an upgrade removed that version) is asked about
+/// again, as is a kept folder whose node has gone.
+///
+/// Its locks are held only to read or write what is kept, never while the
+/// shell is asked: [`NodeDirMemo::peek`], for a check that may not wait,
+/// never waits on a shell another thread is asking.
 struct NodeDirMemo {
     found: Mutex<Option<PathBuf>>,
-    shell: OnceLock<Option<PathBuf>>,
+    shell: Mutex<Option<Option<PathBuf>>>,
+    /// Held while the shell is asked, so two lookups ask it once.
+    asking: Mutex<()>,
+}
+
+/// Whether `dir` still holds a node that can run.
+fn has_node(dir: &Path) -> bool {
+    crate::proc::find::runnable(&dir.join("node"))
+}
+
+/// `mutex` locked, whatever a thread that panicked holding it left.
+fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl NodeDirMemo {
     const fn new() -> Self {
         Self {
             found: Mutex::new(None),
-            shell: OnceLock::new(),
+            shell: Mutex::new(None),
+            asking: Mutex::new(()),
         }
+    }
+
+    /// The directory kept, while its node is still there.
+    fn kept(&self) -> Option<PathBuf> {
+        let mut found = locked(&self.found);
+        if found.as_deref().is_some_and(|dir| !has_node(dir)) {
+            *found = None;
+        }
+        found.clone()
+    }
+
+    /// Keep `dir`, the one found.
+    fn keep(&self, dir: &Path) {
+        *locked(&self.found) = Some(dir.to_path_buf());
+    }
+
+    /// The shell's answer, when it was asked and its answer still holds: a
+    /// miss stays one, a folder whose node has gone is asked about again.
+    fn shell_answer(&self) -> Option<Option<PathBuf>> {
+        let mut shell = locked(&self.shell);
+        if let Some(Some(dir)) = shell.as_ref()
+            && !has_node(dir)
+        {
+            *shell = None;
+        }
+        shell.clone()
     }
 
     /// The node directory: the one kept, else `on_disk`'s, else the shell's.
@@ -106,27 +152,39 @@ impl NodeDirMemo {
         on_disk: impl FnOnce() -> Option<PathBuf>,
         shell: impl FnOnce() -> Option<PathBuf>,
     ) -> Option<PathBuf> {
-        let mut found = self
-            .found
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if found.is_none() {
-            *found = on_disk().or_else(|| self.shell.get_or_init(shell).clone());
+        if let Some(dir) = self.kept().or_else(on_disk) {
+            self.keep(&dir);
+            return Some(dir);
         }
-        found.clone()
+        let _asking = locked(&self.asking);
+        // Another lookup may have asked while this one waited.
+        if let Some(dir) = self.kept() {
+            return Some(dir);
+        }
+        let answer = match self.shell_answer() {
+            Some(answer) => answer,
+            None => {
+                let answer = shell();
+                *locked(&self.shell) = Some(answer.clone());
+                answer
+            }
+        };
+        if let Some(dir) = &answer {
+            self.keep(dir);
+        }
+        answer
     }
 
-    /// [`Self::get`] without asking the shell: the directory kept, else
-    /// `on_disk`'s, else what the shell said if it was asked before.
+    /// [`Self::get`] without asking the shell, and without waiting on a
+    /// lookup that is: the directory kept, else `on_disk`'s, else what the
+    /// shell said if it was asked before.
     fn peek(&self, on_disk: impl FnOnce() -> Option<PathBuf>) -> Option<PathBuf> {
-        let mut found = self
-            .found
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if found.is_none() {
-            *found = on_disk().or_else(|| self.shell.get().cloned().flatten());
-        }
-        found.clone()
+        let dir = self
+            .kept()
+            .or_else(on_disk)
+            .or_else(|| self.shell_answer().flatten())?;
+        self.keep(&dir);
+        Some(dir)
     }
 }
 
@@ -288,12 +346,22 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
+    /// A folder under `root` named `name` with a node that can run.
+    fn node_dir(root: &Path, name: &str) -> PathBuf {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("node"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(dir.join("node"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        dir
+    }
+
     /// #2806: a node found is kept; a miss is no answer for good. The
     /// on-disk layouts are read again next time, so a node installed since
     /// (nvm, Volta, Homebrew) is found without a restart, while the login
     /// shell, which can take 15 s, is asked only once.
     #[test]
     fn a_node_installed_after_a_miss_is_found_and_the_shell_is_asked_once() {
+        let tmp = TempDir::new().unwrap();
         let memo = NodeDirMemo::new();
         let asked = std::cell::Cell::new(0);
         let shell = || {
@@ -301,12 +369,37 @@ mod tests {
             None
         };
         assert_eq!(memo.get(|| None, shell), None);
-        let nvm = PathBuf::from("/home/u/.nvm/versions/node/v22.1.0/bin");
+        let nvm = node_dir(tmp.path(), "nvm-v22.1.0");
         assert_eq!(memo.get(|| Some(nvm.clone()), shell), Some(nvm.clone()));
         assert_eq!(asked.get(), 1, "the shell was asked once");
         assert_eq!(
             memo.get(|| panic!("a found node is kept"), shell),
             Some(nvm),
+        );
+    }
+
+    /// #2809 review: a kept folder whose node has gone, an nvm version an
+    /// upgrade removed, is not answered for good: the disk is read again,
+    /// and a folder the shell named that has gone is asked about again.
+    #[test]
+    fn a_node_that_has_gone_is_looked_for_again() {
+        let tmp = TempDir::new().unwrap();
+        let memo = NodeDirMemo::new();
+        let old = node_dir(tmp.path(), "v22.1.0");
+        assert_eq!(memo.get(|| None, || Some(old.clone())), Some(old.clone()));
+        std::fs::remove_file(old.join("node")).unwrap();
+        let new = node_dir(tmp.path(), "v22.2.0");
+        assert_eq!(
+            memo.get(|| None, || Some(new.clone())),
+            Some(new.clone()),
+            "the shell is asked again: the folder it named has gone"
+        );
+        std::fs::remove_file(new.join("node")).unwrap();
+        let disk = node_dir(tmp.path(), "volta");
+        assert_eq!(
+            memo.peek(|| Some(disk.clone())),
+            Some(disk),
+            "a check that may not wait reads the disk again too"
         );
     }
 
@@ -459,9 +552,10 @@ mod tests {
     /// shell already said, and never asks the shell itself.
     #[test]
     fn a_check_that_may_not_wait_never_asks_the_shell() {
+        let tmp = TempDir::new().unwrap();
         let memo = NodeDirMemo::new();
         assert_eq!(memo.peek(|| None), None);
-        let shell_dir = PathBuf::from("/home/u/.fnm/node/bin");
+        let shell_dir = node_dir(tmp.path(), "fnm");
         assert_eq!(
             memo.get(|| None, || Some(shell_dir.clone())),
             Some(shell_dir.clone())
@@ -470,11 +564,43 @@ mod tests {
         assert_eq!(fresh.get(|| None, || None), None);
         assert_eq!(fresh.peek(|| None), None, "the shell's miss stays a miss");
         let answered = NodeDirMemo::new();
-        let _ = answered.shell.set(Some(shell_dir.clone()));
+        *locked(&answered.shell) = Some(Some(shell_dir.clone()));
         assert_eq!(
             answered.peek(|| None),
             Some(shell_dir),
             "the shell's earlier answer"
         );
+    }
+
+    /// #2809 review: a check that may not wait does not wait on a lookup
+    /// that is asking the shell, which can take 15 s.
+    #[test]
+    fn a_check_that_may_not_wait_does_not_wait_on_the_shell() {
+        let memo = std::sync::Arc::new(NodeDirMemo::new());
+        let (asking_tx, asking_rx) = std::sync::mpsc::channel();
+        let (answer_tx, answer_rx) = std::sync::mpsc::channel::<()>();
+        let lookup = {
+            let memo = std::sync::Arc::clone(&memo);
+            std::thread::spawn(move || {
+                memo.get(
+                    || None,
+                    || {
+                        asking_tx.send(()).unwrap();
+                        let _ = answer_rx.recv();
+                        None
+                    },
+                )
+            })
+        };
+        asking_rx.recv().unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(memo.peek(|| None), None);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "the check waited {:?} on the shell",
+            started.elapsed()
+        );
+        answer_tx.send(()).unwrap();
+        assert_eq!(lookup.join().unwrap(), None);
     }
 }

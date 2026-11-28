@@ -734,14 +734,57 @@ fn interpreter_on_path(name: &str) -> bool {
     // Looked up once per process: the preview rebuilds on every edit, and
     // a PATH walk per python fence per keystroke is a syscall burst.
     static PYTHON3: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    static NODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static NODE: Recheck = Recheck::new();
     let probe = || crate::proc::find::on_path(name).is_some();
     match name {
         "python3" => *PYTHON3.get_or_init(probe),
         // Node as the rest of croft finds it, without asking the login
-        // shell from a frame (#2809).
-        "node" => *NODE.get_or_init(crate::node::known),
+        // shell from a frame (#2809). A miss is looked at again, so a node
+        // the language servers or the debugger find through the shell later
+        // gives the fence its ▷.
+        "node" => NODE.known(crate::node::known),
         _ => probe(),
+    }
+}
+
+/// A check kept once it says yes, and made again after a no at most every
+/// [`Recheck::EVERY`]: cheap per keystroke, and not wrong for good.
+struct Recheck {
+    found: std::sync::atomic::AtomicBool,
+    last_miss: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+impl Recheck {
+    /// How long a no stands before the check is made again.
+    const EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+    const fn new() -> Self {
+        Self {
+            found: std::sync::atomic::AtomicBool::new(false),
+            last_miss: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Whether `check` says yes, as kept or made again now.
+    fn known(&self, check: impl FnOnce() -> bool) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.found.load(Ordering::Relaxed) {
+            return true;
+        }
+        let mut last = self
+            .last_miss
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if last.is_some_and(|at| at.elapsed() < Self::EVERY) {
+            return false;
+        }
+        let found = check();
+        if found {
+            self.found.store(true, Ordering::Relaxed);
+        } else {
+            *last = Some(std::time::Instant::now());
+        }
+        found
     }
 }
 
@@ -2066,6 +2109,19 @@ fn local_image_path(base: &std::path::Path, dest: &str) -> Option<std::path::Pat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2809 review: a fence check that said no is made again later, so a
+    /// node found after the first look gives the fence its ▷; a yes is kept.
+    #[test]
+    fn a_fence_check_that_said_no_looks_again_and_keeps_a_yes() {
+        let check = Recheck::new();
+        assert!(!check.known(|| false));
+        assert!(!check.known(|| panic!("a no stands for a moment")));
+        *check.last_miss.lock().unwrap() =
+            Some(std::time::Instant::now() - Recheck::EVERY - std::time::Duration::from_secs(1));
+        assert!(check.known(|| true), "looked at again once the no is old");
+        assert!(check.known(|| panic!("a yes is kept")));
+    }
 
     #[test]
     fn image_destinations_are_url_decoded_without_query_or_fragment() {
