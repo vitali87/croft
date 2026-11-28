@@ -620,6 +620,16 @@ impl App {
         if self.tree_drag.take().is_some() {
             self.tree.drag_target = None;
         }
+        // A selection being dragged in a rendered view keeps what it has
+        // selected, but stops following the pointer: its views take a drag
+        // before anything else does, so a stale one would claim the next
+        // gesture's whole drag.
+        if let Some(md) = self.editor.markdown_preview.as_mut() {
+            md.dragging = false;
+        }
+        if let Some(log) = self.editor.log.as_mut() {
+            log.dragging = false;
+        }
     }
 
     /// A drag while `gesture` is live: the splitter, scrollbar thumb or

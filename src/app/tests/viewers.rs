@@ -1740,6 +1740,67 @@ fn editor_image_overlay_is_dual_slot_and_clear_ors_both_columns() {
     );
 }
 
+/// #2859 review: a selection begun in the rendered Markdown view whose release
+/// was lost must not take the next press's drag. Here the next press lands on
+/// the status bar's problem counts, which take it before the preview could
+/// end its own selection; the drag after it left the preview selection
+/// following the pointer.
+#[test]
+fn a_press_after_a_lost_release_ends_a_markdown_preview_selection() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let md = tmp.path().join("doc.md");
+    std::fs::write(&md, "# Heading\n\nSome rendered body text here.\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&md).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(
+        KeyCode::Char('v'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let (area, row_idx, text) = {
+        let md = app.editor.markdown_preview.as_ref().unwrap();
+        let (i, t) = md
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(i, cells)| (i as u16, cells.concat()))
+            .find(|(_, r)| r.contains("rendered body"))
+            .expect("the body text must be rendered");
+        (md.last_area, i, t)
+    };
+    let start_col = text.find("rendered").unwrap() as u16;
+    let y = area.y + row_idx;
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        area.x + start_col,
+        y,
+    ));
+    let begun = app.editor.markdown_preview.as_ref().unwrap().selection;
+    assert!(begun.is_some(), "the press starts a preview selection");
+    // That press's release never arrives. The next press is on the status
+    // bar's problem counts.
+    let diag = app.status_diag_rect;
+    assert!(!diag.is_empty(), "the status bar shows the problem counts");
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        diag.x,
+        diag.y,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        area.x + start_col + 6,
+        y,
+    ));
+    let md = app.editor.markdown_preview.as_ref().unwrap();
+    assert!(!md.dragging, "the new press ended the lost selection drag");
+    assert_eq!(md.selection, begun, "the later drag did not extend it");
+}
+
 /// Issue #215: text in the rendered Markdown view must be selectable.
 /// A drag over the preview selects what is on screen, Cmd+C copies the
 /// RENDERED text (not the source), and Esc clears the selection.
