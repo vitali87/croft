@@ -1801,6 +1801,30 @@ fn wheel(app: &mut App, kind: crossterm::event::MouseEventKind, col: u16, row: u
     app.handle_mouse(mouse(kind, col, row));
 }
 
+/// Let the PDF previews' work that runs off the UI thread land (#2824): a
+/// page turn, the page count and a click's link read are jobs, and the tick
+/// shows what finished.
+fn settle_pdf(app: &mut App) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        app.poll_pdf_previews();
+        let busy = app
+            .editor_layout
+            .all_groups(&app.editor)
+            .flat_map(|group| group.editors.iter())
+            .any(|ed| ed.pdf_jobs.busy() || ed.pdf_jobs.waiting_click.is_some());
+        if !busy {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the PDF work must land; status: {}",
+            app.status
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 fn require_pdf_backend() {
     assert!(
         crate::pdf::detect_backend().is_some(),
