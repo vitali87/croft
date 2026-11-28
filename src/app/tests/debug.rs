@@ -6717,6 +6717,58 @@ fn a_python_debug_launch_waits_for_its_debugger_off_the_ui_thread() {
     );
 }
 
+/// A compound whose runnable member waits for its debugger to be set up
+/// still names the member it skipped for its own preLaunchTask, as the line
+/// for a set that started does: the waiting line said only that it was
+/// setting the debugger up (#2803 review, found by CI, which has no Python
+/// debugger set up).
+#[test]
+fn a_compound_waiting_for_its_debugger_still_names_the_member_it_skipped() {
+    let (_tmp, mut app, _tooling, release) = app_with_held_tooling(
+        "s.py",
+        |root| crate::dap::install::Ready::Python(root.join("no-such-python")),
+        None,
+    );
+    let root = app.workspace_root().to_path_buf();
+    std::fs::create_dir_all(root.join(".vscode")).unwrap();
+    std::fs::write(
+        root.join(".vscode/launch.json"),
+        r#"{ "configurations": [
+            { "name": "Server", "type": "python", "request": "launch", "program": "s.py" },
+            { "name": "Client", "type": "python", "request": "launch", "program": "c.py",
+              "preLaunchTask": "build-client" }
+        ],
+        "compounds": [
+            { "name": "Pair", "configurations": ["Server", "Client"] }
+        ]}"#,
+    )
+    .unwrap();
+    app.open_debug_config_picker();
+    let row = app
+        .list_picker
+        .as_ref()
+        .unwrap()
+        .rows
+        .iter()
+        .position(|r| r.label.starts_with("Pair"))
+        .expect("the compound is listed");
+    app.list_picker.as_mut().unwrap().selected = row;
+    app.confirm_list_picker();
+    let feedback = app.run_debug.feedback.clone().unwrap_or_default();
+    for (what, line) in [("feedback", &feedback), ("status", &app.status)] {
+        assert!(
+            line.contains("setting up the debugger for Server"),
+            "staging: Server waits for its debugger ({what}): {line}"
+        );
+        assert!(
+            line.contains("Client") && line.contains("preLaunchTask"),
+            "the skipped member is named ({what}): {line}"
+        );
+    }
+    release.send(()).unwrap();
+    settle_debug_setup(&mut app);
+}
+
 /// #2803: Stop while a launch waits for its debugger drops the launch; the
 /// setup still finishes, for the next F5.
 #[test]
