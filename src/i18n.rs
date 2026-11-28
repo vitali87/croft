@@ -446,7 +446,7 @@ fn template_keys(
             .map(|map| map.into_keys().collect::<Vec<_>>())
             .unwrap_or_default()
     });
-    let mut keys: Vec<String> = crate::widgets::command_palette::ALL_COMMANDS
+    let mut keys: Vec<String> = crate::command_registry::ALL_COMMANDS
         .iter()
         .map(|c| c.title().to_string())
         .chain(extra.iter().map(|s| s.to_string()))
@@ -816,11 +816,10 @@ mod tests {
     /// in step, so neither is allowed; nor is a blank or padded entry.
     #[test]
     fn translatable_repeats_no_palette_title_and_no_entry() {
-        let palette: std::collections::HashSet<&str> =
-            crate::widgets::command_palette::ALL_COMMANDS
-                .iter()
-                .map(|c| c.title())
-                .collect();
+        let palette: std::collections::HashSet<&str> = crate::command_registry::ALL_COMMANDS
+            .iter()
+            .map(|c| c.title())
+            .collect();
         let mut seen = std::collections::HashSet::new();
         for s in TRANSLATABLE {
             assert!(seen.insert(*s), "{s:?} is listed twice");

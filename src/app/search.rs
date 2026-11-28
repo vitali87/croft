@@ -1038,7 +1038,7 @@ impl App {
         state.query_selected = !initial.is_empty();
         if !initial.is_empty() {
             state.set_match_count(
-                crate::widgets::editor_find::count_matches(&self.editor.lines, &initial, opts),
+                crate::find::count_matches(&self.editor.lines, &initial, opts),
                 false,
             );
             self.editor
@@ -1218,7 +1218,7 @@ impl App {
         state.query = new_query;
         let opts = state.opts;
         state.set_match_count(
-            crate::widgets::editor_find::count_matches_in(scope, &state.query, opts, window),
+            crate::find::count_matches_in(scope, &state.query, opts, window),
             false,
         );
         if state.query.is_empty() {
@@ -1411,7 +1411,7 @@ impl App {
         }
     }
 
-    pub(super) fn jump_editor_to_match(&mut self, m: crate::widgets::editor_find::MatchPos) {
+    pub(super) fn jump_editor_to_match(&mut self, m: crate::find::MatchPos) {
         self.editor.cursor_row = m.row;
         self.editor.cursor_col = m.col_chars;
         self.editor.active_search_match = Some((m.row, m.col_chars, m.len_chars));
@@ -1436,14 +1436,14 @@ impl App {
         row: usize,
         col: usize,
         skip_current: bool,
-    ) -> Option<crate::widgets::editor_find::MatchPos> {
+    ) -> Option<crate::find::MatchPos> {
         let range = self.editor_find_range();
         let (scope, first, window) = editor_find_lines(&self.editor, range);
         let (row, col) = editor_find_scope_pos(scope, first, window, (row, col))?;
         let step = if forward {
-            crate::widgets::editor_find::find_next_match_in
+            crate::find::find_next_match_in
         } else {
-            crate::widgets::editor_find::find_prev_match_in
+            crate::find::find_prev_match_in
         };
         let mut m = step(scope, needle, opts, window, row, col, skip_current)?;
         m.row += first;
@@ -1462,20 +1462,13 @@ impl App {
         };
         let opts = state.opts;
         state.match_index = at.filter(|_| !outside).and_then(|(row, col)| {
-            crate::widgets::editor_find::match_index_at_in(
-                scope,
-                &state.query,
-                opts,
-                window,
-                row,
-                col,
-            )
+            crate::find::match_index_at_in(scope, &state.query, opts, window, row, col)
         });
     }
 
     /// The range Find in Selection limits the open find bar to: the active
     /// tab's own (#1577), so another tab never searches by its coordinates.
-    pub(super) fn editor_find_range(&self) -> Option<crate::widgets::editor_find::FindRange> {
+    pub(super) fn editor_find_range(&self) -> Option<crate::find::FindRange> {
         self.editor_find.as_ref()?;
         self.editor.find_range
     }
@@ -1534,7 +1527,7 @@ impl App {
         };
         let (needle, opts) = (state.query.clone(), state.opts);
         state.set_match_count(
-            crate::widgets::editor_find::count_matches_in(scope, &needle, opts, window),
+            crate::find::count_matches_in(scope, &needle, opts, window),
             false,
         );
         self.editor.active_search_match = None;
@@ -1814,14 +1807,9 @@ impl App {
         let Some(line) = self.editor.lines.get(row) else {
             return;
         };
-        let Some(text) = crate::widgets::editor_find::expand_replacement(
-            line,
-            col,
-            len,
-            &needle,
-            &replacement,
-            opts,
-        ) else {
+        let Some(text) =
+            crate::find::expand_replacement(line, col, len, &needle, &replacement, opts)
+        else {
             // Stale match position (buffer changed underneath): resync
             // instead of splicing blindly.
             self.editor_find_jump_next();
@@ -1834,7 +1822,7 @@ impl App {
             && let Some((start, end)) = self.editor.find_range.as_mut()
         {
             // As `replace_find_match` put it in: a `\r` is a line break too.
-            let text = crate::widgets::editor::normalize_newlines(&text);
+            let text = crate::text_edit::normalize_newlines(&text);
             let breaks = text.matches('\n').count();
             if row == end.0 {
                 let after = end.1.saturating_sub(col + len);
@@ -1855,7 +1843,7 @@ impl App {
         let (scope, _, window) = editor_find_lines(&self.editor, range);
         if let Some(s) = self.editor_find.as_mut() {
             s.set_match_count(
-                crate::widgets::editor_find::count_matches_in(scope, &needle, opts, window),
+                crate::find::count_matches_in(scope, &needle, opts, window),
                 false,
             );
         }
@@ -1890,13 +1878,9 @@ impl App {
         let range = self.editor_find_range();
         let (scope, first, window) = editor_find_lines(&self.editor, range);
         let scope_end = first + scope.len();
-        let Some((replaced, n)) = crate::widgets::editor_find::replace_all_in_lines_in(
-            scope,
-            &needle,
-            &replacement,
-            opts,
-            window,
-        ) else {
+        let Some((replaced, n)) =
+            crate::find::replace_all_in_lines_in(scope, &needle, &replacement, opts, window)
+        else {
             return;
         };
         if n == 0 {
@@ -1935,7 +1919,7 @@ impl App {
             // matches, and a hard zero would read "No results" over a body
             // still painted full of highlights.
             s.set_match_count(
-                crate::widgets::editor_find::count_matches_in(scope, &needle, opts, window),
+                crate::find::count_matches_in(scope, &needle, opts, window),
                 false,
             );
             s.match_index = None;
@@ -2127,14 +2111,10 @@ impl App {
 /// tab's symbol (#369) or the whole buffer.
 pub(super) fn editor_find_lines(
     editor: &crate::widgets::editor::Editor,
-    range: Option<crate::widgets::editor_find::FindRange>,
-) -> (
-    &[String],
-    usize,
-    Option<crate::widgets::editor_find::FindRange>,
-) {
+    range: Option<crate::find::FindRange>,
+) -> (&[String], usize, Option<crate::find::FindRange>) {
     if let Some(range) = range {
-        let ((r0, c0), (r1, c1)) = crate::widgets::editor_find::clamp_range(&editor.lines, range);
+        let ((r0, c0), (r1, c1)) = crate::find::clamp_range(&editor.lines, range);
         let lines = editor.lines.get(r0..=r1).unwrap_or(&[]);
         return (lines, r0, Some(((0, c0), (r1 - r0, c1))));
     }
@@ -2149,7 +2129,7 @@ pub(super) fn editor_find_lines(
 pub(super) fn editor_find_scope_pos(
     scope: &[String],
     first: usize,
-    window: Option<crate::widgets::editor_find::FindRange>,
+    window: Option<crate::find::FindRange>,
     (row, col): (usize, usize),
 ) -> Option<(usize, usize)> {
     let last = scope.len().checked_sub(1)?;

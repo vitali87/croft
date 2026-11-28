@@ -204,7 +204,8 @@ impl App {
     /// run targets (a list already selected folds instead); the actions
     /// still to come in #578 say so rather than do nothing.
     pub(in crate::app) fn activate_codeql(&mut self, hit: crate::widgets::codeql::Hit) {
-        use crate::widgets::codeql::{Action, Hit, LANGUAGES};
+        use crate::codeql_db::LANGUAGES;
+        use crate::widgets::codeql::{Action, Hit};
         match hit {
             Hit::Header(section) => self.codeql.toggle(section),
             Hit::Action(Action::SelectLanguage(i)) => {

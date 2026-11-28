@@ -153,11 +153,7 @@ pub enum BranchPurpose {
 /// A COMMITS graph reply: the root and revspec it answers, and the rows.
 /// Tagged rather than bare so a reply for a since-left root or a superseded
 /// view is discarded on drain (#348).
-pub(super) type GraphReply = (
-    PathBuf,
-    Option<String>,
-    Vec<crate::widgets::commit_graph::GraphRow>,
-);
+pub(super) type GraphReply = (PathBuf, Option<String>, Vec<crate::git::GraphRow>);
 
 impl App {
     /// Re-query git status, but no more than once every ~400ms to avoid
@@ -1511,7 +1507,7 @@ impl App {
                 Some(spec) => crate::git::branch_history_range(&root, spec, 400),
                 None => crate::git::commit_graph(&root, 400),
             };
-            let rows = crate::widgets::commit_graph::layout_graph(commits);
+            let rows = crate::git::layout_graph(commits);
             (root, revspec, rows)
         });
         match job {

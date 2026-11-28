@@ -1,0 +1,1 @@
+refactor: the code that uses the Find engine, text-edit application, the commit graph's layout and CodeQL's language table names their new homes, and the four parts outside the UI that read the command list (translations, the VS Code import, keybindings and macros) take it from the command registry rather than the palette (#2062). Nothing changes in use.

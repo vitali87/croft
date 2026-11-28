@@ -6512,7 +6512,7 @@ esac
         press(&mut app, KeyCode::Char('a'));
         type_in(&mut app, "a/b");
         // The language first: it filters rows, which moves the selection.
-        app.codeql.language = crate::widgets::codeql::LANGUAGE_IDS
+        app.codeql.language = crate::codeql_db::LANGUAGE_IDS
             .iter()
             .position(|l| *l == "python");
         app.codeql.select_variant_item(Item::List(0));

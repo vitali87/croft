@@ -169,9 +169,7 @@ fn the_commit_menu() {
     app.show_tree = true;
     app.source_control.status.in_repo = true;
     app.commit_graph
-        .set_rows(crate::widgets::commit_graph::layout_graph(
-            crate::git::commit_graph(p, 100),
-        ));
+        .set_rows(crate::git::layout_graph(crate::git::commit_graph(p, 100)));
     draw(&mut app, W, H);
     let area = app.commit_graph.last_area;
     let y = row_where(area, |y| {
@@ -678,9 +676,7 @@ fn shift_f10_in_commits_opens_the_picked_commits_menu() {
     app.show_tree = true;
     app.source_control.status.in_repo = true;
     app.commit_graph
-        .set_rows(crate::widgets::commit_graph::layout_graph(
-            crate::git::commit_graph(p, 100),
-        ));
+        .set_rows(crate::git::layout_graph(crate::git::commit_graph(p, 100)));
     app.focus_pane(Pane::Tree);
     app.source_control.keys = crate::widgets::source_control::KeyStop::Commits;
     app.commit_graph.select(1);

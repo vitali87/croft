@@ -213,9 +213,7 @@ impl Widget for &mut PtyTerminal {
                 let (logical, offset, start) = logical_row_span(&term, row_line_idx);
                 let row_len = text.chars().count();
                 let mut paint = vec![0u8; cols as usize];
-                for (mc, ml) in
-                    crate::widgets::editor_find::line_matches(&logical, self.search_opts, needle)
-                {
+                for (mc, ml) in crate::find::line_matches(&logical, self.search_opts, needle) {
                     let (lo, hi) = (mc.max(offset), (mc + ml).min(offset + row_len));
                     if lo >= hi {
                         continue;

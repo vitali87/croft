@@ -1,8 +1,4 @@
-pub use crate::find::{
-    FindRange, MatchPos, clamp_range, count_matches, count_matches_in, expand_replacement,
-    find_next_match, find_next_match_in, find_prev_match, find_prev_match_in, find_window,
-    line_matches, match_index_at, match_index_at_in, replace_all_in_lines_in,
-};
+use crate::find::FindRange;
 use crate::search::SearchOpts;
 use ratatui::{
     buffer::Buffer,

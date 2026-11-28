@@ -26,8 +26,8 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::ansi_text::{AnsiLine, AnsiSpan, AnsiStyle, parse_into, parse_line};
+use crate::find::{MatchPos, line_matches};
 use crate::search::{SearchOpts, line_may_match};
-use crate::widgets::editor_find::{MatchPos, line_matches};
 
 /// Whether a NEWLY opened view highlights (#466). The app sets it from the
 /// `disable_log_highlight` preference at startup, on a settings remerge (a
@@ -1706,18 +1706,15 @@ mod tests {
                 for col in 0..=lines[row].chars().count() {
                     for skip in [false, true] {
                         let ours = v.find_next("hit", opts, row, col, skip).found();
-                        let theirs = crate::widgets::editor_find::find_next_match(
-                            &buf, "hit", opts, row, col, skip,
-                        );
+                        let theirs =
+                            crate::find::find_next_match(&buf, "hit", opts, row, col, skip);
                         assert_eq!(
                             ours, theirs,
                             "find_next disagreed at row {row} col {col} skip {skip} on {lines:?}"
                         );
                     }
                     let ours = v.find_prev("hit", opts, row, col).found();
-                    let theirs = crate::widgets::editor_find::find_prev_match(
-                        &buf, "hit", opts, row, col, true,
-                    );
+                    let theirs = crate::find::find_prev_match(&buf, "hit", opts, row, col, true);
                     assert_eq!(
                         ours, theirs,
                         "find_prev disagreed at row {row} col {col} on {lines:?}"

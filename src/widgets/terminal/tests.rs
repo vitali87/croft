@@ -3692,7 +3692,7 @@ fn grid_lines_exposes_output_for_terminal_find() {
     loop {
         let (lines, top) = term.grid_lines();
         if let Some(row) = lines.iter().position(|l| l.contains(needle)) {
-            let hit = crate::widgets::editor_find::find_next_match(
+            let hit = crate::find::find_next_match(
                 &lines,
                 needle,
                 crate::search::SearchOpts::default(),

@@ -181,7 +181,7 @@ pub fn github_database_args(owner_repo: &str, language: &str) -> Vec<String> {
     ]
 }
 
-/// The [`crate::widgets::codeql::LANGUAGES`] label a database's
+/// The [`LANGUAGES`] label a database's
 /// `primaryLanguage` belongs under, so the Language section can filter the
 /// Databases one. CodeQL's combined extractors (`javascript` also covers
 /// TypeScript, `java` Kotlin, `cpp` C) have one label each, as in VS Code.
@@ -199,7 +199,7 @@ pub fn language_label(id: &str) -> Option<&'static str> {
         "swift" => 9,
         _ => return None,
     };
-    Some(crate::widgets::codeql::LANGUAGES[i])
+    Some(LANGUAGES[i])
 }
 
 /// The bytes of every file under `dir`, links not followed; `None` when
@@ -693,7 +693,7 @@ mod tests {
         assert_eq!(language_label("kotlin"), Some("Java / Kotlin"));
         assert_eq!(language_label("c"), Some("C / C++"));
         assert_eq!(language_label("cobol"), None);
-        for id in crate::widgets::codeql::LANGUAGE_IDS {
+        for id in LANGUAGE_IDS {
             assert!(language_label(id).is_some(), "{id}");
         }
     }

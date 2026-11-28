@@ -415,7 +415,7 @@ pub fn replace_all_in_lines_in(
             pos += chunk.len();
         }
         out.extend(
-            crate::widgets::editor::normalize_newlines(&new)
+            crate::text_edit::normalize_newlines(&new)
                 .split('\n')
                 .map(str::to_string),
         );

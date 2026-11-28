@@ -4,7 +4,7 @@
 //! *in front* of them so a VS Code refugee can carry their muscle memory over.
 //! Each binding maps a chord string (`"ctrl+shift+p"`, `"cmd+,"`, `"f2"`) to a
 //! palette [`Command`] id (the stable snake_case name from
-//! [`Command::id`](crate::widgets::command_palette::Command::id)). A bound chord
+//! [`Command::id`](crate::command_registry::Command::id)). A bound chord
 //! wins over the built-in handler for the same chord; an unbound chord falls
 //! through untouched.
 //!
@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::Deserialize;
 
-use crate::widgets::command_palette::Command;
+use crate::command_registry::Command;
 
 /// A normalized key chord: a base key plus the four modifier flags. Both the
 /// parsed config side and the live-event side run through [`Chord::normalize`]
@@ -228,7 +228,7 @@ impl Chord {
 /// two-step chord (`Cmd+K A`) or a hint that only holds in one view
 /// (`R in diff`).
 pub fn hint_chord(hint: &str) -> Option<Chord> {
-    let hint = crate::widgets::command_palette::platform_hint(hint);
+    let hint = crate::command_registry::platform_hint(hint);
     if hint.is_empty() || hint.contains(' ') {
         return None;
     }
@@ -278,7 +278,7 @@ pub fn display_chord(config: &str) -> String {
 
 /// The built-in commands whose own shortcut is `chord` (#1482).
 pub fn builtin_commands_on(chord: Chord) -> Vec<Command> {
-    crate::widgets::command_palette::ALL_COMMANDS
+    crate::command_registry::ALL_COMMANDS
         .iter()
         .copied()
         .filter(|cmd| hint_chord(cmd.keybinding_hint()) == Some(chord))

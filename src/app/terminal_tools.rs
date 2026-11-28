@@ -1267,10 +1267,7 @@ impl App {
         };
         let lines = find_texts(self.terminal().find_lines());
         let mut state = crate::widgets::editor_find::EditorFind::new(initial.clone(), opts);
-        state.set_match_count(
-            crate::widgets::editor_find::count_matches(&lines, &initial, opts),
-            false,
-        );
+        state.set_match_count(crate::find::count_matches(&lines, &initial, opts), false);
         self.terminal_find = Some(state);
         self.terminal_find_pane = self.active_terminal;
         self.terminal_find_match = None;
@@ -1343,7 +1340,7 @@ impl App {
     pub(super) fn terminal_find_set_query(&mut self, new_query: String) {
         let opts = self.search.opts;
         let lines = find_texts(self.terminal().find_lines());
-        let count = crate::widgets::editor_find::count_matches(&lines, &new_query, opts);
+        let count = crate::find::count_matches(&lines, &new_query, opts);
         if let Some(state) = self.terminal_find.as_mut() {
             state.query = new_query.clone();
             state.set_caret(new_query.chars().count());
@@ -1396,23 +1393,9 @@ impl App {
         };
         let skip_current = anchor.is_some();
         let m = if forward {
-            crate::widgets::editor_find::find_next_match(
-                &lines,
-                &needle,
-                opts,
-                from_row,
-                from_col,
-                skip_current,
-            )
+            crate::find::find_next_match(&lines, &needle, opts, from_row, from_col, skip_current)
         } else {
-            crate::widgets::editor_find::find_prev_match(
-                &lines,
-                &needle,
-                opts,
-                from_row,
-                from_col,
-                skip_current,
-            )
+            crate::find::find_prev_match(&lines, &needle, opts, from_row, from_col, skip_current)
         };
         let Some(m) = m else {
             return;
@@ -1423,8 +1406,7 @@ impl App {
             .set_current_match(Some((abs_line, m.col_chars, m.len_chars)), now);
         self.terminal_mut()
             .scroll_to_line(find_lines[m.row].line_of(m.col_chars));
-        let idx =
-            crate::widgets::editor_find::match_index_at(&lines, &needle, opts, m.row, m.col_chars);
+        let idx = crate::find::match_index_at(&lines, &needle, opts, m.row, m.col_chars);
         if let Some(state) = self.terminal_find.as_mut() {
             state.match_index = idx;
         }

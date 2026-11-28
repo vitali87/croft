@@ -173,7 +173,7 @@ impl App {
             return false;
         };
         let before_item = |e: &crate::widgets::editor::TextSpanEdit| {
-            let col = |c| crate::widgets::editor::utf16_to_char_col(line, c as u32);
+            let col = |c| crate::text_edit::utf16_to_char_col(line, c as u32);
             let end = if e.utf16 { col(e.end.1) } else { e.end.1 };
             e.end.0 < row || (e.end.0 == row && end <= start)
         };
@@ -482,7 +482,7 @@ impl App {
         };
         let to_char = |e: &TextSpanEdit, c: usize| {
             if e.utf16 {
-                crate::widgets::editor::utf16_to_char_col(line, c as u32)
+                crate::text_edit::utf16_to_char_col(line, c as u32)
             } else {
                 c
             }
@@ -1006,7 +1006,7 @@ impl App {
                 continue;
             };
             let line = ed.lines.get(row).map_or("", String::as_str);
-            let to_col = |c| crate::widgets::editor::utf16_to_char_col(line, c);
+            let to_col = |c| crate::text_edit::utf16_to_char_col(line, c);
             let ghost = match range {
                 None => Some(crate::inline_complete::Ghost::insert(row, col, seq, text)),
                 Some((sl, sc, el, ec)) if sl as usize == row && el as usize == row => {

@@ -466,11 +466,7 @@ impl App {
                 let lines = find_texts(self.terminals[idx].find_lines());
                 if let Some(state) = self.terminal_find.as_mut() {
                     state.set_match_count(
-                        crate::widgets::editor_find::count_matches(
-                            &lines,
-                            &state.query,
-                            state.opts,
-                        ),
+                        crate::find::count_matches(&lines, &state.query, state.opts),
                         false,
                     );
                     state.match_index = None;
