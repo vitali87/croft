@@ -375,10 +375,19 @@ fn answering_on_a_terminal<T>(answer: &str, then: impl FnOnce() -> T) -> T {
 
 /// The binary a cross-build leaves in the checkout, which the stand-in
 /// cargo builds none of: made for the scenario when it is not there, and
-/// taken away with whatever folders it needed when the scenario ends.
+/// taken away when the scenario ends. Only what the scenario made goes: its
+/// own file, while it still holds what it wrote, and the folders it made,
+/// while they are still empty. A real cross-build of the same checkout
+/// running meanwhile keeps every file it wrote there.
 struct CrossBuilt {
-    made: Option<PathBuf>,
+    binary: PathBuf,
+    /// The folders made for it, deepest first.
+    dirs: Vec<PathBuf>,
+    made: bool,
 }
+
+/// What [`CrossBuilt`] writes in place of the binary.
+const CROSS_BUILT: &str = "built\n";
 
 impl CrossBuilt {
     fn new() -> Self {
@@ -388,29 +397,37 @@ impl CrossBuilt {
             .join("remote-fast")
             .join("croft");
         if binary.exists() {
-            return Self { made: None };
+            return Self {
+                binary,
+                dirs: Vec::new(),
+                made: false,
+            };
         }
-        // The binary itself, or the highest folder above it that is missing.
-        let mut made = binary.clone();
-        while let Some(parent) = made.parent().filter(|p| !p.exists()) {
-            made = parent.to_path_buf();
-        }
+        let dirs: Vec<PathBuf> = binary
+            .ancestors()
+            .skip(1)
+            .take_while(|dir| !dir.exists())
+            .map(Path::to_path_buf)
+            .collect();
         std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
-        std::fs::write(&binary, "built\n").unwrap();
-        Self { made: Some(made) }
+        std::fs::write(&binary, CROSS_BUILT).unwrap();
+        Self {
+            binary,
+            dirs,
+            made: true,
+        }
     }
 }
 
 impl Drop for CrossBuilt {
     fn drop(&mut self) {
-        match &self.made {
-            Some(dir) if dir.is_dir() => {
-                let _ = std::fs::remove_dir_all(dir);
-            }
-            Some(file) => {
-                let _ = std::fs::remove_file(file);
-            }
-            None => {}
+        if self.made && std::fs::read_to_string(&self.binary).is_ok_and(|text| text == CROSS_BUILT)
+        {
+            let _ = std::fs::remove_file(&self.binary);
+        }
+        // `remove_dir` takes only an empty folder.
+        for dir in &self.dirs {
+            let _ = std::fs::remove_dir(dir);
         }
     }
 }
