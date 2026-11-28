@@ -2134,7 +2134,7 @@ impl App {
                     self.tree_click.clear();
                     return;
                 }
-                if rect_contains(self.minimap_img_rect, m.column, m.row) {
+                if rect_contains(self.minimap.img_rect, m.column, m.row) {
                     self.focus_pane(Pane::Editor);
                     self.minimap_scroll_to_row(m.row);
                     self.gesture = Some(Gesture::Minimap);

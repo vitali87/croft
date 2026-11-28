@@ -853,7 +853,7 @@ impl App {
                 MenuAction::ToggleStatusBar,
             ),
             MenuEntry::item(
-                format!("{}Minimap", check(self.minimap_visible)),
+                format!("{}Minimap", check(self.minimap.visible)),
                 MenuAction::ToggleMinimap,
             ),
             MenuEntry::item(
@@ -984,7 +984,7 @@ impl App {
         let saved = crate::prefs::save_layout(crate::prefs::LayoutPrefs {
             activity_bar: self.activity_bar_visible,
             status_bar: self.status_bar_visible,
-            minimap: self.minimap_visible,
+            minimap: self.minimap.visible,
             side_bar_position: self.side_bar_position,
             secondary_side_bar: self.secondary_side_bar_visible,
             panel_alignment: self.panel_alignment,

@@ -397,16 +397,16 @@ mod menus {
         let mut by_command = App::new(tmp.path().to_path_buf()).unwrap();
         for side in [MinimapSide::Left, MinimapSide::Right] {
             assert!(
-                by_command.minimap_side != side,
+                by_command.minimap.side != side,
                 "setup: {side:?} is the other edge"
             );
             by_row.dispatch_menu_action(MenuAction::SetMinimapSide(side), tmp.path().to_path_buf());
             by_command.run_command(crate::widgets::command_palette::Command::ToggleMinimapSide);
             assert!(
-                by_command.minimap_side == side,
+                by_command.minimap.side == side,
                 "the toggle lands on {side:?}"
             );
-            assert!(by_row.minimap_side == side);
+            assert!(by_row.minimap.side == side);
         }
     }
 }
