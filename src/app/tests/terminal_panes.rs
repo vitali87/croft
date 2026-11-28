@@ -1323,7 +1323,7 @@ fn add_button_wins_over_terminal_splitter_on_same_row() {
         modifiers: KeyModifiers::NONE,
     });
     assert!(
-        app.splitter_drag.is_none(),
+        !matches!(app.gesture, Some(Gesture::Splitter(_))),
         "click on [+] must not start a splitter drag"
     );
     assert_eq!(app.terminals.len(), 2);

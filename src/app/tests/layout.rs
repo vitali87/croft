@@ -776,7 +776,7 @@ fn dragging_sidebar_splitter_resizes_sidebar() {
         row: 5,
         modifiers: KeyModifiers::NONE,
     });
-    assert_eq!(app.splitter_drag, Some(SplitterDrag::Sidebar));
+    assert_eq!(app.gesture, Some(Gesture::Splitter(SplitterDrag::Sidebar)));
     // Drag right by 10 cells: column 46 -> sidebar should grow to 42.
     app.handle_mouse(crossterm::event::MouseEvent {
         kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
@@ -792,7 +792,7 @@ fn dragging_sidebar_splitter_resizes_sidebar() {
         row: 5,
         modifiers: KeyModifiers::NONE,
     });
-    assert!(app.splitter_drag.is_none());
+    assert!(!matches!(app.gesture, Some(Gesture::Splitter(_))));
 }
 
 /// A release croft never receives (the button let go outside the window,
@@ -809,7 +809,7 @@ fn a_press_after_a_lost_release_starts_a_new_gesture() {
         .sidebar_splitter_x
         .expect("the side bar is shown, so its splitter is drawn");
     app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), seam, 5));
-    assert_eq!(app.splitter_drag, Some(SplitterDrag::Sidebar));
+    assert_eq!(app.gesture, Some(Gesture::Splitter(SplitterDrag::Sidebar)));
     // The release of that press never arrives.
     let width = app.sidebar_width;
     let x = app.editor.last_inner.x + app.editor.last_gutter_width + 1;
@@ -825,7 +825,7 @@ fn a_press_after_a_lost_release_starts_a_new_gesture() {
         "the drag in the text selects text"
     );
     app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), x + 6, y));
-    assert!(app.splitter_drag.is_none());
+    assert!(!matches!(app.gesture, Some(Gesture::Splitter(_))));
 }
 
 #[test]
@@ -845,7 +845,7 @@ fn sidebar_drag_grabs_one_column_left_of_seam() {
         row: 5,
         modifiers: KeyModifiers::NONE,
     });
-    assert_eq!(app.splitter_drag, Some(SplitterDrag::Sidebar));
+    assert_eq!(app.gesture, Some(Gesture::Splitter(SplitterDrag::Sidebar)));
 }
 
 #[test]
@@ -2847,7 +2847,7 @@ fn auto_hide_is_suppressed_while_dragging_prompting_or_in_zen_mode() {
 
     // Mid seam-drag the pointer is over the editor by definition; collapsing
     // under the cursor is exactly the flapping the issue calls out.
-    app.splitter_drag = Some(SplitterDrag::Sidebar);
+    app.gesture = Some(Gesture::Splitter(SplitterDrag::Sidebar));
     assert!(!app.sidebar_auto_hide_allowed(), "a drag suppresses it");
     app.focus_pane(Pane::Editor);
     // Tick past the delay: since #302 defers the collapse, asserting
@@ -2858,7 +2858,7 @@ fn auto_hide_is_suppressed_while_dragging_prompting_or_in_zen_mode() {
         "the drag suppresses the collapse even once the window elapses"
     );
     assert!(app.show_tree, "and the sidebar survives the drag");
-    app.splitter_drag = None;
+    app.gesture = None;
 
     // Zen Mode already owns chrome visibility and wins, as it does today.
     app.zen_mode = true;
@@ -3254,7 +3254,7 @@ fn a_suppressed_tick_does_not_spend_the_reveal_pin() {
     // The user starts dragging the sidebar seam. This suppresses the collapse
     // on its own — independently of the pin — and is transient: it ends when
     // they release the mouse.
-    app.splitter_drag = Some(SplitterDrag::Sidebar);
+    app.gesture = Some(Gesture::Splitter(SplitterDrag::Sidebar));
 
     // Precondition: the drag alone is enough to stop this collapse, so the
     // tick below declines for a reason that is not the pin.
@@ -3283,7 +3283,7 @@ fn a_suppressed_tick_does_not_spend_the_reveal_pin() {
     // sidebar deliberately releases the pin (mod.rs, the `Pane::Tree` arm), so
     // a Tree->Editor round trip would clear the very flag under test. Focus is
     // already on Editor here; the dwell is what needs re-arming.
-    app.splitter_drag = None;
+    app.gesture = None;
     app.focus_pane(Pane::Terminal);
     let pinned_collapse = app.tick_sidebar_auto_hide_at(now + AUTO_HIDE_DWELL * 2);
     assert!(!pinned_collapse, "the pin exempts this one");
@@ -3961,8 +3961,8 @@ fn a_strip_on_the_sidebar_seam_still_unfolds_its_pane() {
             !app.terminals[idx].collapsed,
             "{pos:?}: the strip on the seam is still the way back out"
         );
-        assert_eq!(
-            app.splitter_drag, None,
+        assert!(
+            !matches!(app.gesture, Some(Gesture::Splitter(_))),
             "{pos:?}: a click on a strip is not a sidebar resize"
         );
     }
@@ -4258,7 +4258,7 @@ fn pressing_and_dragging_the_output_scrollbar_scrolls_the_log() {
         bar.x,
         bar.y + bar.height - 1,
     ));
-    assert!(app.scrollbar_drag.is_none(), "the release ends the drag");
+    assert!(app.gesture.is_none(), "the release ends the drag");
 }
 
 /// #2848: the channel list OUTPUT opens over its log can reach the
@@ -4322,10 +4322,7 @@ fn a_press_on_the_output_scrollbar_with_the_channel_list_open_is_the_lists() {
         !app.output.dropdown_open(),
         "a press on the bar's column while the list is open is the list's"
     );
-    assert!(
-        app.scrollbar_drag.is_none(),
-        "and does not start a scrollbar drag"
-    );
+    assert!(app.gesture.is_none(), "and does not start a scrollbar drag");
     app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), bar.x, bar.y));
 }
 

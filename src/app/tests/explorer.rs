@@ -1344,7 +1344,7 @@ fn click_on_tree_row_aligned_with_terminal_splitter_y_selects_the_row_not_the_sp
     };
     app.handle_mouse(click);
     assert!(
-        app.splitter_drag.is_none(),
+        !matches!(app.gesture, Some(Gesture::Splitter(_))),
         "click in the LEFT (tree) column must never arm a splitter drag, even when the row y lines up with the editor/terminal splitter that lives in the RIGHT column"
     );
     assert_eq!(

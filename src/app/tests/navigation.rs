@@ -321,11 +321,11 @@ fn outline_scrollbar_drag_is_not_hijacked_by_the_sidebar_splitter() {
         bar.y + bar.height - 1,
     ));
     assert!(
-        app.splitter_drag.is_none(),
+        !matches!(app.gesture, Some(Gesture::Splitter(_))),
         "pressing the outline scrollbar must not start a sidebar splitter drag"
     );
     assert!(
-        app.outline_scrollbar_drag,
+        app.gesture == Some(Gesture::Scrollbar(Bar::Outline)),
         "pressing the outline scrollbar must arm the outline scrollbar drag"
     );
 }

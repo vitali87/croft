@@ -310,7 +310,9 @@ impl App {
                 (false, o.row_at(y).and_then(|idx| o.jump_target(idx)))
             }
         });
-        self.secondary_outline_scrollbar_drag = on_bar;
+        if on_bar {
+            self.gesture = Some(Gesture::Scrollbar(Bar::SecondaryOutline));
+        }
         if let Some((path, line, col)) = target
             && !self.jump_in_scrub_view(line)
         {

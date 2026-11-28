@@ -573,6 +573,47 @@ pub(super) enum SplitterDrag {
     EditorSeam(editor_layout::Seam),
 }
 
+/// The drag a left press started, live until its release. One value, so two
+/// drags cannot be under way at once: a new press replaces it (#2859), and a
+/// new kind of drag is a new variant the drag handler must cover.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Gesture {
+    /// A splitter between parts of the window.
+    Splitter(SplitterDrag),
+    /// The minimap's picture: the editor follows the pointer.
+    Minimap,
+    /// A view's vertical scrollbar: the thumb follows the pointer.
+    Scrollbar(Bar),
+    /// The editor's horizontal scrollbar.
+    EditorHScrollbar,
+    /// A press in the editor's breakpoint lane toggled a breakpoint (#1544),
+    /// so the rest of the gesture is the lane's: its drags are dropped.
+    /// Without it the first drag (some terminals send one at the press cell)
+    /// would anchor a selection at the caret and walk the caret to the
+    /// clicked line, undoing the caret-preserving click.
+    BreakpointLane,
+}
+
+/// Which view's vertical scrollbar a [`Gesture::Scrollbar`] drags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Bar {
+    Editor,
+    Explorer,
+    OpenEditors,
+    Outline,
+    /// The secondary side bar's own Outline (#1326).
+    SecondaryOutline,
+    Timeline,
+    Dependencies,
+    Remote,
+    Search,
+    SourceControl,
+    Testing,
+    CommitGraph,
+    Problems,
+    Output,
+}
+
 /// Minimum width in cells of either editor column while split, so a drag
 /// can't collapse a pane to nothing.
 pub(super) const EDITOR_SPLIT_MIN: u16 = 10;
@@ -1759,7 +1800,7 @@ impl App {
         // Mid-drag on the sidebar seam: the pointer is over the editor by
         // definition, and collapsing under the cursor is the flapping the
         // issue calls out.
-        if self.splitter_drag.is_some() {
+        if matches!(self.gesture, Some(Gesture::Splitter(_))) {
             return false;
         }
         // Any pop-up may be anchored over sidebar space, and many ask about
@@ -1769,7 +1810,7 @@ impl App {
             return false;
         }
         // An Explorer drag is a drag over the sidebar the user is dragging
-        // FROM; `splitter_drag` does not cover it.
+        // FROM; a splitter gesture does not cover it.
         if self.tree_drag.is_some() {
             return false;
         }
