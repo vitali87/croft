@@ -137,7 +137,16 @@ impl DapSession {
         let port = crate::dap::transport::free_port()?;
         let args = vec![String::from("dap"), format!("--listen={host}:{port}")];
         let transport =
-            DapTransport::connect_tcp_server(&dlv.to_string_lossy(), &args, cwd, host, port, None)?;
+            // delve runs `go build`: the Go croft found, put on its PATH
+            // when croft's own does not reach it (#2807).
+            DapTransport::connect_tcp_server(
+                &dlv.to_string_lossy(),
+                &args,
+                cwd,
+                host,
+                port,
+                crate::proc::find::go_dir_off_path().as_deref(),
+            )?;
         transport.send(initialize_request(false))?;
         let attached = is_attach(&start_request);
         transport.send(with_remote_output(start_request))?;
