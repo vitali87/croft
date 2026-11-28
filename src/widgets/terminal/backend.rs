@@ -248,7 +248,7 @@ impl PaneLink {
         let mut rd = stream
             .try_clone()
             .context("cloning the pane host connection")?;
-        rd.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut frames = FrameReader::new();
         let mut pending: Vec<u8> = Vec::new();
         let mut pid = None;
@@ -258,9 +258,22 @@ impl PaneLink {
         let mut greeting_exit = None;
         let mut buf = [0u8; 65536];
         while pid.is_none() {
-            let n = rd
-                .read(&mut buf)
-                .context("reading the pane host's greeting")?;
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            anyhow::ensure!(
+                !left.is_zero(),
+                "the pane host at {} sent no greeting",
+                socket.display()
+            );
+            rd.set_read_timeout(Some(left))?;
+            let n = match rd.read(&mut buf) {
+                // A signal that lands during the read (a child exiting, a
+                // resize) is not the host's answer. A socket read with a
+                // timeout is never restarted, so it fails with EINTR instead,
+                // and the restore gave the pane a fresh shell (#2553). Read
+                // again, within what is left of the same five seconds.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                read => read.context("reading the pane host's greeting")?,
+            };
             anyhow::ensure!(n > 0, "the pane host at {} closed", socket.display());
             for frame in frames.push(&buf[..n]) {
                 match frame {

@@ -1,0 +1,1 @@
+fix: A terminal whose shell was still running when croft last closed reattaches to it reliably. A signal that arrived while croft waited for the shell's host to answer, such as another program exiting or the window being resized, made croft give up and start a fresh shell instead (#2553).
