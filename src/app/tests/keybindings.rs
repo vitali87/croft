@@ -3446,6 +3446,33 @@ fn recording_a_shortcut_writes_it_and_takes_effect_at_once() {
     assert_eq!(app.keymap.chord_for(cmd).as_deref(), Some("ctrl+alt+j"));
 }
 
+/// #2874: the shortcut croft writes is loaded at once, so the config watch
+/// does not reload keybindings.json behind it and replace the message saying
+/// what the shortcut now runs with "Keybindings reloaded".
+#[test]
+fn a_recorded_shortcut_is_not_reloaded_again_by_the_config_watch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keybindings_file = tmp.path().join("keybindings.json");
+    app.config_watch = crate::config_sync::ConfigWatch::new(vec![app.keybindings_file.clone()]);
+    let t0 = std::time::Instant::now();
+    app.open_keyboard_shortcuts();
+    let cmd = crate::widgets::command_palette::Command::ToggleLiveRun;
+    app.recording_shortcut = Some((cmd, std::time::Instant::now()));
+    app.handle_key(key(
+        KeyCode::Char('j'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    let recorded = app.status.clone();
+    assert!(recorded.starts_with("ctrl+alt+j now runs"), "{recorded}");
+    assert!(
+        !app.tick_config_watch_at(t0 + crate::config_sync::ConfigWatch::INTERVAL * 2),
+        "croft wrote keybindings.json itself"
+    );
+    assert_eq!(app.status, recorded);
+}
+
 #[test]
 fn escape_leaves_the_shortcut_unchanged() {
     let tmp = tempfile::tempdir().unwrap();

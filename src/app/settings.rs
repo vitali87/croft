@@ -403,16 +403,16 @@ impl App {
                 return;
             }
         };
+        // Applied just below, so it is croft's own write: the settings watch
+        // must not apply it again.
         let written = path
             .parent()
             .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| std::fs::write(&path, new));
+            .and_then(|()| crate::config_sync::write_own(&path, new));
         if let Err(e) = written {
             self.status = format!("{}: {e}", path.display());
             return;
         }
-        // Applied just below, so the settings watch must not apply it again.
-        self.config_watch.note(&path);
         let merged = self.merged_settings_here();
         for w in &merged.warnings {
             crate::output::push("Settings", crate::output::OutputLevel::Warn, w);
@@ -509,7 +509,9 @@ impl App {
                 return;
             }
         };
-        if let Err(e) = std::fs::write(&path, new) {
+        // Applied just below, so it is croft's own write: the settings watch
+        // must not apply it again and replace this reset's message (#2874).
+        if let Err(e) = crate::config_sync::write_own(&path, new) {
             self.status = format!("{}: {e}", path.display());
             return;
         }
@@ -675,7 +677,8 @@ impl App {
                 ConfigFileSeed::Agents => crate::agents::TEMPLATE.to_string(),
                 ConfigFileSeed::Matchers => crate::problem_matchers::TEMPLATE.to_string(),
             };
-            if let Err(e) = std::fs::write(&path, contents) {
+            // croft's own write, not a change from outside to reload (#2874).
+            if let Err(e) = crate::config_sync::write_own(&path, contents) {
                 self.status = format!("Could not create {}: {e}", path.display());
                 return;
             }
@@ -961,7 +964,10 @@ impl App {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        if let Err(e) = std::fs::write(&path, text) {
+        // Loaded just below, so it is croft's own write: the config watch
+        // must not reload it and replace the message saying what the
+        // shortcut now runs (#2874).
+        if let Err(e) = crate::config_sync::write_own(&path, text) {
             self.status = format!("Could not write {}: {e}", path.display());
             return;
         }
