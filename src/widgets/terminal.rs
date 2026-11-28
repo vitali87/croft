@@ -605,6 +605,41 @@ impl PtyTerminal {
     }
 }
 
+/// Test-only: whether a pane's grid is free once its reader is done with the
+/// screen for a read, which tests ask of one pane at a time.
+#[cfg(test)]
+mod lock_probe {
+    use super::*;
+
+    type Grid = Arc<FairMutex<Term<VoidListener>>>;
+
+    /// The panes asked about, each with where its answers go.
+    static ASKED: std::sync::Mutex<
+        Vec<(
+            std::sync::Weak<FairMutex<Term<VoidListener>>>,
+            std::sync::mpsc::Sender<bool>,
+        )>,
+    > = std::sync::Mutex::new(Vec::new());
+
+    /// Answers, one per read from here on, whether `grid` was free.
+    pub(super) fn ask(grid: &Grid) -> std::sync::mpsc::Receiver<bool> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        ASKED.lock().unwrap().push((Arc::downgrade(grid), tx));
+        rx
+    }
+
+    /// Called by the reader once it is done with the screen for a read.
+    pub(super) fn after_screen_work(grid: &Grid) {
+        let mut asked = ASKED.lock().unwrap();
+        asked.retain(|(pane, _)| pane.strong_count() > 0);
+        for (pane, tx) in asked.iter() {
+            if std::ptr::eq(pane.as_ptr(), Arc::as_ptr(grid)) {
+                let _ = tx.send(grid.try_lock_unfair().is_some());
+            }
+        }
+    }
+}
+
 /// What a pane needs from wherever its shell runs: bytes to it, bytes from
 /// it with an fd to poll for them, and the shell's pid.
 struct PaneLink {

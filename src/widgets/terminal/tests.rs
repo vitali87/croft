@@ -5796,3 +5796,30 @@ fn finished_output_keeps_a_final_line_without_trailing_newline() {
         f.output
     );
 }
+
+/// The reader lets go of the pane once it is done with the screen: the
+/// problem matchers and trigger sends after it read only the output's own
+/// lines, and painting or typing must not wait for them.
+#[test]
+fn the_reader_lets_go_of_the_pane_before_the_problem_matchers_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let pane = PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            String::from("sleep 0.5; echo hello; sleep 30"),
+        ],
+        dir.path(),
+    )
+    .unwrap();
+    let answers = lock_probe::ask(&pane.grid_lock_for_test());
+    let free = answers
+        .recv_timeout(crate::test_budget::spawn_budget(
+            std::time::Duration::from_secs(5),
+        ))
+        .expect("the shell's output is read");
+    assert!(
+        free,
+        "the reader still held the pane when it was done with the screen"
+    );
+}
