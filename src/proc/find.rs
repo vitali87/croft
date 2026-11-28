@@ -71,6 +71,24 @@ pub(crate) fn go_in(path_var: Option<&OsStr>, homes: &[PathBuf]) -> Option<PathB
     first_in("go", on_path.chain(homes.iter().cloned()))
 }
 
+/// The folder of the `go` [`go`] finds, when croft's own `PATH` does not
+/// reach it: a program croft starts that runs `go` itself, gopls loading
+/// packages or delve building the program, gets it on its `PATH` (#2807).
+pub(crate) fn go_dir_off_path() -> Option<PathBuf> {
+    go_dir_off_path_in(
+        std::env::var_os("PATH").as_deref(),
+        &GO_HOMES.map(PathBuf::from),
+    )
+}
+
+/// [`go_dir_off_path`] on the `PATH` value `path_var`, with `homes`.
+pub(crate) fn go_dir_off_path_in(path_var: Option<&OsStr>, homes: &[PathBuf]) -> Option<PathBuf> {
+    if on_path_in("go", path_var).is_some() {
+        return None;
+    }
+    go_in(path_var, homes)?.parent().map(Path::to_path_buf)
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -138,5 +156,22 @@ mod tests {
         file(&on_path.join("go"), 0o755);
         assert_eq!(go_in(Some(&path_var), &homes), Some(on_path.join("go")));
         assert_eq!(go_in(None, &[]), None);
+    }
+
+    /// #2807 review: a Go found off croft's `PATH` is put on the `PATH` of
+    /// gopls and delve, which run `go` themselves; one on croft's `PATH`
+    /// needs nothing added.
+    #[test]
+    fn go_off_path_is_named_for_the_programs_that_run_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (on_path, official) = (tmp.path().join("bin"), tmp.path().join("go/bin"));
+        std::fs::create_dir_all(&on_path).unwrap();
+        file(&official.join("go"), 0o755);
+        let path_var = std::env::join_paths([&on_path]).unwrap();
+        let homes = [official.clone()];
+        assert_eq!(go_dir_off_path_in(Some(&path_var), &homes), Some(official));
+        file(&on_path.join("go"), 0o755);
+        assert_eq!(go_dir_off_path_in(Some(&path_var), &homes), None);
+        assert_eq!(go_dir_off_path_in(None, &[]), None);
     }
 }
