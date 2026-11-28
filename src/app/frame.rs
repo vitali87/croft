@@ -434,6 +434,7 @@ impl App {
     }
 
     pub(super) fn render(&mut self, frame: &mut ratatui::Frame) {
+        let _turn = crate::proc::UiTurn::enter();
         // Set again by the welcome panel when it paints the button.
         self.welcome_tour_button = Rect::default();
         self.picture_cover.start_frame();

@@ -910,6 +910,7 @@ impl App {
     /// their dedicated chords use, so the palette can never drift from the
     /// keyboard surface.
     pub(crate) fn run_command(&mut self, cmd: crate::widgets::command_palette::Command) {
+        let _turn = crate::proc::UiTurn::enter();
         use crate::widgets::command_palette::Command as Cmd;
         use crate::widgets::editor::CaseTransform;
         // The tab a tab command acts on (#1427): the clicked tab when a
@@ -2086,11 +2087,17 @@ impl App {
                                 // last failing status kept, so one failing
                                 // project fails the sweep.
                                 let mut done: Option<std::io::Result<std::process::Output>> = None;
+                                // tsc (or npx) is a Node program: under the
+                                // node croft found off its PATH (#2809).
+                                let node = crate::node::dir();
                                 for (program, args) in runs {
-                                    let out = std::process::Command::new(&program)
-                                        .args(&args)
-                                        .current_dir(&root_for_thread)
-                                        .output();
+                                    let out = crate::node::put(
+                                        std::process::Command::new(&program)
+                                            .args(&args)
+                                            .current_dir(&root_for_thread),
+                                        node.as_deref(),
+                                    )
+                                    .output();
                                     done = Some(match (done, out) {
                                         (Some(Ok(mut acc)), Ok(o)) => {
                                             acc.stdout.extend(o.stdout);

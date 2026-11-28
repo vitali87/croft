@@ -2351,6 +2351,7 @@ impl App {
     /// replaying, and only when the editor had focus before and after and
     /// the text went into it (#1464). Before, the replay silently left the pasted text out.
     pub(super) fn handle_paste(&mut self, s: &str) {
+        let _turn = crate::proc::UiTurn::enter();
         if self.screencast.is_on() {
             self.screencast.pasted(std::time::Instant::now());
         }

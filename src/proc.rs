@@ -8,7 +8,9 @@
 //!
 //! A program croft waits for runs through [`Bounded`], which states what
 //! is kept of each output, whether it runs apart from croft's terminal and
-//! how long it may take.
+//! how long it may take. A key press, click, paste, command or frame is a
+//! [`UiTurn`], which in a test may not wait on one. A program croft looks for, on `PATH` or in a list
+//! of folders, is found through [`find`], by one rule for what can run.
 //!
 //! [`info`] reads what the operating system says about a process that is
 //! already running.
@@ -17,11 +19,16 @@ use std::ffi::OsString;
 use std::process::{Command, Stdio};
 
 mod bounded;
+pub(crate) mod find;
 pub mod info;
 #[cfg(test)]
 pub(crate) mod record;
+#[cfg(test)]
+mod starts;
+mod ui_turn;
 
 pub(crate) use bounded::{Apart, Bounded, Keep, Kept, RunError};
+pub(crate) use ui_turn::{UiTurn, about_to_wait};
 
 /// The program croft starts for `name`: `name` itself, or in a test the
 /// stand-in this thread put in its place.
@@ -49,7 +56,9 @@ pub(crate) fn spawn_retrying_busy(cmd: &mut Command) -> std::io::Result<std::pro
 
 /// [`Command::output`] through [`spawn_retrying_busy`]: stdin closed, stdout
 /// and stderr captured, waiting out a moment of "Text file busy".
+#[track_caller]
 pub(crate) fn output_retrying_busy(cmd: &mut Command) -> std::io::Result<std::process::Output> {
+    about_to_wait(cmd.get_program());
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
