@@ -235,6 +235,30 @@ pub fn note_own_write(path: &std::path::Path, before: Option<Stamp>) {
     let Some(after) = stamp(path) else {
         return;
     };
+    record_own_write(path, before, after);
+}
+
+/// Write `contents` to `path` as croft's own write (#2874), for a write
+/// croft applies itself: the watch does not report it back, but an outside
+/// edit it had not seen when croft wrote is still reported, as for
+/// [`note_own_write`]. The written state is read from the open file, not the
+/// path, so a file another writer renames in straight after is not taken for
+/// croft's.
+pub fn write_own(path: &std::path::Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    use std::io::Write;
+    let before = stamp(path);
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(contents.as_ref())?;
+    let meta = file.metadata()?;
+    if let Ok(modified) = meta.modified() {
+        record_own_write(path, before, (modified, meta.len()));
+    }
+    Ok(())
+}
+
+/// Record croft's write of `path` from `before` to `after`. Back-to-back
+/// writes chain: the first one's before-state stands.
+fn record_own_write(path: &std::path::Path, before: Option<Stamp>, after: Stamp) {
     let mut own = OWN_WRITES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -715,6 +739,26 @@ mod tests {
         watch.note(&file);
         let later = std::time::Instant::now() + ConfigWatch::INTERVAL * 2;
         assert!(watch.poll(later).is_empty());
+    }
+
+    /// #2874: a file croft writes itself with `write_own` is not reported,
+    /// one more write by someone else after it is, and an outside edit the
+    /// watch had not seen when croft wrote is reported too: croft's write
+    /// carried it along, and it must still be applied.
+    #[test]
+    fn write_own_is_croft_s_own_but_an_unseen_outside_edit_it_carries_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("keybindings.json");
+        let mut watch = ConfigWatch::new(vec![file.clone()]);
+        let later = |n: u32| std::time::Instant::now() + ConfigWatch::INTERVAL * n;
+        write_own(&file, "[]").unwrap();
+        assert!(watch.poll(later(2)).is_empty(), "croft's own write");
+        std::fs::write(&file, r#"[{"key": "ctrl+k"}]"#).unwrap();
+        assert_eq!(watch.poll(later(4)), vec![file.clone()]);
+
+        std::fs::write(&file, r#"[{"key": "ctrl+j"}, {}]"#).unwrap();
+        write_own(&file, r#"[{"key": "ctrl+j"}, {}, {}]"#).unwrap();
+        assert_eq!(watch.poll(later(6)), vec![file], "the outside edit");
     }
 
     /// #1435: re-seating the list keeps a known file's last-seen state (a

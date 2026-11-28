@@ -1651,6 +1651,37 @@ fn a_settings_editor_reset_is_not_reloaded_again_by_the_watch() {
     assert_eq!(app.status, reset);
 }
 
+/// #2874 (review): an outside edit that adds an `extends` to the workspace
+/// layer, with Reset Setting run in that layer before the watch looks, is
+/// still applied by the watch: the reset's write carried it along, so it is
+/// not croft's own, and the watch follows the new chain to the extended file.
+#[test]
+fn an_outside_extends_a_reset_carried_along_is_still_followed() {
+    use crate::widgets::editor::WhitespaceMode;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let t0 = std::time::Instant::now();
+    app.open_settings_editor();
+    app.settings_editor.as_mut().unwrap().target = crate::config_layers::LayerKind::Workspace;
+    app.write_setting("render_whitespace", serde_json::json!("all"));
+    let layer = crate::config_layers::workspace_config_path(tmp.path());
+    std::fs::write(
+        &layer,
+        r#"{ "extends": "team.json", "render_whitespace": "all" }"#,
+    )
+    .unwrap();
+    app.reset_setting("render_whitespace");
+    assert_eq!(app.whitespace_mode, WhitespaceMode::Selection);
+    assert!(tick_after(&mut app, t0, 2), "the outside edit is applied");
+    std::fs::write(
+        tmp.path().join(".croft/team.json"),
+        r#"{ "render_whitespace": "none" }"#,
+    )
+    .unwrap();
+    assert!(tick_after(&mut app, t0, 4), "team.json is watched now");
+    assert_eq!(app.whitespace_mode, WhitespaceMode::None);
+}
+
 /// #2874: a config file croft creates from its template to open it is
 /// croft's own write, not a change from outside for the watch to reload.
 #[test]
