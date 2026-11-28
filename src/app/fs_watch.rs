@@ -5,8 +5,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 
+use crate::file_index::{has_noise_path_run, is_noise_dir, is_noise_path_under_root};
 use crate::widgets::editor::EditorTabs;
-use crate::widgets::file_finder::{has_noise_path_run, is_noise_dir, is_noise_path_under_root};
 use crate::widgets::file_tree::{FileTree, affected_dir_for_event};
 
 const FS_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -823,7 +823,7 @@ fn leaves_path(kind: &notify::EventKind) -> bool {
 /// whatever it is listed as here (`LspManager::did_change_watched_files`).
 pub fn watched_file_changes(
     drain: &FsDrain,
-    known: &[crate::widgets::file_finder::FileEntry],
+    known: &[crate::file_index::FileEntry],
 ) -> Vec<(PathBuf, lsp_types::FileChangeType)> {
     use lsp_types::FileChangeType;
     let existed = |p: &Path| known.iter().any(|e| e.path == p);

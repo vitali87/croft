@@ -828,7 +828,7 @@ pub fn discover(root: &Path) -> Vec<QueryPack> {
         .filter_entry(|e| {
             e.depth() == 0
                 || !e.file_type().is_some_and(|t| t.is_dir())
-                || !crate::widgets::file_finder::is_noise_dir(e.file_name())
+                || !crate::file_index::is_noise_dir(e.file_name())
         })
         .build()
     {

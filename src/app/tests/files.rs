@@ -469,7 +469,7 @@ fn macos_watch_walk_stops_when_the_dir_budget_is_spent() {
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_watch_targets_never_root_a_stream_above_a_noise_dir() {
-    use crate::widgets::file_finder::is_noise_dir;
+    use crate::file_index::is_noise_dir;
     // A parent-of-repos layout (~/Documents-shaped): root has no top-level
     // noise, but each repo nested under it carries target/, node_modules/, .git.
     let tmp = tempfile::tempdir().unwrap();
@@ -885,7 +885,7 @@ fn watched_file_events_cover_a_moved_directory_and_an_atomic_save() {
     for f in ["old/a.rs", "old/sub/b.rs", "old2.rs", "lib.rs"] {
         std::fs::write(root.join(f), "x").unwrap();
     }
-    let index = crate::widgets::file_finder::build_file_index(root);
+    let index = crate::file_index::build_file_index(root);
     let mut app = App::new(root.to_path_buf()).unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     app.fs_watch.set_test_events(rx);

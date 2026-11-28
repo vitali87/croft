@@ -658,7 +658,7 @@ impl App {
         self.file_finder_index_dirty = false;
         let roots: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
         let job = crate::jobs::Job::spawn(FILE_INDEX_THREAD, crate::jobs::Start::Now, move || {
-            crate::widgets::file_finder::build_multi_file_index(&roots)
+            crate::file_index::build_multi_file_index(&roots)
         });
         match job {
             Ok(job) => self.file_finder_index_job = Some(job),
@@ -705,7 +705,7 @@ impl App {
         // anywhere-in-the-workspace fallback is not answered from nothing.
         if found.is_none() && self.file_finder_index.is_none() {
             let roots: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
-            let entries = crate::widgets::file_finder::build_multi_file_index(&roots);
+            let entries = crate::file_index::build_multi_file_index(&roots);
             self.file_finder_index = Some(std::sync::Arc::new(entries));
             self.file_finder_index_job = None;
             found = crate::header_source::counterpart(&path, &root, &index_paths(self), &is_file);
@@ -739,7 +739,7 @@ impl App {
         // Cmd+P is pressed within the first few hundred ms of launch.
         if self.file_finder_index.is_none() {
             let roots: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
-            let entries = crate::widgets::file_finder::build_multi_file_index(&roots);
+            let entries = crate::file_index::build_multi_file_index(&roots);
             self.file_finder_index = Some(std::sync::Arc::new(entries));
             self.file_finder_index_job = None;
         }
@@ -2098,8 +2098,8 @@ impl App {
     /// (#1345): VS Code's file search honours both exclude settings.
     pub(super) fn without_project_excludes(
         &self,
-        entries: std::sync::Arc<Vec<crate::widgets::file_finder::FileEntry>>,
-    ) -> std::sync::Arc<Vec<crate::widgets::file_finder::FileEntry>> {
+        entries: std::sync::Arc<Vec<crate::file_index::FileEntry>>,
+    ) -> std::sync::Arc<Vec<crate::file_index::FileEntry>> {
         if self.search.project_exclude.is_empty() {
             return entries;
         }
