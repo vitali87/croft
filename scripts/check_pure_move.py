@@ -19,7 +19,11 @@ respelled to the same reach. Private items in test modules (a module named
 only test code can name them, and the test build fails if any user of one
 lost it, so a test moved beside the code it tests is a move. A test helper
 copied into a second test module, identical to one that stays, is listed as
-a copy rather than an addition. A wider visibility can push a line past the width limit, so
+a copy rather than an addition. A commit line `pure-move-module: crate::a ->
+crate::b` says a module moved as a whole: a reach under `crate::a` then
+compares as the same reach under `crate::b`, so the module's own
+`pub(super)` items keep their meaning; the build checks that nothing left
+behind still needed them. A wider visibility can push a line past the width limit, so
 rustfmt lays the item out anew; an item whose text differs is still a match
 when rustfmt, given both versions without their visibility, prints the same
 text for each. rustfmt changes layout only, never meaning, and it keeps every
@@ -85,6 +89,15 @@ MACRO = re.compile(r"\s*((?:\w+::)*\w+)\s*!")
 # Kinds whose `{` belongs to a value or a path, not a body: only `;` ends them.
 SEMI_ONLY = {"const", "static", "type", "use"}
 PURE_MOVE = re.compile(r"^\s*pure-move:\s*true\s*$", re.MULTILINE | re.IGNORECASE)
+# `pure-move-module: crate::widgets::search -> crate::search` in a commit
+# message: a module and everything in it moved to another path, so a reach
+# under the old path compares as the same reach under the new one.
+MOVED_MODULE = re.compile(
+    r"^\s*pure-move-module:\s*(crate(?:::\w+)*)\s*->\s*(crate(?:::\w+)*)\s*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+# The module moves the commits declare, old path to new, as segment tuples.
+MOVED = {}
 BLANK, COMMENT, DOC, INNER, CODE = range(5)
 
 
@@ -473,7 +486,7 @@ def spelled(reach, module):
     return "pub(in " + "::".join(reach) + ")"
 
 
-def widens(old, new, old_module=None, new_module=None):
+def widens(old, new, old_module=None, new_module=None, moved=False):
     """Whether visibility `old` -> `new` keeps or widens the item's reach. A
     move may need a wider visibility; a narrower one can hide what callers
     used, so it is a change, and so is one that cannot be compared. Given
@@ -483,11 +496,24 @@ def widens(old, new, old_module=None, new_module=None):
     level down is narrower; without them, by spelling and rank."""
     a, b = scope(old, old_module), scope(new, new_module)
     if a is not None and b is not None:
+        if moved:
+            a = relocated(a)
         return a[: len(b)] == b
     if old == new:
         return True
     a, b = vis_rank(old), vis_rank(new)
     return a is not None and b is not None and b > a
+
+
+def relocated(reach):
+    """`reach` with a module the commits declare moved (`pure-move-module:`)
+    read at its new path: what reached all of the old module reaches all of
+    the new one. Applied only to items that moved: an item that stays keeps
+    its reach. The build checks that nothing left behind needed it."""
+    for old, new in MOVED.items():
+        if reach[: len(old)] == old:
+            return new + reach[len(old) :]
+    return reach
 
 
 # Kinds whose declaration can carry a visibility of its own.
@@ -519,13 +545,16 @@ def item_widens(o, n):
     and the test build fails if a user of one lost it."""
     if o.vis == n.vis == "" and in_tests(o) and in_tests(n):
         return True
-    return widens(o.vis, n.vis, vis_module(o), vis_module(n))
+    moved = (o.file, o.mods) != (n.file, n.mods)
+    return widens(o.vis, n.vis, vis_module(o), vis_module(n), moved)
 
 
 def same_reach(o, n):
     """Whether two items' visibilities, however spelled, reach the same
     modules: a move into a deeper file can need a new spelling for that."""
     a = scope(o.vis, vis_module(o))
+    if a is not None and (o.file, o.mods) != (n.file, n.mods):
+        a = relocated(a)
     return a is not None and a == scope(n.vis, vis_module(n))
 
 
@@ -715,7 +744,13 @@ def check(base, head, if_declared):
     if not changed_files:
         print("No Rust files changed.")
         return 0
-    declared = bool(PURE_MOVE.search(git("log", f"{base}..{head}", "--format=%B")))
+    messages = git("log", f"{base}..{head}", "--format=%B")
+    declared = bool(PURE_MOVE.search(messages))
+    MOVED.clear()
+    for old, new in MOVED_MODULE.findall(messages):
+        MOVED[tuple(old.split("::"))] = tuple(new.split("::"))
+    for old, new in MOVED.items():
+        print(f"  module moved: {'::'.join(old)} -> {'::'.join(new)}")
     enforced = declared or not if_declared
     sides = ([], []), ([], [])
     errors = []

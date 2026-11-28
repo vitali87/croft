@@ -328,6 +328,44 @@ class PureMoves(unittest.TestCase):
                 self.assertEqual(code, 1, out)
                 self.assertIn(says, out)
 
+    def test_a_declared_module_move_keeps_its_items_reach(self):
+        """A module moved as a whole, declared with `pure-move-module:`,
+        keeps the meaning of its own `pub(super)` items: what reached all of
+        `crate::a` now reaches all of `crate::c`. Undeclared, the two reach
+        different modules and do not compare."""
+        item = "pub(super) fn find() -> u8 {\n    1\n}\n"
+        for message, want in [
+            ("move\n\npure-move-module: crate::a -> crate::c", 0),
+            ("move", 1),
+        ]:
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as tmp:
+                repo = Repo(Path(tmp), {"src/main.rs": "mod a;\n", "src/a.rs": "mod walk;\n", "src/a/walk.rs": item})
+                (Path(tmp) / "src/a/walk.rs").unlink()
+                repo.commit(
+                    {"src/main.rs": "mod a;\nmod c;\n", "src/a.rs": "", "src/c.rs": "mod walk;\n", "src/c/walk.rs": item},
+                    message,
+                )
+                code, out = repo.check()
+                self.assertEqual(code, want, out)
+                if want == 0:
+                    self.assertIn("module moved: crate::a -> crate::c", out)
+                    self.assertIn("moved    fn src/a/walk.rs::find -> src/c/walk.rs::find", out)
+        # Only what moved is read at the new path: an item that stays in the
+        # old module, beside the declaration, is unchanged.
+        stays = "pub(super) fn draw() {}\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp), {
+                "src/main.rs": "mod a;\n", "src/a.rs": "mod walk;\n\n" + stays, "src/a/walk.rs": item,
+            })
+            (Path(tmp) / "src/a/walk.rs").unlink()
+            repo.commit(
+                {"src/main.rs": "mod a;\nmod c;\n", "src/a.rs": stays, "src/c.rs": "mod walk;\n", "src/c/walk.rs": item},
+                "move\n\npure-move-module: crate::a -> crate::c",
+            )
+            code, out = repo.check()
+            self.assertEqual(code, 0, out)
+            self.assertIn("1 unchanged, 1 moved", out)
+
     def test_module_scopes_read_every_spelling(self):
         app = pm.module_of("src/app/codeql.rs")
         self.assertEqual(app, ("crate", "app", "codeql"))
