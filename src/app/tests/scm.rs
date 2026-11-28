@@ -5986,7 +5986,7 @@ fn the_scrubber_consumes_its_own_keys_and_no_others() {
         author: String::from("t"),
         age_secs: 0,
     };
-    app.scrubber = Some(crate::scrubber::Scrubber::new(vec![
+    app.scrub.scrubber = Some(crate::scrubber::Scrubber::new(vec![
         fake("aaaaaaa1", "newest"),
         fake("bbbbbbb2", "older"),
     ]));
@@ -5994,7 +5994,7 @@ fn the_scrubber_consumes_its_own_keys_and_no_others() {
     // Left steps back and lands on HEAD, not past it.
     assert!(app.handle_scrubber_key(KeyCode::Left));
     assert_eq!(
-        app.scrubber.as_ref().unwrap().position(),
+        app.scrub.scrubber.as_ref().unwrap().position(),
         crate::scrubber::Position::At(0)
     );
     assert!(app.status.contains("aaaaaaa"), "status: {}", app.status);
@@ -6008,7 +6008,7 @@ fn the_scrubber_consumes_its_own_keys_and_no_others() {
     assert!(app.handle_scrubber_key(KeyCode::Left));
     assert!(app.handle_scrubber_key(KeyCode::Home));
     assert_eq!(
-        app.scrubber.as_ref().unwrap().position(),
+        app.scrub.scrubber.as_ref().unwrap().position(),
         crate::scrubber::Position::Working
     );
 
@@ -6018,12 +6018,15 @@ fn the_scrubber_consumes_its_own_keys_and_no_others() {
         !app.handle_scrubber_key(KeyCode::Char('x')),
         "an unrelated key must pass through"
     );
-    assert!(app.scrubber.is_some(), "and must not close the scrubber");
+    assert!(
+        app.scrub.scrubber.is_some(),
+        "and must not close the scrubber"
+    );
 
     // Esc closes, and the live buffer is simply what is there — the
     // scrubber never replaced it, so closing cannot lose unsaved work.
     assert!(app.handle_scrubber_key(KeyCode::Esc));
-    assert!(app.scrubber.is_none());
+    assert!(app.scrub.scrubber.is_none());
     // With no scrubber open, its keys are not consumed either.
     assert!(!app.handle_scrubber_key(KeyCode::Left));
 }
@@ -6360,7 +6363,7 @@ fn the_sequence_editor_command_quotes_the_binary_path() {
 /// replace the plain stand-in (#371); the builder runs on its own thread.
 fn settle_scrub_view(app: &mut App) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while !matches!(app.scrub_view_key, Some((_, true))) {
+    while !matches!(app.scrub.view_key, Some((_, true))) {
         assert!(
             std::time::Instant::now() < deadline,
             "the scrubber's view was never built"
@@ -6384,18 +6387,18 @@ fn stepping_back_to_a_finished_scrub_view_reuses_it() {
     settle_scrub_view(&mut app);
     assert!(app.handle_scrubber_key(KeyCode::Right), "back to HEAD");
     assert!(
-        matches!(app.scrub_view_key, Some((_, true))),
+        matches!(app.scrub.view_key, Some((_, true))),
         "HEAD's finished view was kept"
     );
     assert_eq!(
-        app.scrub_view.as_ref().unwrap().lines,
+        app.scrub.view.as_ref().unwrap().lines,
         vec!["v1", "v2", "v3"]
     );
     // Home drops the view; Esc drops the kept ones with the builder.
     assert!(app.handle_scrubber_key(KeyCode::Home));
-    assert!(app.scrub_view.is_none() && app.scrub_view_key.is_none());
+    assert!(app.scrub.view.is_none() && app.scrub.view_key.is_none());
     assert!(app.handle_scrubber_key(KeyCode::Esc));
-    assert!(app.scrub_views.is_empty() && app.scrub_builder.is_none());
+    assert!(app.scrub.views.is_empty() && app.scrub.builder.is_none());
 }
 
 #[test]
@@ -6408,7 +6411,7 @@ fn scrubbing_shows_the_file_at_each_commit_and_its_changes() {
     app.scrub_history();
     assert!(app.handle_scrubber_key(KeyCode::Left), "to HEAD");
     settle_scrub_view(&mut app);
-    let view = app.scrub_view.as_mut().expect("a historical view at HEAD");
+    let view = app.scrub.view.as_mut().expect("a historical view at HEAD");
     assert_eq!(view.lines, vec!["v1", "v2", "v3"]);
     assert_eq!(
         view.git_mark_at(2),
@@ -6417,7 +6420,7 @@ fn scrubbing_shows_the_file_at_each_commit_and_its_changes() {
     assert_eq!(view.git_mark_at(1), None, "unchanged in that commit");
     assert!(app.handle_scrubber_key(KeyCode::Left), "one older");
     settle_scrub_view(&mut app);
-    let view = app.scrub_view.as_mut().unwrap();
+    let view = app.scrub.view.as_mut().unwrap();
     assert_eq!(view.lines, vec!["v1", "v2"]);
     assert_eq!(
         view.git_mark_at(1),
@@ -6425,7 +6428,7 @@ fn scrubbing_shows_the_file_at_each_commit_and_its_changes() {
     );
     assert!(app.handle_scrubber_key(KeyCode::Left), "the root commit");
     settle_scrub_view(&mut app);
-    let view = app.scrub_view.as_mut().unwrap();
+    let view = app.scrub.view.as_mut().unwrap();
     assert_eq!(view.lines, vec!["v1"]);
     assert_eq!(
         view.git_mark_at(0),
@@ -6492,7 +6495,7 @@ fn scrubbing_follows_a_renamed_file_back_past_the_rename() {
     fn step(app: &mut App) -> &mut crate::widgets::editor::Editor {
         assert!(app.handle_scrubber_key(KeyCode::Left));
         settle_scrub_view(app);
-        app.scrub_view.as_mut().unwrap()
+        app.scrub.view.as_mut().unwrap()
     }
     assert_eq!(step(&mut app).lines, lines_of(texts[2]), "v3");
     assert_eq!(step(&mut app).lines, lines_of(texts[1]), "unrelated");
@@ -6527,7 +6530,7 @@ fn the_scrub_bar_names_the_file_as_it_was_called_before_a_rename() {
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
         term.draw(|f| app.render(f)).unwrap();
         let buf = term.backend().buffer();
-        let y = app.scrub_slider.y;
+        let y = app.scrub.slider.y;
         (0..buf.area.width)
             .map(|x| buf[(x, y)].symbol().to_string())
             .collect::<String>()
@@ -6554,7 +6557,7 @@ fn a_file_added_later_still_did_not_exist_before_it() {
         assert!(app.handle_scrubber_key(KeyCode::Left));
     }
     settle_scrub_view(&mut app);
-    let view = app.scrub_view.as_ref().unwrap();
+    let view = app.scrub.view.as_ref().unwrap();
     assert_eq!(view.lines.len(), 1, "{:?}", view.lines);
     assert!(
         view.lines[0].starts_with("(notes.txt did not exist at "),
@@ -6581,7 +6584,7 @@ fn leaving_the_scrubber_restores_the_live_buffer_with_its_unsaved_edits() {
     assert_eq!(app.editor.lines, live, "the live buffer took no keystroke");
     assert!(app.status.contains("history"), "{}", app.status);
     app.handle_scrubber_key(KeyCode::Esc);
-    assert!(app.scrub_view.is_none(), "the historical view is gone");
+    assert!(app.scrub.view.is_none(), "the historical view is gone");
     assert_eq!(app.editor.lines, live);
     assert!(app.editor.dirty, "dirty state untouched");
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
@@ -6680,6 +6683,7 @@ fn the_scrubber_opens_a_commits_version_here_or_diffs_it_to_the_working_tree() {
     assert!(app.handle_scrubber_key(KeyCode::Left), "to HEAD");
     assert!(app.handle_scrubber_key(KeyCode::Left), "to v2");
     let short = app
+        .scrub
         .scrubber
         .as_ref()
         .unwrap()
@@ -6689,7 +6693,7 @@ fn the_scrubber_opens_a_commits_version_here_or_diffs_it_to_the_working_tree() {
         .clone();
 
     assert!(app.handle_scrubber_key(KeyCode::Enter));
-    assert!(app.scrubber.is_none() && app.scrub_view.is_none());
+    assert!(app.scrub.scrubber.is_none() && app.scrub.view.is_none());
     assert_eq!(
         app.editor.path.as_deref(),
         Some(Path::new(&format!("a.txt @ {short}")))
@@ -6704,7 +6708,7 @@ fn the_scrubber_opens_a_commits_version_here_or_diffs_it_to_the_working_tree() {
     assert!(app.handle_scrubber_key(KeyCode::Left));
     assert!(app.handle_scrubber_key(KeyCode::Left));
     app.run_command(crate::widgets::command_palette::Command::ScrubDiffToWorkingTree);
-    assert!(app.scrubber.is_none());
+    assert!(app.scrub.scrubber.is_none());
     let diff = app.editor.diff.as_ref().expect("a diff tab");
     assert_eq!(diff.left_lines, vec!["v1", "v2"]);
     assert_eq!(
@@ -6729,13 +6733,13 @@ fn switching_files_while_scrubbing_shows_the_new_files_history() {
     app.scrub_history();
     assert!(app.handle_scrubber_key(KeyCode::Left), "to HEAD");
     assert_eq!(
-        app.scrub_view.as_ref().unwrap().lines,
+        app.scrub.view.as_ref().unwrap().lines,
         vec!["v1", "v2", "v3"]
     );
     app.editor.open(&repo.path().join("new.txt")).unwrap();
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
-    let view = app.scrub_view.as_ref().expect("still scrubbing");
+    let view = app.scrub.view.as_ref().expect("still scrubbing");
     assert!(
         view.lines[0].contains("new.txt did not exist"),
         "{:?}",
@@ -6754,7 +6758,7 @@ fn the_scrubber_slider_seeks_on_click_and_drag() {
     app.scrub_history();
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
-    let track = app.scrub_slider;
+    let track = app.scrub.slider;
     assert!(track.width > 10, "the slider lays out: {track:?}");
     let row: String = (0..120)
         .map(|x| term.backend().buffer()[(x, track.y)].symbol().to_string())
@@ -6774,7 +6778,7 @@ fn the_scrubber_slider_seeks_on_click_and_drag() {
         track.x,
     );
     assert_eq!(
-        app.scrub_view.as_ref().unwrap().lines,
+        app.scrub.view.as_ref().unwrap().lines,
         vec!["v1"],
         "the oldest commit"
     );
@@ -6790,14 +6794,14 @@ fn the_scrubber_slider_seeks_on_click_and_drag() {
         crossterm::event::MouseEventKind::Drag(MouseButton::Left),
         track.x + track.width + 5,
     );
-    assert!(app.scrub_view.is_none(), "back at the working tree");
+    assert!(app.scrub.view.is_none(), "back at the working tree");
     mouse(
         &mut app,
         crossterm::event::MouseEventKind::Up(MouseButton::Left),
         0,
     );
-    assert!(!app.scrub_dragging);
-    assert!(app.scrubber.is_some(), "the scrubber stays open");
+    assert!(!app.scrub.dragging);
+    assert!(app.scrub.scrubber.is_some(), "the scrubber stays open");
 }
 
 /// #371's criterion, measured: after a warm-up pass, holding an arrow key
@@ -6825,7 +6829,7 @@ fn scrubbing_the_biggest_file_stays_under_a_frame_per_step() {
     let mut app = App::new(root.clone()).unwrap();
     app.editor.open(&biggest).unwrap();
     app.scrub_history();
-    let steps = app.scrubber.as_ref().map_or(0, |s| s.len()).min(200);
+    let steps = app.scrub.scrubber.as_ref().map_or(0, |s| s.len()).min(200);
     assert!(steps > 20, "only {steps} commits to scrub");
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 50)).unwrap();
     term.draw(|f| app.render(f)).unwrap();

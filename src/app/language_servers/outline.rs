@@ -21,7 +21,7 @@ impl App {
         // A tab switch while scrubbing is noticed by render, which runs
         // after this: rebuild here first, or the new file's key would be
         // paired with the previous file's historical text.
-        if self.scrubber.is_some() && self.scrub_for.as_ref() != Some(&path) {
+        if self.scrub.scrubber.is_some() && self.scrub.view_for.as_ref() != Some(&path) {
             self.rebuild_scrub_view();
         }
         // Scrubbing (#371): the outline is the file as it was at the commit
@@ -31,37 +31,39 @@ impl App {
         // view, and until that lands the previous outline stays. Leaving
         // drops the key, so the live outline is recomputed.
         let commit = self
+            .scrub
             .scrubber
             .as_ref()
             .and_then(|s| s.commit())
             .map(|c| c.hash.clone());
-        if let (Some(row), Some(commit)) = (self.scrub_view.as_ref().map(|v| v.cursor_row), commit)
+        if let (Some(row), Some(commit)) = (self.scrub.view.as_ref().map(|v| v.cursor_row), commit)
         {
             let key = (path.clone(), commit.clone());
-            if self.outline_scrub_key.as_ref() != Some(&key) {
+            if self.scrub.outline_key.as_ref() != Some(&key) {
                 let rel = path
                     .strip_prefix(self.workspace_root())
                     .map(|p| p.to_string_lossy().into_owned());
                 let symbols = rel.ok().and_then(|rel| {
-                    self.scrub_outlines
+                    self.scrub
+                        .outlines
                         .get(&crate::scrubber::ViewKey { hash: commit, rel })
                         .cloned()
                 });
                 if let Some(symbols) = symbols {
                     self.outline.set_syntax_symbols(path, symbols, false);
-                    self.outline_scrub_key = Some(key);
+                    self.scrub.outline_key = Some(key);
                     self.outline_synced = None;
                 } else if self.outline.path.as_ref() != Some(&path) {
                     // Another file's outline must never stand in for this
                     // one's: empty until its own lands.
                     self.outline.set_syntax_symbols(path, Vec::new(), false);
-                    self.outline_scrub_key = None;
+                    self.scrub.outline_key = None;
                     self.outline_synced = None;
                 }
             }
             return self.outline.follow_caret(row as u32);
         }
-        if self.outline_scrub_key.take().is_some() {
+        if self.scrub.outline_key.take().is_some() {
             self.outline_synced = None;
         }
         // `lsp_last_seen` carries the edit seq the manager last saw for an open

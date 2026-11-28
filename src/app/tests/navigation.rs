@@ -3205,11 +3205,12 @@ fn settle_scrub_outline(app: &mut App) {
         app.drain_scrub_views();
         app.sync_outline();
         let commit = app
+            .scrub
             .scrubber
             .as_ref()
             .and_then(|s| s.commit())
             .map(|c| c.hash.clone());
-        if commit.is_some() && app.outline_scrub_key.as_ref().map(|(_, c)| c.clone()) == commit {
+        if commit.is_some() && app.scrub.outline_key.as_ref().map(|(_, c)| c.clone()) == commit {
             return;
         }
         assert!(
@@ -3266,7 +3267,7 @@ fn the_outline_and_breadcrumbs_follow_the_scrubbed_commit() {
     // and the breadcrumbs name it from there.
     let target = app.outline.jump_target(0).unwrap().1;
     assert!(app.jump_in_scrub_view(target));
-    assert_eq!(app.scrub_view.as_ref().unwrap().cursor_row, 0);
+    assert_eq!(app.scrub.view.as_ref().unwrap().cursor_row, 0);
     app.editor.cursor_row = 7; // the live caret, inside `gamma`
     let crumbs: Vec<String> = app
         .build_breadcrumbs()

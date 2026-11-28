@@ -2925,59 +2925,12 @@ pub struct App {
     /// the header's size — so a session resized mid-recording plays back
     /// with every later frame wrapped at the wrong width.
     recorded_size: (u16, u16),
-    /// The open history scrubber (#371), or `None` when the editor is
-    /// showing the live buffer. `Some` at `Position::Working` is a real
-    /// state: the scrubber is open and parked at the user's own edits.
-    scrubber: Option<crate::scrubber::Scrubber>,
-    /// The active file as it was at the scrubber's commit (#371): a separate
-    /// read-only editor painted in place of the live one, which is never
-    /// touched. `None` at the working tree.
-    pub scrub_view: Option<crate::widgets::editor::Editor>,
-    /// The file `scrub_view` was built for. Switching tabs while scrubbing
-    /// rebuilds the view for the new file rather than showing the old one's
-    /// history over it.
-    scrub_for: Option<PathBuf>,
-    /// The file and commit the OUTLINE currently shows while scrubbing
-    /// (#371), so it is recomputed once per step, and so leaving the
-    /// scrubber knows to bring the live file's outline back.
-    outline_scrub_key: Option<(PathBuf, String)>,
+    /// The history scrubber's position, view, slider and caches
+    /// (see [`diff_merge::ScrubState`]).
+    scrub: diff_merge::ScrubState,
     /// `a` in the approval popup (#347): the agent whose edits are
     /// approved without asking, until when.
     auto_approve: Option<(String, std::time::Instant)>,
-    /// The scrubber slider's track, from the last frame, and whether a
-    /// drag that started on it is under way (#371).
-    scrub_slider: Rect,
-    scrub_dragging: bool,
-    /// File text per (commit, workspace-relative path) for the scrubber;
-    /// `None` records that the file did not exist there.
-    scrub_cache: std::collections::HashMap<(String, String), Option<std::sync::Arc<str>>>,
-    /// Each scrubbed commit's tree under the workspace root, for the
-    /// Explorer's dimming (#371); `None` records that the listing failed.
-    scrub_trees: std::collections::HashMap<String, Option<std::sync::Arc<crate::git::CommitTree>>>,
-    /// Per workspace-relative path, the name the file had at each commit
-    /// the scrubber walks, so history before a rename reads the old name
-    /// (#1304). One `--follow` walk per file per scrub.
-    scrub_names: std::collections::HashMap<
-        String,
-        std::sync::Arc<std::collections::HashMap<String, String>>,
-    >,
-    /// Builds highlighted historical views off the UI thread (#371),
-    /// started on the first step.
-    scrub_builder: Option<crate::scrubber::ViewBuilder>,
-    /// Finished views near the scrubber's cursor, most recently used last,
-    /// at most `SCRUB_VIEWS_KEPT`.
-    scrub_views: crate::scrubber::KeptViews,
-    /// Plain stand-ins near the cursor, ready for the next step, likewise.
-    scrub_plain: crate::scrubber::KeptViews,
-    /// Each built view's outline, parsed with it off the UI thread, for the
-    /// OUTLINE to show while scrubbing. Dropped with the kept views.
-    scrub_outlines: std::collections::HashMap<
-        crate::scrubber::ViewKey,
-        Vec<crate::lsp::manager::OutlineSymbol>,
-    >,
-    /// What `scrub_view` shows, and whether it is the finished view rather
-    /// than the plain stand-in awaiting one.
-    scrub_view_key: Option<(crate::scrubber::ViewKey, bool)>,
     /// The running `croft demo` tour (#377), with its scratch project and
     /// the workspace to return to.
     pub tour: Option<TourRun>,
@@ -4613,21 +4566,8 @@ impl App {
             notes_shown_gen: 0,
             recording: None,
             recorded_size: (0, 0),
-            scrubber: None,
-            scrub_view: None,
-            scrub_for: None,
-            outline_scrub_key: None,
+            scrub: diff_merge::ScrubState::new(),
             auto_approve: None,
-            scrub_slider: Rect::default(),
-            scrub_dragging: false,
-            scrub_cache: std::collections::HashMap::new(),
-            scrub_trees: std::collections::HashMap::new(),
-            scrub_names: std::collections::HashMap::new(),
-            scrub_builder: None,
-            scrub_views: std::collections::VecDeque::new(),
-            scrub_plain: std::collections::VecDeque::new(),
-            scrub_outlines: std::collections::HashMap::new(),
-            scrub_view_key: None,
             tour: None,
             tour_done: loaded_prefs.tour_done,
             welcome_tour_button: Rect::default(),

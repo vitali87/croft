@@ -1118,7 +1118,7 @@ impl App {
         // unconditionally, so a key only reaches this line when none of them
         // wanted it. The alternative, a list of "overlays that take
         // precedence", silently rots the next time someone adds a modal.
-        if self.scrubber.is_some()
+        if self.scrub.scrubber.is_some()
             && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
             && self.handle_scrubber_key(key.code)
         {
@@ -1126,7 +1126,7 @@ impl App {
         }
         // While a commit is on screen, keys that would edit the hidden live
         // buffer are refused rather than typed blind into it (#371).
-        if self.scrub_view.is_some()
+        if self.scrub.view.is_some()
             && self.focus == Pane::Editor
             && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
             && !key

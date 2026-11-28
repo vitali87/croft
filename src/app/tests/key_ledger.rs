@@ -1024,8 +1024,8 @@ fn fields(app: &App, root: &Path, read: &[String; 5], hide_ids: bool) -> Fields 
                     Some(ShortcutCapture::Confirming { .. })
                 )),
             ),
-            ("scrubber", on(app.scrubber.is_some())),
-            ("scrub_view", on(app.scrub_view.is_some())),
+            ("scrubber", on(app.scrub.scrubber.is_some())),
+            ("scrub_view", on(app.scrub.view.is_some())),
             ("tour", on(app.tour.is_some())),
             ("unsaved", on(app.pending_unsaved.is_some())),
             ("lossy_save", on(app.pending_lossy_save.is_some())),

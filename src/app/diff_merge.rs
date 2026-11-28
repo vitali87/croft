@@ -3,6 +3,86 @@
 
 use super::*;
 
+/// The history scrubber's own state (#371): where it stands, the
+/// historical view painted in place of the editor and what it was built
+/// for, its slider, and the texts, trees, names, views and outlines it
+/// keeps while scrubbing.
+pub(super) struct ScrubState {
+    /// The open history scrubber (#371), or `None` when the editor is
+    /// showing the live buffer. `Some` at `Position::Working` is a real
+    /// state: the scrubber is open and parked at the user's own edits.
+    pub(super) scrubber: Option<crate::scrubber::Scrubber>,
+    /// The active file as it was at the scrubber's commit (#371): a separate
+    /// read-only editor painted in place of the live one, which is never
+    /// touched. `None` at the working tree.
+    pub(super) view: Option<crate::widgets::editor::Editor>,
+    /// The file `view` was built for. Switching tabs while scrubbing
+    /// rebuilds the view for the new file rather than showing the old one's
+    /// history over it.
+    pub(super) view_for: Option<PathBuf>,
+    /// The file and commit the OUTLINE currently shows while scrubbing
+    /// (#371), so it is recomputed once per step, and so leaving the
+    /// scrubber knows to bring the live file's outline back.
+    pub(super) outline_key: Option<(PathBuf, String)>,
+    /// The scrubber slider's track, from the last frame, and whether a
+    /// drag that started on it is under way (#371).
+    pub(super) slider: Rect,
+    pub(super) dragging: bool,
+    /// File text per (commit, workspace-relative path) for the scrubber;
+    /// `None` records that the file did not exist there.
+    pub(super) cache: std::collections::HashMap<(String, String), Option<std::sync::Arc<str>>>,
+    /// Each scrubbed commit's tree under the workspace root, for the
+    /// Explorer's dimming (#371); `None` records that the listing failed.
+    pub(super) trees:
+        std::collections::HashMap<String, Option<std::sync::Arc<crate::git::CommitTree>>>,
+    /// Per workspace-relative path, the name the file had at each commit
+    /// the scrubber walks, so history before a rename reads the old name
+    /// (#1304). One `--follow` walk per file per scrub.
+    pub(super) names: std::collections::HashMap<
+        String,
+        std::sync::Arc<std::collections::HashMap<String, String>>,
+    >,
+    /// Builds highlighted historical views off the UI thread (#371),
+    /// started on the first step.
+    pub(super) builder: Option<crate::scrubber::ViewBuilder>,
+    /// Finished views near the scrubber's cursor, most recently used last,
+    /// at most `SCRUB_VIEWS_KEPT`.
+    pub(super) views: crate::scrubber::KeptViews,
+    /// Plain stand-ins near the cursor, ready for the next step, likewise.
+    pub(super) plain: crate::scrubber::KeptViews,
+    /// Each built view's outline, parsed with it off the UI thread, for the
+    /// OUTLINE to show while scrubbing. Dropped with the kept views.
+    pub(super) outlines: std::collections::HashMap<
+        crate::scrubber::ViewKey,
+        Vec<crate::lsp::manager::OutlineSymbol>,
+    >,
+    /// What `view` shows, and whether it is the finished view rather
+    /// than the plain stand-in awaiting one.
+    pub(super) view_key: Option<(crate::scrubber::ViewKey, bool)>,
+}
+
+impl ScrubState {
+    /// Closed, with nothing built or kept.
+    pub(super) fn new() -> Self {
+        Self {
+            scrubber: None,
+            view: None,
+            view_for: None,
+            outline_key: None,
+            slider: Rect::default(),
+            dragging: false,
+            cache: std::collections::HashMap::new(),
+            trees: std::collections::HashMap::new(),
+            names: std::collections::HashMap::new(),
+            builder: None,
+            views: std::collections::VecDeque::new(),
+            plain: std::collections::VecDeque::new(),
+            outlines: std::collections::HashMap::new(),
+            view_key: None,
+        }
+    }
+}
+
 impl App {
     /// F7 / Shift+F7: move the caret to the next / previous conflict header,
     /// wrapping, and say which of how many the caret landed on.
@@ -771,16 +851,16 @@ impl App {
         // first rather than HEAD, and stepping back from the working tree
         // lands on a commit the current branch may not even contain.
         let commits = crate::git::branch_history(self.workspace_root(), SCRUB_COMMIT_LIMIT);
-        self.scrub_view = None;
-        self.scrub_view_key = None;
+        self.scrub.view = None;
+        self.scrub.view_key = None;
         self.tree.scrub_tree = None;
-        self.scrub_names.clear();
+        self.scrub.names.clear();
         if commits.is_empty() {
             self.status = String::from("No commits to scrub through");
             return;
         }
         let n = commits.len();
-        self.scrubber = Some(crate::scrubber::Scrubber::new(commits));
+        self.scrub.scrubber = Some(crate::scrubber::Scrubber::new(commits));
         self.status = format!(
             "Scrubbing {n} commits — arrows step, Enter opens a commit's version, Home returns to your working tree"
         );
@@ -793,7 +873,7 @@ impl App {
     /// not a mode that swallows the keyboard, so a key it does not use keeps
     /// its normal meaning rather than being silently eaten.
     pub(super) fn handle_scrubber_key(&mut self, code: KeyCode) -> bool {
-        let Some(scrub) = self.scrubber.as_mut() else {
+        let Some(scrub) = self.scrub.scrubber.as_mut() else {
             return false;
         };
         match code {
@@ -811,13 +891,13 @@ impl App {
                 // Closing returns to the live buffer by construction: the
                 // scrubber never replaced it, so there is nothing to put
                 // back and no path where unsaved edits could be lost.
-                self.scrubber = None;
-                self.scrub_view = None;
-                self.scrub_view_key = None;
-                self.scrub_views.clear();
-                self.scrub_plain.clear();
-                self.scrub_outlines.clear();
-                self.scrub_builder = None;
+                self.scrub.scrubber = None;
+                self.scrub.view = None;
+                self.scrub.view_key = None;
+                self.scrub.views.clear();
+                self.scrub.plain.clear();
+                self.scrub.outlines.clear();
+                self.scrub.builder = None;
                 self.sync_scrub_tree();
                 self.status = String::from("Left the history scrubber");
                 return true;
@@ -827,7 +907,7 @@ impl App {
         // git's own short hash, not a byte slice of the full one: that
         // slice is safe only while the string is ASCII hex, and the width
         // git abbreviates to is per-repo rather than always seven.
-        self.status = match self.scrubber.as_ref().and_then(|s| s.commit()) {
+        self.status = match self.scrub.scrubber.as_ref().and_then(|s| s.commit()) {
             Some(c) => format!("At {} — {}", c.short_hash, c.summary),
             None => String::from("At your working tree"),
         };
@@ -847,7 +927,13 @@ impl App {
         crate::git::GraphCommit,
         Option<std::sync::Arc<str>>,
     )> {
-        let Some(commit) = self.scrubber.as_ref().and_then(|s| s.commit()).cloned() else {
+        let Some(commit) = self
+            .scrub
+            .scrubber
+            .as_ref()
+            .and_then(|s| s.commit())
+            .cloned()
+        else {
             self.status = String::from("Step the scrubber to a commit first");
             return None;
         };
@@ -865,7 +951,8 @@ impl App {
         };
         let name = self.scrub_name_at(&rel, &commit.hash);
         let text = self
-            .scrub_cache
+            .scrub
+            .cache
             .entry((commit.hash.clone(), rel.clone()))
             .or_insert_with(|| {
                 crate::git::read_file_at_rev(&root, &commit.hash, &name)
@@ -878,13 +965,13 @@ impl App {
 
     /// Leave the scrubber for a tab that shows what it was showing.
     pub(super) fn close_scrubber_for_tab(&mut self) {
-        self.scrubber = None;
-        self.scrub_view = None;
-        self.scrub_view_key = None;
-        self.scrub_views.clear();
-        self.scrub_plain.clear();
-        self.scrub_outlines.clear();
-        self.scrub_builder = None;
+        self.scrub.scrubber = None;
+        self.scrub.view = None;
+        self.scrub.view_key = None;
+        self.scrub.views.clear();
+        self.scrub.plain.clear();
+        self.scrub.outlines.clear();
+        self.scrub.builder = None;
         self.sync_scrub_tree();
         self.focus_pane(Pane::Editor);
     }
@@ -942,11 +1029,11 @@ impl App {
     /// Seek the scrubber to the stop under screen column `col` on the
     /// slider, and show that commit.
     pub(super) fn scrub_seek_column(&mut self, col: u16) {
-        let track = self.scrub_slider;
+        let track = self.scrub.slider;
         if track.width == 0 {
             return;
         }
-        let Some(scrub) = self.scrubber.as_mut() else {
+        let Some(scrub) = self.scrub.scrubber.as_mut() else {
             return;
         };
         let span = track.width.saturating_sub(1).max(1) as f32;
@@ -956,7 +1043,7 @@ impl App {
         if scrub.position() == before {
             return;
         }
-        self.status = match self.scrubber.as_ref().and_then(|s| s.commit()) {
+        self.status = match self.scrub.scrubber.as_ref().and_then(|s| s.commit()) {
             Some(c) => format!("At {} — {}", c.short_hash, c.summary),
             None => String::from("At your working tree"),
         };
@@ -969,8 +1056,8 @@ impl App {
     /// oldest loaded commit on the left to the working tree on the right,
     /// with the handle where the view is.
     pub(super) fn render_scrub_slider(&mut self, frame: &mut ratatui::Frame) {
-        self.scrub_slider = Rect::default();
-        let Some(scrub) = self.scrubber.as_ref() else {
+        self.scrub.slider = Rect::default();
+        let Some(scrub) = self.scrub.scrubber.as_ref() else {
             return;
         };
         let body = self.editor.last_body;
@@ -992,7 +1079,8 @@ impl App {
         let label = match (scrub.position(), scrub.commit()) {
             (crate::scrubber::Position::At(i), Some(c)) => {
                 let then = rel.as_ref().and_then(|rel| {
-                    self.scrub_names
+                    self.scrub
+                        .names
                         .get(rel)?
                         .get(&c.hash)
                         .filter(|n| *n != rel)
@@ -1039,14 +1127,14 @@ impl App {
                 Style::default().fg(fg).bg(bar_bg),
             );
         }
-        self.scrub_slider = track;
+        self.scrub.slider = track;
     }
 
     /// While a commit is on screen (#371), an Outline or breadcrumb jump
     /// lands in the historical view, whose symbols they list, not in the
     /// hidden live buffer. Returns whether it did.
     pub(super) fn jump_in_scrub_view(&mut self, line: u32) -> bool {
-        let Some(view) = self.scrub_view.as_mut() else {
+        let Some(view) = self.scrub.view.as_mut() else {
             return false;
         };
         let line = (line as usize).min(view.lines.len().saturating_sub(1));
@@ -1062,13 +1150,14 @@ impl App {
     /// listing is cached per commit like the file text, so stepping back
     /// over a visited commit costs no git process.
     pub(super) fn sync_scrub_tree(&mut self) {
-        let Some(commit) = self.scrubber.as_ref().and_then(|s| s.commit()) else {
+        let Some(commit) = self.scrub.scrubber.as_ref().and_then(|s| s.commit()) else {
             self.tree.scrub_tree = None;
             return;
         };
         let root = self.workspace_root().to_path_buf();
         let present = self
-            .scrub_trees
+            .scrub
+            .trees
             .entry(commit.hash.clone())
             .or_insert_with(|| crate::git::tree_paths(&root, &commit.hash).map(std::sync::Arc::new))
             .clone();
@@ -1081,20 +1170,26 @@ impl App {
     /// costs no git process.
     pub(super) fn rebuild_scrub_view(&mut self) {
         self.sync_scrub_tree();
-        self.scrub_for = self.editor.path.clone();
+        self.scrub.view_for = self.editor.path.clone();
         // Read before the view is parked: the next one looks where it did.
         let anchor = self.scrub_view_anchor();
         self.park_scrub_view();
-        let Some(commit) = self.scrubber.as_ref().and_then(|s| s.commit()).cloned() else {
-            self.scrub_view = None;
-            self.scrub_view_key = None;
+        let Some(commit) = self
+            .scrub
+            .scrubber
+            .as_ref()
+            .and_then(|s| s.commit())
+            .cloned()
+        else {
+            self.scrub.view = None;
+            self.scrub.view_key = None;
             // At the working tree: have the first steps back ready.
             self.prefetch_scrub_views();
             return;
         };
         let Some(path) = self.editor.path.clone() else {
-            self.scrub_view = None;
-            self.scrub_view_key = None;
+            self.scrub.view = None;
+            self.scrub.view_key = None;
             return;
         };
         let root = self.workspace_root().to_path_buf();
@@ -1102,8 +1197,8 @@ impl App {
             .strip_prefix(&root)
             .map(|p| p.to_string_lossy().into_owned())
         else {
-            self.scrub_view = None;
-            self.scrub_view_key = None;
+            self.scrub.view = None;
+            self.scrub.view_key = None;
             return;
         };
         let key = crate::scrubber::ViewKey {
@@ -1119,15 +1214,16 @@ impl App {
                 .and_then(|i| kept.remove(i))
                 .map(|(_, v)| v)
         };
-        let (view, finished) = match take(&mut self.scrub_views) {
+        let (view, finished) = match take(&mut self.scrub.views) {
             Some(v) => (Some(v), true),
-            None => (take(&mut self.scrub_plain), false),
+            None => (take(&mut self.scrub.plain), false),
         };
         // Neither ready (the first step, or a jump): build the stand-in here.
         let name = self.scrub_name_at(&rel, &commit.hash);
         let view = view.or_else(|| {
             let text = self
-                .scrub_cache
+                .scrub
+                .cache
                 .entry((commit.hash.clone(), rel.clone()))
                 .or_insert_with(|| {
                     crate::git::read_file_at_rev(&root, &commit.hash, &name)
@@ -1144,8 +1240,8 @@ impl App {
         });
         let Some(mut view) = view else { return };
         Self::align_scrub_view(&mut view, anchor);
-        self.scrub_view = Some(view);
-        self.scrub_view_key = Some((key, finished));
+        self.scrub.view = Some(view);
+        self.scrub.view_key = Some((key, finished));
         self.request_scrub_views(&root, &path, &rel);
     }
 
@@ -1155,16 +1251,17 @@ impl App {
         &mut self,
         rel: &str,
     ) -> std::sync::Arc<std::collections::HashMap<String, String>> {
-        if let Some(names) = self.scrub_names.get(rel) {
+        if let Some(names) = self.scrub.names.get(rel) {
             return std::sync::Arc::clone(names);
         }
-        let Some(scrub) = self.scrubber.as_ref() else {
+        let Some(scrub) = self.scrub.scrubber.as_ref() else {
             return Default::default();
         };
         let touched = crate::git::follow_names(self.workspace_root(), rel, SCRUB_COMMIT_LIMIT);
         let names =
             std::sync::Arc::new(crate::scrubber::names_by_commit(scrub.commits(), &touched));
-        self.scrub_names
+        self.scrub
+            .names
             .insert(rel.to_string(), std::sync::Arc::clone(&names));
         names
     }
@@ -1183,16 +1280,16 @@ impl App {
     /// `SCRUB_VIEWS_KEPT` (a big file's view holds its whole text and
     /// highlighting).
     pub(super) fn park_scrub_view(&mut self) {
-        let Some((key, finished)) = self.scrub_view_key.take() else {
+        let Some((key, finished)) = self.scrub.view_key.take() else {
             return;
         };
-        let Some(view) = self.scrub_view.take() else {
+        let Some(view) = self.scrub.view.take() else {
             return;
         };
         if finished {
             self.keep_scrub_view(key, view);
         } else {
-            Self::keep_view(&mut self.scrub_plain, key, view);
+            Self::keep_view(&mut self.scrub.plain, key, view);
         }
     }
 
@@ -1202,12 +1299,12 @@ impl App {
         view: crate::widgets::editor::Editor,
     ) {
         // Its stand-in is no longer needed.
-        if let Some(i) = self.scrub_plain.iter().position(|(k, _)| *k == key)
-            && let Some(stale) = self.scrub_plain.remove(i)
+        if let Some(i) = self.scrub.plain.iter().position(|(k, _)| *k == key)
+            && let Some(stale) = self.scrub.plain.remove(i)
         {
             fs_watch::offload_drop(stale);
         }
-        Self::keep_view(&mut self.scrub_views, key, view);
+        Self::keep_view(&mut self.scrub.views, key, view);
     }
 
     /// Keep `view` as the most recently used in `kept`, dropping the least
@@ -1252,7 +1349,7 @@ impl App {
     /// screen was looking (a symbol jump moves it), else where the live
     /// buffer is. `(scroll, cursor_row)`.
     pub(super) fn scrub_view_anchor(&self) -> (usize, usize) {
-        match self.scrub_view.as_ref() {
+        match self.scrub.view.as_ref() {
             Some(prev) if prev.path.is_some() && prev.path == self.editor.path => {
                 (prev.scroll, prev.cursor_row)
             }
@@ -1275,7 +1372,7 @@ impl App {
     /// and finished views for the ones without one; most urgent first.
     pub(super) fn request_scrub_views(&mut self, root: &Path, path: &Path, rel: &str) {
         let names = self.scrub_names(rel);
-        let Some(scrub) = self.scrubber.as_ref() else {
+        let Some(scrub) = self.scrub.scrubber.as_ref() else {
             return;
         };
         let jobs: Vec<crate::scrubber::ViewJob> = scrub
@@ -1299,22 +1396,23 @@ impl App {
                     .to_string(),
                 parent: c.parents.first().cloned(),
                 text: self
-                    .scrub_cache
+                    .scrub
+                    .cache
                     .get(&(c.hash.clone(), rel.to_string()))
                     .cloned(),
                 parent_text: c
                     .parents
                     .first()
-                    .and_then(|p| self.scrub_cache.get(&(p.clone(), rel.to_string())).cloned()),
+                    .and_then(|p| self.scrub.cache.get(&(p.clone(), rel.to_string())).cloned()),
             })
             .collect();
-        let shown = self.scrub_view_key.as_ref();
+        let shown = self.scrub.view_key.as_ref();
         let has_finished = |key: &crate::scrubber::ViewKey| {
-            self.scrub_views.iter().any(|(k, _)| k == key)
+            self.scrub.views.iter().any(|(k, _)| k == key)
                 || shown.is_some_and(|(k, f)| k == key && *f)
         };
         let has_plain = |key: &crate::scrubber::ViewKey| {
-            self.scrub_plain.iter().any(|(k, _)| k == key) || shown.is_some_and(|(k, _)| k == key)
+            self.scrub.plain.iter().any(|(k, _)| k == key) || shown.is_some_and(|(k, _)| k == key)
         };
         let finished: Vec<crate::scrubber::ViewJob> = jobs
             .iter()
@@ -1326,7 +1424,8 @@ impl App {
             .filter(|j| !has_finished(&j.key) && !has_plain(&j.key))
             .collect();
         let builder = self
-            .scrub_builder
+            .scrub
+            .builder
             .get_or_insert_with(|| crate::scrubber::ViewBuilder::start(root.to_path_buf()));
         builder.want(plain, finished);
     }
@@ -1335,50 +1434,52 @@ impl App {
     /// finished one in for the stand-in on screen. True when the screen
     /// changed.
     pub fn drain_scrub_views(&mut self) -> bool {
-        let Some(builder) = self.scrub_builder.as_ref() else {
+        let Some(builder) = self.scrub.builder.as_ref() else {
             return false;
         };
         let built = builder.drain();
         let mut changed = false;
         for b in built {
             let rel = b.key.rel.clone();
-            self.scrub_cache
+            self.scrub
+                .cache
                 .entry((b.key.hash.clone(), rel.clone()))
                 .or_insert(b.text);
             if let Some((parent, text)) = b.parent_text {
-                self.scrub_cache.entry((parent, rel)).or_insert(text);
+                self.scrub.cache.entry((parent, rel)).or_insert(text);
             }
             if let Some(outline) = b.outline {
                 // Symbols are small next to a view, but a long session visits
                 // many commits: keep a bounded set.
-                if self.scrub_outlines.len() >= SCRUB_OUTLINES_KEPT {
-                    self.scrub_outlines.clear();
+                if self.scrub.outlines.len() >= SCRUB_OUTLINES_KEPT {
+                    self.scrub.outlines.clear();
                 }
-                self.scrub_outlines.insert(b.key.clone(), outline);
+                self.scrub.outlines.insert(b.key.clone(), outline);
                 changed = true;
             }
             let mut view = b.view;
-            let on_screen = self.scrubber.is_some()
-                && self.scrub_view.is_some()
+            let on_screen = self.scrub.scrubber.is_some()
+                && self.scrub.view.is_some()
                 && self
-                    .scrub_view_key
+                    .scrub
+                    .view_key
                     .as_ref()
                     .is_some_and(|(k, _)| *k == b.key);
             if b.finished {
-                if on_screen && matches!(self.scrub_view_key, Some((_, false))) {
+                if on_screen && matches!(self.scrub.view_key, Some((_, false))) {
                     Self::align_scrub_view(&mut view, self.scrub_view_anchor());
-                    if let Some(stand_in) = self.scrub_view.replace(view) {
+                    if let Some(stand_in) = self.scrub.view.replace(view) {
                         fs_watch::offload_drop(stand_in);
                     }
-                    self.scrub_view_key = Some((b.key, true));
+                    self.scrub.view_key = Some((b.key, true));
                     changed = true;
                 } else if on_screen {
                     fs_watch::offload_drop(view);
                 } else {
                     self.keep_scrub_view(b.key, view);
                 }
-            } else if !on_screen && !self.scrub_views.iter().any(|(k, _)| *k == b.key) {
-                Self::keep_view(&mut self.scrub_plain, b.key, view);
+            } else if !on_screen && !self.scrub.views.iter().any(|(k, _)| *k == b.key) {
+                Self::keep_view(&mut self.scrub.plain, b.key, view);
             } else {
                 fs_watch::offload_drop(view);
             }

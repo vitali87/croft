@@ -4173,7 +4173,8 @@ fn a_file_that_did_not_exist_yet_says_so() {
     app.scrub_history();
     app.handle_scrubber_key(KeyCode::Left);
     let view = app
-        .scrub_view
+        .scrub
+        .view
         .as_ref()
         .expect("a view even for a missing file");
     assert!(view.lines[0].contains("did not exist"), "{:?}", view.lines);
