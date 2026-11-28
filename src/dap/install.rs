@@ -291,7 +291,7 @@ fn download_to_file(url: &str, dest: &Path) -> Result<()> {
 /// Accept a js-debug download only when it is the pinned release byte for
 /// byte ([`JS_DEBUG_SHA256`]).
 fn verify_js_debug(bytes: &[u8]) -> Result<()> {
-    if crate::lsp::install::sha256_matches(bytes, JS_DEBUG_SHA256) {
+    if crate::net::sha256_matches(bytes, JS_DEBUG_SHA256) {
         return Ok(());
     }
     bail!("the js-debug {JS_DEBUG_VERSION} download failed its checksum; refusing to install it")

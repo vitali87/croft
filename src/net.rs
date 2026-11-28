@@ -48,6 +48,26 @@ pub fn read_capped(reader: impl std::io::Read, max: u64) -> std::io::Result<Vec<
     Ok(bytes)
 }
 
+/// Whether `e` is [`read_capped`]'s refusal of a body past its cap, for a
+/// caller that words that refusal its own way.
+pub fn too_large(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::FileTooLarge
+}
+
+/// The SHA-256 of `bytes`, as lowercase hex.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
+/// Whether `bytes` hash to `expected` (hex SHA-256, either case). An empty
+/// or malformed expectation never matches: a gate that passes on a typo is
+/// no gate. The one check every download croft verifies goes through.
+pub fn sha256_matches(bytes: &[u8], expected: &str) -> bool {
+    let expected = expected.trim().to_ascii_lowercase();
+    expected.len() == 64 && sha256_hex(bytes) == expected
+}
+
 /// `max` in whole MiB when it is a whole number of them, else in bytes.
 fn size_label(max: u64) -> String {
     const MIB: u64 = 1024 * 1024;
@@ -195,6 +215,32 @@ fn in_cidr(ip: IpAddr, net: &str, bits: &str) -> bool {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    /// The checksum gate is the only thing between a download and an
+    /// executable; it must reject a mismatch and accept the true digest.
+    #[test]
+    fn sha256_matches_only_the_true_digest() {
+        let bytes = b"csvlens release bytes";
+        // A well-formed digest that is NOT this input's: the real one is
+        // computed below, and the two must differ for the test to mean
+        // anything.
+        let decoy = "8b0fa3ee6b2b3d3b0a0a4f3f6d2d7d5f1a4f0d6b3d5b1f0e3a4b7c2d9e8f1a0b";
+        assert!(!sha256_matches(
+            bytes,
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        ));
+        assert!(!sha256_matches(bytes, ""));
+        let real = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(bytes))
+        };
+        assert_ne!(real, decoy, "the decoy is not this input's digest");
+        assert!(sha256_matches(bytes, &real), "the true digest is accepted");
+        assert!(
+            sha256_matches(bytes, &real.to_uppercase()),
+            "case does not matter"
+        );
+    }
+
     use super::*;
     use std::io::{Read, Write};
     use std::path::Path;

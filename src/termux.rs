@@ -53,12 +53,8 @@ fn looks_like_ttf(bytes: &[u8]) -> bool {
 /// Fetch the pinned font and refuse to hand back anything that is not an
 /// sfnt-flavored font file.
 fn download_font() -> anyhow::Result<Vec<u8>> {
-    use std::io::Read;
     let resp = crate::net::get(FONT_URL).call()?;
-    let mut bytes = Vec::new();
-    resp.into_reader()
-        .take(MAX_FONT_BYTES)
-        .read_to_end(&mut bytes)?;
+    let bytes = crate::net::read_capped(resp.into_reader(), MAX_FONT_BYTES)?;
     anyhow::ensure!(
         looks_like_ttf(&bytes),
         "downloaded body is not a font file ({} bytes)",
