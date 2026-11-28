@@ -795,6 +795,39 @@ fn dragging_sidebar_splitter_resizes_sidebar() {
     assert!(app.splitter_drag.is_none());
 }
 
+/// A release croft never receives (the button let go outside the window,
+/// or a terminal that drops it) must not leave that drag live: the next
+/// press starts a new gesture. Here a side-bar splitter press loses its
+/// release, then a drag in the editor's text selects text and leaves the
+/// side bar's width alone. Before, every later drag kept resizing the side
+/// bar until a release arrived.
+#[test]
+fn a_press_after_a_lost_release_starts_a_new_gesture() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp, _f) = app_with_painted_file("alpha beta gamma delta\nsecond line\n");
+    let seam = app
+        .sidebar_splitter_x
+        .expect("the side bar is shown, so its splitter is drawn");
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), seam, 5));
+    assert_eq!(app.splitter_drag, Some(SplitterDrag::Sidebar));
+    // The release of that press never arrives.
+    let width = app.sidebar_width;
+    let x = app.editor.last_inner.x + app.editor.last_gutter_width + 1;
+    let y = app.editor.last_inner.y;
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+    app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), x + 6, y));
+    assert_eq!(
+        app.sidebar_width, width,
+        "the drag after a new press is the new press's, not the lost splitter drag's"
+    );
+    assert!(
+        app.editor.selection.is_some(),
+        "the drag in the text selects text"
+    );
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), x + 6, y));
+    assert!(app.splitter_drag.is_none());
+}
+
 #[test]
 fn sidebar_drag_grabs_one_column_left_of_seam() {
     // The seam is a single column wide. To make it easier to grab (and

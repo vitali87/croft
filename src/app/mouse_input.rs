@@ -634,6 +634,15 @@ impl App {
     }
 
     pub(super) fn handle_mouse_inner(&mut self, m: MouseEvent) {
+        // A press starts a new gesture (#2859). One still live here lost its
+        // release (the button let go outside the window, or a terminal that
+        // dropped it), so it ends now the way one a pop-up cut short does:
+        // without its drop, and with a press a program in a terminal pane
+        // asked for released there. Left live, it took every later drag
+        // ahead of whatever the new press started.
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+            self.abandon_mouse_gestures(&m);
+        }
         // So does a click (#1609), except on the message itself, which opens
         // its full text below.
         let on_message = rect_contains(self.status_message_rect, m.column, m.row);
@@ -1505,10 +1514,6 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                // A new press starts a new gesture, even if the release of a
-                // breakpoint-lane press never arrived.
-                self.breakpoint_lane_press = false;
-                self.editor_line_drag = None;
                 if in_secondary_outline {
                     self.click_secondary_outline(m.column, m.row);
                     return;
