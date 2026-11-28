@@ -136,6 +136,58 @@ fn clicking_an_scm_entry_below_a_stale_tree_last_area_still_selects_and_opens() 
     );
 }
 
+/// #2860: Source Control's change list draws a scrollbar once its rows
+/// outgrow the panel, and the bar answers the mouse as every other one
+/// does: a press on the track jumps the list there, and dragging the thumb
+/// keeps it under the pointer.
+#[test]
+fn pressing_and_dragging_the_change_list_scrollbar_scrolls_the_list() {
+    use crate::git::{ChangeEntry, ChangeKind};
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.show_tree = true;
+    app.set_sidebar_view(SidebarView::SourceControl);
+    // After set_sidebar_view, whose refresh reads the (empty) live status.
+    app.source_control.status.in_repo = true;
+    app.source_control.status.branch = Some("main".into());
+    app.source_control.entries = (0..80)
+        .map(|i| ChangeEntry {
+            path: format!("file{i:02}.py"),
+            kind: ChangeKind::Untracked,
+            ..Default::default()
+        })
+        .collect();
+    let backend = ratatui::backend::TestBackend::new(80, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let bar = app.source_control.last_scrollbar;
+    assert!(
+        bar.width > 0 && bar.height > 2,
+        "80 changes in a 30-row window must draw a scrollbar"
+    );
+    assert_eq!(app.source_control.scroll, 0, "the list starts at the top");
+
+    // A press near the track's foot jumps the list toward its end.
+    let foot = bar.y + bar.height - 1;
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), bar.x, foot));
+    term.draw(|f| app.render(f)).unwrap();
+    let jumped = app.source_control.scroll;
+    assert!(
+        jumped > 20,
+        "a press on the scrollbar's foot must jump the list down, but it scrolled {jumped} rows"
+    );
+
+    // Dragging the thumb back to the top follows the pointer up.
+    app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), bar.x, bar.y));
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(
+        app.source_control.scroll, 0,
+        "dragging the thumb to the track's top must bring the first rows back"
+    );
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), bar.x, bar.y));
+}
+
 #[test]
 fn click_on_a_deleted_source_control_entry_opens_unified_diff_with_head_lines_all_removed() {
     // A file that's tracked in HEAD but missing from the working
