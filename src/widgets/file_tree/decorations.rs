@@ -18,29 +18,29 @@ impl FileTree {
     /// A row's name colour: dimmed when git ignores it (or it is absent at
     /// the scrubbed commit), its git decoration's colour when it changed,
     /// the plain foreground otherwise.
-    pub(super) fn name_fg(&self, path: &Path) -> Color {
+    pub(super) fn name_fg(&self, cx: &ViewCx, path: &Path) -> Color {
         if self.is_ignored(path) || self.is_absent_at_scrub(path) {
-            self.theme.ignored_fg()
+            cx.theme.ignored_fg()
         } else if let Some(dec) = self.git_decoration(path) {
-            self.theme.git_decoration_fg(dec)
-        } else if let Some(t) = crate::theme::tones(self.theme) {
+            cx.theme.git_decoration_fg(dec)
+        } else if let Some(t) = crate::theme::tones(cx.theme) {
             // Croft Loch's body ink: the named White follows the host
             // terminal's palette and is usually pure #fff.
             t.text()
         } else {
-            self.theme.ui(Color::White)
+            cx.theme.ui(Color::White)
         }
     }
 
     /// A folder icon's colour: the icon's own tan on a boxed theme, eased
     /// most of the way toward the muted ink under `surfaces`, so folders
     /// read by their shape and a long tree is not a column of gold.
-    pub(super) fn folder_icon_fg(&self, color: Color) -> Color {
-        match (crate::theme::tones(self.theme), color) {
+    pub(super) fn folder_icon_fg(&self, cx: &ViewCx, color: Color) -> Color {
+        match (crate::theme::tones(cx.theme), color) {
             (Some(t), Color::Rgb(r, g, b)) => {
                 crate::gradient::rgb_color(crate::gradient::lerp_rgb((r, g, b), t.muted, 0.45))
             }
-            _ => self.theme.ui(color),
+            _ => cx.theme.ui(color),
         }
     }
 

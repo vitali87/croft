@@ -1,6 +1,7 @@
 use crate::icons;
 use crate::widgets::drawn_rows::DrawnRows;
 use crate::widgets::scrollbar;
+use crate::widgets::view_cx::ViewCx;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -103,15 +104,6 @@ pub struct FileTree {
     pub nodes: Vec<Node>,
     pub selected: usize,
     pub scroll: usize,
-    pub focused: bool,
-    /// True under the Black theme. Draws the orange→green gradient border
-    /// (when focused) instead of the solid blue one, and fills the selected
-    /// row with the brand's dark-teal instead of the legacy blue. Set by the
-    /// app's focus/theme sync.
-    pub focus_gradient: bool,
-    /// Active color theme. Drives the scrollbar track/thumb colors (which
-    /// pre-blend against the theme background). Set by the app's theme sync.
-    pub theme: crate::theme::Theme,
     /// Git-ignored paths (absolute; fully-ignored dirs collapsed to one
     /// entry), fed from the git worker's status refresh. Rows whose path is
     /// in the set — or under a dir in the set — render their name in the
@@ -178,10 +170,6 @@ pub struct FileTree {
     /// a highlighted bg so the drop target is unambiguous. Cleared on drop
     /// or cancel.
     pub drag_target: Option<usize>,
-    /// Render-time pointer cell, fed from `App::pointer_cell` each frame so a
-    /// row under the cursor can lift to the hover background. `None` when the
-    /// pointer is outside the panel.
-    pub hover_pointer: Option<(u16, u16)>,
     /// Hit-test rects for the Explorer header toolbar buttons, captured each
     /// render on the panel's top border row: VS Code's New File / New Folder /
     /// Refresh / Collapse Folders affordances. `Rect::default()` (zero width)
@@ -212,9 +200,6 @@ impl FileTree {
             }],
             selected: 0,
             scroll: 0,
-            focused: true,
-            focus_gradient: false,
-            theme: crate::theme::Theme::default(),
             ignored: Arc::default(),
             git_decorations: Arc::default(),
             scrub_tree: None,
@@ -231,7 +216,6 @@ impl FileTree {
             anchor: 0,
             marked: BTreeSet::new(),
             drag_target: None,
-            hover_pointer: None,
             header_new_file_btn: Rect::default(),
             header_new_folder_btn: Rect::default(),
             header_refresh_btn: Rect::default(),

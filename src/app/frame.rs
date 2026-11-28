@@ -714,14 +714,9 @@ impl App {
                 );
             }
             let usable_area = area;
-            // Feed the render-time pointer cell to every side panel so the row
-            // under the cursor (and the remote header pills) can light up,
-            // mirroring the editor tab strip and terminal pane buttons.
-            let panel_pointer = self.pointer_cell;
             // The view drawn below is the side bar's current one, so it has
             // the keyboard exactly when the side bar does.
             let side_cx = self.view_cx(self.focus == Pane::Tree);
-            self.tree.hover_pointer = panel_pointer;
             // Explorer stacks its toggled sub-views (Open Editors / Folders /
             // Outline / Timeline / Dependencies) inside the usable strip.
             // Every other sidebar view fills it with its single activity widget.

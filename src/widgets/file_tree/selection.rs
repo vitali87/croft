@@ -111,6 +111,7 @@ impl FileTree {
         self.anchor = self.selected;
     }
 
+    #[cfg(test)]
     pub fn is_marked(&self, idx: usize) -> bool {
         self.nodes
             .get(idx)

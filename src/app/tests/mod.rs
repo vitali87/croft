@@ -182,6 +182,12 @@ fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
     KeyEvent::new(code, mods)
 }
 
+/// Whether side-bar `view` has the keyboard: the side bar has focus and
+/// shows it, which is what the side bar draws the view's focus from.
+fn side_view_has_keys(app: &App, view: SidebarView) -> bool {
+    app.focus == Pane::Tree && app.sidebar_view == view
+}
+
 /// A key check of the key router.
 #[cfg(not(target_os = "macos"))]
 type KeyPredicate = fn(KeyEvent) -> bool;

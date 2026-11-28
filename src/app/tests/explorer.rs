@@ -6,17 +6,17 @@ use super::*;
 #[test]
 fn explorer_boots_with_gradient_focus_under_the_default_theme() {
     // Regression: the explorer auto-focuses at startup, but the brand-theme
-    // gradient focus used to arm only on the first focus change because
-    // `sync_focus_flags` never ran during construction. `App::new` now syncs
-    // once before returning, so the initial focus already carries the gradient.
+    // gradient focus used to arm only on the first focus change, because the
+    // tree kept its own copy that `sync_focus_flags` filled in. The tree now
+    // draws with the frame's context, built from the app's theme and focus
+    // as they are when it draws, so the first frame has both.
     let tmp = tempfile::tempdir().unwrap();
     let app = App::new(tmp.path().to_path_buf()).unwrap();
     assert_eq!(app.theme, crate::theme::Theme::LOCH);
     assert!(app.theme.gradient(), "the default is a brand theme");
-    assert!(app.tree.focused, "explorer should boot focused");
     assert!(
-        app.tree.focus_gradient,
-        "the gradient focus must arm at startup, not just after a focus change"
+        side_view_has_keys(&app, SidebarView::Explorer),
+        "explorer should boot focused"
     );
 }
 

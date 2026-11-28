@@ -195,11 +195,11 @@ fn ignored_walk_stops_at_the_owning_root() {
 
 #[test]
 fn focused_gradient_border_draws_rounded_corner_and_keeps_title() {
+    let mut cx = ViewCx::default();
     use crate::gradient::{GRAD_TL, rgb_color};
     let (_tmp, mut tree) = fixture();
-    tree.theme = crate::theme::Theme::BLACK;
-    tree.focused = true;
-    tree.focus_gradient = true;
+    cx.theme = crate::theme::Theme::BLACK;
+    cx.focused = true;
     let area = Rect {
         x: 0,
         y: 0,
@@ -207,7 +207,7 @@ fn focused_gradient_border_draws_rounded_corner_and_keeps_title() {
         height: 6,
     };
     let mut buf = Buffer::empty(area);
-    (&mut tree).render(area, &mut buf);
+    tree.draw(&cx, area, &mut buf);
     // Rounded top-left corner in the gradient's top-left colour.
     assert_eq!(buf[(0, 0)].symbol(), "\u{256d}");
     assert_eq!(buf[(0, 0)].fg, rgb_color(GRAD_TL));
@@ -250,7 +250,7 @@ fn the_lane_dot_is_painted_on_the_row_and_clears_when_reviewed() {
     // Nothing touched: no dot anywhere, which is the control that makes
     // the positive assertion below mean something.
     let mut buf = Buffer::empty(area);
-    (&mut tree).render(area, &mut buf);
+    tree.draw(&ViewCx::default(), area, &mut buf);
     let clean = row_containing(&buf, "main.rs").expect("main.rs is on screen");
     assert!(
         !clean.contains(AGENT_DOT),
@@ -262,7 +262,7 @@ fn the_lane_dot_is_painted_on_the_row_and_clears_when_reviewed() {
     tree.agent_touched =
         std::sync::Arc::new(std::collections::HashSet::from([root.join("main.rs")]));
     let mut buf = Buffer::empty(area);
-    (&mut tree).render(area, &mut buf);
+    tree.draw(&ViewCx::default(), area, &mut buf);
     let marked = row_containing(&buf, "main.rs").expect("main.rs is on screen");
     assert!(
         marked.contains(AGENT_DOT),
@@ -277,7 +277,7 @@ fn the_lane_dot_is_painted_on_the_row_and_clears_when_reviewed() {
     // Reviewed: the dot goes, and the row is otherwise what it was.
     tree.agent_touched = std::sync::Arc::new(std::collections::HashSet::new());
     let mut buf = Buffer::empty(area);
-    (&mut tree).render(area, &mut buf);
+    tree.draw(&ViewCx::default(), area, &mut buf);
     let cleared = row_containing(&buf, "main.rs").expect("main.rs is on screen");
     assert!(
         !cleared.contains(AGENT_DOT),
@@ -314,7 +314,7 @@ fn a_root_badge_is_painted_after_the_root_name_and_only_there() {
             .collect()
     };
     let mut buf = Buffer::empty(area);
-    (&mut tree).render(area, &mut buf);
+    tree.draw(&ViewCx::default(), area, &mut buf);
     assert!(
         !rows(&buf).iter().any(|r| r.contains("agent/")),
         "no badge before one is set"
@@ -324,7 +324,7 @@ fn a_root_badge_is_painted_after_the_root_name_and_only_there() {
         String::from("agent/fix-login \u{b7} \u{25c6} claude \u{25cf}"),
     )]));
     let mut buf = Buffer::empty(area);
-    (&mut tree).render(area, &mut buf);
+    tree.draw(&ViewCx::default(), area, &mut buf);
     let lane_name = lane.file_name().unwrap().to_string_lossy().into_owned();
     let rows_now = rows(&buf);
     let row = rows_now
@@ -344,7 +344,7 @@ fn a_root_badge_is_painted_after_the_root_name_and_only_there() {
     );
     tree.root_badges = Arc::default();
     let mut buf = Buffer::empty(area);
-    (&mut tree).render(area, &mut buf);
+    tree.draw(&ViewCx::default(), area, &mut buf);
     assert!(
         !rows(&buf).iter().any(|r| r.contains("agent/")),
         "cleared with the map"
@@ -371,7 +371,7 @@ fn a_root_badge_skips_the_same_path_where_it_appears_as_a_child() {
         height: 14,
     };
     let mut buf = Buffer::empty(area);
-    (&mut tree).render(area, &mut buf);
+    tree.draw(&ViewCx::default(), area, &mut buf);
     let rows: Vec<String> = (0..area.height)
         .map(|y| {
             (0..area.width)
@@ -425,12 +425,12 @@ fn collapse_all_closes_nested_folders_but_keeps_the_root_expanded() {
 
 #[test]
 fn views_pill_stays_clear_of_a_translated_explorer_title() {
+    let mut cx = ViewCx::default();
     // From the narrowest pane whose top border holds the whole title.
     for width in 14..30u16 {
         let (_tmp, mut tree) = fixture();
         // A boxed title keeps its padding; Croft Loch's focus rule takes it.
-        tree.theme = crate::theme::Theme::BLACK;
-        tree.focus_gradient = false;
+        cx.theme = crate::theme::Theme::BLACK;
         let area = Rect {
             x: 0,
             y: 0,
@@ -439,7 +439,7 @@ fn views_pill_stays_clear_of_a_translated_explorer_title() {
         };
         let mut buf = Buffer::empty(area);
         crate::i18n::with_test_catalog(r#"{"EXPLORER": "EXPLORADOR"}"#, || {
-            (&mut tree).render(area, &mut buf);
+            tree.draw(&cx, area, &mut buf);
         });
         let title_row: String = (0..area.width).map(|x| buf[(x, area.y)].symbol()).collect();
         assert!(
@@ -464,7 +464,7 @@ fn views_pill_stays_clear_of_a_translated_explorer_title() {
             };
             let mut buf = Buffer::empty(area);
             crate::i18n::with_test_catalog(r#"{"EXPLORER": "EXPLORADOR"}"#, || {
-                (&mut tree).render(area, &mut buf);
+                tree.draw(&cx, area, &mut buf);
             });
             tree.header_views_btn.width > 0
         },
@@ -474,9 +474,9 @@ fn views_pill_stays_clear_of_a_translated_explorer_title() {
 
 #[test]
 fn explorer_header_toolbar_paints_five_pills_and_hit_tests() {
+    let mut cx = ViewCx::default();
     let (_tmp, mut tree) = fixture();
-    tree.focused = true;
-    tree.focus_gradient = false; // Croft Dark
+    cx.focused = true;
     let area = Rect {
         x: 0,
         y: 0,
@@ -484,7 +484,7 @@ fn explorer_header_toolbar_paints_five_pills_and_hit_tests() {
         height: 8,
     };
     let mut buf = Buffer::empty(area);
-    (&mut tree).render(area, &mut buf);
+    tree.draw(&cx, area, &mut buf);
 
     // The toolbar lives on the root folder row (inner.y), not the title
     // border, mirroring VS Code's workspace-folder header actions.
@@ -537,8 +537,9 @@ fn explorer_header_toolbar_paints_five_pills_and_hit_tests() {
 
 #[test]
 fn explorer_header_toolbar_is_withheld_when_the_panel_is_too_narrow() {
+    let mut cx = ViewCx::default();
     let (_tmp, mut tree) = fixture();
-    tree.focused = true;
+    cx.focused = true;
     let area = Rect {
         x: 0,
         y: 0,
@@ -546,15 +547,16 @@ fn explorer_header_toolbar_is_withheld_when_the_panel_is_too_narrow() {
         height: 6,
     };
     let mut buf = Buffer::empty(area);
-    (&mut tree).render(area, &mut buf);
+    tree.draw(&cx, area, &mut buf);
     assert_eq!(tree.header_new_file_btn.width, 0);
     assert_eq!(tree.header_collapse_btn.width, 0);
 }
 
 #[test]
 fn explorer_header_toolbar_is_withheld_when_the_panel_is_unfocused() {
+    let mut cx = ViewCx::default();
     let (_tmp, mut tree) = fixture();
-    tree.focused = false;
+    cx.focused = false;
     let area = Rect {
         x: 0,
         y: 0,
@@ -562,7 +564,7 @@ fn explorer_header_toolbar_is_withheld_when_the_panel_is_unfocused() {
         height: 8,
     };
     let mut buf = Buffer::empty(area);
-    (&mut tree).render(area, &mut buf);
+    tree.draw(&cx, area, &mut buf);
     assert_eq!(tree.header_new_file_btn.width, 0);
     assert_eq!(tree.header_collapse_btn.width, 0);
 }
@@ -582,12 +584,14 @@ fn croft_loch_explorer_is_an_unboxed_surface_with_a_focus_aware_selection() {
     let area = Rect::new(0, 0, 30, 8);
     let render = |focused: bool| {
         let (_tmp, mut tree) = fixture();
-        tree.theme = loch;
-        tree.focus_gradient = loch.gradient();
-        tree.focused = focused;
+        let cx = ViewCx {
+            theme: loch,
+            focused,
+            pointer: None,
+        };
         tree.selected = 0;
         let mut buf = Buffer::empty(area);
-        (&mut tree).render(area, &mut buf);
+        tree.draw(&cx, area, &mut buf);
         (tree.last_inner, buf)
     };
     let (inner, unfocused) = render(false);
@@ -628,17 +632,18 @@ fn croft_loch_explorer_is_an_unboxed_surface_with_a_focus_aware_selection() {
 /// codicon pair the panel uses.
 #[test]
 fn croft_loch_tree_type_ramp_keeps_weight_for_the_root_alone() {
+    let mut cx = ViewCx::default();
     use crate::theme::tones;
     use crate::widgets::surface::CHEVRON_UNFOLDED;
     let loch = crate::theme::Theme::LOCH;
     let t = tones(loch).unwrap();
     let area = Rect::new(0, 0, 30, 8);
     let (_tmp, mut tree) = fixture();
-    tree.theme = loch;
-    tree.focused = true;
+    cx.theme = loch;
+    cx.focused = true;
     tree.selected = 2;
     let mut buf = Buffer::empty(area);
-    (&mut tree).render(area, &mut buf);
+    tree.draw(&cx, area, &mut buf);
     let at = |buf: &Buffer, needle: &str| -> (u16, u16) {
         for y in 0..area.height {
             let row: String = (0..area.width).map(|x| buf[(x, y)].symbol()).collect();
@@ -664,9 +669,9 @@ fn croft_loch_tree_type_ramp_keeps_weight_for_the_root_alone() {
         "the workspace root keeps its weight"
     );
     assert_eq!(buf[(root.x, root.y)].symbol(), CHEVRON_UNFOLDED.to_string());
-    tree.focused = false;
+    cx.focused = false;
     let mut buf = Buffer::empty(area);
-    (&mut tree).render(area, &mut buf);
+    tree.draw(&cx, area, &mut buf);
     assert_eq!(buf[at(&buf, "EXPLORER")].fg, t.muted(), "unfocused title");
 }
 
@@ -675,6 +680,7 @@ fn croft_loch_tree_type_ramp_keeps_weight_for_the_root_alone() {
 /// selected row's parent; the root's level has none.
 #[test]
 fn croft_loch_draws_thin_indent_guides_and_brightens_the_active_one() {
+    let mut cx = ViewCx::default();
     use crate::theme::tones;
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
@@ -682,8 +688,8 @@ fn croft_loch_draws_thin_indent_guides_and_brightens_the_active_one() {
     fs::write(root.join("a/b/deep.rs"), "//\n").unwrap();
     fs::write(root.join("a/side.rs"), "//\n").unwrap();
     let mut tree = FileTree::new(root.to_path_buf());
-    tree.theme = crate::theme::Theme::LOCH;
-    let t = tones(tree.theme).unwrap();
+    cx.theme = crate::theme::Theme::LOCH;
+    let t = tones(cx.theme).unwrap();
     assert!(tree.reveal_path(&root.join("a/b/deep.rs")));
     let deep = tree
         .nodes
@@ -693,7 +699,7 @@ fn croft_loch_draws_thin_indent_guides_and_brightens_the_active_one() {
     tree.selected = deep;
     let area = Rect::new(0, 0, 40, 10);
     let mut buf = Buffer::empty(area);
-    (&mut tree).render(area, &mut buf);
+    tree.draw(&cx, area, &mut buf);
     let inner = tree.last_inner;
     let row_of = |needle: &str| -> u16 {
         (0..area.height)
@@ -734,18 +740,19 @@ fn croft_loch_draws_thin_indent_guides_and_brightens_the_active_one() {
 /// scrollbar lane keeps the chrome.
 #[test]
 fn croft_loch_hover_marks_and_sticky_band_use_the_tones() {
+    let mut cx = ViewCx::default();
     use crate::theme::tones;
     let loch = crate::theme::Theme::LOCH;
     let t = tones(loch).unwrap();
     let (_tmp, mut tree) = fixture();
-    tree.theme = loch;
-    tree.focused = true;
+    cx.theme = loch;
+    cx.focused = true;
     tree.toggle_mark(2);
     tree.selected = 0;
     let area = Rect::new(0, 0, 30, 8);
-    tree.hover_pointer = Some((2, 2));
+    cx.pointer = Some((2, 2));
     let mut buf = Buffer::empty(area);
-    (&mut tree).render(area, &mut buf);
+    tree.draw(&cx, area, &mut buf);
     assert_eq!(buf[(2, 2)].bg, t.hover_on(t.chrome), "hover lift");
     let marked = buf[(2, 3)].bg;
     assert_ne!(marked, t.chrome());
@@ -759,11 +766,11 @@ fn croft_loch_hover_marks_and_sticky_band_use_the_tones() {
         fs::write(root.join(format!("dir/f{i:02}.rs")), "//\n").unwrap();
     }
     let mut tree = FileTree::new(root.to_path_buf());
-    tree.theme = loch;
+    cx.theme = loch;
     assert!(tree.reveal_path(&root.join("dir/f19.rs")));
     tree.selected = tree.nodes.len() - 1;
     let mut buf = Buffer::empty(area);
-    (&mut tree).render(area, &mut buf);
+    tree.draw(&cx, area, &mut buf);
     let &(y, _) = tree.sticky_rows_for_test().first().expect("a sticky row");
     assert_eq!(buf[(tree.last_inner.x + 3, y)].bg, t.raised());
     let bar = tree.last_scrollbar;
@@ -775,10 +782,10 @@ fn croft_loch_hover_marks_and_sticky_band_use_the_tones() {
 
 #[test]
 fn hovering_an_unselected_row_lifts_it_without_touching_the_selection() {
+    let mut cx = ViewCx::default();
     let (_tmp, mut tree) = fixture();
-    tree.focused = true;
-    tree.focus_gradient = false; // Croft Dark
-    tree.theme = crate::theme::Theme::DARK_BLUE;
+    cx.focused = true;
+    cx.theme = crate::theme::Theme::DARK_BLUE;
     tree.selected = 0; // the root row stays selected
     let area = Rect {
         x: 0,
@@ -788,9 +795,9 @@ fn hovering_an_unselected_row_lifts_it_without_touching_the_selection() {
     };
     // Rest the pointer on the second visible row (a child of the root).
     let inner_y = area.y + 1;
-    tree.hover_pointer = Some((area.x + 1, inner_y + 1));
+    cx.pointer = Some((area.x + 1, inner_y + 1));
     let mut buf = Buffer::empty(area);
-    (&mut tree).render(area, &mut buf);
+    tree.draw(&cx, area, &mut buf);
     assert_eq!(
         buf[(area.x + 1, inner_y + 1)].bg,
         Color::Rgb(0x2b, 0x31, 0x42),
@@ -805,11 +812,11 @@ fn hovering_an_unselected_row_lifts_it_without_touching_the_selection() {
 
 #[test]
 fn a_selected_row_is_not_overridden_by_hovering_it() {
+    let mut cx = ViewCx::default();
     let (_tmp, mut tree) = fixture();
     // Croft Dark's selection blue; Croft Loch's band is checked below.
-    tree.theme = crate::theme::Theme::DARK_BLUE;
-    tree.focused = true;
-    tree.focus_gradient = false;
+    cx.theme = crate::theme::Theme::DARK_BLUE;
+    cx.focused = true;
     tree.selected = 0;
     let area = Rect {
         x: 0,
@@ -819,28 +826,28 @@ fn a_selected_row_is_not_overridden_by_hovering_it() {
     };
     let inner_y = area.y + 1;
     // Hover the selected row itself.
-    tree.hover_pointer = Some((area.x + 1, inner_y));
+    cx.pointer = Some((area.x + 1, inner_y));
     let mut buf = Buffer::empty(area);
-    (&mut tree).render(area, &mut buf);
+    tree.draw(&cx, area, &mut buf);
     assert_eq!(
         buf[(area.x + 1, inner_y)].bg,
-        tree.theme.ui(Color::Rgb(0x09, 0x4d, 0x77)),
+        cx.theme.ui(Color::Rgb(0x09, 0x4d, 0x77)),
         "selection outranks hover so the row never dims to the hover lift"
     );
     let loch = crate::theme::Theme::LOCH;
     let t = crate::theme::tones(loch).unwrap();
-    tree.theme = loch;
+    cx.theme = loch;
     let mut buf = Buffer::empty(area);
-    (&mut tree).render(area, &mut buf);
+    tree.draw(&cx, area, &mut buf);
     assert_eq!(buf[(area.x + 1, inner_y)].bg, t.band_on(t.chrome));
 }
 
 #[test]
 fn croft_dark_keeps_solid_blue_focus_border() {
+    let mut cx = ViewCx::default();
     let (_tmp, mut tree) = fixture();
-    tree.theme = crate::theme::Theme::DARK_BLUE;
-    tree.focused = true;
-    tree.focus_gradient = false;
+    cx.theme = crate::theme::Theme::DARK_BLUE;
+    cx.focused = true;
     let area = Rect {
         x: 0,
         y: 0,
@@ -848,7 +855,7 @@ fn croft_dark_keeps_solid_blue_focus_border() {
         height: 6,
     };
     let mut buf = Buffer::empty(area);
-    (&mut tree).render(area, &mut buf);
+    tree.draw(&cx, area, &mut buf);
     // Square corner, solid blue: the historical Croft Dark highlight.
     assert_eq!(buf[(0, 0)].symbol(), "\u{250c}");
     assert_eq!(buf[(0, 0)].fg, Color::Rgb(0x4e, 0x9a, 0xff));
@@ -917,7 +924,7 @@ fn a_collapsed_folder_rolls_up_an_unreviewed_agent_write() {
     let row = |tree: &mut FileTree, name: &str| -> String {
         let area = Rect::new(0, 0, 40, 12);
         let mut buf = Buffer::empty(area);
-        tree.render(area, &mut buf);
+        tree.draw(&ViewCx::default(), area, &mut buf);
         (0..area.height)
             .map(|y| {
                 (0..area.width)
@@ -981,7 +988,7 @@ fn row_with_badge(tree: &mut FileTree, needle: &str) -> (Color, String, Color) {
         height: 10,
     };
     let mut buf = Buffer::empty(area);
-    tree.render(area, &mut buf);
+    tree.draw(&ViewCx::default(), area, &mut buf);
     let badge_x = area.width - 3;
     for y in 0..area.height {
         let cells: Vec<String> = (0..area.width)
@@ -1017,7 +1024,7 @@ fn changed_rows_wear_their_git_status_colour_and_letter() {
         (root.join("src"), D::Untracked),
         (root.join("src/lib.rs"), D::Untracked),
     ]));
-    let theme = tree.theme;
+    let theme = crate::theme::Theme::default();
     let (fg, badge, badge_fg) = row_with_badge(&mut tree, "main.rs");
     assert_eq!(fg, theme.git_decoration_fg(D::Modified));
     assert_eq!(badge, "M", "a modified file shows M at the right edge");
@@ -1039,9 +1046,10 @@ fn changed_rows_wear_their_git_status_colour_and_letter() {
 /// carry no status colour or badge, whatever the map says.
 #[test]
 fn unchanged_ignored_root_and_scrubbed_rows_wear_no_git_status() {
+    let mut cx = ViewCx::default();
     use crate::git::GitDecoration as D;
     let (_tmp, mut tree) = fixture();
-    tree.focused = false;
+    cx.focused = false;
     let root = tree.root.clone();
     let root_name = root.file_name().unwrap().to_string_lossy().into_owned();
     tree.git_decorations = Arc::new(HashMap::from([
@@ -1050,7 +1058,7 @@ fn unchanged_ignored_root_and_scrubbed_rows_wear_no_git_status() {
         (root.join("src/lib.rs"), D::Modified),
     ]));
     tree.ignored = Arc::new(HashSet::from([root.join("README.md")]));
-    let theme = tree.theme;
+    let theme = cx.theme;
     let (fg, badge, _) = row_with_badge(&mut tree, "main.rs");
     assert_eq!((fg, badge.as_str()), (plain_ink(), " "), "unchanged");
     let (fg, badge, _) = row_with_badge(&mut tree, "README.md");
@@ -1083,8 +1091,8 @@ fn ignored_rows_render_with_the_dimmed_foreground() {
         height: 10,
     };
     let mut buf = Buffer::empty(area);
-    (&mut tree).render(area, &mut buf);
-    let dim = tree.theme.ignored_fg();
+    tree.draw(&ViewCx::default(), area, &mut buf);
+    let dim = crate::theme::Theme::default().ignored_fg();
     // Multi-byte icon glyphs mean a byte offset into the joined row text
     // is not a column; walk the cells to map the match back to its column.
     let row_fg = |needle: &str| {
@@ -1147,8 +1155,8 @@ fn rows_missing_from_the_scrubbed_commit_render_dimmed() {
         height: 14,
     };
     let mut buf = Buffer::empty(area);
-    (&mut tree).render(area, &mut buf);
-    let dim = tree.theme.ignored_fg();
+    tree.draw(&ViewCx::default(), area, &mut buf);
+    let dim = crate::theme::Theme::default().ignored_fg();
     let row_fg = |needle: &str| {
         for y in 0..area.height {
             let cells: Vec<String> = (0..area.width)
@@ -1786,7 +1794,7 @@ fn expanding_a_chain_of_only_child_folders_opens_one_row() {
     assert!(row.expanded && row.folded == 4);
     let area = Rect::new(0, 0, 40, 6);
     let mut buf = Buffer::empty(area);
-    (&mut tree).render(area, &mut buf);
+    tree.draw(&ViewCx::default(), area, &mut buf);
     let painted: String = (0..40).map(|x| buf[(x, 2)].symbol()).collect();
     assert!(painted.contains("src/main/java/com/acme"), "{painted:?}");
 }
@@ -2337,7 +2345,7 @@ fn sticky_band_pins_ancestors_and_maps_clicks_but_never_covers_the_selection() {
         height: 8,
     };
     let mut buf = Buffer::empty(area);
-    (&mut tree).render(area, &mut buf);
+    tree.draw(&ViewCx::default(), area, &mut buf);
     assert!(
         !tree.sticky_rows_for_test().is_empty(),
         "scrolled deep inside inner/, the band must pin ancestors"
@@ -2362,7 +2370,7 @@ fn sticky_band_pins_ancestors_and_maps_clicks_but_never_covers_the_selection() {
     // Selection on the top visible row: the band must yield entirely.
     tree.selected = tree.scroll;
     let mut buf = Buffer::empty(area);
-    (&mut tree).render(area, &mut buf);
+    tree.draw(&ViewCx::default(), area, &mut buf);
     assert!(
         tree.sticky_rows_for_test().is_empty(),
         "the band never covers the selected row"
@@ -2436,7 +2444,7 @@ fn a_click_after_a_wheel_step_meets_the_drawn_rows() {
         height: 10,
     };
     let mut buf = Buffer::empty(area);
-    (&mut tree).render(area, &mut buf);
+    tree.draw(&ViewCx::default(), area, &mut buf);
     let y = tree.last_inner.y + 1;
     let drawn = tree.node_at_y(y).expect("a row is drawn there");
     let before = tree.scroll;
@@ -2485,7 +2493,7 @@ fn a_click_on_the_pinned_band_never_meets_the_row_under_it() {
         width: 34,
         height: 8,
     };
-    (&mut tree).render(area, &mut Buffer::empty(area));
+    tree.draw(&ViewCx::default(), area, &mut Buffer::empty(area));
     let band = tree.sticky_rows_for_test();
     let inner = index_of(&tree, "outer/inner").expect("listed");
     let &(inner_y, _) = band
@@ -2533,7 +2541,7 @@ fn a_click_after_a_folder_closes_above_meets_the_drawn_row() {
         width: 30,
         height: 12,
     };
-    (&mut tree).render(area, &mut Buffer::empty(area));
+    tree.draw(&ViewCx::default(), area, &mut Buffer::empty(area));
     let line_of = |tree: &FileTree, name: &str| {
         let at = index_of(tree, name).expect("drawn");
         (tree.last_inner.y..tree.last_inner.y + tree.last_inner.height)

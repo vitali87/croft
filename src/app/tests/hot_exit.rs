@@ -2771,11 +2771,17 @@ fn a_restored_editor_focus_is_drawn_on_the_editor() {
     let state = app.capture_session_state();
 
     let mut next = App::new(tmp.path().to_path_buf()).unwrap();
-    assert!(next.tree.focused, "a new window starts in the Explorer");
+    assert!(
+        side_view_has_keys(&next, SidebarView::Explorer),
+        "a new window starts in the Explorer"
+    );
     next.apply_session_state(&state);
     assert!(next.focus == Pane::Editor, "keys go to the editor");
     assert!(next.editor.focused, "the editor draws focused");
-    assert!(!next.tree.focused, "the Explorer does not");
+    assert!(
+        !side_view_has_keys(&next, SidebarView::Explorer),
+        "the Explorer does not"
+    );
 }
 
 /// #2670: screen reader mode read the pane behind eight pop-ups (the
