@@ -64,21 +64,16 @@ fn test_only_modules(files: &[PathBuf]) -> Vec<PathBuf> {
         let text = std::fs::read_to_string(file).unwrap();
         let lines: Vec<&str> = text.lines().map(str::trim).collect();
         for (i, line) in lines.iter().enumerate() {
-            let is_cfg_test = line.starts_with("#[cfg(") && line.contains("test");
-            let Some(next) = lines[i + 1..].iter().find(|l| !l.is_empty()) else {
+            if !is_cfg_test(line) {
                 continue;
-            };
-            let Some(name) = next
-                .strip_prefix("pub(crate) mod ")
-                .or_else(|| next.strip_prefix("pub mod "))
-                .or_else(|| next.strip_prefix("mod "))
-                .and_then(|rest| rest.strip_suffix(';'))
+            }
+            let Some(name) = item_after(&lines, i)
+                .map(|m| lines[m])
+                .filter(|item| item.ends_with(';'))
+                .and_then(module_name)
             else {
                 continue;
             };
-            if !is_cfg_test {
-                continue;
-            }
             let stem = file.file_stem().unwrap();
             let dir = if stem == "main" || stem == "mod" || stem == "lib" {
                 file.parent().unwrap().to_path_buf()
@@ -93,21 +88,75 @@ fn test_only_modules(files: &[PathBuf]) -> Vec<PathBuf> {
     out
 }
 
-/// `text` up to an inline `#[cfg(test)] mod … {`: the tests at a file's end.
-fn shipped_part(text: &str) -> &str {
-    let mut offset = 0;
-    let mut lines = text.split_inclusive('\n').peekable();
-    while let Some(line) = lines.next() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("#[cfg(") && trimmed.contains("test") {
-            let next = lines.peek().map(|l| l.trim()).unwrap_or("");
-            if next.starts_with("mod ") && next.ends_with('{') {
-                return &text[..offset];
-            }
+/// `text` with each inline `#[cfg(test)] mod … { … }` blanked line for
+/// line, so what is left is the shipped code at its own line numbers: items
+/// after a test module count too. The module ends at the first `}` at its
+/// own indent, which rustfmt guarantees.
+fn shipped_part(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let trimmed: Vec<&str> = lines.iter().map(|l| l.trim()).collect();
+    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let module = is_cfg_test(trimmed[i])
+            .then(|| item_after(&trimmed, i))
+            .flatten()
+            .filter(|&m| trimmed[m].ends_with('{') && module_name(trimmed[m]).is_some());
+        if let Some(m) = module {
+            let indent = &lines[m][..lines[m].len() - lines[m].trim_start().len()];
+            let close = format!("{indent}}}");
+            let end = (m + 1..lines.len())
+                .find(|&j| lines[j] == close)
+                .unwrap_or(lines.len() - 1);
+            out.extend(std::iter::repeat_n("", end + 1 - i));
+            i = end + 1;
+        } else {
+            out.push(lines[i]);
+            i += 1;
         }
-        offset += line.len();
     }
-    text
+    out.join("\n")
+}
+
+/// Whether `line` is an attribute that compiles what follows for tests
+/// alone: `#[cfg(test)]`, `#[cfg(all(test, unix))]`, never
+/// `#[cfg(not(test))]` or `#[cfg(any(test, …))]`.
+fn is_cfg_test(line: &str) -> bool {
+    line.starts_with("#[cfg(")
+        && line.contains("test")
+        && !line.contains("not(")
+        && !line.contains("any(")
+}
+
+/// The line of the item the attribute at `lines[at]` applies to: the next
+/// one that is not blank, a comment or another attribute (one spanning
+/// lines too). `lines` are trimmed.
+fn item_after(lines: &[&str], at: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    for (i, line) in lines.iter().enumerate().skip(at + 1) {
+        if depth > 0 || line.starts_with("#[") {
+            depth += line.matches('[').count() as i32 - line.matches(']').count() as i32;
+            continue;
+        }
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        return Some(i);
+    }
+    None
+}
+
+/// The name of the module `item` declares, if it declares one.
+fn module_name(item: &str) -> Option<&str> {
+    let rest = ["pub(crate) ", "pub(super) ", "pub "]
+        .iter()
+        .find_map(|vis| item.strip_prefix(vis))
+        .unwrap_or(item);
+    let name = rest
+        .strip_prefix("mod ")?
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .next()?;
+    (!name.is_empty()).then_some(name)
 }
 
 /// The direct starts may only fall in number: a new one is a program no
@@ -138,7 +187,25 @@ fn direct_program_starts_only_fall() {
 #[test]
 fn test_code_is_not_counted() {
     let text = "fn a() { Command::new(\"x\"); }\n#[cfg(test)]\nmod tests {\n    fn b() { Command::new(\"y\"); }\n}\n";
-    assert_eq!(shipped_part(text), "fn a() { Command::new(\"x\"); }\n");
+    assert_eq!(
+        shipped_part(text),
+        "fn a() { Command::new(\"x\"); }\n\n\n\n"
+    );
+    // Another attribute, or a comment, may sit between the two; an item
+    // after the module is shipped and keeps its line number.
+    let text = "#[cfg(test)]\n#[allow(\n    clippy::items_after_test_module,\n)]\n// the tests\nmod tests {\n    fn b() { Command::new(\"y\"); }\n}\n\nfn c() { Command::new(\"z\"); }\n";
+    let shipped = shipped_part(text);
+    assert!(!shipped.contains("\"y\""), "{shipped}");
+    assert_eq!(
+        shipped.lines().position(|l| l.contains("\"z\"")),
+        Some(9),
+        "{shipped}"
+    );
+    // Code compiled only outside tests is shipped.
+    let text = "#[cfg(not(test))]\nmod real {\n    fn d() { Command::new(\"w\"); }\n}\n";
+    assert_eq!(shipped_part(text), text.trim_end());
+    assert_eq!(module_name("pub(crate) mod test_git;"), Some("test_git"));
+    assert_eq!(module_name("fn modest() {"), None);
     assert!(is_test_file(Path::new("app/tests/debug.rs")));
     assert!(is_test_file(Path::new("remote/tests.rs")));
     assert!(!is_test_file(Path::new("remote/relay.rs")));
