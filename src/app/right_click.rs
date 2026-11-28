@@ -130,7 +130,8 @@ impl App {
         // Fall back to the strips so a folded pane has a second
         // gesture rather than left-click alone.
         let terminal_hit = terminal_hit.or_else(|| {
-            self.terminal_strip_rects
+            self.panel_hits
+                .collapsed_strips
                 .iter()
                 .position(|r| rect_contains(*r, col, row))
         });

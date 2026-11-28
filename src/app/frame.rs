@@ -26,6 +26,19 @@ pub(super) fn status_cells(s: &str) -> u16 {
     unicode_width::UnicodeWidthStr::width(s) as u16
 }
 
+/// `area` cut off at column `x`: whole if it ends by then, narrowed if it
+/// crosses it, empty if it starts there or later.
+pub(super) fn ends_before(area: Rect, x: u16) -> Rect {
+    if area.x >= x {
+        Rect::default()
+    } else {
+        Rect {
+            width: area.width.min(x - area.x),
+            ..area
+        }
+    }
+}
+
 /// Cells left blank after the status bar's last right-hand segment: none,
 /// since the language pill's rounded end already reads as an edge.
 pub(super) const STATUS_RIGHT_MARGIN: u16 = 0;
@@ -1173,6 +1186,10 @@ impl App {
             self.paint_layout_icons(frame, strip_row);
         }
         crate::startup_trace::mark("editor drawn");
+        // Every tab and button of the panel starts the frame with no area,
+        // drawn or not: one that is not drawn this frame must not keep the
+        // last frame's, whose cells now belong to whatever is drawn there.
+        self.panel_hits.reset();
         if let Some(area) = terminal_area {
             // Left/Right panel alignment narrows the terminal to one half of
             // its band; paint the leftover strip with the editor background so
@@ -1221,7 +1238,6 @@ impl App {
                     let n = self.terminals.len().max(1);
                     let multi = self.terminals.len() > 1;
                     let maximized = self.terminal_pane_maximized && multi;
-                    self.clear_terminal_rail();
                     // Maximize mode: the active pane owns the panel's width
                     // minus a right rail listing every terminal (VS Code's
                     // terminal-tabs list); hidden panes drop their hit rects
@@ -1308,12 +1324,6 @@ impl App {
                         }
                     }
                     let show_close = multi;
-                    self.terminal_add_buttons.clear();
-                    self.terminal_profile_buttons.clear();
-                    self.terminal_close_buttons.clear();
-                    self.terminal_label_rects.clear();
-                    self.terminal_collapse_buttons.clear();
-                    self.terminal_strip_rects.clear();
                     // Croft Loch hangs a lone terminal's `∨ +` on the tab row,
                     // just left of the panel chevron, as VS Code does: the
                     // panel's controls then share one row instead of stepping
@@ -1324,14 +1334,14 @@ impl App {
                         && self.terminals.len() == 1
                         && !self.terminals[0].collapsed
                         && strip.height == 1
-                        && !self.panel_maximize_button.is_empty())
+                        && !self.panel_hits.maximize_button.is_empty())
                     .then(|| {
                         let tabs_end = [
-                            self.problems_tab_rect,
-                            self.output_tab_rect,
-                            self.terminal_tab_rect,
-                            self.ports_tab_rect,
-                            self.captures_tab_rect,
+                            self.panel_hits.problems_tab,
+                            self.panel_hits.output_tab,
+                            self.panel_hits.terminal_tab,
+                            self.panel_hits.ports_tab,
+                            self.panel_hits.captures_tab,
                         ]
                         .iter()
                         .map(|r| r.right())
@@ -1343,7 +1353,7 @@ impl App {
                         // lays that column on the chevron's own padding, so
                         // `+` sits two cells from the chevron's glyph, the
                         // same step as between `∨` and `+`.
-                        let x1 = self.panel_maximize_button.x + 1;
+                        let x1 = self.panel_hits.maximize_button.x + 1;
                         Rect::new(x0, strip.y, x1.saturating_sub(x0), 1)
                     })
                     .filter(|slot| {
@@ -1356,12 +1366,12 @@ impl App {
                         // Hidden panes still push placeholders so a button's
                         // position in each vec names its terminal index.
                         if col.width == 0 {
-                            self.terminal_add_buttons.push(Rect::default());
-                            self.terminal_profile_buttons.push(Rect::default());
-                            self.terminal_close_buttons.push(Rect::default());
-                            self.terminal_label_rects.push(Rect::default());
-                            self.terminal_collapse_buttons.push(Rect::default());
-                            self.terminal_strip_rects.push(Rect::default());
+                            self.panel_hits.add_buttons.push(Rect::default());
+                            self.panel_hits.profile_buttons.push(Rect::default());
+                            self.panel_hits.close_buttons.push(Rect::default());
+                            self.panel_hits.pane_labels.push(Rect::default());
+                            self.panel_hits.collapse_buttons.push(Rect::default());
+                            self.panel_hits.collapsed_strips.push(Rect::default());
                             continue;
                         }
                         // A collapsed pane's whole chrome is its strip: no
@@ -1369,15 +1379,15 @@ impl App {
                         // gesture it offers is the way back out.
                         if self.terminals[i].collapsed && !maximized {
                             let strip = self.paint_terminal_collapsed_strip(frame, *col, i);
-                            self.terminal_add_buttons.push(Rect::default());
-                            self.terminal_profile_buttons.push(Rect::default());
-                            self.terminal_close_buttons.push(Rect::default());
-                            self.terminal_label_rects.push(Rect::default());
-                            self.terminal_collapse_buttons.push(Rect::default());
-                            self.terminal_strip_rects.push(strip);
+                            self.panel_hits.add_buttons.push(Rect::default());
+                            self.panel_hits.profile_buttons.push(Rect::default());
+                            self.panel_hits.close_buttons.push(Rect::default());
+                            self.panel_hits.pane_labels.push(Rect::default());
+                            self.panel_hits.collapse_buttons.push(Rect::default());
+                            self.panel_hits.collapsed_strips.push(strip);
                             continue;
                         }
-                        self.terminal_strip_rects.push(Rect::default());
+                        self.panel_hits.collapsed_strips.push(Rect::default());
                         let buttons = paint_terminal_pane_buttons(
                             frame,
                             header_slot.unwrap_or(*col),
@@ -1386,13 +1396,17 @@ impl App {
                             self.theme,
                             self.pointer_cell,
                         );
-                        self.terminal_add_buttons
+                        self.panel_hits
+                            .add_buttons
                             .push(buttons.add.unwrap_or_default());
-                        self.terminal_profile_buttons
+                        self.panel_hits
+                            .profile_buttons
                             .push(buttons.profile.unwrap_or_default());
-                        self.terminal_close_buttons
+                        self.panel_hits
+                            .close_buttons
                             .push(buttons.close.unwrap_or_default());
-                        self.terminal_collapse_buttons
+                        self.panel_hits
+                            .collapse_buttons
                             .push(buttons.collapse.unwrap_or_default());
                         // Auto/manual pane label at top-left, only with 2+ panes
                         // (a lone pane needs no name). Kept clear of the buttons.
@@ -1498,101 +1512,33 @@ impl App {
                                 };
                             }
                         }
-                        self.terminal_label_rects.push(label_rect);
+                        self.panel_hits.pane_labels.push(label_rect);
                     }
                 }
                 BottomPanelTab::Problems => {
-                    // The terminals are hidden behind the PROBLEMS view; drop
-                    // their hit rects so a click never phantom-matches a pane
-                    // that isn't painted (mirrors the hidden-panel reset).
-                    self.terminal_add_buttons.clear();
-                    self.terminal_profile_buttons.clear();
-                    self.terminal_close_buttons.clear();
-                    self.terminal_label_rects.clear();
-                    self.terminal_collapse_buttons.clear();
-                    self.terminal_strip_rects.clear();
-                    self.clear_terminal_rail();
-                    for t in self.terminals.iter_mut() {
-                        t.last_area = Rect::default();
-                        t.redacted_on_screen = 0;
-                    }
+                    // The terminals are hidden behind the PROBLEMS view.
+                    self.hide_terminal_panes();
                     self.problems.draw(&panel_cx, content, frame.buffer_mut());
                     self.paint_panel_view_top(frame, content);
                 }
                 BottomPanelTab::Output => {
-                    // Same hidden-terminal reset as PROBLEMS: the OUTPUT view
-                    // covers the panes, so their hit rects must not linger.
-                    self.terminal_add_buttons.clear();
-                    self.terminal_profile_buttons.clear();
-                    self.terminal_close_buttons.clear();
-                    self.terminal_label_rects.clear();
-                    self.terminal_collapse_buttons.clear();
-                    self.terminal_strip_rects.clear();
-                    self.clear_terminal_rail();
-                    for t in self.terminals.iter_mut() {
-                        t.last_area = Rect::default();
-                        t.redacted_on_screen = 0;
-                    }
+                    self.hide_terminal_panes();
                     self.output.draw(&panel_cx, content, frame.buffer_mut());
                     self.paint_panel_view_top(frame, content);
                 }
                 BottomPanelTab::Ports => {
-                    // Same hidden-terminal reset: the PORTS view covers the
-                    // panes, so their hit rects must not linger.
-                    self.terminal_add_buttons.clear();
-                    self.terminal_profile_buttons.clear();
-                    self.terminal_close_buttons.clear();
-                    self.terminal_label_rects.clear();
-                    self.terminal_collapse_buttons.clear();
-                    self.terminal_strip_rects.clear();
-                    self.clear_terminal_rail();
-                    for t in self.terminals.iter_mut() {
-                        t.last_area = Rect::default();
-                        t.redacted_on_screen = 0;
-                    }
+                    self.hide_terminal_panes();
                     self.ports.draw(&panel_cx, content, frame.buffer_mut());
                     self.paint_panel_view_top(frame, content);
                 }
                 BottomPanelTab::Captures => {
-                    // Same hidden-terminal reset as the PORTS arm above.
-                    self.terminal_add_buttons.clear();
-                    self.terminal_profile_buttons.clear();
-                    self.terminal_close_buttons.clear();
-                    self.terminal_label_rects.clear();
-                    self.terminal_collapse_buttons.clear();
-                    self.terminal_strip_rects.clear();
-                    self.clear_terminal_rail();
-                    for t in self.terminals.iter_mut() {
-                        t.last_area = Rect::default();
-                        t.redacted_on_screen = 0;
-                    }
+                    self.hide_terminal_panes();
                     self.captures.draw(&panel_cx, content, frame.buffer_mut());
                     self.paint_panel_view_top(frame, content);
                 }
             }
         } else {
-            self.terminal_add_buttons.clear();
-            self.terminal_profile_buttons.clear();
-            self.terminal_close_buttons.clear();
-            self.terminal_focus_button = Rect::default();
-            self.panel_maximize_button = Rect::default();
-            self.terminal_label_rects.clear();
-            self.terminal_collapse_buttons.clear();
-            self.terminal_strip_rects.clear();
-            self.clear_terminal_rail();
-            self.problems_tab_rect = Rect::default();
-            self.output_tab_rect = Rect::default();
-            self.ports_tab_rect = Rect::default();
-            self.captures_tab_rect = Rect::default();
-            self.terminal_tab_rect = Rect::default();
-            // A hidden terminal must not keep stale hit rects alive, or
-            // `terminal_at_pos` would phantom-match clicks meant for
-            // whatever now occupies those cells (mirrors the SYSTEM
-            // panel's hidden-state reset).
-            for t in self.terminals.iter_mut() {
-                t.last_area = Rect::default();
-                t.redacted_on_screen = 0;
-            }
+            self.hide_terminal_panes();
             // The panel's other views likewise: their rows would take the
             // clicks, hover and right-clicks of the editor that now fills
             // their cells (#2740).
@@ -1658,7 +1604,7 @@ impl App {
         let offer_chip_x: u16 = spans.iter().map(|s| status_cells(&s.content)).sum();
         if let Some(toast) = self.update_toast.as_ref().filter(|t| !t.ready) {
             let hovered =
-                crate::widgets::hover::contains(self.status_offer_rect, self.pointer_cell);
+                crate::widgets::hover::contains(self.status_hits.offer, self.pointer_cell);
             spans.extend(crate::widgets::update_popup::pill_spans(
                 &format!(
                     "{} Update Available: v{}",
@@ -1987,7 +1933,10 @@ impl App {
             }
         }
         self.announce_pos = None;
-        self.status_message_rect = Rect::default();
+        // Every clickable item of the bar starts with no area and is recorded
+        // again below where it is drawn. The update pill's hover above read
+        // the last frame's area: the pill is drawn before its place is known.
+        self.status_hits = StatusHitAreas::default();
         let mut status_x: u16 = 0;
         if !status_text.is_empty() {
             spans.push(Span::styled(format!("{div} "), zone_div));
@@ -2013,46 +1962,28 @@ impl App {
         }
 
         let status_rect = outer[2];
-        // The F1 cheat-sheet is gone; F1 / the palette still open Shortcuts.
-        self.shortcuts_hit_rect = None;
-        self.status_codeql_rect = match codeql_chip {
-            Some((x, w)) if status_h > 0 && x < status_rect.width => Rect {
-                x: status_rect.x + x,
-                y: status_rect.y,
-                width: w.min(status_rect.width - x),
-                height: 1,
-            },
-            _ => Rect::default(),
-        };
-        self.status_update_rect = match update_chip {
-            Some((x, w)) if status_h > 0 && x < status_rect.width => Rect {
-                x: status_rect.x + x,
-                y: status_rect.y,
-                width: w.min(status_rect.width - x),
-                height: 1,
-            },
-            _ => Rect::default(),
-        };
-        self.status_offer_rect = match offer_chip {
-            Some((x, w)) if status_h > 0 && x < status_rect.width => Rect {
-                x: status_rect.x + x,
-                y: status_rect.y,
-                width: w.min(status_rect.width - x),
-                height: 1,
-            },
-            _ => Rect::default(),
-        };
-        // Diagnostics hit rect (left group), for click-to-PROBLEMS.
-        self.status_diag_rect = if status_h > 0 {
-            Rect {
+        // The chips' cells, for a click on each, and the problem counts', for
+        // click-to-PROBLEMS.
+        if status_h > 0 {
+            let chip = |(x, w): (u16, u16)| {
+                (x < status_rect.width).then(|| Rect {
+                    x: status_rect.x + x,
+                    y: status_rect.y,
+                    width: w.min(status_rect.width - x),
+                    height: 1,
+                })
+            };
+            let hits = &mut self.status_hits;
+            hits.codeql = codeql_chip.and_then(chip).unwrap_or_default();
+            hits.update = update_chip.and_then(chip).unwrap_or_default();
+            hits.offer = offer_chip.and_then(chip).unwrap_or_default();
+            hits.diagnostics = Rect {
                 x: status_rect.x.saturating_add(diag_start_col),
                 y: status_rect.y,
                 width: diag_len.min(status_rect.width.saturating_sub(diag_start_col)),
                 height: 1,
-            }
-        } else {
-            Rect::default()
-        };
+            };
+        }
 
         // ---- Right cluster: document facts, right-justified. Indentation /
         // encoding / EOL / language are clickable to change (hit rects recorded
@@ -2203,7 +2134,7 @@ impl App {
             }
             if status_h > 0 && status_x < status_rect.width {
                 let shown = spans.last().map_or(0, |l| text_cells(&l.content));
-                self.status_message_rect = Rect {
+                self.status_hits.message = Rect {
                     x: status_rect.x + status_x,
                     y: status_rect.y,
                     width: shown.min(status_rect.width - status_x),
@@ -2218,43 +2149,26 @@ impl App {
             Paragraph::new(Line::from(spans)).style(Style::default().bg(status_bg)),
             status_rect,
         );
-        // Reset clickable rects; re-record only when the right cluster fits.
-        self.status_indent_rect = Rect::default();
-        self.status_encoding_rect = Rect::default();
-        self.status_eol_rect = Rect::default();
-        self.status_language_rect = Rect::default();
-        self.status_agents_rect = Rect::default();
-        self.status_position_rect = Rect::default();
+        // The right cluster's items are recorded only when it fits.
         if status_h > 0 && right_total > 0 && right_total <= status_rect.width {
             let rx = status_rect.right() - right_total;
-            if self.status_message_rect.right() > rx {
-                self.status_message_rect.width = rx.saturating_sub(self.status_message_rect.x);
+            if self.status_hits.message.right() > rx {
+                self.status_hits.message.width = rx.saturating_sub(self.status_hits.message.x);
             }
             // The right cluster paints OVER the left paragraph, so the
             // diagnostics hit rect must stop where it starts. Clipped only to
             // the frame edge, it went on answering for cells that now read
             // "Ln 1, Col 1" — opening PROBLEMS from a click on the position
             // readout, with the counts it claimed not even on screen.
-            if self.status_codeql_rect.x >= rx {
-                self.status_codeql_rect = Rect::default();
-            } else if self.status_codeql_rect.right() > rx {
-                self.status_codeql_rect.width = rx - self.status_codeql_rect.x;
-            }
-            if self.status_update_rect.x >= rx {
-                self.status_update_rect = Rect::default();
-            } else if self.status_update_rect.right() > rx {
-                self.status_update_rect.width = rx - self.status_update_rect.x;
-            }
-            if self.status_offer_rect.x >= rx {
-                self.status_offer_rect = Rect::default();
-            } else if self.status_offer_rect.right() > rx {
-                self.status_offer_rect.width = rx - self.status_offer_rect.x;
-            }
-            if self.status_diag_rect.x >= rx {
-                // Entirely behind the cluster: not on screen, so not a target.
-                self.status_diag_rect = Rect::default();
-            } else if self.status_diag_rect.right() > rx {
-                self.status_diag_rect.width = rx - self.status_diag_rect.x;
+            // One entirely behind the cluster is not on screen, so not a target.
+            let hits = &mut self.status_hits;
+            for area in [
+                &mut hits.codeql,
+                &mut hits.update,
+                &mut hits.offer,
+                &mut hits.diagnostics,
+            ] {
+                *area = ends_before(*area, rx);
             }
             // Build the spans now that x positions are known. The settings
             // (indentation, encoding, line endings) are muted; the position
@@ -2332,12 +2246,12 @@ impl App {
                     ));
                 }
                 match i {
-                    0 => self.status_position_rect = r,
-                    1 => self.status_indent_rect = r,
-                    2 => self.status_encoding_rect = r,
-                    3 => self.status_eol_rect = r,
-                    4 => self.status_language_rect = r,
-                    5 => self.status_agents_rect = r,
+                    0 => self.status_hits.position = r,
+                    1 => self.status_hits.indent = r,
+                    2 => self.status_hits.encoding = r,
+                    3 => self.status_hits.eol = r,
+                    4 => self.status_hits.language = r,
+                    5 => self.status_hits.agents = r,
                     _ => {}
                 }
                 cx = cx.saturating_add(widths[i]);

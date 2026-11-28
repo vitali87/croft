@@ -928,8 +928,8 @@ fn reordering_a_maximized_pane_keeps_its_rect_with_the_terminal() {
     // between — the main loop drains the whole burst before painting, so the
     // live pane rect still belongs to whichever pane was active at the last
     // paint, not to the one being dragged.
-    let press = app.terminal_rail_rects[0];
-    let target = app.terminal_rail_rects[2];
+    let press = app.panel_hits.rail_rows[0];
+    let target = app.panel_hits.rail_rows[2];
     app.handle_mouse(crossterm::event::MouseEvent {
         kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
         column: press.x + 1,
@@ -1010,7 +1010,7 @@ fn clicking_the_status_bar_update_pill_starts_the_rebuild() {
     let backend = ratatui::backend::TestBackend::new(200, 30);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
-    let pill = app.status_update_rect;
+    let pill = app.status_hits.update;
     assert!(pill.width > 0, "the drift pill is a click target");
     let bar: String = (0..200)
         .map(|x| term.backend().buffer()[(x, pill.y)].symbol().to_string())
@@ -1208,7 +1208,7 @@ fn the_active_panel_tab_is_underlined() {
     term.draw(|f| app.render(f)).unwrap();
     // TERMINAL is active by default: its label underlines like a VS Code tab,
     // but the underline hugs the word, not the padded hit rect.
-    let t = app.terminal_tab_rect;
+    let t = app.panel_hits.terminal_tab;
     let buf = term.backend().buffer();
     let underlined = (t.x..t.x + t.width)
         .filter(|&x| buf[(x, t.y)].modifier.contains(Modifier::UNDERLINED))
@@ -1242,7 +1242,7 @@ fn croft_loch_panel_tabs_step_from_muted_to_text_to_strong() {
     let backend = ratatui::backend::TestBackend::new(140, 50);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
-    let out = app.output_tab_rect;
+    let out = app.panel_hits.output_tab;
     app.handle_mouse(crossterm::event::MouseEvent {
         kind: crossterm::event::MouseEventKind::Moved,
         column: out.x + 2,
@@ -1258,14 +1258,18 @@ fn croft_loch_panel_tabs_step_from_muted_to_text_to_strong() {
             .unwrap()
             .clone()
     };
-    let active = word(app.terminal_tab_rect);
+    let active = word(app.panel_hits.terminal_tab);
     assert_eq!(active.fg, t.strong());
     assert!(!active.modifier.contains(Modifier::BOLD));
     assert!(active.modifier.contains(Modifier::UNDERLINED));
     assert_eq!(active.underline_color, t.accent());
-    assert_eq!(word(app.output_tab_rect).fg, t.text(), "hover is body text");
-    assert_eq!(word(app.ports_tab_rect).fg, t.muted());
-    let first = app.problems_tab_rect;
+    assert_eq!(
+        word(app.panel_hits.output_tab).fg,
+        t.text(),
+        "hover is body text"
+    );
+    assert_eq!(word(app.panel_hits.ports_tab).fg, t.muted());
+    let first = app.panel_hits.problems_tab;
     assert_eq!(buf[(first.x, first.y)].symbol(), "P", "no leading pad");
     let inner = app.terminals[0].last_inner;
     assert_eq!(first.x, inner.x, "the first title lines up with the shell");
@@ -1290,7 +1294,7 @@ fn croft_loch_palette_scrim_sinks_the_active_tabs_underline() {
         .set_query("toggle terminal");
     term.draw(|f| app.render(f)).unwrap();
     let card = app.command_palette.as_ref().unwrap().last_rect;
-    let tab = app.terminal_tab_rect;
+    let tab = app.panel_hits.terminal_tab;
     assert!(
         card.intersection(tab).is_empty(),
         "the tab is behind the scrim: {card:?} / {tab:?}"
@@ -1844,8 +1848,8 @@ fn a_wide_workspace_name_keeps_the_status_bar_targets_under_their_text() {
         "the cap names the folder: {row:?}"
     );
     // The counts' target opens on the space before the glyph.
-    assert_eq!(app.status_diag_rect.x + 1, glyph_x);
-    assert_eq!(app.status_diag_rect.y, y);
+    assert_eq!(app.status_hits.diagnostics.x + 1, glyph_x);
+    assert_eq!(app.status_hits.diagnostics.y, y);
 }
 
 /// #925: a message of several lines (git's text, a tool's error) is drawn
@@ -1950,7 +1954,7 @@ fn status_messages_are_kept_in_the_messages_channel() {
         "logged once"
     );
 
-    let r = app.status_message_rect;
+    let r = app.status_hits.message;
     assert!(r.width > 0, "the message has a click target");
     app.handle_mouse(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
@@ -1988,7 +1992,7 @@ fn a_status_message_that_fits_keeps_the_cluster() {
         "an empty status is not logged"
     );
     assert_eq!(
-        app.status_message_rect.width, 0,
+        app.status_hits.message.width, 0,
         "no message, no click target"
     );
 }
@@ -3939,7 +3943,7 @@ fn a_strip_on_the_sidebar_seam_still_unfolds_its_pane() {
         app.toggle_terminal_collapse(idx);
         term.draw(|f| app.render(f)).unwrap();
 
-        let strip = app.terminal_strip_rects[idx];
+        let strip = app.panel_hits.collapsed_strips[idx];
         assert_eq!(strip.width, 1, "{pos:?}: pane {idx} is folded to a strip");
         let seam = app
             .sidebar_splitter_x
@@ -3999,7 +4003,8 @@ fn maximize_ignores_the_collapse_flags_and_gives_them_back_on_exit() {
         "maximize must not silently clear the folding"
     );
     assert_eq!(
-        app.terminal_strip_rects
+        app.panel_hits
+            .collapsed_strips
             .iter()
             .filter(|r| r.width > 0)
             .count(),
@@ -4010,7 +4015,7 @@ fn maximize_ignores_the_collapse_flags_and_gives_them_back_on_exit() {
     app.toggle_terminal_pane_maximize();
     term.draw(|f| app.render(f)).unwrap();
     assert_eq!(
-        app.terminal_strip_rects[2].width, 1,
+        app.panel_hits.collapsed_strips[2].width, 1,
         "leaving maximize brings the strip back"
     );
 }

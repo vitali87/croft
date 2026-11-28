@@ -354,7 +354,8 @@ impl App {
     /// pane's dropdown would hang under the leftmost one. Falls back to the
     /// toolbar's top-right corner before the caret has been painted.
     pub(super) fn terminal_caret_origin(&self, pane: usize) -> (u16, u16) {
-        self.terminal_profile_buttons
+        self.panel_hits
+            .profile_buttons
             .get(pane)
             .filter(|c| c.width > 0)
             .map(|c| (c.x, c.y.saturating_add(1)))
@@ -812,19 +813,23 @@ impl App {
         self.terminals[idx].collapsed = false;
     }
 
-    /// Drop the rail's hit rects and its column. Both must go together: a
-    /// stale area would keep swallowing the wheel after the rail left screen.
-    pub(super) fn clear_terminal_rail(&mut self) {
-        self.terminal_rail_rects.clear();
-        self.terminal_rail_area = Rect::default();
+    /// Forget where every terminal pane was drawn, for a frame that does not
+    /// draw them (the panel hidden, or another of its views showing). A
+    /// pane's area must not outlive its cells, or `terminal_at_pos` would
+    /// match clicks meant for whatever now occupies them.
+    pub(super) fn hide_terminal_panes(&mut self) {
+        for t in self.terminals.iter_mut() {
+            t.last_area = Rect::default();
+            t.redacted_on_screen = 0;
+        }
     }
 
     /// Paint the maximize-mode rail: one row per terminal down the panel's
     /// right edge — the active one highlighted, the rest hover-lit — so the
     /// user can shuffle between maximized terminals. Records one hit rect
-    /// per row in `terminal_rail_rects`, index-aligned with `terminals`.
+    /// per row in `panel_hits.rail_rows`, index-aligned with `terminals`.
     pub(super) fn paint_terminal_rail(&mut self, frame: &mut ratatui::Frame, rail: Rect) {
-        self.terminal_rail_area = rail;
+        self.panel_hits.rail = rail;
         if rail.width == 0 || rail.height == 0 {
             return;
         }
@@ -860,7 +865,7 @@ impl App {
             // position in the vec keeps naming its terminal. `rect_contains`
             // rejects empty rects, so they can never phantom-match a click.
             if i < scroll || i >= scroll + rows {
-                self.terminal_rail_rects.push(Rect::default());
+                self.panel_hits.rail_rows.push(Rect::default());
                 continue;
             }
             let y = rail.y + (i - scroll) as u16;
@@ -915,7 +920,7 @@ impl App {
                     self.focus == Pane::Terminal,
                 );
             }
-            self.terminal_rail_rects.push(row);
+            self.panel_hits.rail_rows.push(row);
         }
     }
 

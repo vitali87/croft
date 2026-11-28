@@ -640,7 +640,7 @@ fn terminal_header_probe(app: &mut App) -> Rect {
         area.width > 20 && area.height > 2,
         "terminal pane must render"
     );
-    app.terminal_add_buttons[0]
+    app.panel_hits.add_buttons[0]
 }
 
 #[test]
@@ -964,8 +964,8 @@ fn a_translated_panel_tab_is_clickable_across_its_whole_label() {
         &mut app,
         r#"{"PROBLEMS": "問題", "OUTPUT": "AUSGABE-UND-PROTOKOLL"}"#,
     );
-    let problems = app.problems_tab_rect;
-    let output = app.output_tab_rect;
+    let problems = app.panel_hits.problems_tab;
+    let output = app.panel_hits.output_tab;
     assert_eq!(problems.width, 6, "' 問題 ' is six cells wide");
     assert_eq!(output.x, problems.x + problems.width + 1);
     assert_eq!(output.width, " AUSGABE-UND-PROTOKOLL ".len() as u16);
@@ -983,7 +983,7 @@ fn titles_without_a_catalog_entry_stay_english() {
     for want in [" EXPLORER ", " PROBLEMS ", " OUTPUT ", " TERMINAL "] {
         assert!(screen.contains(want), "{want:?} missing:\n{screen}");
     }
-    assert_eq!(app.output_tab_rect.width, " OUTPUT ".len() as u16);
+    assert_eq!(app.panel_hits.output_tab.width, " OUTPUT ".len() as u16);
 }
 
 #[test]

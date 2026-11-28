@@ -504,7 +504,7 @@ fn clicking_the_ports_tab_switches_the_panel_view() {
     let backend = ratatui::backend::TestBackend::new(140, 50);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
-    let r = app.ports_tab_rect;
+    let r = app.panel_hits.ports_tab;
     assert!(r.width > 0, "the PORTS tab must have a hit rect");
     left_click(&mut app, r.x, r.y);
     assert_eq!(

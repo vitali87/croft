@@ -1202,10 +1202,10 @@ fn the_profile_picker_anchors_under_the_pane_that_owns_the_caret() {
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
 
-    let caret = app.terminal_profile_buttons[2];
+    let caret = app.panel_hits.profile_buttons[2];
     assert!(caret.width > 0, "the maximized pane paints a profile caret");
     assert_eq!(
-        app.terminal_profile_buttons[0],
+        app.panel_hits.profile_buttons[0],
         ratatui::layout::Rect::default(),
         "the hidden pane holds a placeholder, which is what `.first()` found"
     );
@@ -1219,9 +1219,9 @@ fn the_profile_picker_anchors_under_the_pane_that_owns_the_caret() {
     // live one would hang every pane's dropdown under the leftmost.
     app.terminal_pane_maximized = false;
     term.draw(|f| app.render(f)).unwrap();
-    let rightmost = app.terminal_profile_buttons[2];
+    let rightmost = app.panel_hits.profile_buttons[2];
     assert!(
-        rightmost.x > app.terminal_profile_buttons[0].x,
+        rightmost.x > app.panel_hits.profile_buttons[0].x,
         "the panes must really be side by side for this to prove anything"
     );
     assert_eq!(

@@ -2803,7 +2803,7 @@ fn once_the_paste_is_answered_clicks_and_pastes_work_again() {
         .unwrap();
     app.handle_paste("echo again");
     assert_eq!(pasted(&app), "echo again");
-    let other = app.terminal_rail_rects[1];
+    let other = app.panel_hits.rail_rows[1];
     left_click(&mut app, other.x + 1, other.y);
     assert_eq!(app.active_terminal, 1, "the rail row switches panes again");
 }

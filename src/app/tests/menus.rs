@@ -314,7 +314,7 @@ fn dismissing_a_strips_menu_never_leaves_focus_on_the_strip() {
     let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
     app.toggle_terminal_collapse(1);
     term.draw(|f| app.render(f)).unwrap();
-    let strip = app.terminal_strip_rects[1];
+    let strip = app.panel_hits.collapsed_strips[1];
     assert_eq!(strip.width, 1, "precondition: the strip is painted");
 
     app.handle_mouse(mouse(

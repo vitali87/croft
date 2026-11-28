@@ -3968,7 +3968,7 @@ fn a_running_codeql_query_shows_in_the_status_bar_and_a_click_cancels_it() {
         term.draw(|f| app.render(f)).unwrap();
         let screen = screen_text(&term);
         assert!(screen.contains("CodeQL q.ql 0:0"), "{screen}");
-        let chip = app.status_codeql_rect;
+        let chip = app.status_hits.codeql;
         assert!(chip.width > 0, "the chip is a click target");
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -3996,7 +3996,7 @@ fn a_running_codeql_query_shows_in_the_status_bar_and_a_click_cancels_it() {
         );
         term.draw(|f| app.render(f)).unwrap();
         assert!(!screen_text(&term).contains("CodeQL q.ql"), "the chip goes");
-        assert_eq!(app.status_codeql_rect, ratatui::layout::Rect::default());
+        assert_eq!(app.status_hits.codeql, ratatui::layout::Rect::default());
     });
 }
 

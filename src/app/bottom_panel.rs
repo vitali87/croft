@@ -976,18 +976,12 @@ impl App {
     /// non-zero problem count rides the PROBLEMS label as a badge.
     pub(super) fn paint_panel_tabs(&mut self, frame: &mut ratatui::Frame, strip: Rect) {
         use ratatui::widgets::Block;
-        // Every target on this row is cleared before anything can return: a
-        // row that is not painted must not keep the last frame's, whose cells
-        // now belong to whatever is drawn there (the status bar, in a one-row
-        // window).
-        self.problems_tab_rect = Rect::default();
-        self.output_tab_rect = Rect::default();
-        self.ports_tab_rect = Rect::default();
-        self.captures_tab_rect = Rect::default();
-        self.terminal_tab_rect = Rect::default();
+        // The row's tabs and buttons start the frame with no area (the frame
+        // resets `panel_hits` before drawing the panel), and the badge's cell
+        // is cleared here before anything can return: a row that is not
+        // painted must not keep the last frame's, whose cells now belong to
+        // whatever is drawn there (the status bar, in a one-row window).
         self.problems_badge_cell = None;
-        self.panel_maximize_button = Rect::default();
-        self.terminal_focus_button = Rect::default();
         // The labels go through `set_stringn`, which indexes the buffer
         // directly, so a strip with no row inside the frame paints nothing.
         let strip = strip.intersection(frame.area());
@@ -1082,11 +1076,11 @@ impl App {
                 height: 1,
             };
             match tab {
-                BottomPanelTab::Problems => self.problems_tab_rect = rect,
-                BottomPanelTab::Output => self.output_tab_rect = rect,
-                BottomPanelTab::Ports => self.ports_tab_rect = rect,
-                BottomPanelTab::Captures => self.captures_tab_rect = rect,
-                BottomPanelTab::Terminal => self.terminal_tab_rect = rect,
+                BottomPanelTab::Problems => self.panel_hits.problems_tab = rect,
+                BottomPanelTab::Output => self.panel_hits.output_tab = rect,
+                BottomPanelTab::Ports => self.panel_hits.ports_tab = rect,
+                BottomPanelTab::Captures => self.panel_hits.captures_tab = rect,
+                BottomPanelTab::Terminal => self.panel_hits.terminal_tab = rect,
             }
             placed.push((tab, label, rect, badge_w));
             x = x.saturating_add(w + 1);
@@ -1220,7 +1214,7 @@ impl App {
             buf.set_string(bx, strip.y, label, style);
             rect
         };
-        self.panel_maximize_button = place(if self.terminal_maximized {
+        self.panel_hits.maximize_button = place(if self.terminal_maximized {
             PANEL_RESTORE_LABEL
         } else {
             PANEL_MAXIMIZE_LABEL
@@ -1228,9 +1222,9 @@ impl App {
         // With one terminal there is nothing to focus against.
         if self.bottom_panel_tab == BottomPanelTab::Terminal
             && self.terminals.len() > 1
-            && !self.panel_maximize_button.is_empty()
+            && !self.panel_hits.maximize_button.is_empty()
         {
-            self.terminal_focus_button = place(if self.terminal_pane_maximized {
+            self.panel_hits.focus_button = place(if self.terminal_pane_maximized {
                 TERMINAL_RESTORE_LABEL
             } else {
                 TERMINAL_MAX_LABEL

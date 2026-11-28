@@ -31,18 +31,18 @@ fn clicking_the_position_readout_does_not_open_problems() {
     // The right cluster begins with " Ln", so its left edge is one cell before.
     let rx = ln_col.saturating_sub(1);
     assert!(
-        app.status_diag_rect.right() <= rx,
+        app.status_hits.diagnostics.right() <= rx,
         "the diagnostics hit rect must stop where the right cluster starts \
          (rect {:?} reaches {}, cluster starts at {}); row reads {text:?}",
-        app.status_diag_rect,
-        app.status_diag_rect.right(),
+        app.status_hits.diagnostics,
+        app.status_hits.diagnostics.right(),
         rx
     );
     // And concretely: the cells that visibly read "Col 1" must not be a
     // diagnostics target.
     let col_at = text.find("Col ").unwrap() as u16;
     assert!(
-        !rect_contains(app.status_diag_rect, col_at, row),
+        !rect_contains(app.status_hits.diagnostics, col_at, row),
         "clicking the column readout opened PROBLEMS"
     );
 }
@@ -344,7 +344,7 @@ fn clicking_the_problems_tab_switches_the_panel_view() {
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     assert_eq!(app.bottom_panel_tab, BottomPanelTab::Terminal);
-    let r = app.problems_tab_rect;
+    let r = app.panel_hits.problems_tab;
     assert!(r.width > 0, "the PROBLEMS tab must have a hit rect");
     left_click(&mut app, r.x, r.y);
     assert_eq!(
@@ -353,7 +353,7 @@ fn clicking_the_problems_tab_switches_the_panel_view() {
         "a click on the PROBLEMS tab activates that view",
     );
     // And the TERMINAL tab switches back.
-    let t = app.terminal_tab_rect;
+    let t = app.panel_hits.terminal_tab;
     left_click(&mut app, t.x, t.y);
     assert_eq!(app.bottom_panel_tab, BottomPanelTab::Terminal);
 }
@@ -617,7 +617,7 @@ fn the_problems_count_paints_an_orange_pill_in_the_tab_strip() {
     let buf = term.backend().buffer();
     // Somewhere along the PROBLEMS tab the count badge fills with the brand
     // gradient's orange corner, the "circle" the user asked for.
-    let strip = app.problems_tab_rect;
+    let strip = app.panel_hits.problems_tab;
     let orange = crate::gradient::rgb_color(crate::gradient::GRAD_TR);
     let painted = (strip.x..strip.x + strip.width).any(|x| buf[(x, strip.y)].bg == orange);
     assert!(painted, "the problem count wears an orange pill");
@@ -648,7 +648,7 @@ fn croft_loch_problems_count_is_a_tinted_chip_without_caps() {
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let buf = term.backend().buffer();
-    let tab = app.problems_tab_rect;
+    let tab = app.panel_hits.problems_tab;
     let cells: Vec<_> = (tab.x..tab.right()).map(|x| &buf[(x, tab.y)]).collect();
     let text: String = cells.iter().map(|c| c.symbol()).collect();
     assert!(text.ends_with(" 1 "), "{text:?}");

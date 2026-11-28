@@ -409,7 +409,7 @@ fn the_terminal_menus() {
     app.toggle_terminal_collapse(0);
     app.context_menu = None;
     draw(&mut app, 160, 30);
-    let strip = app.terminal_strip_rects[0];
+    let strip = app.panel_hits.collapsed_strips[0];
     right_click(&mut app, strip.x, strip.y + 1);
     text.push_str(&written(&app, "a folded terminal's strip"));
     writeln!(text, "active pane {}", app.active_terminal).unwrap();
