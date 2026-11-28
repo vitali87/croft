@@ -5055,10 +5055,10 @@ fn hovering_the_inline_blame_shows_its_commits_whole_message() {
         "the commit's card",
         || {
             app.drain_blame_hover();
-            app.hover_popup.is_some()
+            app.hover.popup.is_some()
         },
     );
-    let card = app.hover_popup.as_ref().unwrap().lines.join("\n");
+    let card = app.hover.popup.as_ref().unwrap().lines.join("\n");
     assert!(card.starts_with("Bo Chen <bo@example.com>\n"), "{card}");
     assert!(
         card.contains("Raise b to 20\n\nThe old limit overflowed."),
@@ -5066,11 +5066,11 @@ fn hovering_the_inline_blame_shows_its_commits_whole_message() {
     );
     app.handle_mouse(mouse(MouseEventKind::Moved, col + 3, row));
     assert!(
-        app.hover_popup.is_some(),
+        app.hover.popup.is_some(),
         "the card stays along the annotation"
     );
     app.handle_mouse(mouse(MouseEventKind::Moved, col, row - 1));
-    assert!(app.hover_popup.is_none(), "and goes off it");
+    assert!(app.hover.popup.is_none(), "and goes off it");
     app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
     crate::test_budget::await_spawned(
         std::time::Duration::from_millis(500),
@@ -5116,18 +5116,18 @@ fn a_blame_card_for_a_commit_no_longer_under_the_pointer_is_dropped() {
     );
     crate::test_budget::await_spawned(std::time::Duration::from_millis(500), "f.py's card", || {
         app.drain_blame_hover();
-        app.blame_hover.is_none() || app.hover_popup.is_some()
+        app.blame_hover.is_none() || app.hover.popup.is_some()
     });
     assert!(
-        app.hover_popup.is_none(),
+        app.hover.popup.is_none(),
         "f.py's card shows over g.py's blame"
     );
     app.hover_at_cell(col, row);
     crate::test_budget::await_spawned(std::time::Duration::from_millis(500), "g.py's card", || {
         app.drain_blame_hover();
-        app.hover_popup.is_some()
+        app.hover.popup.is_some()
     });
-    let card = app.hover_popup.as_ref().unwrap().lines.join("\n");
+    let card = app.hover.popup.as_ref().unwrap().lines.join("\n");
     assert!(card.starts_with("Ann Lee <ann@example.com>\n"), "{card}");
 }
 

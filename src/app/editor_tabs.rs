@@ -344,8 +344,8 @@ impl App {
     }
 
     pub(super) fn open_at(&mut self, path: &Path, row: usize, col: usize) -> Result<()> {
-        self.hover_popup = None;
-        self.hover_diagnostic = None;
+        self.hover.popup = None;
+        self.hover.diagnostic = None;
         self.editor.open_preview(path)?;
         self.sync_open_file_poll_mtime();
         self.place_caret_at(row, col);
@@ -1662,8 +1662,8 @@ impl App {
             let current = std::mem::take(&mut self.editor);
             self.editor = self.editor_layout.refocus_to_dfs(current, group);
         }
-        self.hover_popup = None;
-        self.hover_diagnostic = None;
+        self.hover.popup = None;
+        self.hover.diagnostic = None;
         let same_tab = self.editor.editors.get(tab).is_some_and(|ed| {
             ed.path.as_deref() == Some(path.as_path())
                 && !ed.has_non_text_view()

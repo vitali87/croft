@@ -2689,30 +2689,15 @@ pub struct App {
     /// the tick can re-query when the caret moves or the buffer changes while
     /// the popup is open and close it once the caret leaves the call.
     signature_help_anchor: Option<(usize, usize, u64)>,
-    hover: HoverDwell,
-    hover_popup: Option<crate::widgets::hover_popup::HoverPopup>,
-    hover_request_id: Option<u64>,
+    /// The editor's word hover: dwell, popup, request and what it was asked about
+    /// (see [`mouse_input::HoverState`]).
+    hover: mouse_input::HoverState,
     /// The rust-analyzer request a `Rust:` command is waiting on (#1626);
     /// a reply to any other id is stale and dropped.
     rust_analyzer_request: Option<(u64, crate::lsp::rust_analyzer::RaRequest)>,
-    hover_anchor: Option<(u16, u16)>,
-    hover_word: Option<(usize, usize, usize)>,
-    /// Diagnostic block for the point a hover is anchored to, captured
-    /// synchronously when the dwell fires (server diagnostics already live in
-    /// the editor). Stacked above the async LSP hover reply by `compose_hover`
-    /// so a squiggle's message shows even when the server returns no type info.
-    hover_diagnostic: Option<String>,
-    /// Set when the keyboard asked for the hover at the caret (#1518), not
-    /// the pointer's rest: its reply is checked against the caret, and says
-    /// there is no hover only over the status line this holds, the one shown
-    /// at the request, so a newer message is not replaced.
-    hover_at_caret: Option<String>,
-    /// The tab and edit count the hover was asked about: a reply after
-    /// either changed (a paste over the word keeps its span) is dropped.
-    hover_doc: (Option<PathBuf>, u64),
     /// Separate dwell timer for the editor tab strip. Hovering a tab for
     /// `HOVER_DELAY` surfaces `tab_tooltip` with the tab's full path so
-    /// same-named files can be told apart. Kept distinct from `hover`
+    /// same-named files can be told apart. Kept distinct from `hover.dwell`
     /// (which drives LSP word hover in the editor body) so the two never
     /// fight over the same timer.
     tab_hover: HoverDwell,
@@ -2745,7 +2730,7 @@ pub struct App {
     /// jump, different consumer — the response opens the peek popup at the
     /// caret instead of moving it.
     peek_definition_request_id: Option<u64>,
-    /// The open peek popup, rendered beside `hover_popup` against the whole
+    /// The open peek popup, rendered beside `hover.popup` against the whole
     /// frame; `peek_target` is where Enter jumps.
     peek_popup: Option<crate::widgets::hover_popup::HoverPopup>,
     peek_target: Option<(PathBuf, u32, u32)>,
@@ -4505,15 +4490,8 @@ impl App {
             pending_color_presentations: Vec::new(),
             pending_color_context: None,
             color_presentations_request: None,
-            hover: HoverDwell::default(),
-            hover_popup: None,
-            hover_request_id: None,
+            hover: mouse_input::HoverState::new(),
             rust_analyzer_request: None,
-            hover_anchor: None,
-            hover_word: None,
-            hover_diagnostic: None,
-            hover_at_caret: None,
-            hover_doc: (None, 0),
             tab_hover: HoverDwell::default(),
             tab_tooltip: None,
             tab_hover_idx: None,

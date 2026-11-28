@@ -170,10 +170,11 @@ fn a_second_tap_on_the_same_cell_rearms_the_dwell() {
     use crossterm::event::{MouseButton, MouseEventKind};
     let (mut app, _tmp, col, row) = app_with_open_file_and_editor_cell();
     app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
-    app.hover.mark_fired();
+    app.hover.dwell.mark_fired();
     app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
     assert!(
         app.hover
+            .dwell
             .due(std::time::Instant::now() + HOVER_DELAY, HOVER_DELAY),
         "a fresh tap must restart the dwell even on the same cell, else a \
          dismissed popup could never be re-summoned by tapping again"

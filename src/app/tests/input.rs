@@ -947,7 +947,7 @@ fn clicking_an_annotated_span_still_clears_the_click_selection() {
     );
     app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), cx, cy));
     app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), cx, cy));
-    assert!(app.hover_popup.is_some(), "the click must pop the note");
+    assert!(app.hover.popup.is_some(), "the click must pop the note");
     assert!(
         app.terminals[0].selection().is_none(),
         "the zero-area click selection must not stay painted"

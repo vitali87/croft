@@ -156,7 +156,8 @@ fn cmd_k_n_annotates_the_selection_and_a_click_shows_the_note() {
         inner.y + vrow,
     ));
     let popup = app
-        .hover_popup
+        .hover
+        .popup
         .as_ref()
         .expect("clicking the span shows the note");
     assert!(
@@ -187,12 +188,12 @@ fn cmd_k_n_annotates_the_selection_and_a_click_shows_the_note() {
     // used to kill the popup instantly).
     app.handle_mouse(mouse(MouseEventKind::Moved, inner.x + 4, inner.y + vrow));
     assert!(
-        app.hover_popup.is_some(),
+        app.hover.popup.is_some(),
         "drifting within the span must keep the note open"
     );
     app.handle_mouse(mouse(MouseEventKind::Moved, inner.x + 60, inner.y + vrow));
     assert!(
-        app.hover_popup.is_none(),
+        app.hover.popup.is_none(),
         "leaving the span dismisses the note"
     );
 
