@@ -29,11 +29,10 @@
 //! wearing a value its current text never produced.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::mpsc::{Receiver, Sender};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// The name of Live Run's runner thread, which the crash notice names.
 pub const THREAD: &str = "croft-live-run";
@@ -446,17 +445,6 @@ impl Drop for ReportFile {
     }
 }
 
-/// Kill the run and everything it started (its process group, on unix).
-fn kill_group(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    if let Ok(pid) = i32::try_from(child.id()) {
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
-        }
-    }
-    let _ = child.kill();
-}
-
 /// How much of a failed run's stderr is kept for its error line.
 const STDERR_TAIL: usize = 16 * 1024;
 
@@ -470,90 +458,54 @@ fn run(job: &Job) -> Result<Report, String> {
         .map(Path::to_path_buf)
         .unwrap_or_else(std::env::temp_dir);
     let mut cmd = Command::new(&job.python);
-    cmd
-        .arg("-c")
+    cmd.arg("-c")
         .arg(INSTRUMENTER)
         .arg(&job.path)
         .arg(report_file.path())
         .arg(RUN_BUDGET.as_secs_f64().to_string())
         .current_dir(cwd)
         // A live run must not litter the project with bytecode caches.
-        .env("PYTHONDONTWRITEBYTECODE", "1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    // Its own process group, so the kill below also takes down anything the
-    // script started (a server, `sleep` in a subprocess): otherwise every
-    // re-run on a pause in typing would leave another one behind.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        cmd.process_group(0);
-    }
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Live Run: cannot start {}: {e}", job.python.display()))?;
+        .env("PYTHONDONTWRITEBYTECODE", "1");
     let mut source = job.lines.join("\n");
     source.push('\n');
-    // Written from its own thread: an interpreter that never reads stdin
-    // would block a large buffer's write forever, before the kill deadline
-    // below even starts. A write error means it exited; stderr says why.
-    if let Some(mut stdin) = child.stdin.take() {
-        std::thread::spawn(move || {
-            let _ = stdin.write_all(source.as_bytes());
-        });
+    let limit = RUN_BUDGET + KILL_GRACE;
+    // Its own process group, so the kill at the deadline also takes down
+    // anything the script started (a server, `sleep` in a subprocess). The
+    // source goes in on stdin only as fast as the interpreter reads it, and
+    // stderr is drained while it runs, so neither a script that never reads
+    // nor one that floods stderr can hold the run past the deadline.
+    crate::proc::Bounded {
+        stdout: crate::proc::Keep::Nothing,
+        stderr: crate::proc::Keep::Tail(STDERR_TAIL),
+        apart: crate::proc::Apart::Group,
+        limit,
+        retry_busy: false,
     }
-    // Drained while the script runs: one that writes more than a pipe
-    // holds would otherwise block on stderr until the deadline killed it.
-    let stderr = child.stderr.take().map(|mut pipe| {
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            use std::io::Read;
-            let mut tail: Vec<u8> = Vec::new();
-            let mut buf = [0u8; 8192];
-            while let Ok(n) = pipe.read(&mut buf) {
-                if n == 0 {
-                    break;
-                }
-                tail.extend_from_slice(&buf[..n]);
-                if tail.len() > STDERR_TAIL {
-                    tail.drain(..tail.len() - STDERR_TAIL);
-                }
-            }
-            let _ = tx.send(String::from_utf8_lossy(&tail).into_owned());
-        });
-        rx
-    });
-    let deadline = Instant::now() + RUN_BUDGET + KILL_GRACE;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() >= deadline => {
-                kill_group(&mut child);
-                let _ = child.wait();
-                return Err(format!(
-                    "Live Run: killed after {}s (a call ignored the interrupt)",
-                    (RUN_BUDGET + KILL_GRACE).as_secs()
-                ));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
-            Err(e) => return Err(format!("Live Run: {e}")),
+    .run_fed(&mut cmd, source.as_bytes())
+    .map_err(|e| match e {
+        crate::proc::RunError::Spawn(e) => {
+            format!("Live Run: cannot start {}: {e}", job.python.display())
         }
-    }
-    let json = std::fs::read_to_string(report_file.path()).unwrap_or_default();
-    if json.trim().is_empty() {
-        // A process the script left behind can hold stderr open; don't
-        // wait on it for long.
-        let err = stderr
-            .and_then(|rx| rx.recv_timeout(Duration::from_millis(500)).ok())
-            .unwrap_or_default();
+        crate::proc::RunError::TimedOut => format!(
+            "Live Run: killed after {}s (a call ignored the interrupt)",
+            limit.as_secs()
+        ),
+        crate::proc::RunError::Wait(e) | crate::proc::RunError::Pipe(e) => format!("Live Run: {e}"),
+        // Neither stream is kept whole, so neither can be too long.
+        crate::proc::RunError::TooLong { .. } => String::from("Live Run: too much output"),
+    })
+    .and_then(|ran| {
+        let json = std::fs::read_to_string(report_file.path()).unwrap_or_default();
+        if !json.trim().is_empty() {
+            return parse_report(&json);
+        }
+        let err = ran.stderr.text();
         let last = err.lines().rev().find(|l| !l.trim().is_empty());
-        return Err(match last {
+        Err(match last {
             Some(line) => format!("Live Run: {}", line.trim()),
             None => String::from("Live Run: the script exited before reporting (os._exit?)"),
-        });
-    }
-    parse_report(&json)
+        })
+    })
 }
 
 /// Whether Live Run can run this file at all.
@@ -567,6 +519,7 @@ pub fn supports(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     fn report(json: &str) -> Report {
         parse_report(json).expect("parses")
