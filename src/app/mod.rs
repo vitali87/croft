@@ -6332,6 +6332,9 @@ pub fn run(
     result?;
     if app.drop_to_local {
         crate::widgets::editor::delete_own_gunzip_copies();
+        // `exit` skips dropping the app: finish ending the panes already
+        // closed, or a shell that ignores hang-up outlives croft (#2831).
+        app.wait_for_ending_terminals();
         std::process::exit(crate::remote::DROP_TO_LOCAL_EXIT_CODE);
     }
     // A background self-update landed: serialize the session and replace
@@ -6368,6 +6371,10 @@ pub fn run(
             .arg(&session_path);
         // The relaunched croft reopens each archive from the saved session.
         crate::widgets::editor::delete_own_gunzip_copies();
+        // Replacing the process skips dropping the app too. Only the panes
+        // already closed are waited for: the live ones stay, and a hosted
+        // pane is found again by the relaunched croft (#2831).
+        app.wait_for_ending_terminals();
         let err = CommandExt::exec(&mut cmd);
         eprintln!("croft self-relaunch failed: {err}");
         return Ok(());

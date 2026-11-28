@@ -1119,6 +1119,14 @@ impl App {
         for term in std::mem::take(&mut self.terminals) {
             self.end_terminal(term);
         }
+        self.wait_for_ending_terminals();
+    }
+
+    /// Wait for the panes already ending on jobs, and leave the live ones
+    /// alone: for a way out of croft that skips dropping the app (an exit,
+    /// or replacing the process), which would cut those jobs off and leave a
+    /// shell that ignores hang-up running after croft.
+    pub(super) fn wait_for_ending_terminals(&mut self) {
         for job in self.ending_terminals.drain(..) {
             let _ = job.wait();
         }
