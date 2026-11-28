@@ -5820,14 +5820,22 @@ fn the_masked_transcript_tail_matches_masking_the_whole_scrollback() {
         (20, 5, (0..50).map(|i| format!("line {i}\r\n")).collect()),
         (12, 4, format!("a\r\nexport TOKEN={token}\r\nb\r\n")),
         (12, 4, format!("x\r\nexport TOKEN={token}")),
-        (12, 4, format!("{}\r\n\r\n\r\nafter blanks\r\n\r\n", "w".repeat(30))),
+        (
+            12,
+            4,
+            format!("{}\r\n\r\n\r\nafter blanks\r\n\r\n", "w".repeat(30)),
+        ),
     ];
     for (cols, rows, out) in cases {
         let mut term = fresh_term(cols, rows);
         feed(&mut term, out.as_bytes());
         for keep in [1, 2, 3, 4, 5, 8, 200] {
             let tail = masked_tail_rows(&term, keep, &triggers);
-            assert_eq!(tail, whole(&term, keep), "{cols} columns, keep {keep}: {out:?}");
+            assert_eq!(
+                tail,
+                whole(&term, keep),
+                "{cols} columns, keep {keep}: {out:?}"
+            );
             assert!(
                 tail.iter().all(|row| !row.contains("C3d4")),
                 "no part of the token is kept: {tail:?}"
