@@ -2561,7 +2561,10 @@ fn status_bar_go_to_line_drops_the_selection_it_leaves_behind() {
 
 /// A wheel burst over a PDF in a background split steps one page, as it does
 /// in the focused group: without the cooldown a flick raced through a page
-/// per queued event.
+/// per queued event. A flick's ticks arrive before the first page is drawn
+/// (drawing is a background job, #2824), so the burst is sent back to back:
+/// waiting for the drawing between its ticks would let the cooldown run out
+/// on a slow machine and turn the second tick into a fresh step (#2892).
 #[test]
 fn a_wheel_burst_over_a_background_split_pdf_steps_one_page() {
     require_pdf_backend();
@@ -2599,11 +2602,13 @@ fn a_wheel_burst_over_a_background_split_pdf_steps_one_page() {
     // The mouse handlers pass three text lines per wheel tick.
     assert!(app.scroll_inactive_group_at(10, 10, 3));
     assert_eq!(page(&mut app), 2, "one tick steps one page, not three");
+    // A reversal is deliberate and always passes, however soon it comes.
+    assert!(app.scroll_inactive_group_at(10, 10, -3));
+    assert_eq!(page(&mut app), 1, "a reversal turns back a page");
+    // A flick: two same-direction ticks before the first page is drawn.
+    assert!(app.scroll_inactive_group_at(10, 10, 3));
     assert!(app.scroll_inactive_group_at(10, 10, 3));
     assert_eq!(page(&mut app), 2, "a same-direction burst steps one page");
-    // A reversal is deliberate and always passes.
-    assert!(app.scroll_inactive_group_at(10, 10, -3));
-    assert_eq!(page(&mut app), 1);
 }
 
 /// With a submenu open, the wheel over the parent panel drives the parent:

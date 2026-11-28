@@ -830,9 +830,10 @@ impl App {
         let active = self.editor_layout.active_dfs_index();
         let inactive_idx = if dfs > active { dfs - 1 } else { dfs };
         if let Some(group) = self.editor_layout.inactive_groups_mut().nth(inactive_idx) {
-            // A PDF page step is a synchronous rasterise, so a background
-            // split's PDF coalesces a wheel burst exactly like the focused one
-            // (see wheel_pdf_page), stamped after the render.
+            // A background split's PDF coalesces a wheel burst exactly like
+            // the focused one (see wheel_pdf_page): the step asks for a page
+            // that a background job draws (#2824), and the cooldown is
+            // stamped when the step is asked for, not when it lands.
             let ed = group.active_editor_mut();
             let pdf_doc = (ed.diff.is_none() && ed.pdf_page().is_some()).then(|| ed.path.clone());
             if let Some(doc) = pdf_doc {
