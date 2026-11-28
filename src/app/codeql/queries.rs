@@ -79,7 +79,7 @@ impl App {
                 query
             }
         };
-        if self.codeql_query_help.is_some() {
+        if self.codeql_jobs.query_help.is_some() {
             self.status = String::from("Query help is already being rendered");
             return;
         }
@@ -95,7 +95,7 @@ impl App {
             .join("codeql")
             .join("help")
             .join(format!("{stem}.md"));
-        let program = self.codeql_program.clone();
+        let program = self.codeql_jobs.program.clone();
         let args = crate::codeql_query::query_help_args(&query, &help);
         let out = help.clone();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -111,14 +111,14 @@ impl App {
             let _ = tx.send(outcome);
         });
         self.status = format!("Rendering the help of {name}\u{2026}");
-        self.codeql_query_help = Some((rx, help, name));
+        self.codeql_jobs.query_help = Some((rx, help, name));
     }
 
     /// Preview rendered query help (#578), or say the query has none: the
     /// CLI fails, or writes nothing, when there is no `.qhelp` or `.md`
     /// beside the query.
     pub fn drain_codeql_query_help(&mut self) -> bool {
-        let Some((rx, _, _)) = self.codeql_query_help.as_ref() else {
+        let Some((rx, _, _)) = self.codeql_jobs.query_help.as_ref() else {
             return false;
         };
         let outcome = match rx.try_recv() {
@@ -128,7 +128,7 @@ impl App {
                 Err(String::from("the help rendering stopped unexpectedly"))
             }
         };
-        let Some((_, help, name)) = self.codeql_query_help.take() else {
+        let Some((_, help, name)) = self.codeql_jobs.query_help.take() else {
             return false;
         };
         let written = std::fs::metadata(&help).is_ok_and(|m| m.len() > 0);
@@ -158,7 +158,7 @@ impl App {
     /// the UI thread instead. A walk still in flight is dropped: it may
     /// predate what this one finds.
     pub(in crate::app) fn refresh_codeql_queries(&mut self) {
-        self.codeql_queries_job = None;
+        self.codeql_jobs.queries_job = None;
         self.codeql.discovering_queries = false;
         self.codeql.queries = crate::codeql_query::discover(self.workspace_root());
     }
@@ -172,7 +172,8 @@ impl App {
     pub(in crate::app) fn discover_codeql_queries(&mut self) {
         let root = self.workspace_root().to_path_buf();
         if self
-            .codeql_queries_job
+            .codeql_jobs
+            .queries_job
             .as_ref()
             .is_some_and(|(walked, _)| *walked == root)
         {
@@ -183,7 +184,7 @@ impl App {
         std::thread::spawn(move || {
             let _ = tx.send(crate::codeql_query::discover(&walk));
         });
-        self.codeql_queries_job = Some((root, rx));
+        self.codeql_jobs.queries_job = Some((root, rx));
         self.codeql.discovering_queries = true;
     }
 
@@ -192,11 +193,11 @@ impl App {
     /// is dropped unread, landed or not, and the view, if showing, walks
     /// the root it shows now.
     pub fn drain_codeql_queries(&mut self) -> bool {
-        let Some((walked, rx)) = self.codeql_queries_job.as_ref() else {
+        let Some((walked, rx)) = self.codeql_jobs.queries_job.as_ref() else {
             return false;
         };
         if walked.as_path() != self.workspace_root() {
-            self.codeql_queries_job = None;
+            self.codeql_jobs.queries_job = None;
             self.codeql.discovering_queries = false;
             if self.sidebar_view == SidebarView::CodeQL {
                 self.discover_codeql_queries();
@@ -211,7 +212,7 @@ impl App {
                 self.codeql.discovering_queries = false;
             }
         }
-        self.codeql_queries_job = None;
+        self.codeql_jobs.queries_job = None;
         true
     }
 
@@ -289,7 +290,7 @@ impl App {
             self.status = String::from("Open a .qlref file first");
             return;
         };
-        if self.codeql_doc_job.is_some() {
+        if self.codeql_jobs.doc_job.is_some() {
             self.status = String::from("A CodeQL view is already being made");
             return;
         }
@@ -297,7 +298,7 @@ impl App {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let program = self.codeql_program.clone();
+        let program = self.codeql_jobs.program.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let found = Self::codeql_stdout(&program, &crate::codeql_query::qlref_args(&qlref))
@@ -308,7 +309,7 @@ impl App {
             let _ = tx.send(found);
         });
         self.status = format!("Resolving {name}\u{2026}");
-        self.codeql_doc_job = Some((
+        self.codeql_jobs.doc_job = Some((
             rx,
             format!("The query {name} references"),
             format!("Could not resolve {name}"),

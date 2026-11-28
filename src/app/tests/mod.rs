@@ -2692,7 +2692,7 @@ fn fake_codeql(dir: &std::path::Path, body: &str, code: i32, err: &str) -> std::
 /// Drain the query run until it lands, or fail after a few seconds.
 fn wait_for_codeql(app: &mut App) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while app.codeql_run.is_some() {
+    while app.codeql_jobs.run.is_some() {
         app.drain_codeql_run();
         assert!(
             std::time::Instant::now() < deadline,

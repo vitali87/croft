@@ -150,7 +150,7 @@ impl App {
     /// Search"). The side bar's language scopes the search.
     pub(in crate::app) fn prompt_codeql_variant_code_search(&mut self) {
         use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
-        if self.codeql_code_search.is_some() {
+        if self.codeql_jobs.code_search.is_some() {
             self.status = String::from("A GitHub Code Search is already running");
             return;
         }
@@ -229,13 +229,13 @@ impl App {
             let _ = tx.send(Ok((crate::codeql_variant::parse_code_search(&out), cut)));
         });
         self.status = format!("Searching GitHub code for {query}…");
-        self.codeql_code_search = Some((list, rx));
+        self.codeql_jobs.code_search = Some((list, rx));
     }
 
     /// Add a finished Code Search's repositories to its list. Returns true
     /// when one finished.
     pub fn drain_codeql_code_search(&mut self) -> bool {
-        let Some((_, rx)) = self.codeql_code_search.as_ref() else {
+        let Some((_, rx)) = self.codeql_jobs.code_search.as_ref() else {
             return false;
         };
         let outcome = match rx.try_recv() {
@@ -245,7 +245,7 @@ impl App {
                 Err(String::from("the search stopped without answering"))
             }
         };
-        let Some((list, _)) = self.codeql_code_search.take() else {
+        let Some((list, _)) = self.codeql_jobs.code_search.take() else {
             return false;
         };
         let (found, cut) = match outcome {

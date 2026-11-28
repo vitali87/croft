@@ -1322,8 +1322,8 @@ impl App {
         // here (#364); turning it off also takes down an offer on screen.
         self.remote_offer_disabled = p.disable_remote_offer;
         self.lane_agent = p.lane_agent.clone();
-        if p.codeql_cli_path != self.codeql_cli_setting {
-            self.codeql_cli_setting = p.codeql_cli_path.clone();
+        if p.codeql_cli_path != self.codeql_jobs.cli_setting {
+            self.codeql_jobs.cli_setting = p.codeql_cli_path.clone();
             self.resolve_codeql_cli();
         }
         // Live like every other pref here (#363): editing a group in

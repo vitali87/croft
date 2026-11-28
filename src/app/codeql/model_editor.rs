@@ -10,7 +10,7 @@ impl App {
     /// Modeling.
     pub(in crate::app) fn open_codeql_model_editor(&mut self) {
         use crate::codeql_query as cq;
-        if self.codeql_model_job.is_some() {
+        if self.codeql_jobs.model_job.is_some() {
             self.status = String::from("The model editor is already reading endpoints");
             return;
         }
@@ -24,7 +24,7 @@ impl App {
             return;
         };
         let dir = Self::codeql_contextual_dir("model");
-        let program = self.codeql_program.clone();
+        let program = self.codeql_jobs.program.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         let lang_for = lang.clone();
         std::thread::spawn(move || {
@@ -62,7 +62,7 @@ impl App {
             let _ = tx.send(read());
         });
         self.status = format!("Reading the endpoints of {}\u{2026}", db.name);
-        self.codeql_model_job = Some((rx, db.name, lang));
+        self.codeql_jobs.model_job = Some((rx, db.name, lang));
     }
 
     /// Model endpoint `endpoint` of the Model Editor (#578): pick what it
@@ -223,7 +223,7 @@ impl App {
     /// List a finished endpoints read under Method Modeling (#578), or say
     /// why there is none.
     pub fn drain_codeql_model(&mut self) -> bool {
-        let Some((rx, ..)) = self.codeql_model_job.as_ref() else {
+        let Some((rx, ..)) = self.codeql_jobs.model_job.as_ref() else {
             return false;
         };
         let outcome = match rx.try_recv() {
@@ -233,7 +233,7 @@ impl App {
                 Err(String::from("the endpoints read stopped unexpectedly"))
             }
         };
-        let Some((_, database, language)) = self.codeql_model_job.take() else {
+        let Some((_, database, language)) = self.codeql_jobs.model_job.take() else {
             return false;
         };
         match outcome {

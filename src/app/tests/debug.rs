@@ -5197,7 +5197,7 @@ fn debugging_a_codeql_query_stops_at_its_first_breakpoint() {
             tmp.path(),
             "import python\n\npredicate isCall(Call c) { exists(c) }\n\nfrom Call c\nwhere isCall(c)\nselect c\n",
         );
-        app.codeql_program = fake_query_server(
+        app.codeql_jobs.program = fake_query_server(
             bin.path(),
             r#"{"resultType": 0, "message": "", "evaluationTime": 1}"#,
             "\"c\"\n",

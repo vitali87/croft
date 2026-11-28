@@ -465,16 +465,17 @@ fn a_codeql_query_suite_runs_through_database_analyze_into_sarif() {
         let tmp = tempfile::tempdir().unwrap();
         let bin = tempfile::tempdir().unwrap();
         let mut app = codeql_query_fixture(tmp.path(), "select 1");
-        app.codeql_program = fake_codeql(bin.path(), r#"{"version":"2.1.0","runs":[]}"#, 0, "");
+        app.codeql_jobs.program =
+            fake_codeql(bin.path(), r#"{"version":"2.1.0","runs":[]}"#, 0, "");
         // `resolve queries` answers with the suite's queries: one alert
         // query, listed in a file the test can switch to a table query.
         let alert = tmp.path().join("Alert.ql");
         std::fs::write(&alert, "/** @kind problem */ select 1").unwrap();
         let listed = bin.path().join("resolved.json");
         std::fs::write(&listed, format!("[\"{}\"]", alert.display())).unwrap();
-        let script = std::fs::read_to_string(&app.codeql_program).unwrap();
+        let script = std::fs::read_to_string(&app.codeql_jobs.program).unwrap();
         std::fs::write(
-            &app.codeql_program,
+            &app.codeql_jobs.program,
             script.replacen(
                 "\n",
                 &format!(
@@ -487,7 +488,7 @@ fn a_codeql_query_suite_runs_through_database_analyze_into_sarif() {
         .unwrap();
         app.run_command(Command::CodeqlRunQuerySuite);
         assert_eq!(app.status, "Open a .qls query suite to run it");
-        assert!(app.codeql_run.is_none());
+        assert!(app.codeql_jobs.run.is_none());
 
         let suite = tmp.path().join("s.qls");
         std::fs::write(&suite, "- queries: .\n").unwrap();
@@ -499,7 +500,7 @@ fn a_codeql_query_suite_runs_through_database_analyze_into_sarif() {
             app.status,
             "Save s.qls before running it: CodeQL reads it from disk"
         );
-        assert!(app.codeql_run.is_none());
+        assert!(app.codeql_jobs.run.is_none());
         app.editor.dirty = false;
         app.run_command(Command::CodeqlRunQuerySuite);
         assert!(

@@ -206,11 +206,11 @@ impl App {
         index: usize,
         job: crate::codeql_query::DbJob,
     ) {
-        if let Some((_, running, _, _)) = self.codeql_upgrade.as_ref() {
+        if let Some((_, running, _, _)) = self.codeql_jobs.upgrade.as_ref() {
             self.status = format!("A CodeQL database {} is already running", running.noun());
             return;
         }
-        if self.codeql_run.is_some() {
+        if self.codeql_jobs.run.is_some() {
             self.status = format!(
                 "Wait for the CodeQL query run to finish before {}",
                 job.gerund()
@@ -221,20 +221,20 @@ impl App {
         let Some(db) = store.databases.get(index).cloned() else {
             return;
         };
-        let program = self.codeql_program.clone();
+        let program = self.codeql_jobs.program.clone();
         let path = db.path.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(Self::codeql_command(&program, &job.args(&path)));
         });
         self.status = job.running(&db.name);
-        self.codeql_upgrade = Some((rx, job, db.name, db.path));
+        self.codeql_jobs.upgrade = Some((rx, job, db.name, db.path));
     }
 
     /// Collect a finished database upgrade or cache cleanup (#578) onto the
     /// status line.
     pub fn drain_codeql_upgrade(&mut self) -> bool {
-        let Some((rx, _, _, _)) = self.codeql_upgrade.as_ref() else {
+        let Some((rx, _, _, _)) = self.codeql_jobs.upgrade.as_ref() else {
             return false;
         };
         let outcome = match rx.try_recv() {
@@ -244,7 +244,7 @@ impl App {
                 Err(String::from("the job stopped unexpectedly"))
             }
         };
-        let Some((_, job, name, _)) = self.codeql_upgrade.take() else {
+        let Some((_, job, name, _)) = self.codeql_jobs.upgrade.take() else {
             return false;
         };
         self.status = job.finished(&name, outcome);
@@ -258,7 +258,7 @@ impl App {
     pub(in crate::app) fn unused_codeql_databases(&self) -> Vec<PathBuf> {
         let store = crate::codeql_db::DatabaseStore::load(&Self::codeql_db_store_path());
         let history = crate::codeql_query::History::load(&Self::codeql_history_path());
-        let upgrading = self.codeql_upgrade.as_ref().map(|(_, _, _, p)| p);
+        let upgrading = self.codeql_jobs.upgrade.as_ref().map(|(_, _, _, p)| p);
         store
             .databases
             .iter()
@@ -362,11 +362,11 @@ impl App {
             .retain(|path, _| store.databases.iter().any(|db| &db.path == path));
         for db in &store.databases {
             if self.codeql.db_sizes.contains_key(&db.path)
-                || !self.codeql_size_pending.insert(db.path.clone())
+                || !self.codeql_jobs.size_pending.insert(db.path.clone())
             {
                 continue;
             }
-            let tx = self.codeql_size_tx.clone();
+            let tx = self.codeql_jobs.size_tx.clone();
             let path = db.path.clone();
             std::thread::spawn(move || {
                 let size = crate::codeql_db::folder_size(&path);
