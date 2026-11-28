@@ -430,7 +430,7 @@
 427 | OpenSettingsJson | open_settings_json | Preferences: Open Settings (JSON) |  |  |  |
 428 | OpenWorkspaceSettingsJson | open_workspace_settings_json | Preferences: Open Workspace Settings (JSON) |  |  |  |
 429 | OpenWorkspaceSettingsLocalJson | open_workspace_settings_local_json | Preferences: Open Workspace Settings — Local (JSON) |  |  |  |
-430 | OpenUserMenu | open_user_menu | User Menu: Open |  | Cmd+K Shift+N | Ctrl+K Shift+N |
+430 | OpenUserMenu | open_user_menu | User Menu: Open |  | Cmd+K Shift+J | Ctrl+K Shift+J |
 431 | OpenUserMenuJson | open_user_menu_json | Preferences: Open User Menu (JSON) |  |  |  |
 432 | OpenKeybindingsJson | open_keybindings_json | Preferences: Open Keyboard Shortcuts (JSON) |  |  |  |
 433 | ConfigureSnippets | configure_snippets | Preferences: Configure User Snippets |  |  |  |
