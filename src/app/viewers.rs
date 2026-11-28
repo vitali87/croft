@@ -649,6 +649,8 @@ impl App {
         // not render, or a file the PDF viewer turned away to the hex viewer.
         // Its open said "Opened …" long before (#2829 review).
         let said = self.editor.status.clone();
+        // Whether a rebuild on disk finished rendering, said or not.
+        let mut rebuilt = false;
         for (g, group) in self
             .editor_layout
             .all_groups_mut(&mut self.editor)
@@ -656,7 +658,9 @@ impl App {
         {
             let active = group.active_index();
             for (i, editor) in group.editors.iter_mut().enumerate() {
+                let rebuilding = editor.pdf_jobs.reloading();
                 changed |= editor.poll_pdf_jobs();
+                rebuilt |= rebuilding && !editor.pdf_jobs.reloading();
                 // A click acts on the preview in front: one left waiting on
                 // a tab or group the user has since left is dropped, so it
                 // never fires on their return.
@@ -679,6 +683,16 @@ impl App {
         }
         if !landed.is_empty() {
             self.announce_external_changes(landed);
+            changed = true;
+        }
+        if rebuilt {
+            // The file may have been written again while it rendered, and
+            // the sweeps meanwhile left it alone (one rebuild at a time):
+            // look again now, or that write waits for some other change on
+            // disk to be noticed at all. A rebuild that failed quietly,
+            // because the file had moved on, is the likeliest case of all
+            // (#2830 review).
+            self.reload_open_file_after_external_change();
             changed = true;
         }
         let links_in = self

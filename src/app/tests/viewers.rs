@@ -2323,6 +2323,94 @@ fn a_pdf_rebuilt_on_disk_reloads_without_waiting_and_says_so() {
     );
 }
 
+/// Push `path`'s modified time `secs` into the future, so the next look at
+/// it sees a new version whatever the clock's resolution.
+fn bump_mtime(path: &std::path::Path, secs: u64) {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(secs))
+        .unwrap();
+}
+
+/// A PDF written again while its rebuild renders shows the newer file once
+/// that rebuild lands, with nothing else changing on disk: the sweeps
+/// meanwhile leave it alone, one rebuild at a time, so the landing has to
+/// look again (#2830 review). The first rebuild is made to fail, so it
+/// cannot happen to read the newer file itself.
+#[test]
+fn a_pdf_written_again_while_its_rebuild_renders_shows_the_newer_file() {
+    require_pdf_backend();
+    let one_page = concat!(
+        "%PDF-1.4\n",
+        "1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n",
+        "2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n",
+        "3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]/Contents 4 0 R>>endobj\n",
+        "4 0 obj<</Length 27>>stream\n0 0 1 rg 10 10 100 100 re f\nendstream endobj\n",
+        "trailer<</Root 1 0 R/Size 5>>\n%%EOF\n",
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("doc.pdf");
+    write_three_page_pdf(&path);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&path).unwrap();
+    settle_pdf(&mut app);
+    write_three_page_pdf(&path);
+    bump_mtime(&path, 2);
+    *crate::pdf::FAIL_RASTERIZE_ONCE_FOR_TEST.lock().unwrap() = Some((path.clone(), 1));
+    app.reload_open_file_after_external_change();
+    assert!(app.editor.pdf_jobs.reloading());
+    std::fs::write(&path, one_page).unwrap();
+    bump_mtime(&path, 4);
+    // The watcher's sweep meanwhile: it leaves the rebuild rendering alone.
+    app.reload_open_file_after_external_change();
+    settle_pdf(&mut app);
+    let count = app
+        .editor
+        .image
+        .as_ref()
+        .and_then(|i| i.pdf.as_ref())
+        .and_then(|pdf| pdf.page_count);
+    assert_eq!(count, Some(1), "the newer file is shown: {}", app.status);
+}
+
+/// A file in another tab written while a PDF rebuild renders reloads when
+/// the rebuild lands (#2830 review): the landing took in every open file's
+/// new version without looking at any of them, so that write was never
+/// noticed.
+#[test]
+fn a_file_written_while_a_pdf_rebuild_renders_still_reloads() {
+    require_pdf_backend();
+    let tmp = tempfile::tempdir().unwrap();
+    let notes = tmp.path().join("notes.txt");
+    std::fs::write(&notes, "old\n").unwrap();
+    let pdf = tmp.path().join("doc.pdf");
+    write_three_page_pdf(&pdf);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&notes).unwrap();
+    app.editor.open_pinned(&pdf).unwrap();
+    settle_pdf(&mut app);
+    write_three_page_pdf(&pdf);
+    bump_mtime(&pdf, 2);
+    app.reload_open_file_after_external_change();
+    assert!(app.editor.pdf_jobs.reloading());
+    std::fs::write(&notes, "new\n").unwrap();
+    bump_mtime(&notes, 2);
+    settle_pdf(&mut app);
+    let tab = app
+        .editor
+        .iter_tabs()
+        .find(|t| t.path.as_deref() == Some(notes.as_path()))
+        .expect("the notes tab");
+    assert_eq!(
+        tab.lines.first().map(String::as_str),
+        Some("new"),
+        "{}",
+        app.status
+    );
+}
+
 /// End pressed right after the open, before the page count is in, goes to
 /// the last page once it is: the count is read on a job (#2824).
 #[test]
