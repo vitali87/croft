@@ -19,7 +19,7 @@ use ratatui::{
 
 use std::collections::HashSet;
 
-use crate::theme::Theme;
+use crate::widgets::view_cx::ViewCx;
 
 const COLOR_DIM: Color = Color::Rgb(0x80, 0x88, 0x98);
 const COLOR_HEAD: Color = Color::Rgb(0x8b, 0x93, 0xa1);
@@ -96,11 +96,6 @@ pub struct PortsPanel {
     /// pop straight back into the list. Cleared for a port only by restarting.
     dismissed: HashSet<u16>,
 
-    pub focus_gradient: bool,
-    pub theme: Theme,
-    pub focused: bool,
-    pub hover_pointer: Option<(u16, u16)>,
-
     pub last_area: Rect,
     /// Body-row hit rects (index into `entries`), recomputed each render.
     row_rects: Vec<(Rect, usize)>,
@@ -116,19 +111,11 @@ impl PortsPanel {
             entries: Vec::new(),
             selected: 0,
             dismissed: HashSet::new(),
-            focus_gradient: false,
-            theme: Theme::default(),
-            focused: false,
-            hover_pointer: None,
             last_area: Rect::default(),
             row_rects: Vec::new(),
             first_row_y: 0,
             scroll: 0,
         }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
     }
 
     pub fn len(&self) -> usize {
@@ -318,25 +305,26 @@ fn rect_has(r: Rect, x: u16, y: u16) -> bool {
     r.width > 0 && r.height > 0 && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
 }
 
-impl Widget for &mut PortsPanel {
-    fn render(self, area: Rect, buf: &mut Buffer) {
+impl PortsPanel {
+    /// Draw the view into `area` with this frame's [`ViewCx`].
+    pub fn draw(&mut self, cx: &ViewCx, area: Rect, buf: &mut Buffer) {
         self.last_area = area;
         self.row_rects.clear();
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let accent = if self.focus_gradient {
+        let accent = if cx.theme.gradient() {
             crate::gradient::rgb_color(crate::gradient::PANEL_TITLE_FG)
         } else {
-            self.theme.ui(Color::White)
+            cx.theme.ui(Color::White)
         };
         let orange = crate::gradient::rgb_color(crate::gradient::GRAD_TR);
-        buf.set_style(area, Style::default().bg(self.theme.editor_bg()));
+        buf.set_style(area, Style::default().bg(cx.theme.editor_bg()));
 
         if self.entries.is_empty() {
             Paragraph::new(Line::from(Span::styled(
                 "No ports detected yet. Croft watches this session and surfaces a port the moment one starts listening.",
-                Style::default().fg(self.theme.ui(COLOR_DIM)),
+                Style::default().fg(cx.theme.ui(COLOR_DIM)),
             )))
             .render(area, buf);
             return;
@@ -357,7 +345,7 @@ impl Widget for &mut PortsPanel {
                 "PORT", "ADDRESS", "PROCESS", "ORIGIN"
             ),
             Style::default()
-                .fg(self.theme.ui(COLOR_HEAD))
+                .fg(cx.theme.ui(COLOR_HEAD))
                 .add_modifier(Modifier::BOLD),
         );
 
@@ -400,8 +388,7 @@ impl Widget for &mut PortsPanel {
             };
             self.row_rects.push((r, idx));
             let selected = idx == self.selected;
-            let hovered =
-                crate::widgets::hover::row_hover_bg(r, self.hover_pointer, self.theme).is_some();
+            let hovered = crate::widgets::hover::row_hover_bg(r, cx.pointer, cx.theme).is_some();
             if selected || hovered {
                 buf.set_style(
                     r,
@@ -412,9 +399,9 @@ impl Widget for &mut PortsPanel {
             // Green only while the port is actually listening; a stopped server
             // greys out (and a non-forwarded one is then dropped by the poll).
             let dot_color = if entry.live {
-                self.theme.ui(COLOR_LIVE)
+                cx.theme.ui(COLOR_LIVE)
             } else {
-                self.theme.ui(COLOR_DIM)
+                cx.theme.ui(COLOR_DIM)
             };
             let addr = match (&entry.origin, entry.local_port) {
                 (PortOrigin::Remote(_), Some(lp)) if lp != entry.port => {
@@ -424,13 +411,13 @@ impl Widget for &mut PortsPanel {
             };
             let origin = match &entry.origin {
                 PortOrigin::Local => {
-                    Span::styled("local", Style::default().fg(self.theme.ui(COLOR_DIM)))
+                    Span::styled("local", Style::default().fg(cx.theme.ui(COLOR_DIM)))
                 }
                 PortOrigin::Remote(host) => {
                     let fg = if entry.forwarded {
                         orange
                     } else {
-                        self.theme.ui(COLOR_DIM)
+                        cx.theme.ui(COLOR_DIM)
                     };
                     Span::styled(format!("\u{21c4} {host}"), Style::default().fg(fg))
                 }
@@ -443,11 +430,11 @@ impl Widget for &mut PortsPanel {
                 ),
                 Span::styled(
                     format!("{addr:<24}"),
-                    Style::default().fg(self.theme.ui(COLOR_MSG)),
+                    Style::default().fg(cx.theme.ui(COLOR_MSG)),
                 ),
                 Span::styled(
                     format!("{:<18}", entry.process.as_deref().unwrap_or("")),
-                    Style::default().fg(self.theme.ui(COLOR_DIM)),
+                    Style::default().fg(cx.theme.ui(COLOR_DIM)),
                 ),
                 origin,
             ];
@@ -482,7 +469,7 @@ impl Widget for &mut PortsPanel {
                 area.y + area.height - 1,
                 hint,
                 area.width as usize,
-                Style::default().fg(self.theme.ui(COLOR_DIM)),
+                Style::default().fg(cx.theme.ui(COLOR_DIM)),
             );
         }
     }
@@ -500,7 +487,7 @@ mod tests {
             height: h,
         };
         let mut buf = Buffer::empty(area);
-        p.render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         let mut out = String::new();
         for y in 0..h {
             for x in 0..w {

@@ -7,6 +7,7 @@
 //! the user scrolls up. The rows are a pure projection of the bus, refreshed
 //! whenever its generation counter advances.
 
+use crate::widgets::view_cx::ViewCx;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -16,7 +17,6 @@ use ratatui::{
 };
 
 use crate::output::{OutputLevel, OutputLine};
-use crate::theme::Theme;
 use crate::widgets::scrollbar;
 
 const COLOR_DIM: Color = Color::Rgb(0x60, 0x68, 0x78);
@@ -66,11 +66,6 @@ pub struct OutputPanel {
     /// the list fits.
     dropdown_scrollbar: Rect,
 
-    pub focus_gradient: bool,
-    pub theme: Theme,
-    pub focused: bool,
-    pub hover_pointer: Option<(u16, u16)>,
-
     pub last_area: Rect,
     pub last_scrollbar: Rect,
 
@@ -100,10 +95,6 @@ impl OutputPanel {
             dropdown_open: false,
             dropdown_scroll: 0,
             dropdown_scrollbar: Rect::default(),
-            focus_gradient: false,
-            theme: Theme::default(),
-            focused: false,
-            hover_pointer: None,
             last_area: Rect::default(),
             last_scrollbar: Rect::default(),
             dropdown_rect: Rect::default(),
@@ -157,16 +148,8 @@ impl OutputPanel {
         self.channels.get(self.selected).cloned()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.channels.is_empty()
-    }
-
     pub fn dropdown_open(&self) -> bool {
         self.dropdown_open
-    }
-
-    pub fn min_level(&self) -> OutputLevel {
-        self.min_level
     }
 
     /// Select a channel by name, if present. Returns whether it was found.
@@ -313,8 +296,9 @@ impl Default for OutputPanel {
     }
 }
 
-impl Widget for &mut OutputPanel {
-    fn render(self, area: Rect, buf: &mut Buffer) {
+impl OutputPanel {
+    /// Draw the view into `area` with this frame's [`ViewCx`].
+    pub fn draw(&mut self, cx: &ViewCx, area: Rect, buf: &mut Buffer) {
         self.last_area = area;
         self.last_scrollbar = Rect::default();
         self.dropdown_rect = Rect::default();
@@ -327,12 +311,12 @@ impl Widget for &mut OutputPanel {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let accent = if self.focus_gradient {
+        let accent = if cx.theme.gradient() {
             crate::gradient::rgb_color(crate::gradient::PANEL_TITLE_FG)
         } else {
-            self.theme.ui(Color::White)
+            cx.theme.ui(Color::White)
         };
-        buf.set_style(area, Style::default().bg(self.theme.editor_bg()));
+        buf.set_style(area, Style::default().bg(cx.theme.editor_bg()));
 
         // Toolbar row: dropdown on the left, actions on the right.
         let toolbar = Rect {
@@ -341,7 +325,7 @@ impl Widget for &mut OutputPanel {
             width: area.width,
             height: 1,
         };
-        self.render_toolbar(toolbar, buf, accent);
+        self.render_toolbar(cx, toolbar, buf, accent);
 
         let body = Rect {
             x: area.x,
@@ -356,7 +340,7 @@ impl Widget for &mut OutputPanel {
         if self.channels.is_empty() {
             Paragraph::new(Line::from(Span::styled(
                 "No output yet. Channels appear as language servers and tasks log.",
-                Style::default().fg(self.theme.ui(COLOR_DIM)),
+                Style::default().fg(cx.theme.ui(COLOR_DIM)),
             )))
             .render(body, buf);
             return;
@@ -406,11 +390,11 @@ impl Widget for &mut OutputPanel {
             let spans = vec![
                 Span::styled(
                     format!("{} ", line.level.label()),
-                    Style::default().fg(level_color(line.level, self.theme)),
+                    Style::default().fg(level_color(line.level, cx.theme)),
                 ),
                 Span::styled(
                     row_text(&line.text),
-                    Style::default().fg(self.theme.ui(COLOR_MSG)),
+                    Style::default().fg(cx.theme.ui(COLOR_MSG)),
                 ),
             ];
             Paragraph::new(Line::from(spans)).render(row_rect, buf);
@@ -418,18 +402,18 @@ impl Widget for &mut OutputPanel {
 
         if let Some(metrics) = bar {
             self.last_scrollbar = metrics.area;
-            scrollbar::render_vertical(buf, metrics, self.focused, self.theme);
+            scrollbar::render_vertical(buf, metrics, cx.focused, cx.theme);
         }
 
         // The dropdown overlays the body, so paint it last.
         if self.dropdown_open {
-            self.render_dropdown(body, buf, accent);
+            self.render_dropdown(cx, body, buf, accent);
         }
     }
 }
 
 impl OutputPanel {
-    fn render_toolbar(&mut self, area: Rect, buf: &mut Buffer, accent: Color) {
+    fn render_toolbar(&mut self, cx: &ViewCx, area: Rect, buf: &mut Buffer, accent: Color) {
         let chevron = if self.dropdown_open {
             CHEVRON_UP
         } else {
@@ -470,13 +454,12 @@ impl OutputPanel {
                 width: tw,
                 height: 1,
             };
-            let hovered =
-                crate::widgets::hover::row_hover_bg(rect, self.hover_pointer, self.theme).is_some();
+            let hovered = crate::widgets::hover::row_hover_bg(rect, cx.pointer, cx.theme).is_some();
             let on = slot == 1 && rpc_on;
             let fg = if on || hovered {
                 accent
             } else {
-                self.theme.ui(COLOR_DIM)
+                cx.theme.ui(COLOR_DIM)
             };
             buf.set_stringn(rect.x, area.y, &tok, tw as usize, Style::default().fg(fg));
             match slot {
@@ -487,7 +470,7 @@ impl OutputPanel {
         }
     }
 
-    fn render_dropdown(&mut self, body: Rect, buf: &mut Buffer, accent: Color) {
+    fn render_dropdown(&mut self, cx: &ViewCx, body: Rect, buf: &mut Buffer, accent: Color) {
         let n = self.channels.len() as u16;
         let longest = self
             .channels
@@ -549,13 +532,13 @@ impl OutputPanel {
         Clear.render(area, buf);
         // Croft Loch lifts the dropdown onto its raised surface, like every
         // other overlay card.
-        let fill = self
+        let fill = cx
             .theme
             .surfaces()
-            .map_or(self.theme.editor_bg(), |s| s.raised());
+            .map_or(cx.theme.editor_bg(), |s| s.raised());
         buf.set_style(area, Style::default().bg(fill));
         if pad == 1 {
-            crate::widgets::surface::paint_overlay_frame(buf, area, self.theme);
+            crate::widgets::surface::paint_overlay_frame(buf, area, cx.theme);
         }
         if overflow {
             let track = Rect {
@@ -568,7 +551,7 @@ impl OutputPanel {
             if let Some(metrics) =
                 scrollbar::vertical_metrics(track, n as usize, rows as usize, self.dropdown_scroll)
             {
-                scrollbar::render_vertical(buf, metrics, self.focused, self.theme);
+                scrollbar::render_vertical(buf, metrics, cx.focused, cx.theme);
             }
         }
         for (row, name) in self
@@ -588,8 +571,7 @@ impl OutputPanel {
             };
             self.dropdown_items.push((r, row));
             let selected = row == self.selected;
-            let hovered =
-                crate::widgets::hover::row_hover_bg(r, self.hover_pointer, self.theme).is_some();
+            let hovered = crate::widgets::hover::row_hover_bg(r, cx.pointer, cx.theme).is_some();
             if hovered || selected {
                 buf.set_style(
                     r,
@@ -599,7 +581,7 @@ impl OutputPanel {
             let fg = if selected {
                 accent
             } else {
-                self.theme.ui(COLOR_MSG)
+                cx.theme.ui(COLOR_MSG)
             };
             // A space either side of the name, inside the row.
             buf.set_stringn(
@@ -652,6 +634,7 @@ fn row_text(text: &str) -> std::borrow::Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::Theme;
 
     fn render(p: &mut OutputPanel, w: u16, h: u16) -> String {
         let area = Rect {
@@ -661,7 +644,7 @@ mod tests {
             height: h,
         };
         let mut buf = Buffer::empty(area);
-        p.render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         let mut out = String::new();
         for y in 0..h {
             for x in 0..w {
@@ -731,12 +714,18 @@ mod tests {
     fn croft_loch_lifts_the_channel_dropdown_onto_its_raised_surface() {
         let loch = crate::theme::Theme::from_id("loch");
         let mut p = OutputPanel::new();
-        p.theme = loch;
         p.channels = vec!["Git".into(), "ruff".into()];
         p.dropdown_open = true;
         let area = Rect::new(0, 0, 40, 10);
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(
+            &ViewCx {
+                theme: loch,
+                ..ViewCx::default()
+            },
+            area,
+            &mut buf,
+        );
         // The second name: the first is the selected channel's row.
         let row = p.dropdown_items[1].0;
         assert_eq!(buf[(row.x, row.y)].bg, loch.surfaces().unwrap().raised());
@@ -753,7 +742,6 @@ mod tests {
     fn the_channel_dropdown_draws_its_names_inside_a_blank_bordered_box() {
         let mut p = OutputPanel::new();
         // The boxed dropdown, which Croft Loch draws as a card instead.
-        p.theme = Theme::BLACK;
         p.channels = vec!["Git".into(), "ruff".into(), "Test Runner".into()];
         p.selected = 2;
         p.lines = (0..8)
@@ -766,7 +754,14 @@ mod tests {
         p.dropdown_open = true;
         let area = Rect::new(0, 0, 40, 10);
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(
+            &ViewCx {
+                theme: Theme::BLACK,
+                ..ViewCx::default()
+            },
+            area,
+            &mut buf,
+        );
         // The box: the widest name plus a space either side, plus the
         // border, from the column after the body's edge, under the toolbar.
         let (left, right, top, bottom) = (1, 15, 1, 5);
@@ -801,16 +796,31 @@ mod tests {
         assert!(!p.dropdown_open);
         p.dropdown_open = true;
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(
+            &ViewCx {
+                theme: Theme::BLACK,
+                ..ViewCx::default()
+            },
+            area,
+            &mut buf,
+        );
         assert!(p.click(5, top + 1));
         assert_eq!(p.selected, 0, "the first name's row selects Git");
     }
 
     /// Renders `p` into a fresh `w`x`h` buffer and returns the buffer.
     fn render_buf(p: &mut OutputPanel, w: u16, h: u16) -> Buffer {
+        render_buf_in(p, Theme::default(), w, h)
+    }
+
+    fn render_buf_in(p: &mut OutputPanel, theme: Theme, w: u16, h: u16) -> Buffer {
         let area = Rect::new(0, 0, w, h);
         let mut buf = Buffer::empty(area);
-        p.render(area, &mut buf);
+        let cx = ViewCx {
+            theme,
+            ..ViewCx::default()
+        };
+        p.draw(&cx, area, &mut buf);
         buf
     }
 
@@ -849,11 +859,10 @@ mod tests {
     fn an_overflowing_list_keeps_the_border_and_its_scrollbar_inside() {
         let mut p = OutputPanel::new();
         // The boxed dropdown, which Croft Loch draws as a card instead.
-        p.theme = Theme::BLACK;
         p.channels = (0..12).map(|i| format!("chan-{i:02}")).collect();
         p.dropdown_open = true;
         // 1 toolbar + 6 body rows: the border takes two, four names fit.
-        let buf = render_buf(&mut p, 40, 7);
+        let buf = render_buf_in(&mut p, Theme::BLACK, 40, 7);
         // "chan-00" + a space either side + the scrollbar column + border.
         let (left, right) = (1u16, 12u16);
         assert_eq!(
@@ -938,10 +947,9 @@ mod tests {
     fn a_long_channel_name_is_cut_inside_the_right_border() {
         let mut p = OutputPanel::new();
         // The boxed dropdown, which Croft Loch draws as a card instead.
-        p.theme = Theme::BLACK;
         p.channels = vec!["Git".into(), "a-very-long-channel-name-for-the-box".into()];
         p.dropdown_open = true;
-        let buf = render_buf(&mut p, 20, 8);
+        let buf = render_buf_in(&mut p, Theme::BLACK, 20, 8);
         // The box spans the body's width less the column it starts after.
         let right = 19u16;
         assert_eq!(cells(&buf, 1, right..=right), "╮");

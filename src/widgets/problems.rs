@@ -8,6 +8,7 @@
 //! the app's per-file diagnostics store, refreshed whenever a language server
 //! republishes.
 
+use crate::widgets::view_cx::ViewCx;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -20,7 +21,6 @@ use ratatui::{
 };
 
 use crate::lsp::manager::DiagnosticSeverity;
-use crate::theme::Theme;
 use crate::widgets::scrollbar;
 
 const COLOR_HEADER: Color = Color::Rgb(0xE8, 0xEE, 0xF8);
@@ -232,11 +232,6 @@ pub struct ProblemsPanel {
     /// projection of one list; this field only records the choice.
     pub scope: ProblemScope,
 
-    pub focus_gradient: bool,
-    pub theme: Theme,
-    pub focused: bool,
-    pub hover_pointer: Option<(u16, u16)>,
-
     pub last_area: Rect,
     pub last_scrollbar: Rect,
     /// The diagnostic a Fix with Navigator turn is streaming for, as
@@ -276,10 +271,6 @@ impl ProblemsPanel {
             text_filter: String::new(),
             group_by_file: true,
             scope: ProblemScope::default(),
-            focus_gradient: false,
-            theme: Theme::default(),
-            focused: false,
-            hover_pointer: None,
             last_area: Rect::default(),
             last_scrollbar: Rect::default(),
             fixing: None,
@@ -314,10 +305,6 @@ impl ProblemsPanel {
         self.drawn_groups.get_or_insert(old);
         self.scroll = self.scroll.min(self.max_scroll());
         true
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.groups.is_empty()
     }
 
     /// Total diagnostics across all files, for the tab badge.
@@ -657,8 +644,9 @@ fn severity_glyph(severity: DiagnosticSeverity, theme: crate::theme::Theme) -> (
     }
 }
 
-impl Widget for &mut ProblemsPanel {
-    fn render(self, area: Rect, buf: &mut Buffer) {
+impl ProblemsPanel {
+    /// Draw the view into `area` with this frame's [`ViewCx`].
+    pub fn draw(&mut self, cx: &ViewCx, area: Rect, buf: &mut Buffer) {
         self.last_area = area;
         self.last_scrollbar = Rect::default();
         self.filter_rect = Rect::default();
@@ -670,7 +658,7 @@ impl Widget for &mut ProblemsPanel {
         }
         // Paint the panel background so the previous frame's terminal cells
         // can't ghost through the gaps between rows.
-        buf.set_style(area, Style::default().bg(self.theme.editor_bg()));
+        buf.set_style(area, Style::default().bg(cx.theme.editor_bg()));
 
         if self.groups.is_empty() {
             // Under Open Files the list is scoped, so "in the workspace" would
@@ -684,7 +672,7 @@ impl Widget for &mut ProblemsPanel {
             };
             Paragraph::new(Line::from(Span::styled(
                 empty_msg,
-                Style::default().fg(self.theme.ui(COLOR_DIM)),
+                Style::default().fg(cx.theme.ui(COLOR_DIM)),
             )))
             .render(
                 Rect {
@@ -706,7 +694,7 @@ impl Widget for &mut ProblemsPanel {
             width: area.width,
             height: 1,
         };
-        self.render_toolbar(toolbar, buf);
+        self.render_toolbar(cx, toolbar, buf);
         let body = Rect {
             x: area.x,
             y: area.y + 1,
@@ -719,7 +707,7 @@ impl Widget for &mut ProblemsPanel {
         if self.rows.is_empty() {
             Paragraph::new(Line::from(Span::styled(
                 "No problems match the current filter.",
-                Style::default().fg(self.theme.ui(COLOR_DIM)),
+                Style::default().fg(cx.theme.ui(COLOR_DIM)),
             )))
             .render(
                 Rect {
@@ -757,7 +745,7 @@ impl Widget for &mut ProblemsPanel {
         // Croft Loch keeps a one-cell gutter, so a row's text starts on the
         // column a terminal's text does and switching tabs doesn't jog the
         // content sideways. The hover fill still spans the whole row.
-        let gutter = u16::from(self.theme.surfaces().is_some());
+        let gutter = u16::from(cx.theme.surfaces().is_some());
 
         for row in 0..visible {
             let render_row = self.rows[self.scroll + row].clone();
@@ -768,15 +756,13 @@ impl Widget for &mut ProblemsPanel {
                 width: content_w,
                 height: 1,
             };
-            if let Some(bg) =
-                crate::widgets::hover::row_hover_bg(row_rect, self.hover_pointer, self.theme)
-            {
+            if let Some(bg) = crate::widgets::hover::row_hover_bg(row_rect, cx.pointer, cx.theme) {
                 buf.set_style(row_rect, Style::default().bg(bg));
             }
             let spans = match render_row {
-                RenderRow::Header(g) => self.header_spans(g),
-                RenderRow::Diag(g, i) => self.diag_spans(g, i),
-                RenderRow::Related(g, i, r) => self.related_spans(g, i, r),
+                RenderRow::Header(g) => self.header_spans(cx, g),
+                RenderRow::Diag(g, i) => self.diag_spans(cx, g, i),
+                RenderRow::Related(g, i, r) => self.related_spans(cx, g, i, r),
             };
             let text_rect = Rect {
                 x: row_rect.x + gutter.min(row_rect.width),
@@ -788,7 +774,7 @@ impl Widget for &mut ProblemsPanel {
 
         if let Some(metrics) = bar {
             self.last_scrollbar = metrics.area;
-            scrollbar::render_vertical(buf, metrics, self.focused, self.theme);
+            scrollbar::render_vertical(buf, metrics, cx.focused, cx.theme);
         }
     }
 }
@@ -800,10 +786,10 @@ impl ProblemsPanel {
     /// when off-default they get a soft translucent accent chip so a lit filter
     /// or flat view reads at a glance. Clickable (hit rects recorded for
     /// [`ProblemsPanel::click`]).
-    fn render_toolbar(&mut self, area: Rect, buf: &mut Buffer) {
-        let muted = self.theme.ignored_fg();
-        let accent = self.theme.accent();
-        let chip = self.theme.accent_chip_bg();
+    fn render_toolbar(&mut self, cx: &ViewCx, area: Rect, buf: &mut Buffer) {
+        let muted = cx.theme.ignored_fg();
+        let accent = cx.theme.accent();
+        let chip = cx.theme.accent_chip_bg();
 
         // The chip carries user-typed text, so bound what it shows: the
         // last FILTER_CHIP_CHARS characters (the tail is what the user is
@@ -867,7 +853,7 @@ impl ProblemsPanel {
         self.group_rect = control(group_label, !self.group_by_file, buf);
     }
 
-    fn header_spans(&self, g: usize) -> Vec<Span<'static>> {
+    fn header_spans(&self, cx: &ViewCx, g: usize) -> Vec<Span<'static>> {
         let group = &self.groups[g];
         let chevron = if self.collapsed.contains(&group.path) {
             crate::icons::CHEVRON_CLOSED
@@ -883,23 +869,23 @@ impl ProblemsPanel {
         let mut spans = vec![
             Span::styled(
                 format!("{chevron} "),
-                Style::default().fg(self.theme.ui(COLOR_DIM)),
+                Style::default().fg(cx.theme.ui(COLOR_DIM)),
             ),
             Span::styled(
                 format!("{} ", icon.glyph),
-                Style::default().fg(self.theme.ui(icon.color)),
+                Style::default().fg(cx.theme.ui(icon.color)),
             ),
             Span::styled(
                 group.name.clone(),
                 Style::default()
-                    .fg(self.theme.ui(COLOR_HEADER))
+                    .fg(cx.theme.ui(COLOR_HEADER))
                     .add_modifier(Modifier::BOLD),
             ),
         ];
         if !group.rel_dir.is_empty() {
             spans.push(Span::styled(
                 format!(" {}", group.rel_dir),
-                Style::default().fg(self.theme.ui(COLOR_DIM)),
+                Style::default().fg(cx.theme.ui(COLOR_DIM)),
             ));
         }
         // Count what the filter actually shows beneath this header, not the
@@ -911,14 +897,14 @@ impl ProblemsPanel {
             .count();
         spans.push(Span::styled(
             format!("  {shown}"),
-            Style::default().fg(self.theme.ui(COLOR_DIM)),
+            Style::default().fg(cx.theme.ui(COLOR_DIM)),
         ));
         spans
     }
 
-    fn diag_spans(&self, g: usize, i: usize) -> Vec<Span<'static>> {
+    fn diag_spans(&self, cx: &ViewCx, g: usize, i: usize) -> Vec<Span<'static>> {
         let item = &self.groups[g].items[i];
-        let (glyph, color) = severity_glyph(item.severity, self.theme);
+        let (glyph, color) = severity_glyph(item.severity, cx.theme);
         // The message can span several lines on the wire; collapse to one row.
         let message = item.message.replace('\n', " ");
         // A row the navigator is fixing wears the spinner in place of its
@@ -931,14 +917,14 @@ impl ProblemsPanel {
         let lead = if fixing && !self.fix_glyph.is_empty() {
             Span::styled(
                 format!("   {} ", self.fix_glyph),
-                Style::default().fg(self.theme.ui(COLOR_INFO)),
+                Style::default().fg(cx.theme.ui(COLOR_INFO)),
             )
         } else {
             Span::styled(format!("   {glyph} "), Style::default().fg(color))
         };
         let mut spans = vec![
             lead,
-            Span::styled(message, Style::default().fg(self.theme.ui(COLOR_MSG))),
+            Span::styled(message, Style::default().fg(cx.theme.ui(COLOR_MSG))),
         ];
         let source = match &item.code {
             Some(code) => code.label(&item.source),
@@ -947,18 +933,18 @@ impl ProblemsPanel {
         if !source.is_empty() {
             spans.push(Span::styled(
                 format!(" {source} "),
-                Style::default().fg(self.theme.ui(COLOR_DIM)),
+                Style::default().fg(cx.theme.ui(COLOR_DIM)),
             ));
         }
         spans.push(Span::styled(
             format!("[Ln {}, Col {}]", item.line + 1, item.col + 1),
-            Style::default().fg(self.theme.ui(COLOR_DIM)),
+            Style::default().fg(cx.theme.ui(COLOR_DIM)),
         ));
         // Flat list has no file header, so name the file on the row itself.
         if !self.group_by_file {
             spans.push(Span::styled(
                 format!(" {}", self.groups[g].name),
-                Style::default().fg(self.theme.ui(COLOR_DIM)),
+                Style::default().fg(cx.theme.ui(COLOR_DIM)),
             ));
         }
         spans
@@ -966,7 +952,7 @@ impl ProblemsPanel {
 
     /// A related location's row (#1523), indented under its diagnostic's
     /// message and read as VS Code's: `file [Ln, Col]: message`.
-    fn related_spans(&self, g: usize, i: usize, r: usize) -> Vec<Span<'static>> {
+    fn related_spans(&self, cx: &ViewCx, g: usize, i: usize, r: usize) -> Vec<Span<'static>> {
         let related = &self.groups[g].items[i].related[r];
         vec![
             Span::styled(
@@ -976,11 +962,11 @@ impl ProblemsPanel {
                     related.line + 1,
                     related.col + 1
                 ),
-                Style::default().fg(self.theme.ui(COLOR_DIM)),
+                Style::default().fg(cx.theme.ui(COLOR_DIM)),
             ),
             Span::styled(
                 crate::lsp::manager::one_line(&related.message),
-                Style::default().fg(self.theme.ui(COLOR_MSG)),
+                Style::default().fg(cx.theme.ui(COLOR_MSG)),
             ),
         ]
     }
@@ -1015,6 +1001,10 @@ mod tests {
     }
 
     fn render(p: &mut ProblemsPanel, w: u16, h: u16) -> String {
+        render_in(p, &ViewCx::default(), w, h)
+    }
+
+    fn render_in(p: &mut ProblemsPanel, cx: &ViewCx, w: u16, h: u16) -> String {
         let area = Rect {
             x: 0,
             y: 0,
@@ -1022,7 +1012,7 @@ mod tests {
             height: h,
         };
         let mut buf = Buffer::empty(area);
-        p.render(area, &mut buf);
+        p.draw(cx, area, &mut buf);
         let mut out = String::new();
         for y in 0..h {
             for x in 0..w {
@@ -1085,7 +1075,7 @@ mod tests {
             height: 6,
         };
         let mut buf = Buffer::empty(area);
-        (&mut p).render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         // Every painted cell stays inside the buffer (a render that ran
         // past `area` would have panicked above), and the severity label
         // is still visible on the toolbar row beside the bounded filter.
@@ -1232,7 +1222,7 @@ mod tests {
             p.cycle_filter();
         }
         let text: String = p
-            .header_spans(0)
+            .header_spans(&ViewCx::default(), 0)
             .iter()
             .map(|s| s.content.clone())
             .collect();
@@ -1446,12 +1436,15 @@ mod tests {
     fn croft_loch_rows_keep_a_one_cell_gutter_and_black_stays_flush() {
         let rows = |theme: crate::theme::Theme| {
             let mut p = ProblemsPanel::new();
-            p.theme = theme;
             p.set_groups(vec![group(
                 "a.rs",
                 vec![diag(3, DiagnosticSeverity::Error, "boom")],
             )]);
-            render(&mut p, 60, 4)
+            let cx = ViewCx {
+                theme,
+                ..ViewCx::default()
+            };
+            render_in(&mut p, &cx, 60, 4)
                 .lines()
                 .map(String::from)
                 .collect::<Vec<_>>()
@@ -1655,8 +1648,8 @@ mod tests {
             height: 6,
         };
         let mut buf = Buffer::empty(area);
-        p.render(area, &mut buf);
-        let chip = p.theme.accent_chip_bg();
+        p.draw(&ViewCx::default(), area, &mut buf);
+        let chip = ViewCx::default().theme.accent_chip_bg();
         let cell_bg = |b: &Buffer, r: Rect| b[(r.x, r.y)].style().bg;
         assert_ne!(
             cell_bg(&buf, p.filter_rect),
@@ -1667,7 +1660,7 @@ mod tests {
         // Turn the filter off-default: it lights up with the accent chip.
         p.cycle_filter();
         let mut buf = Buffer::empty(area);
-        p.render(area, &mut buf);
+        p.draw(&ViewCx::default(), area, &mut buf);
         assert_eq!(
             cell_bg(&buf, p.filter_rect),
             Some(chip),
