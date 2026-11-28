@@ -641,6 +641,8 @@ fn run_pdftoppm(
         // the renderer forked and not only the renderer itself.
         cmd.process_group(0);
     }
+    // Waited on below: never during a key press, click or frame (#2827).
+    crate::proc::about_to_wait(program.as_os_str());
     let mut child = cmd.spawn()?;
     let mut stderr_pipe = child.stderr.take();
     // Non-blocking, and read from ONE place: this thread (#553).
@@ -855,6 +857,8 @@ fn rasterize_with_sips(pdf: &Path) -> std::io::Result<Vec<u8>> {
     let dir = unique_temp_dir("croft-pdf")?;
     let _guard = TempDirGuard(dir.clone());
     let out = dir.join("page.png");
+    // Waited on below: never during a key press, click or frame (#2827).
+    crate::proc::about_to_wait(std::ffi::OsStr::new("sips"));
     let status = Command::new("sips")
         .args(["-s", "format", "png"])
         .arg(pdf)
@@ -918,6 +922,25 @@ mod tests {
         std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         script
+    }
+
+    /// #2827: the renderer tells the UI-turn check before it waits, so a
+    /// render during a key press, click or frame fails a test.
+    #[cfg(unix)]
+    #[test]
+    fn the_renderer_may_not_wait_during_a_ui_turn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = fake_pdftoppm(tmp.path(), "exit 0");
+        let pdf = tmp.path().join("doc.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        let turn = crate::proc::UiTurn::enter();
+        let waited = std::panic::catch_unwind(|| run_pdftoppm(&script, &pdf, 1, budget(5_000)));
+        drop(turn);
+        assert!(
+            waited.is_err(),
+            "a render during a UI turn must fail the test"
+        );
+        let _ = run_pdftoppm(&script, &pdf, 1, budget(5_000));
     }
 
     /// #493: a renderer that hangs is killed at the budget and the open

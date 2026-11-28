@@ -519,6 +519,7 @@ fn clicking_an_internal_pdf_link_flips_to_its_page() {
     app.cell_pixel = Some((10, 20));
     app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::Kitty;
     app.editor.open_pinned(&pdf).unwrap();
+    settle_pdf(&mut app);
     let backend = ratatui::backend::TestBackend::new(120, 40);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|frame| app.render(frame)).unwrap();
@@ -2237,6 +2238,29 @@ fn home_after_an_early_end_stays_on_the_first_pdf_page() {
     assert_eq!(current_pdf_page(&mut app), 1, "Home came after End");
 }
 
+/// Opening a PDF from the Explorer returns at once (#2827): the tab comes
+/// up saying page 1 is rendering, and the page shows when it lands.
+#[test]
+fn opening_a_pdf_does_not_wait_for_its_first_page() {
+    require_pdf_backend();
+    let tmp = tempfile::tempdir().unwrap();
+    write_three_page_pdf(&tmp.path().join("doc.pdf"));
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    open_from_explorer(&mut app, "doc.pdf");
+    assert!(
+        app.editor.image.as_ref().is_some_and(|i| i.pdf.is_some()),
+        "the PDF tab is open at once"
+    );
+    assert!(
+        !app.editor.pdf_page_shown(),
+        "the open must not wait for page 1 to render"
+    );
+    assert!(app.editor.pdf_jobs.rendering());
+    settle_pdf(&mut app);
+    assert!(app.editor.pdf_page_shown(), "page 1 shows once it lands");
+    assert_eq!(app.editor.pdf_page(), Some(1));
+}
+
 /// End pressed right after the open, before the page count is in, goes to
 /// the last page once it is: the count is read on a job (#2824).
 #[test]
@@ -2507,6 +2531,7 @@ fn turning_a_pdf_page_rebakes_the_inline_image_overlay() {
     app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::Kitty;
     app.cell_pixel = Some((8, 16));
     app.editor.open(&path).unwrap();
+    settle_pdf(&mut app);
     let area = Rect {
         x: 0,
         y: 0,

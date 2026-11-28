@@ -2577,6 +2577,7 @@ fn the_svg_header_shows_the_drawings_size_not_the_rasters() {
     let mut buf = ratatui::buffer::Buffer::empty(area);
     render_image_placeholder(
         img,
+        false,
         Some(&p),
         area,
         &mut buf,
@@ -3487,6 +3488,14 @@ fn extensionless_pdf_and_plain_zip_never_dead_end() {
         e.image.as_ref().is_some_and(|i| i.pdf.is_some()) || e.hex.is_some(),
         "a sniffed PDF opens in the reader or falls to hex, never errors"
     );
+    // Its first page renders on a job (#2827): one that will not render
+    // lands in hex then, saying why.
+    settle_pdf_jobs(&mut e);
+    assert!(
+        e.pdf_page_shown() || e.hex.is_some(),
+        "a sniffed PDF that would not render falls to hex; status: {}",
+        e.status
+    );
 
     // A zip that is NOT a workbook: the xlsx attempt fails, the hex
     // fallback catches it.
@@ -3506,6 +3515,54 @@ fn extensionless_pdf_and_plain_zip_never_dead_end() {
         "a non-workbook zip lands in the archive browser (#179)"
     );
     assert!(e.sheet.is_none() && e.hex.is_none());
+}
+
+/// A file sniffed as a PDF whose first page will not render goes to the hex
+/// viewer saying why (#2827): the render is on a job now, and its failure
+/// lands where the open's used to.
+#[test]
+fn a_sniffed_pdf_that_will_not_render_lands_in_hex_saying_why() {
+    if crate::pdf::detect_backend().is_none() {
+        eprintln!("skipping: no PDF rasteriser installed");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let pdf = tmp.path().join("notes");
+    std::fs::write(&pdf, b"%PDF-1.4\nnot really a pdf\n\x00\x01").unwrap();
+    let mut e = Editor::new();
+    e.open(&pdf).unwrap();
+    settle_pdf_jobs(&mut e);
+    assert!(e.hex.is_some(), "status: {}", e.status);
+    assert!(
+        e.hex_routed_because()
+            .is_some_and(|why| why.contains("PDF viewer could not render")),
+        "{:?}",
+        e.hex_routed_because()
+    );
+}
+
+/// A `.pdf` whose first page will not render keeps its tab, which says the
+/// page is not rendered, and asking for a page asks again (#2827).
+#[test]
+fn a_pdf_whose_first_page_will_not_render_keeps_its_tab_and_asks_again() {
+    if crate::pdf::detect_backend().is_none() {
+        eprintln!("skipping: no PDF rasteriser installed");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let pdf = tmp.path().join("half-written.pdf");
+    std::fs::write(&pdf, b"%PDF-1.4\nnot really a pdf\n").unwrap();
+    let mut e = Editor::new();
+    e.open(&pdf).unwrap();
+    settle_pdf_jobs(&mut e);
+    assert!(e.image.as_ref().is_some_and(|i| i.pdf.is_some()));
+    assert!(!e.pdf_page_shown());
+    assert!(e.status.contains("failed"), "{}", e.status);
+    e.set_pdf_page(1);
+    assert!(
+        e.pdf_jobs.rendering(),
+        "page 1 is asked for again, though it is the current page"
+    );
 }
 
 fn gzip_to(path: &Path, data: &[u8]) {
@@ -11325,6 +11382,7 @@ fn open_pdf_tab_keeps_last_good_page_through_a_mid_write_sweep() {
     std::fs::write(&path, one_page_pdf).unwrap();
     let mut tabs = EditorTabs::new();
     tabs.open_pinned(&path).unwrap();
+    settle_pdf_jobs(&mut tabs);
     let good_bytes = {
         let tab = tabs.iter_tabs().next().unwrap();
         tab.image
@@ -11449,6 +11507,7 @@ fn pdf_reload_keeps_the_current_page() {
     std::fs::write(&path, two_page_pdf).unwrap();
     let mut tabs = EditorTabs::new();
     tabs.open_pinned(&path).unwrap();
+    settle_pdf_jobs(&mut tabs);
     tabs.change_pdf_page(1);
     settle_pdf_jobs(&mut tabs);
     assert_eq!(tabs.pdf_page(), Some(2));
@@ -14187,6 +14246,7 @@ fn non_iterm2_canvases_paint_the_theme_background_not_reset() {
     let mut buf = ratatui::buffer::Buffer::empty(area);
     render_image_placeholder(
         e.image.as_ref().unwrap(),
+        false,
         None,
         area,
         &mut buf,
@@ -14254,6 +14314,7 @@ fn the_kitty_image_canvas_keeps_the_default_bg_so_the_deep_z_preview_shows() {
     let mut buf = ratatui::buffer::Buffer::empty(area);
     render_image_placeholder(
         &image,
+        false,
         None,
         area,
         &mut buf,
